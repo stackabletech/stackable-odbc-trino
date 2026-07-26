@@ -1,0 +1,78 @@
+# cargo-release configuration for stackable-odbc-trino.
+#
+# cargo-release is dry-run by default; --execute is required to mutate state.
+# Publication to crates.io is deliberately disabled: this configuration only
+# bumps the version, rewrites CHANGELOG.md and packaging/README.md, commits,
+# tags and pushes. The v{version} tag then triggers
+# .github/workflows/release.yaml, which builds both binaries, assembles the
+# release archives and publishes the GitHub Release.
+#
+# Publishing to crates.io is blocked for a second reason anyway: a path
+# dependency cannot be published, and stackable-odbc-core is still one.
+
+publish = false
+push = true
+# Signing is requested here rather than left to the releaser's `tag.gpgsign` /
+# `commit.gpgsign`, so a release tag is signed regardless of whose machine it
+# is cut on — and fails loudly instead of silently producing an unsigned tag
+# when no signing key is configured.
+sign-tag = true
+sign-commit = true
+consolidate-commits = false
+
+# Day-to-day work happens on feature branches. Without this, a stray
+# `--execute` would tag whichever branch happened to be checked out.
+allow-branch = ["main"]
+
+# No git hooks are installed in .git/hooks, so pre-commit does not run on the
+# commit cargo-release makes. Run it explicitly instead. This executes against
+# the pre-bump tree, so it validates code rather than version strings.
+pre-release-hook = ["pre-commit", "run", "--all-files"]
+
+# Both follow the conventional-commit style used throughout this repo's
+# history, rather than cargo-release's defaults.
+pre-release-commit-message = "chore(release): version {{version}}"
+tag-message = "chore(release): version {{version}}"
+
+[[pre-release-replacements]]
+file = "CHANGELOG.md"
+search = "## \\[Unreleased\\]"
+replace = "## [Unreleased]\n\n## [{{version}}] — {{date}}"
+exactly = 1
+
+# The next two rules maintain the link-reference footer. Exactly one of them
+# applies to any given release, and the order matters: replacements run
+# sequentially, so the compare-form rule must come first. Reversed, the
+# `commits/HEAD` rule would write a `compare/...` link that the compare-form
+# rule then matched in the same pass, emitting the tag link twice.
+
+# Subsequent-release case: rewrite the `[Unreleased]` compare link to point at
+# the new version, and prepend a `[{version}]` tag link. With `min = 0`, this
+# rule is a silent no-op on the first release, when the footer still holds the
+# `commits/HEAD` placeholder; after that it matches on every release.
+[[pre-release-replacements]]
+file = "CHANGELOG.md"
+search = "\\[Unreleased\\]: https://github.com/stackabletech/stackable-odbc-trino/compare/v[0-9]+\\.[0-9]+\\.[0-9]+\\.\\.\\.HEAD"
+replace = "[Unreleased]: https://github.com/stackabletech/stackable-odbc-trino/compare/v{{version}}...HEAD\n[{{version}}]: https://github.com/stackabletech/stackable-odbc-trino/releases/tag/v{{version}}"
+min = 0
+
+# First-release case: the initial placeholder points at `commits/HEAD`.
+# Fires exactly once — on the first release — after which the line is in the
+# `compare/...` form the rule above owns, and this one never matches again.
+[[pre-release-replacements]]
+file = "CHANGELOG.md"
+search = "\\[Unreleased\\]: https://github.com/stackabletech/stackable-odbc-trino/commits/HEAD"
+replace = "[Unreleased]: https://github.com/stackabletech/stackable-odbc-trino/compare/v{{version}}...HEAD\n[{{version}}]: https://github.com/stackabletech/stackable-odbc-trino/releases/tag/v{{version}}"
+min = 0
+
+[[pre-release-replacements]]
+file = "packaging/README.md"
+search = "VERSION=[0-9]+\\.[0-9]+\\.[0-9]+"
+replace = "VERSION={{version}}"
+exactly = 1
+
+[[pre-release-replacements]]
+file = "packaging/README.md"
+search = "stackable-odbc-trino-[0-9]+\\.[0-9]+\\.[0-9]+-linux-x64\\.tar\\.gz"
+replace = "stackable-odbc-trino-{{version}}-linux-x64.tar.gz"
+exactly = 1
