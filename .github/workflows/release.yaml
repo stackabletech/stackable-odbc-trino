@@ -1,0 +1,146 @@
+---
+name: Release
+
+on:
+  push:
+    tags:
+      # The tag format cargo-release produces; see release.toml.
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_TOOLCHAIN_VERSION: "1.95.0"
+
+jobs:
+  verify-version:
+    name: Verify tag matches Cargo.toml
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.extract.outputs.version }}
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          persist-credentials: false
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - id: extract
+        name: Compare tag and Cargo.toml version
+        run: |
+          TAG="${GITHUB_REF#refs/tags/}"
+          TAG_VERSION="${TAG#v}"
+          CARGO_VERSION=$(grep -m1 '^version = ' Cargo.toml | sed -E 's/version = "(.+)"/\1/')
+          if [ "$TAG_VERSION" != "$CARGO_VERSION" ]; then
+            echo "::error::Tag $TAG says version $TAG_VERSION but Cargo.toml has $CARGO_VERSION"
+            exit 1
+          fi
+          echo "version=$CARGO_VERSION" >> "$GITHUB_OUTPUT"
+          echo "Verified: releasing stackable-odbc-trino $CARGO_VERSION"
+
+  build-and-package:
+    name: Build and package release archives
+    runs-on: ubuntu-latest
+    needs: [verify-version]
+    steps:
+      - name: Install host dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y unixodbc-dev gcc-mingw-w64-x86-64 zip
+
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          persist-credentials: false
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install Rust ${{ env.RUST_TOOLCHAIN_VERSION }} toolchain
+        uses: dtolnay/rust-toolchain@b3b07ba8b418998c39fb20f53e8b695cdcc8de1b
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN_VERSION }}
+          targets: x86_64-pc-windows-gnu
+
+      - name: Setup Rust Cache
+        uses: Swatinem/rust-cache@98c8021b550208e191a6a3145459bfc9fb29c4c0 # v2.8.0
+        with:
+          key: release
+
+      - name: Build Linux release binary
+        run: cargo build --release
+
+      - name: Build Windows release binary (cross)
+        run: cargo build --release --target x86_64-pc-windows-gnu
+
+      - name: Assemble release archives
+        env:
+          VERSION: ${{ needs.verify-version.outputs.version }}
+        run: ./packaging/build-archives.sh
+
+      - name: Sanity-check archive contents
+        env:
+          VERSION: ${{ needs.verify-version.outputs.version }}
+        run: |
+          DIST=packaging/dist
+          LINUX="$DIST/stackable-odbc-trino-${VERSION}-linux-x64.tar.gz"
+          WINDOWS="$DIST/stackable-odbc-trino-${VERSION}-windows-x64.zip"
+          MEZ="$DIST/StackableTrinoODBC-${VERSION}.mez"
+
+          echo "--- Linux archive ---"
+          tar -tzf "$LINUX"
+          for f in libstackable_odbc_trino.so install.sh uninstall.sh README.md LICENSE; do
+            tar -tzf "$LINUX" | grep -qx "./$f" || { echo "::error::missing $f in linux archive"; exit 1; }
+          done
+
+          echo "--- Windows archive ---"
+          unzip -l "$WINDOWS"
+          for f in stackable_odbc_trino.dll StackableTrinoODBC.mez install.bat uninstall.bat README.md LICENSE; do
+            unzip -l "$WINDOWS" | grep -q " $f\$" || { echo "::error::missing $f in windows archive"; exit 1; }
+          done
+
+          echo "--- Standalone .mez ---"
+          test -f "$MEZ" || { echo "::error::missing standalone .mez"; exit 1; }
+          unzip -l "$MEZ" | grep -q 'StackableTrinoODBC.pq' || { echo "::error::.mez missing StackableTrinoODBC.pq"; exit 1; }
+
+          echo "Archive sanity check passed."
+
+      - name: Upload archives as workflow artifacts
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: release-archives
+          path: packaging/dist/*
+          retention-days: 7
+
+  publish-release:
+    name: Publish GitHub Release
+    runs-on: ubuntu-latest
+    needs: [verify-version, build-and-package]
+    steps:
+      - name: Download archives
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: release-archives
+          path: dist
+
+      - name: Determine prerelease flag
+        id: prerelease
+        env:
+          VERSION: ${{ needs.verify-version.outputs.version }}
+        run: |
+          if [[ "$VERSION" == *-* ]]; then
+            echo "flag=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "flag=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@72f2c25fcb47643c292f7107632f7a47c1df5cd8 # v2.3.2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: stackable-odbc-trino ${{ needs.verify-version.outputs.version }}
+          generate_release_notes: true
+          prerelease: ${{ steps.prerelease.outputs.flag }}
+          files: |
+            dist/stackable-odbc-trino-${{ needs.verify-version.outputs.version }}-linux-x64.tar.gz
+            dist/stackable-odbc-trino-${{ needs.verify-version.outputs.version }}-windows-x64.zip
+            dist/StackableTrinoODBC-${{ needs.verify-version.outputs.version }}.mez
