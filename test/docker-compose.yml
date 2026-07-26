@@ -1,0 +1,32 @@
+services:
+  postgres:
+    image: postgres:17
+    environment:
+      POSTGRES_DB: testdb
+      POSTGRES_USER: trino
+      POSTGRES_PASSWORD: trino
+    volumes:
+      - ./postgres-init.sql:/docker-entrypoint-initdb.d/init.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U trino -d testdb"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  trino:
+    image: trinodb/trino:467
+    ports:
+      - "8080:8080"
+      - "8443:8443"
+    volumes:
+      - ./trino-config:/etc/trino
+      - ./tls:/etc/trino/tls
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/v1/info"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 30s

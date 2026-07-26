@@ -19,3 +19,7 @@ connector/bin/
 
 # Release packaging output
 packaging/dist/
+
+# Python bytecode from the test scripts
+__pycache__/
+*.pyc
