@@ -738,6 +738,13 @@ impl Backend for TrinoBackend {
         "\\"
     }
 
+    /// Trino's reserved words, raw — core subtracts ODBC's own, sorts and
+    /// joins them into `SQL_KEYWORDS`. See [`info::TRINO_RESERVED_KEYWORDS`]
+    /// for where the list comes from and why it is static rather than probed.
+    fn keywords() -> &'static [&'static str] {
+        info::TRINO_RESERVED_KEYWORDS
+    }
+
     /// `0`, the spec's value for a data source that does not support
     /// transactions, matching the `SQL_TC_NONE` this driver reports. See
     /// [`TrinoBackend::end_tran`] for why that is a driver limitation rather

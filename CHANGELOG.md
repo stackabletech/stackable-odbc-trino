@@ -65,6 +65,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   depends on the deployment's access control rather than on the driver.
 - `SQL_DATABASE_NAME` now reports the catalog the connection was opened
   against, instead of the empty string.
+- `SQL_KEYWORDS` now lists Trino's 22 reserved words that ODBC does not
+  already reserve — `UNNEST`, `LISTAGG`, `ROLLUP`, the `JSON_*` family and the
+  rest — instead of the empty string, which claimed Trino reserves nothing of
+  its own. Applications read this to decide which identifiers need quoting, so
+  an empty list can leave a generated identifier unquoted where it collides
+  with a keyword. The list is static, from Trino's reserved-words
+  documentation: unlike SQLite there is no API to enumerate them, and unlike
+  the SQL-92 capability bitmaps it is deliberately not version-gated, because
+  over-reporting a keyword only causes a needless quote while under-reporting
+  causes a parse error.
 
 ### Fixed
 

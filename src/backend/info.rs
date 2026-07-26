@@ -888,6 +888,113 @@ pub(crate) const TRINO_NUMERIC_FUNCTIONS: u32 = SQL_FN_NUM_ABS
     | SQL_FN_NUM_ROUND
     | SQL_FN_NUM_TRUNCATE;
 
+/// Trino's reserved words, as `SQL_KEYWORDS` (89) needs them: the raw list,
+/// which core then filters against `ODBC_RESERVED_KEYWORDS`, sorts and joins.
+/// Of the 83 below, 22 survive that subtraction.
+///
+/// Transcribed from <https://trino.io/docs/current/language/reserved.html>
+/// rather than read out of the server, because there is nothing to read.
+/// Trino has no equivalent of SQLite's `sqlite3_keyword_name`: `system.jdbc`
+/// -- the schema backing the JDBC driver's `DatabaseMetaData`, and so the one
+/// place such a list would live -- has no keywords table, nor does
+/// `system.metadata`, and this driver speaks HTTP so there is no library to
+/// ask. Trino's own JDBC driver hardcodes `getSQLKeywords()` for the same
+/// reason.
+///
+/// Deliberately **not** gated on `server_major`, unlike the SQL-92 predicate
+/// and join-operator bitmaps. The safe direction is inverted here: over-
+/// reporting a keyword only makes an application quote an identifier it need
+/// not have, while under-reporting leaves a genuinely reserved word unquoted
+/// and the statement fails to parse. So this tracks the newest list rather
+/// than the connected server's. The drift is small and additive -- of the
+/// twelve sampled against a live 467, eleven were already reserved and only
+/// `AUTO` was newer.
+pub(crate) const TRINO_RESERVED_KEYWORDS: &[&str] = &[
+    "ALTER",
+    "AND",
+    "AS",
+    "AUTO",
+    "BETWEEN",
+    "BY",
+    "CASE",
+    "CAST",
+    "CONSTRAINT",
+    "CREATE",
+    "CROSS",
+    "CUBE",
+    "CURRENT_CATALOG",
+    "CURRENT_DATE",
+    "CURRENT_PATH",
+    "CURRENT_ROLE",
+    "CURRENT_SCHEMA",
+    "CURRENT_TIME",
+    "CURRENT_TIMESTAMP",
+    "CURRENT_USER",
+    "DEALLOCATE",
+    "DELETE",
+    "DESCRIBE",
+    "DISTINCT",
+    "DROP",
+    "ELSE",
+    "END",
+    "ESCAPE",
+    "EXCEPT",
+    "EXISTS",
+    "EXTRACT",
+    "FALSE",
+    "FOR",
+    "FROM",
+    "FULL",
+    "GROUP",
+    "GROUPING",
+    "HAVING",
+    "IN",
+    "INNER",
+    "INSERT",
+    "INTERSECT",
+    "INTO",
+    "IS",
+    "JOIN",
+    "JSON_ARRAY",
+    "JSON_EXISTS",
+    "JSON_OBJECT",
+    "JSON_QUERY",
+    "JSON_TABLE",
+    "JSON_VALUE",
+    "LEFT",
+    "LIKE",
+    "LISTAGG",
+    "LOCALTIME",
+    "LOCALTIMESTAMP",
+    "NATURAL",
+    "NORMALIZE",
+    "NOT",
+    "NULL",
+    "ON",
+    "OR",
+    "ORDER",
+    "OUTER",
+    "OVERLAPS",
+    "PREPARE",
+    "RECURSIVE",
+    "RIGHT",
+    "ROLLUP",
+    "SELECT",
+    "SKIP",
+    "TABLE",
+    "THEN",
+    "TRIM",
+    "TRUE",
+    "UESCAPE",
+    "UNION",
+    "UNNEST",
+    "USING",
+    "VALUES",
+    "WHEN",
+    "WHERE",
+    "WITH",
+];
+
 /// What the `SQL_*_FUNCTIONS` bitmaps mean here.
 ///
 /// The spec defines them in terms of the ODBC scalar-function escape, not in
@@ -2068,6 +2175,76 @@ mod tests {
             SQL_SVE_CASE | SQL_SVE_CAST | SQL_SVE_COALESCE | SQL_SVE_NULLIF
         );
         assert_eq!(TRINO_SQL92_VALUE_EXPRESSIONS, 0x0F);
+    }
+
+    /// `SQL_KEYWORDS` is Trino's reserved words *minus* the ones ODBC already
+    /// reserves, so this asserts the value an application receives rather than
+    /// the raw list the hook returns -- the subtraction is core's, and getting
+    /// it wrong in either direction is what the info type exists to prevent.
+    ///
+    /// The expected string is written out rather than recomputed from
+    /// `TRINO_RESERVED_KEYWORDS`, which would just restate the implementation.
+    #[test]
+    fn sql_keywords_excludes_the_words_odbc_already_reserves() {
+        use stackable_odbc_core::backend::Backend;
+        use stackable_odbc_core::types::ODBC_RESERVED_KEYWORDS;
+
+        let reported: Vec<&str> = TrinoBackend::keywords()
+            .iter()
+            .filter(|k| {
+                !ODBC_RESERVED_KEYWORDS
+                    .iter()
+                    .any(|r| r.eq_ignore_ascii_case(k))
+            })
+            .copied()
+            .collect();
+
+        assert_eq!(
+            reported.join(","),
+            "AUTO,CUBE,CURRENT_CATALOG,CURRENT_PATH,CURRENT_ROLE,CURRENT_SCHEMA,\
+             GROUPING,JSON_ARRAY,JSON_EXISTS,JSON_OBJECT,JSON_QUERY,JSON_TABLE,\
+             JSON_VALUE,LISTAGG,LOCALTIME,LOCALTIMESTAMP,NORMALIZE,RECURSIVE,\
+             ROLLUP,SKIP,UESCAPE,UNNEST"
+        );
+
+        // The words Trino shares with ODBC must not be reported: an
+        // application already knows SELECT is reserved.
+        for shared in ["SELECT", "FROM", "WHERE", "JOIN", "CREATE"] {
+            assert!(
+                TRINO_RESERVED_KEYWORDS.contains(&shared),
+                "{shared} should be in the raw list"
+            );
+            assert!(
+                !reported.contains(&shared),
+                "{shared} is an ODBC reserved word and must be subtracted out"
+            );
+        }
+    }
+
+    /// A duplicate would be reported twice, and a lowercase entry would slip
+    /// past a case-sensitive reader of the value even though core's own
+    /// subtraction is case-insensitive.
+    #[test]
+    fn trino_reserved_keywords_are_unique_sorted_and_upper_case() {
+        let mut sorted = TRINO_RESERVED_KEYWORDS.to_vec();
+        sorted.sort_unstable();
+        assert_eq!(
+            TRINO_RESERVED_KEYWORDS,
+            &sorted[..],
+            "the list should stay sorted so it can be diffed against the docs"
+        );
+
+        let mut deduped = sorted.clone();
+        deduped.dedup();
+        assert_eq!(
+            deduped.len(),
+            TRINO_RESERVED_KEYWORDS.len(),
+            "duplicate entry"
+        );
+
+        for k in TRINO_RESERVED_KEYWORDS {
+            assert_eq!(*k, k.to_ascii_uppercase(), "{k} should be upper case");
+        }
     }
 
     #[test]

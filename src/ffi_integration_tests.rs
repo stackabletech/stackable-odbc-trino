@@ -328,6 +328,62 @@ unsafe fn assert_get_info_str(conn: *mut c_void, info_type: InfoType, expected: 
     }
 }
 
+/// `SQL_KEYWORDS` through the real FFI path, which is the only place the
+/// wiring is observable.
+///
+/// `TrinoBackend::keywords` returns Trino's raw reserved words and
+/// `stackable-odbc-core` subtracts `ODBC_RESERVED_KEYWORDS`, sorts and joins
+/// them. A unit test in `backend/info.rs` can only redo that subtraction
+/// itself, which proves the list is right but not that core is actually
+/// asking this backend for it -- before the hook existed, core answered every
+/// backend with the empty string and `SQLGetInfo` still returned `SUCCESS`.
+///
+/// There is no `odbc_sys::InfoType` variant for 89, so this goes through the
+/// raw `u16` rather than `assert_get_info_str`.
+#[test]
+fn get_info_sql_keywords_reports_trinos_words_minus_odbcs() {
+    unsafe {
+        let (env, conn) = alloc_conn_with_injected_trino_connection();
+
+        // 22 words, ~230 characters: sized well clear of the answer so a
+        // truncation would show up as a short string rather than as SUCCESS.
+        let mut buf = [0xEEu16; 512];
+        let mut str_len: i16 = -1;
+        let ret = ffi::info::sql_get_info_w::<TrinoBackend>(
+            conn,
+            stackable_odbc_core::types::SQL_KEYWORDS,
+            buf.as_mut_ptr() as *mut c_void,
+            (buf.len() * 2) as i16,
+            &mut str_len,
+        );
+        assert_eq!(ret, SqlReturn::SUCCESS, "SQL_KEYWORDS must succeed");
+        assert!(
+            str_len >= 0 && str_len % 2 == 0,
+            "SQL_KEYWORDS is a character string, so StringLength is an even \
+             byte count; got {str_len}"
+        );
+        let units = str_len as usize / 2;
+        let value = String::from_utf16_lossy(&buf[..units]);
+        assert_eq!(buf[units], 0, "SQL_KEYWORDS must be null-terminated");
+
+        assert_eq!(
+            value,
+            "AUTO,CUBE,CURRENT_CATALOG,CURRENT_PATH,CURRENT_ROLE,CURRENT_SCHEMA,\
+             GROUPING,JSON_ARRAY,JSON_EXISTS,JSON_OBJECT,JSON_QUERY,JSON_TABLE,\
+             JSON_VALUE,LISTAGG,LOCALTIME,LOCALTIMESTAMP,NORMALIZE,RECURSIVE,\
+             ROLLUP,SKIP,UESCAPE,UNNEST",
+            "SQL_KEYWORDS must be Trino's reserved words minus ODBC's own"
+        );
+        assert!(
+            !value.contains("SELECT"),
+            "SELECT is reserved by both, so the spec excludes it from this list"
+        );
+
+        let _ = ffi::handle::sql_free_handle::<TrinoBackend>(HandleType::Dbc as i16, conn);
+        let _ = ffi::handle::sql_free_handle::<TrinoBackend>(HandleType::Env as i16, env);
+    }
+}
+
 /// Guards the get_info_raw-first ordering in `info_type_default_response`
 /// (stackable-odbc-core/src/ffi/info.rs). Every info type asserted here has no arm in
 /// `default_get_info` or `trino_get_info`'s match, so a passing `SUCCESS`
