@@ -35,8 +35,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the referential integrity entry level requires is absent, and the driver
   reports `SQL_TC_NONE` where entry level requires `COMMIT`/`ROLLBACK`.
 
+- `SQL_STRING_FUNCTIONS`, `SQL_SYSTEM_FUNCTIONS` and `SQL_TIMEDATE_FUNCTIONS`
+  no longer advertise `LOCATE`, `POSITION`, `USERNAME`, `DBNAME`, `CURDATE`,
+  `CURTIME`, `CURRENT_DATE`, `CURRENT_TIME`, `CURRENT_TIMESTAMP`,
+  `TIMESTAMPADD`, `TIMESTAMPDIFF` or `DAYOFWEEK`. The spec defines these
+  bitmaps in terms of the `{fn ...}` escape, and each of those escapes reached
+  the coordinator untranslated and failed there — a client that read the
+  bitmap and emitted `{fn CURDATE()}` got `FUNCTION_NOT_FOUND`. Trino can do
+  all of them, but only through syntax a name-only remap cannot produce, so
+  the bits return once the translator can rewrite the call rather than the
+  name. `DAYOFWEEK` was worse than an error: Trino's `day_of_week()` is
+  ISO-numbered where ODBC specifies 1 = Sunday.
+
 ### Fixed
 
+- `SQL_MULT_RESULT_SETS`, `SQL_NEED_LONG_DATA_LEN` and
+  `SQL_MAX_ROW_SIZE_INCLUDES_LONG` now report `"N"` instead of the empty
+  string, which is not one of the two values the spec defines for any of them.
 - `SQL_NULL_COLLATION` now reports `SQL_NC_END` instead of `SQL_NC_HIGH`.
   Trino's default null ordering is `NULLS LAST` regardless of the ordering
   direction, which is what `SQL_NC_END` means; `SQL_NC_HIGH` told applications

@@ -3,41 +3,24 @@
 //! differently from ODBC.
 //!
 //! The remap table is traceable to the `SQL_*_FUNCTIONS` bitmaps
-//! `src/backend/info.rs` advertises for Trino.
-//! Every arm below corresponds to one advertised `SQL_FN_*`
-//! bit whose ODBC name Trino spells differently *and* for which a bare
-//! name substitution (`stackable_odbc_core::escape` only ever swaps the identifier in
-//! front of the parentheses, it does not rewrite argument syntax or values)
-//! still produces valid, semantically equivalent Trino SQL.
+//! `src/backend/info.rs` advertises for Trino, and the two are kept in exact
+//! correspondence: a bit is advertised only if the escape survives
+//! translation, and `stackable_odbc_core::escape` only ever swaps the
+//! identifier in front of the parentheses — it never sees the arguments, so it
+//! cannot rewrite argument syntax or values.
 //!
-//! Advertised names that are NOT remapped here, and why a name-only swap
-//! would be wrong for them:
+//! Every arm below is therefore one advertised `SQL_FN_*` bit whose ODBC name
+//! Trino spells differently but which a bare name substitution still turns
+//! into valid, semantically equivalent Trino SQL.
 //!
-//! - `LOCATE`, `POSITION` (`SQL_FN_STR_LOCATE`, `SQL_FN_STR_POSITION`): Trino's
-//!   equivalent is `position(substring IN string)`, a special reserved-word
-//!   syntax with an `IN` keyword, not a comma-separated argument list. Renaming
-//!   just the identifier would produce `position(a, b)`, which Trino's grammar
-//!   rejects (it does not accept a plain function-call form for `position`).
-//! - `CURDATE`, `CURTIME` (`SQL_FN_TD_CURDATE`, `SQL_FN_TD_CURTIME`) and
-//!   `CURRENT_DATE`, `CURRENT_TIME`, `CURRENT_TIMESTAMP`: Trino's
-//!   `current_date` / `current_time` / `current_timestamp` are bare SQL-92
-//!   keywords taken *without* parentheses. The ODBC escape always includes
-//!   `()` (e.g. `{fn CURDATE()}`), and the translator appends whatever
-//!   follows the name verbatim, so renaming still leaves a trailing `()`
-//!   that Trino's grammar does not accept for these keywords.
-//! - `TIMESTAMPADD`, `TIMESTAMPDIFF` (`SQL_FN_TD_TIMESTAMPADD`,
-//!   `SQL_FN_TD_TIMESTAMPDIFF`): Trino's `date_add(unit, value, ts)` /
-//!   `date_diff(unit, ts1, ts2)` take `unit` as a string literal (`'day'`),
-//!   while ODBC's first argument is an unquoted interval keyword
-//!   (`SQL_TSI_DAY`). A name-only rename cannot re-quote that argument.
-//! - `USERNAME`, `DBNAME` (`SQL_FN_SYS_USERNAME`, `SQL_FN_SYS_DBNAME`):
-//!   Trino's `current_user` / `current_catalog` are bare keywords without
-//!   parentheses; same problem as `CURDATE`/`CURTIME` above.
-//! - `DAYOFWEEK` (`SQL_FN_TD_DAYOFWEEK`): Trino's `day_of_week()` is
-//!   ISO-numbered (1 = Monday), while ODBC's `DAYOFWEEK` is 1 = Sunday (see
-//!   the `SQL_TIMEDATE_FUNCTIONS` doc comment in `backend/info.rs`). Remapping
-//!   the name would silently return a *different, wrong* day number rather
-//!   than failing loudly, worse than leaving it untranslated.
+//! The names that a rename *cannot* fix are not remapped here and are not
+//! advertised either — `LOCATE`, `POSITION`, `CURDATE`, `CURTIME`,
+//! `CURRENT_DATE`, `CURRENT_TIME`, `CURRENT_TIMESTAMP`, `USERNAME`, `DBNAME`,
+//! `TIMESTAMPADD`, `TIMESTAMPDIFF` and `DAYOFWEEK`. Trino needs an `IN`
+//! keyword, no parentheses at all, a quoted interval argument, or (for
+//! `DAYOFWEEK`) a different day numbering. The `TRINO_STRING_FUNCTIONS` doc
+//! comment in `backend/info.rs` records what each escape reaches the
+//! coordinator as and how it fails there.
 //!
 //! `NOW`, `MONTH`, `QUARTER`, `WEEK`, `YEAR`, `HOUR`, `MINUTE`, `SECOND`,
 //! `EXTRACT` and the numeric/string functions not listed as arms below are

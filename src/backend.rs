@@ -633,18 +633,17 @@ impl Backend for TrinoBackend {
         0
     }
 
-    /// `0` for both interval bitmaps while the `{fn TIMESTAMPADD}` /
-    /// `{fn TIMESTAMPDIFF}` escapes remain untranslatable.
+    /// `0` for both interval bitmaps.
     ///
-    /// The spec defines these as the intervals those two scalar functions
-    /// accept, so a non-zero value here is meaningful only once the escapes
-    /// work. They do not today: `crate::escape_dialect` cannot rewrite ODBC's
-    /// unquoted `SQL_TSI_DAY` into the quoted `'day'` that Trino's
-    /// `date_add`/`date_diff` require, so `{fn TIMESTAMPADD(SQL_TSI_DAY, ...)}`
-    /// reaches the coordinator as `TIMESTAMPADD(SQL_TSI_DAY, ...)` and fails
-    /// with `COLUMN_NOT_FOUND: 'sql_tsi_day'`.
+    /// The spec defines these as the intervals `TIMESTAMPADD` and
+    /// `TIMESTAMPDIFF` accept, and this driver does not advertise either
+    /// function in `SQL_TIMEDATE_FUNCTIONS` — `crate::escape_dialect` cannot
+    /// rewrite ODBC's unquoted `SQL_TSI_DAY` into the quoted `'day'` Trino's
+    /// `date_add`/`date_diff` require. Naming intervals for a function the
+    /// driver does not offer would be the same overclaim one step removed.
     ///
-    /// When that is fixed, the honest value for both is
+    /// Should core's `EscapeDialect` ever gain a hook that sees the whole
+    /// call, the honest value for both becomes
     /// `SECOND | MINUTE | HOUR | DAY | WEEK | MONTH | QUARTER | YEAR`:
     /// `date_add`/`date_diff` accept every one of those units and reject
     /// `nanosecond`, so `SQL_FN_TSI_FRAC_SECOND` (billionths of a second)
