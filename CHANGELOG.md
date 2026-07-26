@@ -78,6 +78,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- The Power Query connector no longer overrides `SQL_SQL92_PREDICATES` and
+  `SQL_SQL92_RELATIONAL_JOIN_OPERATORS` with every bit set. The driver gates
+  both on the coordinator's version — `MATCH` and `UNIQUE` arrived in Trino
+  482, `OVERLAPS` in 483, `CORRESPONDING` in 475 — and the flat overrides
+  re-asserted all of them on every server, so Power BI could fold a predicate
+  the coordinator then rejected. The join override also claimed `NATURAL JOIN`,
+  which Trino rejects with `NOT_SUPPORTED`, and `UNION JOIN`, which has no
+  production in its grammar at any version. `SQL_AGGREGATE_FUNCTIONS`,
+  `SQL_SQL92_VALUE_EXPRESSIONS` and `SQL_IDENTIFIER_QUOTE_CHAR` are no longer
+  overridden either; the driver reports exactly those values, and an override
+  wins over the driver silently, so keeping them only invited drift.
+  `SQL_SQL_CONFORMANCE` is still overridden to `SQL_SC_SQL92_FULL`, which is
+  Microsoft's documented guidance for Power Query connectors and is what
+  `SupportsDerivedTable` keys off.
 - `SQL_MULT_RESULT_SETS`, `SQL_NEED_LONG_DATA_LEN` and
   `SQL_MAX_ROW_SIZE_INCLUDES_LONG` now report `"N"` instead of the empty
   string, which is not one of the two values the spec defines for any of them.

@@ -15,9 +15,25 @@ section StackableTrinoODBC;
 // The ODBC driver name as registered in odbcinst.ini / the Windows registry.
 Config_DriverName = "stackable_odbc_trino";
 
-// SQL conformance override. The driver currently reports SQL_SC_MINIMUM (1),
-// but it supports the SQL-92 Entry Level constructs PowerBI needs. Override
-// to SQL_SC_SQL92_FULL (8) so query folding isn't artificially limited.
+// SQL conformance override.
+//
+// The driver reports SQL_SC_SQL92_FULL here and 0 through SQLGetInfo, and
+// both are right for their own audience. To an ODBC application the info type
+// is a conformance claim, and Trino does not reach even Entry level: its
+// CREATE TABLE rejects PRIMARY KEY, UNIQUE, CHECK and REFERENCES, and the
+// driver reports SQL_TC_NONE where Entry level requires COMMIT/ROLLBACK. To
+// Power Query it is the knob that unlocks SQL generation, and Microsoft's own
+// guidance is to turn it up and narrow the specifics elsewhere: "In Power
+// Query scenarios, the connector is used in a Read Only mode. Most drivers
+// will want to report a SQL_SC_SQL92_FULL compliance level, and override
+// specific SQL generation behavior using the SQLGetInfo and SQLGetFunctions
+// properties."
+//
+// SupportsDerivedTable also keys off this: it defaults to false for any
+// conformance level below SQL_SC_SQL92_FULL, and derived tables are required
+// for many DirectQuery scenarios. It is set explicitly below regardless.
+//
+// https://learn.microsoft.com/en-us/power-query/odbc-parameters
 Config_SqlConformance = ODBC[SQL_SC][SQL_SC_SQL92_FULL]; // 8
 
 // Trino uses LIMIT x OFFSET y syntax.
@@ -81,29 +97,40 @@ shared StackableTrinoODBC.Contents = (
 
         SqlCapabilities = defaultConfig[SqlCapabilities] & [
             FractionalSecondsScale = 3,
-            // Trino supports GROUP BY without restrictions.
-            GroupByCapabilities = 2,
+            // GroupByCapabilities is not a documented SqlCapabilities field --
+            // the GROUP BY relationship is expressed through SQL_GROUP_BY in
+            // the SQLGetInfo record, which the driver now answers with
+            // SQL_GB_GROUP_BY_CONTAINS_SELECT (the value that used to be here,
+            // in the wrong record). Its old comment, "Trino supports GROUP BY
+            // without restrictions", was wrong either way: Trino rejects a
+            // non-aggregated select column that is absent from GROUP BY with
+            // EXPRESSION_NOT_AGGREGATE.
             SupportsDerivedTable = true,
             SupportsTop = false
         ],
 
-        SQLGetInfo = defaultConfig[SQLGetInfo] & [
-            // Override SQL-92 capabilities that the driver doesn't yet
-            // report correctly. Power Query checks these via ODBC
-            // SQLGetInfoW and refuses to fold if they're zero.
-            //
-            // 0x3FFF = all SQL_SP bits (EXISTS, ISNOTNULL, ISNULL, LIKE, IN, BETWEEN, etc.)
-            SQL_SQL92_PREDICATES = 0x3FFF,
-            // 0x7F = AVG | COUNT | MAX | MIN | SUM | DISTINCT | ALL
-            SQL_AGGREGATE_FUNCTIONS = 0x7F,
-            // CROSS | FULL OUTER | INNER | LEFT OUTER | NATURAL | RIGHT OUTER + more
-            SQL_SQL92_RELATIONAL_JOIN_OPERATORS = 0x3FF,
-            // CASE | CAST | COALESCE | NULLIF
-            SQL_SQL92_VALUE_EXPRESSIONS = 0x0F,
-            // Tell PowerBI to use double-quote for identifier quoting
-            // instead of SQL Server-style square brackets.
-            SQL_IDENTIFIER_QUOTE_CHAR = """"
-        ],
+        // Overrides are for what the driver gets wrong. Anything the driver
+        // reports correctly is deliberately absent, because an override here
+        // silently wins over SQLGetInfoW and cannot be corrected by fixing the
+        // driver. SQL_SQL92_PREDICATES, SQL_AGGREGATE_FUNCTIONS,
+        // SQL_SQL92_RELATIONAL_JOIN_OPERATORS, SQL_SQL92_VALUE_EXPRESSIONS and
+        // SQL_IDENTIFIER_QUOTE_CHAR were all overridden here and are all now
+        // answered honestly by the driver.
+        //
+        // Two of them were actively harmful. The driver gates
+        // SQL_SQL92_PREDICATES and SQL_SQL92_RELATIONAL_JOIN_OPERATORS on the
+        // coordinator's version, because MATCH and UNIQUE arrived in Trino
+        // 482, OVERLAPS in 483 and CORRESPONDING in 475. The flat 0x3FFF and
+        // 0x3FF here re-asserted all of them on every server, and 0x3FF also
+        // claimed NATURAL JOIN -- which a live 467 rejects with
+        // "NOT_SUPPORTED: Natural join not supported" -- and UNION JOIN, which
+        // has no production in Trino's grammar at any version. Folding any of
+        // those produces SQL the coordinator refuses.
+        //
+        // Nothing Power Query actually generates is lost: comparison, IN,
+        // LIKE, BETWEEN, IS NULL, EXISTS and the four join types are all in
+        // the driver's ungated set.
+        SQLGetInfo = defaultConfig[SQLGetInfo],
 
         SQLColumns = (catalogName, schemaName, tableName, columnName, source) =>
             source,
@@ -266,6 +293,11 @@ BuildOdbcConfig = () as record =>
             Merge(withEscape, [LimitClauseKind = Config_LimitClauseKind]),
 
         // CAST instead of CONVERT.
+        //
+        // Kept even though the driver already reports SQL_FN_CVT_CAST and no
+        // CONVERT, because the M engine's documented default is to attempt
+        // CONVERT and this is the documented way to redirect it. The override
+        // agrees with the driver rather than contradicting it.
         withCastOrConvert =
             if (Config_UseCastInsteadOfConvert <> null) then
                 let
