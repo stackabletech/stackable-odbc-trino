@@ -724,7 +724,9 @@ fn trino_get_info(info_type: InfoType) -> Result<InfoValue, TrinoError> {
         // SQL_TXN_CAPABLE is `An SQLUSMALLINT value` per the SQLGetInfo
         // spec, not SQLUINTEGER -- found by the info-type conformance test
         // (`stackable_odbc_core::conformance`). SQL_TC_NONE: this driver does not
-        // implement SQLEndTran/manual-commit.
+        // implement SQLEndTran/manual-commit. Trino does support transactions,
+        // so this reports a driver limitation rather than a platform one:
+        // see TrinoBackend::end_tran.
         InfoType::TransactionCapable => return Ok(InfoValue::U16(SQL_TC_NONE as u16)),
         // SQL_GD_BLOCK is deliberately not claimed: it means SQLGetData can
         // be called for a row in a block cursor after a bulk fetch, but no
@@ -765,11 +767,10 @@ fn trino_get_info(info_type: InfoType) -> Result<InfoValue, TrinoError> {
     }
 
     // Fall through to shared defaults
-    default_get_info(info_type, &TrinoBackend::catalog_result_column_widths()).ok_or_else(|| {
-        TrinoError::NotImplemented {
+    default_get_info::<TrinoBackend>(info_type, &TrinoBackend::catalog_result_column_widths())
+        .ok_or_else(|| TrinoError::NotImplemented {
             feature: format!("get_info({info_type:?})"),
-        }
-    })
+        })
 }
 
 pub(super) fn get_info(
@@ -1006,7 +1007,7 @@ pub(super) fn get_info_raw(
         // Trino supports LIKE ... ESCAPE and full outer joins.
         SQL_LIKE_ESCAPE_CLAUSE => Some(Ok(InfoValue::String("Y".into()))),
         SQL_OUTER_JOINS => Some(Ok(InfoValue::String("Y".into()))),
-        _ => common_get_info_raw(info_type).map(Ok),
+        _ => common_get_info_raw::<TrinoBackend>(info_type).map(Ok),
     }
 }
 
@@ -1185,7 +1186,7 @@ mod tests {
     }
     use super::*;
     use stackable_odbc_core::types::{
-        DEFAULT_IDENTIFIER_LEN, InfoType, InfoValue, SQL_AM_NONE, SQL_CA1_NEXT,
+        DEFAULT_IDENTIFIER_LEN, InfoType, InfoValue, SQL_AM_NONE, SQL_CA1_NEXT, SQL_CB_PRESERVE,
         SQL_DRIVER_ODBC_VER_STRING, SQL_FN_CVT_CAST, SQL_GB_NO_RELATION, SQL_GD_ANY_COLUMN,
         SQL_GD_ANY_ORDER, SQL_GD_BOUND, SQL_IC_LOWER, SQL_INSENSITIVE, SQL_MAX_CURSOR_NAME_LEN,
         SQL_NC_HIGH, SQL_OIC_CORE, SQL_SC_SQL92_ENTRY, SQL_SO_FORWARD_ONLY, SQL_SQ_COMPARISON,
@@ -1229,7 +1230,10 @@ mod tests {
         (InfoType::MaxDriverConnections,          Expected::U16(0)),
         (InfoType::MaxConcurrentActivities,       Expected::U16(0)),
         (InfoType::ConcatNullBehavior,            Expected::U16(0)),
-        (InfoType::CursorCommitBehaviour,         Expected::U16(0)),
+        // Derived by stackable-odbc-core from Backend::cursor_commit_behavior,
+        // which this driver leaves at CursorBehavior::Preserve: Trino reports
+        // SQL_TC_NONE, so no transaction ever closes a cursor.
+        (InfoType::CursorCommitBehaviour,         Expected::U16(SQL_CB_PRESERVE)),
         (InfoType::IdentifierCase,                Expected::U16(SQL_IC_LOWER)),
         (InfoType::MaxColumnNameLen,              Expected::U16(DEFAULT_IDENTIFIER_LEN)),
         (InfoType::MaxCursorNameLen,              Expected::U16(SQL_MAX_CURSOR_NAME_LEN)),

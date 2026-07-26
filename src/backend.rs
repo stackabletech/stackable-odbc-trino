@@ -497,10 +497,19 @@ impl Backend for TrinoBackend {
         &["host", "port", "user"]
     }
 
-    /// Trino is effectively always in autocommit mode; transactions are not supported.
-    /// SQLEndTran calls are accepted as no-ops so that tools like PowerBI do not fail.
+    /// This driver does not implement transactions, so every connection behaves
+    /// as if it were in autocommit mode. SQLEndTran calls are accepted as no-ops
+    /// so that tools like PowerBI do not fail.
+    ///
+    /// Trino itself does support transactions — `START TRANSACTION` / `COMMIT` /
+    /// `ROLLBACK` over the `X-Trino-Transaction-Id` headers — so this is a
+    /// driver limitation, not a platform one. Implementing it means reporting
+    /// something other than `SQL_TC_NONE` from
+    /// [`Backend::get_info_raw`]'s `SQL_TXN_CAPABLE` arm, honouring
+    /// `SQL_ATTR_AUTOCOMMIT`, and declaring the real
+    /// `cursor_commit_behavior` / `cursor_rollback_behavior`.
     fn end_tran(_conn: &TrinoConnection, _commit: bool) -> Result<(), OdbcError> {
-        tracing::debug!("TrinoBackend::end_tran (no-op: Trino has no explicit transactions)");
+        tracing::debug!("TrinoBackend::end_tran (no-op: this driver has no transaction support)");
         Ok(())
     }
 
