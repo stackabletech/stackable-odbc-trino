@@ -3,7 +3,7 @@
 //! differently from ODBC.
 //!
 //! The remap table is traceable to the `SQL_*_FUNCTIONS` bitmaps
-//! `crates/stackable-odbc-trino/src/backend/info.rs` advertises for Trino.
+//! `src/backend/info.rs` advertises for Trino.
 //! Every arm below corresponds to one advertised `SQL_FN_*`
 //! bit whose ODBC name Trino spells differently *and* for which a bare
 //! name substitution (`stackable_odbc_core::escape` only ever swaps the identifier in

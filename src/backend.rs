@@ -972,7 +972,7 @@ mod tests {
     // pool) from the FFI integration tests. Running both groups against the
     // same Trino coordinator causes intermittent failures because the two
     // pools' TCP sockets can interfere at the server level. Use
-    // `cargo test -p stackable-odbc-trino -- --ignored backend` to
+    // `cargo test -- --ignored backend` to
     // run them in isolation. The FFI integration tests provide equivalent
     // coverage via the ODBC call stack.
 

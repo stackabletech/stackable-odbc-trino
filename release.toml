@@ -6,9 +6,6 @@
 # tags and pushes. The v{version} tag then triggers
 # .github/workflows/release.yaml, which builds both binaries, assembles the
 # release archives and publishes the GitHub Release.
-#
-# Publishing to crates.io is blocked for a second reason anyway: a path
-# dependency cannot be published, and stackable-odbc-core is still one.
 
 publish = false
 push = true

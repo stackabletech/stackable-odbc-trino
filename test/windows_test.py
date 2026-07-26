@@ -43,7 +43,7 @@ REMOTE_PYTHON = r'"C:\Program Files\Python312\python.exe"'
 # The host-only network gateway — the VM reaches the host (and Docker) via this
 # IP. Override with --gateway or ODBC_TEST_HOST_GATEWAY for non-default subnets.
 DEFAULT_HOST_GATEWAY = "192.168.197.1"
-HTTP_PORT = 8081  # avoid conflict with SQLite's 8080
+HTTP_PORT = 8081  # avoid conflict with Trino's 8080
 
 
 def main():

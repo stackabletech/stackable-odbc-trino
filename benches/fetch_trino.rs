@@ -1,20 +1,20 @@
 //! End-to-end fetch-path benchmarks for the Trino backend.
 //!
 //! Opt-in: requires a running Trino coordinator. Skips silently if
-//! `TRINO_BENCH_URL` is unset (so `cargo bench --workspace` still works on a
+//! `TRINO_BENCH_URL` is unset (so `cargo bench` still works on a
 //! plain checkout).
 //!
 //! Run:
-//!   ./test/trino/setup.sh
-//!   TRINO_BENCH_URL=http://localhost:8080 cargo bench -p stackable-odbc-trino
+//!   ./test/setup.sh
+//!   TRINO_BENCH_URL=http://localhost:8080 cargo bench
 //!
 //! Override workload size:
-//!   TRINO_BENCH_URL=http://localhost:8080 BENCH_ROWS=1000000 cargo bench -p stackable-odbc-trino
+//!   TRINO_BENCH_URL=http://localhost:8080 BENCH_ROWS=1000000 cargo bench
 //!
 //! The default query uses Trino's `SEQUENCE` builtin and does not require any
 //! particular catalog. To override:
 //!   TRINO_BENCH_QUERY="SELECT * FROM tpcds.tiny.store_sales LIMIT 100000" \
-//!     TRINO_BENCH_URL=http://localhost:8080 cargo bench -p stackable-odbc-trino
+//!     TRINO_BENCH_URL=http://localhost:8080 cargo bench
 
 use std::ffi::c_void;
 use std::hint::black_box;
