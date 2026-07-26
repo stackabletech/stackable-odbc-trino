@@ -1,0 +1,21 @@
+# OpenSSL configuration that enables the legacy provider.
+# Required for WinRM NTLM authentication, which uses MD4
+# (disabled by default in modern OpenSSL).
+#
+# Usage: OPENSSL_CONF=windows/openssl_legacy.cnf python3 ...
+# The test/windows_test.py script sets this automatically.
+
+openssl_conf = openssl_init
+
+[openssl_init]
+providers = provider_sect
+
+[provider_sect]
+default = default_sect
+legacy = legacy_sect
+
+[default_sect]
+activate = 1
+
+[legacy_sect]
+activate = 1
