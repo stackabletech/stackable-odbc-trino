@@ -1,0 +1,42 @@
+[package]
+name = "stackable-odbc-trino"
+version = "0.0.1"
+edition = "2024"
+rust-version = "1.95.0"
+authors = ["Stackable GmbH <info@stackable.tech>"]
+license = "Apache-2.0"
+description = "ODBC driver for Trino, built on the stackable-odbc-core framework."
+repository = "https://github.com/stackabletech/stackable-odbc-trino"
+readme = "README.md"
+keywords = ["odbc", "trino", "driver", "ffi", "sql"]
+categories = ["database", "external-ffi-bindings", "api-bindings"]
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+base64 = "0.23"
+chrono = { version = "0.4", default-features = false }
+chrono-tz = "0.10"
+serde_json = "1"
+snafu = "0.9"
+# TODO: switch to a crates.io version dep once stackable-odbc-core is published.
+stackable-odbc-core = { path = "../stackable-odbc-core" }
+tokio = { version = "1.51", features = ["rt", "macros"] }
+tracing = "0.1"
+trino-rust-client = "0.11"
+
+[dev-dependencies]
+criterion = { version = "0.8", features = ["html_reports"] }
+odbc-sys = "0.31"
+proptest = "1"
+serial_test = "3"
+
+[lints.clippy]
+unwrap_in_result = "deny"
+unwrap_used = "deny"
+panic = "deny"
+
+[[bench]]
+name = "fetch_trino"
+harness = false

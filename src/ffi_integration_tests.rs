@@ -1,0 +1,2956 @@
+//! FFI-level integration tests for the Trino backend.
+//!
+//! All tests require Trino running at localhost:8080.
+//! Start with: `./test/trino/setup.sh`
+//!
+//! Run with: `cargo test -p stackable-odbc-trino -- --ignored ffi_integration_tests`
+//!
+//! All tests share a single ODBC connection via [`SHARED_CONN`] (created once
+//! via `OnceLock`). This mirrors production usage where one connection serves
+//! many queries, and avoids creating multiple `reqwest` connection pools that
+//! can interfere with each other on the same Trino coordinator.
+//!
+//! Tests are marked `#[serial]` (from the `serial_test` crate) to prevent
+//! concurrent access to the shared connection. Do NOT run these alongside
+//! the `backend::tests` integration tests: they use a separate
+//! `TrinoConnection` with its own reqwest pool, and the two pools cause
+//! intermittent TCP socket corruption. Run backend tests in isolation:
+//! `cargo test -p stackable-odbc-trino -- --ignored backend`
+
+use std::ffi::c_void;
+use std::sync::{Arc, OnceLock};
+
+use serial_test::serial;
+use stackable_odbc_core::conformance::{
+    all_info_types, genuine_convert_info_types, observe_info_value_kind, observe_u32_value,
+};
+use stackable_odbc_core::ffi;
+use stackable_odbc_core::handles::{ConnectionHandle, as_handle_ref};
+use stackable_odbc_core::types::{
+    AttrOdbcVersion, CDataType, Desc, EnvironmentAttribute, HandleType, HeaderDiagnosticIdentifier,
+    InfoType, ParamType, SQL_ADD, SQL_DIAG_MESSAGE_TEXT, SQL_IC_SENSITIVE, SQL_INDEX_UNIQUE,
+    SQL_LOCK_NO_CHANGE, SQL_NTS, SQL_NULL_DATA, SQL_POSITION, SQL_QUICK, SqlDataType, SqlReturn,
+    StatementAttribute, expected_kind,
+};
+use trino_rust_client::ClientBuilder;
+
+use crate::backend::info::{
+    TRINO_AGGREGATE_FUNCTIONS, TRINO_NUMERIC_FUNCTIONS, TRINO_SQL92_VALUE_EXPRESSIONS,
+    TRINO_STRING_FUNCTIONS, TRINO_SYSTEM_FUNCTIONS, TRINO_TIMEDATE_FUNCTIONS,
+};
+use crate::backend::{TrinoBackend, TrinoConnection};
+
+const CONN_STR: &str =
+    "Host=localhost;Port=8080;User=admin;Password=admin;Protocol=http;Catalog=tpcds";
+
+// ---------------------------------------------------------------------------
+// Shared connection infrastructure
+// ---------------------------------------------------------------------------
+//
+// Most tests need a connected ODBC handle but don't test the connection
+// lifecycle itself. Reusing a single env + conn across tests mirrors how a
+// real ODBC client works (one connection, many statements) and avoids rapid
+// connect/disconnect cycles that expose Trino server-side timing sensitivity.
+//
+// Tests that specifically exercise connection/disconnection (e.g.
+// connect_and_disconnect_lifecycle) use the standalone alloc_handles() +
+// connect_trino() + cleanup() helpers instead.
+
+/// Wrapper around raw ODBC handle pointers so they can be stored in OnceLock.
+///
+/// SAFETY: the raw pointers are heap-allocated ODBC handles that live for the
+/// entire test process. They are only accessed by tests running under
+/// #[serial], so there is no concurrent mutation.
+struct SharedHandles(*mut c_void, *mut c_void);
+unsafe impl Sync for SharedHandles {}
+unsafe impl Send for SharedHandles {}
+
+/// Process-wide shared env + conn handles, connected once.
+static SHARED_CONN: OnceLock<SharedHandles> = OnceLock::new();
+
+/// Returns (env, conn) that are connected to Trino. Created on first call,
+/// reused thereafter. Panics if the connection fails.
+fn shared_conn() -> (*mut c_void, *mut c_void) {
+    let h = SHARED_CONN.get_or_init(|| unsafe {
+        let mut env: *mut c_void = std::ptr::null_mut();
+        assert_eq!(
+            ffi::handle::sql_alloc_handle::<TrinoBackend>(
+                HandleType::Env as i16,
+                std::ptr::null_mut(),
+                &mut env,
+            ),
+            SqlReturn::SUCCESS
+        );
+        let mut conn: *mut c_void = std::ptr::null_mut();
+        assert_eq!(
+            ffi::handle::sql_alloc_handle::<TrinoBackend>(HandleType::Dbc as i16, env, &mut conn,),
+            SqlReturn::SUCCESS
+        );
+        assert_eq!(
+            connect_trino(conn),
+            SqlReturn::SUCCESS,
+            "shared connection failed"
+        );
+        SharedHandles(env, conn)
+    });
+    (h.0, h.1)
+}
+
+/// Allocate a fresh statement handle on the shared connection.
+unsafe fn alloc_stmt() -> (*mut c_void, *mut c_void, *mut c_void) {
+    let (env, conn) = shared_conn();
+    let mut stmt: *mut c_void = std::ptr::null_mut();
+    unsafe {
+        assert_eq!(
+            ffi::handle::sql_alloc_handle::<TrinoBackend>(HandleType::Stmt as i16, conn, &mut stmt,),
+            SqlReturn::SUCCESS
+        );
+    }
+    (env, conn, stmt)
+}
+
+/// Free just the statement handle. Drains any in-flight result first.
+/// The shared env + conn are left intact for the next test.
+unsafe fn cleanup_stmt(stmt: *mut c_void) {
+    unsafe {
+        while ffi::fetch::sql_fetch::<TrinoBackend>(stmt) == SqlReturn::SUCCESS {}
+        let _ = ffi::handle::sql_free_handle::<TrinoBackend>(HandleType::Stmt as i16, stmt);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Standalone helpers for lifecycle tests (allocate + connect + disconnect)
+// ---------------------------------------------------------------------------
+
+/// Helper: allocate env + conn + stmt handles using the Trino backend.
+unsafe fn alloc_handles() -> (*mut c_void, *mut c_void, *mut c_void) {
+    unsafe {
+        let mut env: *mut c_void = std::ptr::null_mut();
+        let _ = ffi::handle::sql_alloc_handle::<TrinoBackend>(
+            HandleType::Env as i16,
+            std::ptr::null_mut(),
+            &mut env,
+        );
+        let mut conn: *mut c_void = std::ptr::null_mut();
+        let _ =
+            ffi::handle::sql_alloc_handle::<TrinoBackend>(HandleType::Dbc as i16, env, &mut conn);
+        let mut stmt: *mut c_void = std::ptr::null_mut();
+        let _ =
+            ffi::handle::sql_alloc_handle::<TrinoBackend>(HandleType::Stmt as i16, conn, &mut stmt);
+        (env, conn, stmt)
+    }
+}
+
+/// Helper: connect to Trino at localhost:8080.
+unsafe fn connect_trino(conn: *mut c_void) -> SqlReturn {
+    let wide: Vec<u16> = CONN_STR.encode_utf16().collect();
+    unsafe {
+        ffi::connect::sql_driver_connect_w::<TrinoBackend>(
+            conn,
+            std::ptr::null_mut(),
+            wide.as_ptr(),
+            SQL_NTS as i16,
+            std::ptr::null_mut(),
+            0,
+            std::ptr::null_mut(),
+            0,
+        )
+    }
+}
+
+/// Helper: execute a SQL statement.
+unsafe fn exec_direct(stmt: *mut c_void, sql: &str) -> SqlReturn {
+    let wide: Vec<u16> = sql.encode_utf16().collect();
+    unsafe {
+        ffi::execute::sql_exec_direct_w::<TrinoBackend>(stmt, wide.as_ptr(), wide.len() as i32)
+    }
+}
+
+/// Helper: free all handles (for lifecycle tests that own their connection).
+unsafe fn cleanup(env: *mut c_void, conn: *mut c_void, stmt: *mut c_void) {
+    unsafe {
+        while ffi::fetch::sql_fetch::<TrinoBackend>(stmt) == SqlReturn::SUCCESS {}
+        let _ = ffi::handle::sql_free_handle::<TrinoBackend>(HandleType::Stmt as i16, stmt);
+        let _ = ffi::connect::sql_disconnect::<TrinoBackend>(conn);
+        let _ = ffi::handle::sql_free_handle::<TrinoBackend>(HandleType::Dbc as i16, conn);
+        let _ = ffi::handle::sql_free_handle::<TrinoBackend>(HandleType::Env as i16, env);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Fallback-chain tests: named InfoType variants with no get_info arm
+// ---------------------------------------------------------------------------
+//
+// SqlFileUsage/SqlQuotedIdentifierCase and the ten PowerBI capability info
+// types below have no arm in default_get_info or trino_get_info's match --
+// they only get a real value via TrinoBackend::get_info_raw, reached through
+// the get_info_raw-first fallback in sql_get_info_w. See the "ordering is
+// load-bearing" note on info_type_default_response in
+// stackable-odbc-core/src/ffi/info.rs.
+//
+// These need `handle.connection = Some(_)` to reach that fallback at all
+// (info_type_default_response skips get_info_raw entirely when conn is
+// None), but going through TrinoBackend::connect requires a live Trino
+// server since it now validates the connection with a real query. Building
+// a TrinoConnection directly and injecting it into the handle sidesteps
+// that: ClientBuilder::build() only constructs a reqwest::Client
+// synchronously (see TrinoBackend::connect in backend.rs, which performs no
+// I/O until the separate validate_connection call), so this test needs no
+// live server and is not `#[ignore]`d like the rest of this file.
+
+/// Builds a `TrinoConnection` that performs no network I/O: `ClientBuilder::build()`
+/// only assembles a `reqwest::Client` (URL parsing, timeout config, etc.), and
+/// building a `tokio::runtime::Runtime` is a local operation. Neither talks to a
+/// server -- validation only happens in the separate `validate_connection` call
+/// that `TrinoBackend::connect` makes after building the connection.
+fn disconnected_trino_conn() -> TrinoConnection {
+    let client = ClientBuilder::new("test", "localhost")
+        .port(8080)
+        .build()
+        .expect("ClientBuilder::build performs no I/O and cannot fail here");
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("Runtime::build performs no I/O and cannot fail here");
+    TrinoConnection {
+        runtime: Arc::new(runtime),
+        client: Arc::new(client),
+        // No live server was contacted, so no version was probed either --
+        // this mirrors the "probe failed" state `TrinoBackend::connect` would
+        // leave behind if `fetch_server_version` could not reach a coordinator.
+        dbms_version: String::new(),
+        server_major: 0,
+    }
+}
+
+/// Allocates env + conn handles and injects a network-free `TrinoConnection`
+/// directly into the connection handle, bypassing `TrinoBackend::connect`
+/// (which requires a live server). This is enough to put `sql_get_info_w` on
+/// the connected (`B::get_info` / `B::get_info_raw`) path -- the fallback
+/// chain under test here never touches the connection's fields.
+unsafe fn alloc_conn_with_injected_trino_connection() -> (*mut c_void, *mut c_void) {
+    unsafe {
+        let mut env: *mut c_void = std::ptr::null_mut();
+        assert_eq!(
+            ffi::handle::sql_alloc_handle::<TrinoBackend>(
+                HandleType::Env as i16,
+                std::ptr::null_mut(),
+                &mut env,
+            ),
+            SqlReturn::SUCCESS
+        );
+        let mut conn: *mut c_void = std::ptr::null_mut();
+        assert_eq!(
+            ffi::handle::sql_alloc_handle::<TrinoBackend>(HandleType::Dbc as i16, env, &mut conn),
+            SqlReturn::SUCCESS
+        );
+        let handle =
+            as_handle_ref::<ConnectionHandle<TrinoBackend>>(conn).expect("valid conn handle");
+        handle.connection = Some(disconnected_trino_conn());
+        (env, conn)
+    }
+}
+
+/// Frees handles allocated by `alloc_conn_with_injected_trino_connection`.
+/// `TrinoBackend::disconnect` is a no-op (the runtime drops on its own), so
+/// calling it here over the injected connection is safe.
+unsafe fn cleanup_injected_conn(env: *mut c_void, conn: *mut c_void) {
+    unsafe {
+        let _ = ffi::connect::sql_disconnect::<TrinoBackend>(conn);
+        let _ = ffi::handle::sql_free_handle::<TrinoBackend>(HandleType::Dbc as i16, conn);
+        let _ = ffi::handle::sql_free_handle::<TrinoBackend>(HandleType::Env as i16, env);
+    }
+}
+
+/// Asserts `sql_get_info_w` returns exactly `expected` (a `U32`) for `info_type`.
+unsafe fn assert_get_info_u32(conn: *mut c_void, info_type: InfoType, expected: u32) {
+    unsafe {
+        let mut value: u32 = 0xDEAD_BEEF;
+        let mut str_len: i16 = 0;
+        let ret = ffi::info::sql_get_info_w::<TrinoBackend>(
+            conn,
+            info_type as u16,
+            &mut value as *mut u32 as *mut c_void,
+            4,
+            &mut str_len,
+        );
+        assert_eq!(ret, SqlReturn::SUCCESS, "{info_type:?} must succeed");
+        assert_eq!(str_len, 4, "{info_type:?} string_length_ptr");
+        assert_eq!(
+            value, expected,
+            "{info_type:?} must come from get_info_raw, not the generic default"
+        );
+    }
+}
+
+/// Asserts `sql_get_info_w` returns exactly `expected` (a `U16`) for `info_type`.
+unsafe fn assert_get_info_u16(conn: *mut c_void, info_type: InfoType, expected: u16) {
+    unsafe {
+        let mut value: u16 = 0xDEAD;
+        let mut str_len: i16 = 0;
+        let ret = ffi::info::sql_get_info_w::<TrinoBackend>(
+            conn,
+            info_type as u16,
+            &mut value as *mut u16 as *mut c_void,
+            2,
+            &mut str_len,
+        );
+        assert_eq!(ret, SqlReturn::SUCCESS, "{info_type:?} must succeed");
+        assert_eq!(str_len, 2, "{info_type:?} string_length_ptr");
+        assert_eq!(
+            value, expected,
+            "{info_type:?} must come from get_info_raw, not the generic default"
+        );
+    }
+}
+
+/// Asserts `sql_get_info_w` returns exactly `expected` (a `String`) for `info_type`.
+unsafe fn assert_get_info_str(conn: *mut c_void, info_type: InfoType, expected: &str) {
+    unsafe {
+        let mut buf = [0u16; 128];
+        let mut str_len: i16 = 0;
+        let ret = ffi::info::sql_get_info_w::<TrinoBackend>(
+            conn,
+            info_type as u16,
+            buf.as_mut_ptr() as *mut c_void,
+            256,
+            &mut str_len,
+        );
+        assert_eq!(ret, SqlReturn::SUCCESS, "{info_type:?} must succeed");
+        let result = String::from_utf16_lossy(&buf[..(str_len / 2) as usize]);
+        assert_eq!(
+            result, expected,
+            "{info_type:?} must come from get_info_raw, not the generic default"
+        );
+    }
+}
+
+/// Guards the get_info_raw-first ordering in `info_type_default_response`
+/// (stackable-odbc-core/src/ffi/info.rs). Every info type asserted here has no arm in
+/// `default_get_info` or `trino_get_info`'s match, so a passing `SUCCESS`
+/// alone would prove nothing -- reordering the fallback to try the numeric
+/// defaults first would still return `SUCCESS`, just with the wrong value
+/// (`U32(0)`/`0xFFFFFFFF` instead of the driver's real value). Asserting the
+/// exact expected value is what makes this test fail on that regression.
+///
+/// The version-gated bitmaps (`Sql92Predicates`,
+/// `Sql92RelationalJoinOperators`) are asserted at their `server_major == 0`
+/// values here, since `disconnected_trino_conn` leaves that field at 0 (a
+/// failed version probe) -- see `sql92_predicates`/`sql92_join_operators`'s
+/// own tests in `backend/info.rs` for the version-gated cases.
+#[test]
+fn get_info_named_but_unhandled_types_fall_back_to_get_info_raw() {
+    unsafe {
+        let (env, conn) = alloc_conn_with_injected_trino_connection();
+
+        // Trino-specific PowerBI/Power Query capability bitmaps, computed by
+        // TrinoBackend::get_info_raw.
+        assert_get_info_str(conn, InfoType::OuterJoins, "Y");
+        assert_get_info_u32(conn, InfoType::NumericFunctions, TRINO_NUMERIC_FUNCTIONS);
+        assert_get_info_u32(conn, InfoType::StringFunctions, TRINO_STRING_FUNCTIONS);
+        assert_get_info_u32(conn, InfoType::SystemFunctions, TRINO_SYSTEM_FUNCTIONS);
+        assert_get_info_u32(conn, InfoType::TimedateFunctions, TRINO_TIMEDATE_FUNCTIONS);
+        assert_get_info_str(conn, InfoType::LikeEscapeClause, "Y");
+        // Sql92Predicates and Sql92RelationalJoinOperators are version-gated
+        // (computed by sql92_predicates/sql92_join_operators for the injected
+        // server version), so they have no single named const to reference.
+        assert_get_info_u32(conn, InfoType::Sql92Predicates, 0x3E07);
+        assert_get_info_u32(conn, InfoType::Sql92RelationalJoinOperators, 0x17E);
+        assert_get_info_u32(
+            conn,
+            InfoType::Sql92ValueExpressions,
+            TRINO_SQL92_VALUE_EXPRESSIONS,
+        );
+        assert_get_info_u32(
+            conn,
+            InfoType::AggregateFunctions,
+            TRINO_AGGREGATE_FUNCTIONS,
+        );
+
+        // Not Trino-specific -- these fall through to stackable-odbc-core's
+        // common_get_info_raw after TrinoBackend::get_info_raw's own match
+        // misses, so Trino depends on that fallback ordering for them too.
+        assert_get_info_u16(conn, InfoType::SqlFileUsage, 0);
+        assert_get_info_u16(conn, InfoType::SqlQuotedIdentifierCase, SQL_IC_SENSITIVE);
+
+        cleanup_injected_conn(env, conn);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SQLGetInfoW info-type conformance test
+// ---------------------------------------------------------------------------
+//
+// Three real, shipped bugs were all "nothing enumerated the spec": a value
+// the Windows Driver Manager treats as an integer where the driver returned
+// a string (or vice versa), and conversion bitmaps that returned 0 (which
+// makes the Windows DM block SQLGetData with HYC00). Line coverage stayed
+// green throughout, because the code path that produced the wrong answer
+// ran constantly -- nobody had asserted what it returned for every info
+// type, just the ones a test happened to name.
+//
+// These two tests close that gap by iterating every `InfoType` odbc-sys
+// compiles (derived from `info_type_from_raw`, not a hand-copied list -- see
+// `stackable_odbc_core::conformance`) through the real `sql_get_info_w` FFI entry
+// point, against the real `TrinoBackend`. Both use the network-free
+// connection injection (`alloc_conn_with_injected_trino_connection`) /
+// unconnected allocation (`alloc_handles`) already established above, so
+// (like `get_info_named_but_unhandled_types_fall_back_to_get_info_raw`)
+// neither needs a live Trino server and neither is `#[ignore]`d.
+
+/// Property 1: every `InfoType`'s returned value has the shape the
+/// SQLGetInfo spec declares for it (`stackable_odbc_core::types::expected_kind`),
+/// whether `TrinoBackend` answers it itself (`trino_get_info`), falls
+/// through to the shared `default_get_info`, or reaches the generic
+/// DM-safe default in `info_type_default_response`.
+#[test]
+fn get_info_every_named_info_type_has_the_declared_shape_connected() {
+    unsafe {
+        let (env, conn) = alloc_conn_with_injected_trino_connection();
+
+        for info_type in all_info_types() {
+            let (ret, kind, _string_length) =
+                observe_info_value_kind::<TrinoBackend>(conn, info_type as u16);
+            assert_eq!(
+                ret,
+                SqlReturn::SUCCESS,
+                "{info_type:?}: SQLGetInfoW must not return SQL_ERROR"
+            );
+            assert_eq!(
+                kind,
+                expected_kind(info_type),
+                "{info_type:?}: TrinoBackend returned shape {kind:?}, expected \
+                 {:?} per the SQLGetInfo spec",
+                expected_kind(info_type)
+            );
+        }
+
+        cleanup_injected_conn(env, conn);
+    }
+}
+
+/// Property 1, pre-connect path: the Windows Driver Manager queries some
+/// info types (e.g. `SQL_DRIVER_ODBC_VER`) before `SQLDriverConnectW`, which
+/// routes through `TrinoBackend::get_info_pre_connect` instead of
+/// `get_info`. Uses a plain unconnected handle (`alloc_handles`), not the
+/// injected-connection helper, since there is no connection at all on this
+/// path.
+#[test]
+fn get_info_every_named_info_type_has_the_declared_shape_pre_connect() {
+    unsafe {
+        let (env, conn, stmt) = alloc_handles();
+
+        for info_type in all_info_types() {
+            let (ret, kind, _string_length) =
+                observe_info_value_kind::<TrinoBackend>(conn, info_type as u16);
+            assert_eq!(
+                ret,
+                SqlReturn::SUCCESS,
+                "{info_type:?}: SQLGetInfoW must not return SQL_ERROR pre-connect"
+            );
+            assert_eq!(
+                kind,
+                expected_kind(info_type),
+                "{info_type:?}: TrinoBackend returned shape {kind:?} pre-connect, \
+                 expected {:?} per the SQLGetInfo spec",
+                expected_kind(info_type)
+            );
+        }
+
+        // stmt was never used to run a query; free directly rather than via
+        // the shared `cleanup`, which drains an in-flight result via fetch.
+        let _ = ffi::handle::sql_free_handle::<TrinoBackend>(HandleType::Stmt as i16, stmt);
+        let _ = ffi::handle::sql_free_handle::<TrinoBackend>(HandleType::Dbc as i16, conn);
+        let _ = ffi::handle::sql_free_handle::<TrinoBackend>(HandleType::Env as i16, env);
+    }
+}
+
+/// Property 2: no genuine `SQL_CONVERT_*` code ever returns 0 through
+/// `TrinoBackend` -- per `AGENTS.md`, a `0` conversion bitmap is what makes
+/// the Windows Driver Manager block `SQLGetData` with `HYC00`.
+#[test]
+fn get_info_no_genuine_convert_info_type_ever_returns_zero() {
+    unsafe {
+        let (env, conn) = alloc_conn_with_injected_trino_connection();
+
+        for info_type in genuine_convert_info_types() {
+            let (ret, value) = observe_u32_value::<TrinoBackend>(conn, info_type);
+            assert_eq!(
+                ret,
+                SqlReturn::SUCCESS,
+                "raw SQL_CONVERT_* info type {info_type} must not error"
+            );
+            assert_ne!(
+                value, 0,
+                "raw SQL_CONVERT_* info type {info_type} returned 0 -- this is the \
+                 exact shape that makes the Windows Driver Manager block SQLGetData \
+                 with HYC00 (AGENTS.md)"
+            );
+        }
+
+        cleanup_injected_conn(env, conn);
+    }
+}
+
+/// Helper: fetch column 1 as a WChar string after sql_fetch succeeds.
+///
+/// Calls sql_get_data with CDataType::WChar and returns the result as a String.
+/// Panics if sql_get_data does not return SUCCESS.
+unsafe fn fetch_wchar(stmt: *mut c_void) -> String {
+    let mut buf = [0u16; 512];
+    let mut ind: isize = 0;
+    let ret = unsafe {
+        ffi::fetch::sql_get_data::<TrinoBackend>(
+            stmt,
+            1,
+            CDataType::WChar as i16,
+            buf.as_mut_ptr().cast(),
+            (buf.len() * 2) as isize,
+            &mut ind,
+        )
+    };
+    assert_eq!(ret, SqlReturn::SUCCESS, "sql_get_data failed");
+    let code_units = (ind as usize) / 2;
+    String::from_utf16_lossy(&buf[..code_units]).to_string()
+}
+
+/// Fetch the given 1-based column as a WChar string after `sql_fetch` succeeds.
+///
+/// One-column generalisation of [`fetch_wchar`].
+unsafe fn get_wchar_col(stmt: *mut c_void, col: u16) -> String {
+    let mut buf = [0u16; 512];
+    let mut ind: isize = 0;
+    let ret = unsafe {
+        ffi::fetch::sql_get_data::<TrinoBackend>(
+            stmt,
+            col,
+            CDataType::WChar as i16,
+            buf.as_mut_ptr().cast(),
+            (buf.len() * 2) as isize,
+            &mut ind,
+        )
+    };
+    assert_eq!(ret, SqlReturn::SUCCESS, "sql_get_data failed");
+    if ind == SQL_NULL_DATA {
+        return String::new();
+    }
+    let code_units = (ind as usize) / 2;
+    String::from_utf16_lossy(&buf[..code_units]).to_string()
+}
+
+/// Fetch the given 1-based column as an i64 after `sql_fetch` succeeds.
+///
+/// NULL (e.g. DECIMAL_DIGITS for a non-decimal column) is reported as 0,
+/// matching the query path's `trino_ty_scale` default for non-decimal types.
+unsafe fn get_i64_col(stmt: *mut c_void, col: u16) -> i64 {
+    let mut val: i64 = 0;
+    let mut ind: isize = 0;
+    let ret = unsafe {
+        ffi::fetch::sql_get_data::<TrinoBackend>(
+            stmt,
+            col,
+            CDataType::SBigInt as i16,
+            (&raw mut val).cast(),
+            8,
+            &mut ind,
+        )
+    };
+    assert_eq!(ret, SqlReturn::SUCCESS, "sql_get_data failed");
+    if ind == SQL_NULL_DATA { 0 } else { val }
+}
+
+// ---------------------------------------------------------------------------
+// Lifecycle test
+// ---------------------------------------------------------------------------
+
+#[test]
+#[serial]
+#[ignore = "requires Trino at localhost:8080 -- run test/trino/setup.sh first"]
+fn connect_and_disconnect_lifecycle() {
+    unsafe {
+        let (env, conn, stmt) = alloc_handles();
+        assert_eq!(connect_trino(conn), SqlReturn::SUCCESS, "connect failed");
+        assert_eq!(
+            exec_direct(stmt, "SELECT 1"),
+            SqlReturn::SUCCESS,
+            "exec_direct failed"
+        );
+        let ret = stackable_odbc_core::ffi::fetch::sql_fetch::<TrinoBackend>(stmt);
+        assert_eq!(ret, SqlReturn::SUCCESS, "sql_fetch failed");
+        cleanup(env, conn, stmt);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests moved from backend.rs
+// ---------------------------------------------------------------------------
+
+#[test]
+#[serial]
+#[ignore = "requires Trino at localhost:8080 -- run test/trino/setup.sh first"]
+fn tables_returns_tpcds_tables() {
+    unsafe {
+        let (_env, _conn, stmt) = alloc_stmt();
+        let catalog: Vec<u16> = "tpcds".encode_utf16().collect();
+        let schema: Vec<u16> = "sf1".encode_utf16().collect();
+        let ret = ffi::metadata::sql_tables_w::<TrinoBackend>(
+            stmt,
+            catalog.as_ptr(),
+            catalog.len() as i16,
+            schema.as_ptr(),
+            schema.len() as i16,
+            std::ptr::null(),
+            0,
+            std::ptr::null(),
+            0,
+        );
+        assert_eq!(ret, SqlReturn::SUCCESS);
+        assert_eq!(
+            ffi::fetch::sql_fetch::<TrinoBackend>(stmt),
+            SqlReturn::SUCCESS,
+            "expected at least one table"
+        );
+        cleanup_stmt(stmt);
+    }
+}
+
+/// Trino sends VARBINARY as base64 text over the REST API. The driver decodes it
+/// to `ColumnValue::Bytes`, so `SQLGetData(SQL_C_BINARY)` must yield the raw
+/// payload, not the ASCII bytes of the base64 string ("3q2+7w==").
+#[test]
+#[serial]
+#[ignore = "requires Trino at localhost:8080 -- run test/trino/setup.sh first"]
+fn varbinary_get_data_returns_raw_bytes() {
+    unsafe {
+        let (_env, _conn, stmt) = alloc_stmt();
+        assert_eq!(exec_direct(stmt, "SELECT X'DEADBEEF'"), SqlReturn::SUCCESS);
+        assert_eq!(
+            ffi::fetch::sql_fetch::<TrinoBackend>(stmt),
+            SqlReturn::SUCCESS
+        );
+        let mut buf = [0u8; 16];
+        let mut ind: isize = 0;
+        let ret = ffi::fetch::sql_get_data::<TrinoBackend>(
+            stmt,
+            1,
+            CDataType::Binary as i16,
+            buf.as_mut_ptr().cast(),
+            buf.len() as isize,
+            &mut ind,
+        );
+        assert_eq!(ret, SqlReturn::SUCCESS, "SQLGetData(Binary) failed");
+        assert_eq!(ind, 4, "expected 4 bytes of VARBINARY payload");
+        assert_eq!(
+            &buf[..4],
+            &[0xDE, 0xAD, 0xBE, 0xEF],
+            "VARBINARY did not decode to raw bytes"
+        );
+        cleanup_stmt(stmt);
+    }
+}
+
+/// End-to-end proof that `TrinoBackend::escape_dialect()` is actually wired
+/// into the execute path: `SQLExecDirect` is given raw ODBC escape syntax
+/// (`{fn UCASE(...)}`, `{d '...'}`) that is not valid Trino SQL on its own,
+/// and only succeeds because `sql_exec_direct_w` translates it first (see
+/// `crate::escape_dialect`).
+#[test]
+#[serial]
+#[ignore = "requires Trino at localhost:8080 -- run test/trino/setup.sh first"]
+fn escape_fn_and_date_literal_translate_for_trino() {
+    unsafe {
+        let (_env, _conn, stmt) = alloc_stmt();
+        assert_eq!(
+            exec_direct(
+                stmt,
+                "SELECT {fn UCASE('abc')}, CAST({d '2020-01-01'} AS VARCHAR)"
+            ),
+            SqlReturn::SUCCESS,
+            "exec_direct with {{fn}}/{{d}} escapes failed to translate"
+        );
+        assert_eq!(
+            ffi::fetch::sql_fetch::<TrinoBackend>(stmt),
+            SqlReturn::SUCCESS
+        );
+        assert_eq!(
+            get_wchar_col(stmt, 1),
+            "ABC",
+            "{{fn UCASE(...)}} not remapped to upper()"
+        );
+        assert_eq!(
+            get_wchar_col(stmt, 2),
+            "2020-01-01",
+            "{{d '...'}} not rendered as Trino's DATE '...' literal"
+        );
+        cleanup_stmt(stmt);
+    }
+}
+
+#[test]
+#[serial]
+#[ignore = "requires Trino at localhost:8080 -- run test/trino/setup.sh first"]
+fn date_columns_return_column_date_not_string() {
+    unsafe {
+        let (_env, _conn, stmt) = alloc_stmt();
+        assert_eq!(
+            exec_direct(
+                stmt,
+                "SELECT d_date FROM tpcds.sf1.date_dim WHERE d_date IS NOT NULL LIMIT 1"
+            ),
+            SqlReturn::SUCCESS
+        );
+        assert_eq!(
+            ffi::fetch::sql_fetch::<TrinoBackend>(stmt),
+            SqlReturn::SUCCESS
+        );
+        // SQL_DATE_STRUCT layout: year (i16) + month (u16) + day (u16) = 6 bytes
+        let mut date_buf = [0u8; 6];
+        let mut ind: isize = 0;
+        let ret = ffi::fetch::sql_get_data::<TrinoBackend>(
+            stmt,
+            1,
+            CDataType::TypeDate as i16,
+            date_buf.as_mut_ptr().cast(),
+            date_buf.len() as isize,
+            &mut ind,
+        );
+        assert_eq!(ret, SqlReturn::SUCCESS, "TypeDate conversion failed");
+        cleanup_stmt(stmt);
+    }
+}
+
+/// A `time(3)` value's milliseconds must survive `SQLGetData(SQL_C_WCHAR)` as
+/// text, even though `SQL_TIME_STRUCT` (the target of `SQL_C_TYPE_TIME`) has
+/// no field to hold them. `time(3)` is Trino's normal default precision for
+/// `TIME` (unlike the ANSI SQL default of 0), so this is the common case, not
+/// an edge case; the fraction must not be dropped before the C type of the
+/// target is known. The literal below is used instead of the
+/// `postgresql.public.types_test.col_time` column (a real `time(6)` column,
+/// per `\d types_test` in the PostgreSQL container) because that table's
+/// seed data (`test/trino/postgres-init.sql`) only has whole-second values.
+#[test]
+#[serial]
+#[ignore = "requires Trino at localhost:8080 -- run test/trino/setup.sh first"]
+fn time_with_fraction_keeps_milliseconds_via_get_data_string() {
+    unsafe {
+        let (_env, _conn, stmt) = alloc_stmt();
+        assert_eq!(
+            exec_direct(stmt, "SELECT TIME '13:30:15.123'"),
+            SqlReturn::SUCCESS
+        );
+        assert_eq!(
+            ffi::fetch::sql_fetch::<TrinoBackend>(stmt),
+            SqlReturn::SUCCESS
+        );
+        let mut buf = [0u16; 32];
+        let mut ind: isize = 0;
+        let ret = ffi::fetch::sql_get_data::<TrinoBackend>(
+            stmt,
+            1,
+            CDataType::WChar as i16,
+            buf.as_mut_ptr().cast(),
+            (buf.len() * 2) as isize,
+            &mut ind,
+        );
+        assert_eq!(ret, SqlReturn::SUCCESS, "SQLGetData(WChar) failed");
+        let char_count = (ind / 2) as usize;
+        let s = String::from_utf16_lossy(&buf[..char_count]);
+        assert_eq!(
+            s, "13:30:15.123",
+            "time(3) fraction did not survive as text"
+        );
+        cleanup_stmt(stmt);
+    }
+}
+
+#[test]
+#[serial]
+#[ignore = "requires Trino at localhost:8080 -- run test/trino/setup.sh first"]
+fn exec_direct_select_and_fetch() {
+    unsafe {
+        let (_env, _conn, stmt) = alloc_stmt();
+        assert_eq!(exec_direct(stmt, "SELECT 1 AS n"), SqlReturn::SUCCESS);
+        assert_eq!(
+            ffi::fetch::sql_fetch::<TrinoBackend>(stmt),
+            SqlReturn::SUCCESS
+        );
+        let mut val: i32 = 0;
+        let mut ind: isize = 0;
+        let ret = ffi::fetch::sql_get_data::<TrinoBackend>(
+            stmt,
+            1,
+            CDataType::SLong as i16,
+            (&raw mut val).cast(),
+            4,
+            &mut ind,
+        );
+        assert_eq!(ret, SqlReturn::SUCCESS);
+        assert_eq!(val, 1);
+        assert_eq!(
+            ffi::fetch::sql_fetch::<TrinoBackend>(stmt),
+            SqlReturn::NO_DATA
+        );
+        cleanup_stmt(stmt);
+    }
+}
+
+/// Bind a single i64 parameter on `stmt`.
+unsafe fn bind_i64(stmt: *mut c_void, param: u16, val: &mut i64) -> SqlReturn {
+    unsafe {
+        ffi::params::sql_bind_parameter::<TrinoBackend>(
+            stmt,
+            param,
+            ParamType::Input as i16,
+            CDataType::SBigInt as i16,
+            SqlDataType::EXT_BIG_INT.0,
+            19,
+            0,
+            (val as *mut i64).cast(),
+            std::mem::size_of::<i64>() as isize,
+            std::ptr::null_mut(),
+        )
+    }
+}
+
+/// Fetch a single i64 from column 1 and assert there are no further rows.
+unsafe fn fetch_one_i64(stmt: *mut c_void) -> i64 {
+    unsafe {
+        assert_eq!(
+            ffi::fetch::sql_fetch::<TrinoBackend>(stmt),
+            SqlReturn::SUCCESS,
+            "expected a row"
+        );
+        let mut val: i64 = 0;
+        let mut ind: isize = 0;
+        assert_eq!(
+            ffi::fetch::sql_get_data::<TrinoBackend>(
+                stmt,
+                1,
+                CDataType::SBigInt as i16,
+                (&raw mut val).cast(),
+                8,
+                &mut ind,
+            ),
+            SqlReturn::SUCCESS
+        );
+        val
+    }
+}
+
+#[test]
+#[serial]
+#[ignore = "requires Trino at localhost:8080 -- run test/trino/setup.sh first"]
+fn prepared_statement_binds_parameter() {
+    unsafe {
+        let (_env, _conn, stmt) = alloc_stmt();
+        let sql = "SELECT CAST(? AS BIGINT) AS n";
+        let wide: Vec<u16> = sql.encode_utf16().collect();
+        assert_eq!(
+            ffi::execute::sql_prepare_w::<TrinoBackend>(stmt, wide.as_ptr(), wide.len() as i32),
+            SqlReturn::SUCCESS
+        );
+
+        let mut val: i64 = 4242;
+        assert_eq!(bind_i64(stmt, 1, &mut val), SqlReturn::SUCCESS);
+        assert_eq!(
+            ffi::execute::sql_execute::<TrinoBackend>(stmt),
+            SqlReturn::SUCCESS
+        );
+        assert_eq!(fetch_one_i64(stmt), 4242, "bound parameter was not sent");
+
+        cleanup_stmt(stmt);
+    }
+}
+
+#[test]
+#[serial]
+#[ignore = "requires Trino at localhost:8080 -- run test/trino/setup.sh first"]
+fn prepared_statement_re_executes_with_new_parameter() {
+    // The point of preparing is running the same statement with different
+    // values; the second execute must not fail or reuse the first value.
+    unsafe {
+        let (_env, _conn, stmt) = alloc_stmt();
+        let sql = "SELECT CAST(? AS BIGINT) AS n";
+        let wide: Vec<u16> = sql.encode_utf16().collect();
+        assert_eq!(
+            ffi::execute::sql_prepare_w::<TrinoBackend>(stmt, wide.as_ptr(), wide.len() as i32),
+            SqlReturn::SUCCESS
+        );
+
+        for expected in [1i64, 2, 3] {
+            let mut val: i64 = expected;
+            assert_eq!(bind_i64(stmt, 1, &mut val), SqlReturn::SUCCESS);
+            assert_eq!(
+                ffi::execute::sql_execute::<TrinoBackend>(stmt),
+                SqlReturn::SUCCESS,
+                "execute failed for value {expected}"
+            );
+            assert_eq!(fetch_one_i64(stmt), expected);
+            assert_eq!(
+                ffi::cursor::sql_close_cursor::<TrinoBackend>(stmt),
+                SqlReturn::SUCCESS
+            );
+        }
+
+        cleanup_stmt(stmt);
+    }
+}
+
+#[test]
+#[serial]
+#[ignore = "requires Trino at localhost:8080 -- run test/trino/setup.sh first"]
+fn string_parameter_with_quotes_is_not_injected() {
+    // A payload that would break out of the literal must come back verbatim as
+    // data. If escaping were wrong this would be a syntax error or return the
+    // wrong row.
+    unsafe {
+        let (_env, _conn, stmt) = alloc_stmt();
+        let sql = "SELECT CAST(? AS VARCHAR) AS s";
+        let wide: Vec<u16> = sql.encode_utf16().collect();
+        assert_eq!(
+            ffi::execute::sql_prepare_w::<TrinoBackend>(stmt, wide.as_ptr(), wide.len() as i32),
+            SqlReturn::SUCCESS
+        );
+
+        let payload = "'; DROP TABLE users; --";
+        let mut buf: Vec<u8> = payload.as_bytes().to_vec();
+        assert_eq!(
+            ffi::params::sql_bind_parameter::<TrinoBackend>(
+                stmt,
+                1,
+                ParamType::Input as i16,
+                CDataType::Char as i16,
+                SqlDataType::VARCHAR.0,
+                buf.len(),
+                0,
+                buf.as_mut_ptr().cast(),
+                buf.len() as isize,
+                std::ptr::null_mut(),
+            ),
+            SqlReturn::SUCCESS
+        );
+        assert_eq!(
+            ffi::execute::sql_execute::<TrinoBackend>(stmt),
+            SqlReturn::SUCCESS
+        );
+
+        assert_eq!(
+            ffi::fetch::sql_fetch::<TrinoBackend>(stmt),
+            SqlReturn::SUCCESS
+        );
+        let mut out = [0u8; 64];
+        let mut ind: isize = 0;
+        assert_eq!(
+            ffi::fetch::sql_get_data::<TrinoBackend>(
+                stmt,
+                1,
+                CDataType::Char as i16,
+                out.as_mut_ptr().cast(),
+                out.len() as isize,
+                &mut ind,
+            ),
+            SqlReturn::SUCCESS
+        );
+        let got = std::str::from_utf8(&out[..ind as usize]).expect("utf8");
+        assert_eq!(got, payload, "payload was altered in transit");
+
+        cleanup_stmt(stmt);
+    }
+}
+
+#[test]
+#[serial]
+#[ignore = "requires Trino at localhost:8080 -- run test/trino/setup.sh first"]
+fn columns_returns_tpcds_sf1_columns() {
+    unsafe {
+        let (_env, _conn, stmt) = alloc_stmt();
+        let catalog: Vec<u16> = "tpcds".encode_utf16().collect();
+        let schema: Vec<u16> = "sf1".encode_utf16().collect();
+        let table: Vec<u16> = "customer".encode_utf16().collect();
+        let ret = ffi::metadata::sql_columns_w::<TrinoBackend>(
+            stmt,
+            catalog.as_ptr(),
+            catalog.len() as i16,
+            schema.as_ptr(),
+            schema.len() as i16,
+            table.as_ptr(),
+            table.len() as i16,
+            std::ptr::null(),
+            0,
+        );
+        if ret != SqlReturn::SUCCESS {
+            // Read the diagnostic to understand the failure.
+            let mut state = [0u16; 6];
+            let mut msg = [0u16; 512];
+            let mut msg_len: i16 = 0;
+            let mut native: i32 = 0;
+            let _ = ffi::diag::sql_get_diag_rec_w::<TrinoBackend>(
+                HandleType::Stmt as i16,
+                stmt,
+                1,
+                state.as_mut_ptr(),
+                &mut native,
+                msg.as_mut_ptr(),
+                msg.len() as i16,
+                &mut msg_len,
+            );
+            let state_str = String::from_utf16_lossy(&state[..5]);
+            let msg_str = String::from_utf16_lossy(&msg[..msg_len as usize]);
+            panic!("SQLColumnsW returned {ret:?}: SQLSTATE={state_str} msg={msg_str}");
+        }
+        assert_eq!(
+            ffi::fetch::sql_fetch::<TrinoBackend>(stmt),
+            SqlReturn::SUCCESS,
+            "expected at least one column"
+        );
+        cleanup_stmt(stmt);
+    }
+}
+
+#[test]
+#[serial]
+#[ignore = "requires Trino at localhost:8080 -- run test/trino/setup.sh first"]
+fn tables_catalog_enumeration_mode() {
+    unsafe {
+        let (_env, _conn, stmt) = alloc_stmt();
+        // catalog="%" + schema="" + table="" → ODBC catalog enumeration mode
+        let catalog: Vec<u16> = "%".encode_utf16().collect();
+        let schema: Vec<u16> = "".encode_utf16().collect();
+        let table: Vec<u16> = "".encode_utf16().collect();
+        let ret = ffi::metadata::sql_tables_w::<TrinoBackend>(
+            stmt,
+            catalog.as_ptr(),
+            catalog.len() as i16,
+            schema.as_ptr(),
+            schema.len() as i16,
+            table.as_ptr(),
+            table.len() as i16,
+            std::ptr::null(),
+            0,
+        );
+        assert_eq!(ret, SqlReturn::SUCCESS);
+        assert_eq!(
+            ffi::fetch::sql_fetch::<TrinoBackend>(stmt),
+            SqlReturn::SUCCESS,
+            "expected at least one catalog row"
+        );
+        cleanup_stmt(stmt);
+    }
+}
+
+#[test]
+#[serial]
+#[ignore = "requires Trino at localhost:8080 -- run test/trino/setup.sh first"]
+fn tables_schema_enumeration_mode() {
+    unsafe {
+        let (_env, _conn, stmt) = alloc_stmt();
+        // catalog="" + schema="%" + table="" → ODBC schema enumeration mode
+        let catalog: Vec<u16> = "".encode_utf16().collect();
+        let schema: Vec<u16> = "%".encode_utf16().collect();
+        let table: Vec<u16> = "".encode_utf16().collect();
+        let ret = ffi::metadata::sql_tables_w::<TrinoBackend>(
+            stmt,
+            catalog.as_ptr(),
+            catalog.len() as i16,
+            schema.as_ptr(),
+            schema.len() as i16,
+            table.as_ptr(),
+            table.len() as i16,
+            std::ptr::null(),
+            0,
+        );
+        assert_eq!(ret, SqlReturn::SUCCESS);
+        assert_eq!(
+            ffi::fetch::sql_fetch::<TrinoBackend>(stmt),
+            SqlReturn::SUCCESS,
+            "expected at least one schema row"
+        );
+        cleanup_stmt(stmt);
+    }
+}
+
+#[test]
+#[serial]
+#[ignore = "requires Trino at localhost:8080 -- run test/trino/setup.sh first"]
+fn tables_table_type_enumeration_mode() {
+    unsafe {
+        let (_env, _conn, stmt) = alloc_stmt();
+        // catalog="" + schema="" + table="" + table_type="%" → table type enumeration mode
+        let catalog: Vec<u16> = "".encode_utf16().collect();
+        let schema: Vec<u16> = "".encode_utf16().collect();
+        let table: Vec<u16> = "".encode_utf16().collect();
+        let table_type: Vec<u16> = "%".encode_utf16().collect();
+        let ret = ffi::metadata::sql_tables_w::<TrinoBackend>(
+            stmt,
+            catalog.as_ptr(),
+            catalog.len() as i16,
+            schema.as_ptr(),
+            schema.len() as i16,
+            table.as_ptr(),
+            table.len() as i16,
+            table_type.as_ptr(),
+            table_type.len() as i16,
+        );
+        assert_eq!(ret, SqlReturn::SUCCESS);
+        // TABLE and VIEW must be present
+        assert_eq!(
+            ffi::fetch::sql_fetch::<TrinoBackend>(stmt),
+            SqlReturn::SUCCESS,
+            "expected TABLE row"
+        );
+        assert_eq!(
+            ffi::fetch::sql_fetch::<TrinoBackend>(stmt),
+            SqlReturn::SUCCESS,
+            "expected VIEW row"
+        );
+        cleanup_stmt(stmt);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// New variant tests: exotic Trino types fetched as WChar strings
+// ---------------------------------------------------------------------------
+
+// The variant tests below verify the full type-conversion chain:
+//   Trino REST response → ColumnValue variant → C WChar buffer
+// At the FFI level, ColumnValue is not directly observable: sql_get_data
+// has already marshalled it to a C string. Checking the WChar output
+// is the correct way to assert "the correct variant is returned via
+// sql_get_data" at this layer of the stack.
+
+#[test]
+#[serial]
+#[ignore = "requires Trino at localhost:8080 -- run test/trino/setup.sh first"]
+fn decimal_literal_returns_wchar_string() {
+    unsafe {
+        let (_env, _conn, stmt) = alloc_stmt();
+        assert_eq!(
+            exec_direct(stmt, "SELECT CAST(123.456 AS DECIMAL(6,3)) AS v"),
+            SqlReturn::SUCCESS
+        );
+        assert_eq!(
+            ffi::fetch::sql_fetch::<TrinoBackend>(stmt),
+            SqlReturn::SUCCESS
+        );
+        let s = fetch_wchar(stmt);
+        assert!(s.contains("123.456"), "expected '123.456' in {s:?}");
+        cleanup_stmt(stmt);
+    }
+}
+
+#[test]
+#[serial]
+#[ignore = "requires Trino at localhost:8080 -- run test/trino/setup.sh first"]
+fn json_literal_returns_wchar_string() {
+    unsafe {
+        let (_env, _conn, stmt) = alloc_stmt();
+        assert_eq!(
+            exec_direct(stmt, r#"SELECT JSON '{"key":"value"}' AS v"#),
+            SqlReturn::SUCCESS
+        );
+        assert_eq!(
+            ffi::fetch::sql_fetch::<TrinoBackend>(stmt),
+            SqlReturn::SUCCESS
+        );
+        let s = fetch_wchar(stmt);
+        assert!(s.contains("key"), "expected 'key' in {s:?}");
+        assert!(s.contains("value"), "expected 'value' in {s:?}");
+        cleanup_stmt(stmt);
+    }
+}
+
+#[test]
+#[serial]
+#[ignore = "requires Trino at localhost:8080 -- run test/trino/setup.sh first"]
+fn interval_year_month_returns_wchar() {
+    unsafe {
+        let (_env, _conn, stmt) = alloc_stmt();
+        assert_eq!(
+            exec_direct(stmt, "SELECT INTERVAL '3-7' YEAR TO MONTH AS v"),
+            SqlReturn::SUCCESS
+        );
+        assert_eq!(
+            ffi::fetch::sql_fetch::<TrinoBackend>(stmt),
+            SqlReturn::SUCCESS
+        );
+        let s = fetch_wchar(stmt);
+        assert!(s.contains('3'), "expected '3' in {s:?}");
+        assert!(s.contains('7'), "expected '7' in {s:?}");
+        cleanup_stmt(stmt);
+    }
+}
+
+#[test]
+#[serial]
+#[ignore = "requires Trino at localhost:8080 -- run test/trino/setup.sh first"]
+fn interval_day_time_returns_wchar() {
+    unsafe {
+        let (_env, _conn, stmt) = alloc_stmt();
+        assert_eq!(
+            exec_direct(stmt, "SELECT INTERVAL '2 03:04:05.678' DAY TO SECOND AS v"),
+            SqlReturn::SUCCESS
+        );
+        assert_eq!(
+            ffi::fetch::sql_fetch::<TrinoBackend>(stmt),
+            SqlReturn::SUCCESS
+        );
+        let s = fetch_wchar(stmt);
+        assert!(s.contains('2'), "expected '2' in {s:?}");
+        cleanup_stmt(stmt);
+    }
+}
+
+#[test]
+#[serial]
+#[ignore = "requires Trino at localhost:8080 -- run test/trino/setup.sh first"]
+fn timestamp_with_tz_returns_wchar() {
+    unsafe {
+        let (_env, _conn, stmt) = alloc_stmt();
+        assert_eq!(
+            exec_direct(stmt, "SELECT TIMESTAMP '2024-03-15 10:30:00 +00:00' AS v"),
+            SqlReturn::SUCCESS
+        );
+        assert_eq!(
+            ffi::fetch::sql_fetch::<TrinoBackend>(stmt),
+            SqlReturn::SUCCESS
+        );
+        let s = fetch_wchar(stmt);
+        assert!(s.contains("2024"), "expected '2024' in {s:?}");
+        cleanup_stmt(stmt);
+    }
+}
+
+#[test]
+#[serial]
+#[ignore = "requires Trino at localhost:8080 -- run test/trino/setup.sh first"]
+fn timestamp_with_named_tz_returns_utc_via_get_data() {
+    unsafe {
+        let (_env, _conn, stmt) = alloc_stmt();
+        // America/New_York in March 2025 is EDT (UTC-4).
+        // 20:21:22 EDT → 2025-03-11 00:21:22 UTC.
+        assert_eq!(
+            exec_direct(
+                stmt,
+                "SELECT TIMESTAMP '2025-03-10 20:21:22.123 America/New_York' AS v"
+            ),
+            SqlReturn::SUCCESS
+        );
+        assert_eq!(
+            ffi::fetch::sql_fetch::<TrinoBackend>(stmt),
+            SqlReturn::SUCCESS
+        );
+
+        let mut buf = [0u8; std::mem::size_of::<odbc_sys::Timestamp>()];
+        let mut ind: isize = 0;
+        let ret = ffi::fetch::sql_get_data::<TrinoBackend>(
+            stmt,
+            1,
+            CDataType::TypeTimestamp as i16,
+            buf.as_mut_ptr().cast(),
+            std::mem::size_of::<odbc_sys::Timestamp>() as isize,
+            &mut ind,
+        );
+        assert_eq!(
+            ret,
+            SqlReturn::SUCCESS,
+            "sql_get_data(TypeTimestamp) failed"
+        );
+
+        let ts = std::ptr::read(buf.as_ptr().cast::<odbc_sys::Timestamp>());
+        assert_eq!(ts.year, 2025, "year");
+        assert_eq!(ts.month, 3, "month");
+        assert_eq!(ts.day, 11, "day (should roll forward from 10th)");
+        assert_eq!(ts.hour, 0, "hour (20 EDT → 0 UTC)");
+        assert_eq!(ts.minute, 21, "minute");
+        assert_eq!(ts.second, 22, "second");
+        assert_eq!(ts.fraction, 123_000_000, "fraction (nanoseconds)");
+
+        cleanup_stmt(stmt);
+    }
+}
+
+#[test]
+#[serial]
+#[ignore = "requires Trino at localhost:8080 -- run test/trino/setup.sh first"]
+fn timestamp_with_utc_tz_returns_utc_via_get_data() {
+    unsafe {
+        let (_env, _conn, stmt) = alloc_stmt();
+        assert_eq!(
+            exec_direct(stmt, "SELECT TIMESTAMP '2020-05-05 22:00:00.000 UTC' AS v"),
+            SqlReturn::SUCCESS
+        );
+        assert_eq!(
+            ffi::fetch::sql_fetch::<TrinoBackend>(stmt),
+            SqlReturn::SUCCESS
+        );
+
+        let mut buf = [0u8; std::mem::size_of::<odbc_sys::Timestamp>()];
+        let mut ind: isize = 0;
+        let ret = ffi::fetch::sql_get_data::<TrinoBackend>(
+            stmt,
+            1,
+            CDataType::TypeTimestamp as i16,
+            buf.as_mut_ptr().cast(),
+            std::mem::size_of::<odbc_sys::Timestamp>() as isize,
+            &mut ind,
+        );
+        assert_eq!(
+            ret,
+            SqlReturn::SUCCESS,
+            "sql_get_data(TypeTimestamp) failed"
+        );
+
+        let ts = std::ptr::read(buf.as_ptr().cast::<odbc_sys::Timestamp>());
+        assert_eq!(ts.year, 2020);
+        assert_eq!(ts.month, 5);
+        assert_eq!(ts.day, 5);
+        assert_eq!(ts.hour, 22);
+        assert_eq!(ts.minute, 0);
+        assert_eq!(ts.second, 0);
+        assert_eq!(ts.fraction, 0);
+
+        cleanup_stmt(stmt);
+    }
+}
+
+#[test]
+#[serial]
+#[ignore = "requires Trino at localhost:8080 -- run test/trino/setup.sh first"]
+fn array_literal_returns_wchar() {
+    unsafe {
+        let (_env, _conn, stmt) = alloc_stmt();
+        assert_eq!(
+            exec_direct(stmt, "SELECT ARRAY[1, 2, 3] AS v"),
+            SqlReturn::SUCCESS
+        );
+        assert_eq!(
+            ffi::fetch::sql_fetch::<TrinoBackend>(stmt),
+            SqlReturn::SUCCESS
+        );
+        let s = fetch_wchar(stmt);
+        assert!(s.contains('1'), "expected '1' in {s:?}");
+        assert!(s.contains('2'), "expected '2' in {s:?}");
+        assert!(s.contains('3'), "expected '3' in {s:?}");
+        cleanup_stmt(stmt);
+    }
+}
+
+#[test]
+#[serial]
+#[ignore = "requires Trino at localhost:8080 -- run test/trino/setup.sh first"]
+fn map_literal_returns_wchar() {
+    unsafe {
+        let (_env, _conn, stmt) = alloc_stmt();
+        assert_eq!(
+            exec_direct(stmt, "SELECT MAP(ARRAY['a'], ARRAY[1]) AS v"),
+            SqlReturn::SUCCESS
+        );
+        assert_eq!(
+            ffi::fetch::sql_fetch::<TrinoBackend>(stmt),
+            SqlReturn::SUCCESS
+        );
+        let s = fetch_wchar(stmt);
+        assert!(s.contains('a'), "expected 'a' in {s:?}");
+        assert!(s.contains('1'), "expected '1' in {s:?}");
+        cleanup_stmt(stmt);
+    }
+}
+
+#[test]
+#[serial]
+#[ignore = "requires Trino at localhost:8080 -- run test/trino/setup.sh first"]
+fn row_literal_returns_wchar() {
+    unsafe {
+        let (_env, _conn, stmt) = alloc_stmt();
+        assert_eq!(
+            exec_direct(stmt, "SELECT ROW(1, 'hello', true) AS v"),
+            SqlReturn::SUCCESS
+        );
+        assert_eq!(
+            ffi::fetch::sql_fetch::<TrinoBackend>(stmt),
+            SqlReturn::SUCCESS
+        );
+        let s = fetch_wchar(stmt);
+        assert!(s.contains('1'), "expected '1' in {s:?}");
+        assert!(s.contains("hello"), "expected 'hello' in {s:?}");
+        cleanup_stmt(stmt);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// P1: SQLGetData truncation
+// ---------------------------------------------------------------------------
+
+#[test]
+#[serial]
+#[ignore = "requires Trino at localhost:8080 -- run test/trino/setup.sh first"]
+fn get_data_truncates_string_returns_success_with_info() {
+    // Verifies that reading a string column into a buffer that is too small
+    // returns SUCCESS_WITH_INFO (SQLSTATE 01004) and writes the truncated value.
+    // "hello world here" (16 chars); buffer holds 4 u16 slots (8 bytes) →
+    // capacity for 3 chars + null → truncated to "hel\0", ind = 32 bytes.
+    unsafe {
+        let (_env, _conn, stmt) = alloc_stmt();
+
+        assert_eq!(
+            exec_direct(stmt, "SELECT 'hello world here' AS v"),
+            SqlReturn::SUCCESS
+        );
+        assert_eq!(
+            ffi::fetch::sql_fetch::<TrinoBackend>(stmt),
+            SqlReturn::SUCCESS
+        );
+
+        // 4 u16 slots = 8 bytes → capacity for 3 chars + null terminator.
+        let mut wbuf = [0u16; 4];
+        let mut ind: isize = 0;
+        let ret = ffi::fetch::sql_get_data::<TrinoBackend>(
+            stmt,
+            1,
+            CDataType::WChar as i16,
+            wbuf.as_mut_ptr().cast(),
+            8, // bytes
+            &mut ind,
+        );
+        assert_eq!(ret, SqlReturn::SUCCESS_WITH_INFO);
+        // ind reports the full byte count of the original string (no null).
+        assert_eq!(ind, 32); // 16 chars × 2 bytes
+        // Buffer contains "hel\0".
+        assert_eq!(String::from_utf16_lossy(&wbuf[..3]), "hel");
+        assert_eq!(wbuf[3], 0u16);
+
+        cleanup_stmt(stmt);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// P1: Fetch after NO_DATA returns NO_DATA again (not ERROR)
+// ---------------------------------------------------------------------------
+
+#[test]
+#[serial]
+#[ignore = "requires Trino at localhost:8080 -- run test/trino/setup.sh first"]
+fn fetch_after_no_data_returns_no_data_again() {
+    // After a result set is exhausted (SQLFetch returns NO_DATA), subsequent
+    // SQLFetch calls must also return NO_DATA, not ERROR or panic.
+    unsafe {
+        let (_env, _conn, stmt) = alloc_stmt();
+
+        assert_eq!(exec_direct(stmt, "SELECT 1 AS v"), SqlReturn::SUCCESS);
+
+        // Fetch the single row.
+        assert_eq!(
+            ffi::fetch::sql_fetch::<TrinoBackend>(stmt),
+            SqlReturn::SUCCESS
+        );
+        // Cursor exhausted.
+        assert_eq!(
+            ffi::fetch::sql_fetch::<TrinoBackend>(stmt),
+            SqlReturn::NO_DATA
+        );
+        // A second call past the end must still return NO_DATA, not ERROR.
+        assert_eq!(
+            ffi::fetch::sql_fetch::<TrinoBackend>(stmt),
+            SqlReturn::NO_DATA
+        );
+
+        cleanup_stmt(stmt);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// P1: Statement handle is reusable after an error
+// ---------------------------------------------------------------------------
+
+#[test]
+#[serial]
+#[ignore = "requires Trino at localhost:8080 -- run test/trino/setup.sh first"]
+fn exec_direct_reuse_after_error() {
+    // After a failed exec_direct (invalid SQL → SQL_ERROR), the same statement
+    // handle must accept a valid query and succeed.
+    unsafe {
+        let (_env, _conn, stmt) = alloc_stmt();
+
+        // Invalid SQL — must fail.
+        assert_eq!(exec_direct(stmt, "NOT VALID SQL AT ALL"), SqlReturn::ERROR);
+
+        // Valid query on the same handle — must succeed.
+        assert_eq!(exec_direct(stmt, "SELECT 1 AS v"), SqlReturn::SUCCESS);
+        assert_eq!(
+            ffi::fetch::sql_fetch::<TrinoBackend>(stmt),
+            SqlReturn::SUCCESS
+        );
+        let mut val: i32 = 0;
+        let mut ind: isize = 0;
+        assert_eq!(
+            ffi::fetch::sql_get_data::<TrinoBackend>(
+                stmt,
+                1,
+                CDataType::SLong as i16,
+                (&raw mut val).cast(),
+                4,
+                &mut ind,
+            ),
+            SqlReturn::SUCCESS
+        );
+        assert_eq!(val, 1);
+
+        cleanup_stmt(stmt);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// P2: SQLColAttributeW — nullable, precision, octet_length via FFI
+// ---------------------------------------------------------------------------
+
+#[test]
+#[serial]
+#[ignore = "requires Trino at localhost:8080 -- run test/trino/setup.sh first"]
+fn sql_col_attribute_w_returns_nullable() {
+    // SQL_DESC_NULLABLE (1008): verify the field is readable and returns a
+    // valid ODBC nullable value (0 = not nullable, 1 = nullable, 2 = unknown).
+    unsafe {
+        let (_env, _conn, stmt) = alloc_stmt();
+
+        assert_eq!(
+            exec_direct(
+                stmt,
+                "SELECT c_customer_sk, c_first_name FROM tpcds.sf1.customer LIMIT 1"
+            ),
+            SqlReturn::SUCCESS
+        );
+
+        for col in [1u16, 2u16] {
+            let mut num_attr: isize = 99;
+            let ret = ffi::metadata::sql_col_attribute_w::<TrinoBackend>(
+                stmt,
+                col,
+                Desc::Nullable as u16,
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null_mut(),
+                &mut num_attr,
+            );
+            assert_eq!(ret, SqlReturn::SUCCESS, "col {col}");
+            assert!(
+                (0..=2).contains(&num_attr),
+                "col {col}: nullable must be 0, 1, or 2, got {num_attr}"
+            );
+        }
+
+        cleanup_stmt(stmt);
+    }
+}
+
+#[test]
+#[serial]
+#[ignore = "requires Trino at localhost:8080 -- run test/trino/setup.sh first"]
+fn sql_col_attribute_w_returns_precision_for_integer() {
+    // SQL_DESC_PRECISION (1005): integer columns must return a positive precision.
+    unsafe {
+        let (_env, _conn, stmt) = alloc_stmt();
+
+        assert_eq!(
+            exec_direct(stmt, "SELECT c_birth_year FROM tpcds.sf1.customer LIMIT 1"),
+            SqlReturn::SUCCESS
+        );
+
+        let mut num_attr: isize = -1;
+        let ret = ffi::metadata::sql_col_attribute_w::<TrinoBackend>(
+            stmt,
+            1,
+            Desc::Precision as u16,
+            std::ptr::null_mut(),
+            0,
+            std::ptr::null_mut(),
+            &mut num_attr,
+        );
+        assert_eq!(ret, SqlReturn::SUCCESS);
+        assert!(
+            num_attr >= 0,
+            "precision must be non-negative, got {num_attr}"
+        );
+
+        cleanup_stmt(stmt);
+    }
+}
+
+#[test]
+#[serial]
+#[ignore = "requires Trino at localhost:8080 -- run test/trino/setup.sh first"]
+fn sql_col_attribute_w_returns_octet_length_for_integer() {
+    // SQL_DESC_OCTET_LENGTH (1013): integer columns must return a positive length.
+    unsafe {
+        let (_env, _conn, stmt) = alloc_stmt();
+
+        assert_eq!(
+            exec_direct(stmt, "SELECT c_birth_year FROM tpcds.sf1.customer LIMIT 1"),
+            SqlReturn::SUCCESS
+        );
+
+        let mut num_attr: isize = -1;
+        let ret = ffi::metadata::sql_col_attribute_w::<TrinoBackend>(
+            stmt,
+            1,
+            Desc::OctetLength as u16,
+            std::ptr::null_mut(),
+            0,
+            std::ptr::null_mut(),
+            &mut num_attr,
+        );
+        assert_eq!(ret, SqlReturn::SUCCESS);
+        assert!(
+            num_attr > 0,
+            "octet_length must be positive, got {num_attr}"
+        );
+
+        cleanup_stmt(stmt);
+    }
+}
+
+/// A `timestamp(6)` column's declared fractional-seconds scale must reach
+/// three different, independently-meaningful descriptor fields with three
+/// different correct values (a column's declared temporal scale must not be
+/// ignored):
+///
+/// - `SQL_DESC_LENGTH`/`COLUMN_SIZE`: the character length of the string
+///   representation, `20 + s` = 26 (ODBC "Column Size" appendix).
+/// - `SQL_DESC_PRECISION`: the fractional-seconds scale itself, 6 (per the
+///   `SQLColAttribute` spec: "For data types SQL_TYPE_TIME,
+///   SQL_TYPE_TIMESTAMP, ... its value is the applicable precision of the
+///   fractional seconds component").
+///
+/// If `has_precision_param()` excluded TIME/TIMESTAMP,
+/// `type_name_precision("timestamp(6)")` would fall back to `fixed_precision()`,
+/// a constant derived from the undeclared-column default scale (3), and
+/// both fields would report the values for scale 3 (23/3) rather than the
+/// column's actual declared scale 6 (26/6). Treating the parenthesised
+/// argument as `SQL_DESC_LENGTH` directly would instead push `SQL_DESC_LENGTH`
+/// to `6` (the scale, not the column size); this test pins both fields
+/// independently so neither mistake can pass silently.
+#[test]
+#[serial]
+#[ignore = "requires Trino at localhost:8080 -- run test/trino/setup.sh first"]
+fn timestamp_6_reports_correct_length_and_precision_via_sql_col_attribute() {
+    unsafe {
+        let (_env, _conn, stmt) = alloc_stmt();
+
+        assert_eq!(
+            exec_direct(
+                stmt,
+                "SELECT CAST(TIMESTAMP '2024-03-05 13:30:15.123456' AS TIMESTAMP(6))"
+            ),
+            SqlReturn::SUCCESS
+        );
+
+        let mut length: isize = -1;
+        assert_eq!(
+            ffi::metadata::sql_col_attribute_w::<TrinoBackend>(
+                stmt,
+                1,
+                Desc::Length as u16,
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null_mut(),
+                &mut length,
+            ),
+            SqlReturn::SUCCESS
+        );
+        assert_eq!(length, 26, "SQL_DESC_LENGTH/COLUMN_SIZE must be 20 + 6");
+
+        let mut precision: isize = -1;
+        assert_eq!(
+            ffi::metadata::sql_col_attribute_w::<TrinoBackend>(
+                stmt,
+                1,
+                Desc::Precision as u16,
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null_mut(),
+                &mut precision,
+            ),
+            SqlReturn::SUCCESS
+        );
+        assert_eq!(
+            precision, 6,
+            "SQL_DESC_PRECISION must be the fractional-seconds scale, not the column size"
+        );
+
+        cleanup_stmt(stmt);
+    }
+}
+
+/// The `TIME` counterpart of the test above: `time(6)` must report
+/// `SQL_DESC_LENGTH` = `9 + 6` = 15 and `SQL_DESC_PRECISION` = 6.
+#[test]
+#[serial]
+#[ignore = "requires Trino at localhost:8080 -- run test/trino/setup.sh first"]
+fn time_6_reports_correct_length_and_precision_via_sql_col_attribute() {
+    unsafe {
+        let (_env, _conn, stmt) = alloc_stmt();
+
+        assert_eq!(
+            exec_direct(stmt, "SELECT CAST(TIME '13:30:15.123456' AS TIME(6))"),
+            SqlReturn::SUCCESS
+        );
+
+        let mut length: isize = -1;
+        assert_eq!(
+            ffi::metadata::sql_col_attribute_w::<TrinoBackend>(
+                stmt,
+                1,
+                Desc::Length as u16,
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null_mut(),
+                &mut length,
+            ),
+            SqlReturn::SUCCESS
+        );
+        assert_eq!(length, 15, "SQL_DESC_LENGTH/COLUMN_SIZE must be 9 + 6");
+
+        let mut precision: isize = -1;
+        assert_eq!(
+            ffi::metadata::sql_col_attribute_w::<TrinoBackend>(
+                stmt,
+                1,
+                Desc::Precision as u16,
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null_mut(),
+                &mut precision,
+            ),
+            SqlReturn::SUCCESS
+        );
+        assert_eq!(
+            precision, 6,
+            "SQL_DESC_PRECISION must be the fractional-seconds scale, not the column size"
+        );
+
+        cleanup_stmt(stmt);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// P2: SQLCloseCursor called twice returns 24000 on the second call
+// ---------------------------------------------------------------------------
+
+#[test]
+#[serial]
+#[ignore = "requires Trino at localhost:8080 -- run test/trino/setup.sh first"]
+fn close_cursor_twice_returns_error() {
+    // The second SQLCloseCursor call must return ERROR (SQLSTATE 24000, invalid
+    // cursor state) because there is no open cursor after the first close.
+    unsafe {
+        let (_env, _conn, stmt) = alloc_stmt();
+
+        assert_eq!(exec_direct(stmt, "SELECT 1 AS v"), SqlReturn::SUCCESS);
+
+        // First close — cursor is open, must succeed.
+        assert_eq!(
+            ffi::cursor::sql_close_cursor::<TrinoBackend>(stmt),
+            SqlReturn::SUCCESS
+        );
+        // Second close — no cursor open, must return ERROR (24000).
+        assert_eq!(
+            ffi::cursor::sql_close_cursor::<TrinoBackend>(stmt),
+            SqlReturn::ERROR
+        );
+
+        cleanup_stmt(stmt);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// P2: SQLNumResultCols after SQLPrepare but before SQLExecute
+// ---------------------------------------------------------------------------
+
+#[test]
+#[serial]
+#[ignore = "requires Trino at localhost:8080 -- run test/trino/setup.sh first"]
+fn num_result_cols_after_prepare_before_execute() {
+    // After SQLPrepare (but before SQLExecute), SQLNumResultCols must return
+    // SUCCESS. The Trino backend returns count=0 because column metadata is
+    // only populated after execute.
+    unsafe {
+        let (_env, _conn, stmt) = alloc_stmt();
+
+        let sql = "SELECT c_customer_sk FROM tpcds.sf1.customer LIMIT 1";
+        let wide: Vec<u16> = sql.encode_utf16().collect();
+        let ret =
+            ffi::execute::sql_prepare_w::<TrinoBackend>(stmt, wide.as_ptr(), wide.len() as i32);
+        assert_eq!(ret, SqlReturn::SUCCESS);
+
+        let mut count: i16 = 99;
+        let ret = ffi::cursor::sql_num_result_cols::<TrinoBackend>(stmt, &mut count);
+        assert_eq!(ret, SqlReturn::SUCCESS);
+        // Column metadata is populated only after execute.
+        assert_eq!(count, 0);
+
+        cleanup_stmt(stmt);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// P3: SQLGetDiagFieldW — field-by-field after an error
+// ---------------------------------------------------------------------------
+
+#[test]
+#[serial]
+#[ignore = "requires Trino at localhost:8080 -- run test/trino/setup.sh first"]
+fn get_diag_field_number_after_error() {
+    // SQL_DIAG_NUMBER (2) on the header record (rec_number=0) reports the count
+    // of diagnostic records. After one error it must be 1.
+    unsafe {
+        let (_env, _conn, stmt) = alloc_stmt();
+
+        assert_eq!(exec_direct(stmt, "NOT VALID SQL"), SqlReturn::ERROR);
+
+        let mut count: i32 = 0;
+        let ret = ffi::diag::sql_get_diag_field_w::<TrinoBackend>(
+            HandleType::Stmt as i16,
+            stmt,
+            0, // header field: rec_number = 0
+            HeaderDiagnosticIdentifier::Number as i16,
+            &mut count as *mut i32 as *mut c_void,
+            0,
+            std::ptr::null_mut(),
+        );
+        assert_eq!(ret, SqlReturn::SUCCESS);
+        assert_eq!(count, 1, "one diagnostic record after one error");
+
+        cleanup_stmt(stmt);
+    }
+}
+
+#[test]
+#[serial]
+#[ignore = "requires Trino at localhost:8080 -- run test/trino/setup.sh first"]
+fn get_diag_field_sqlstate_after_error() {
+    // SQL_DIAG_SQLSTATE (4) on rec_number=1 returns the 5-character SQLSTATE.
+    unsafe {
+        let (_env, _conn, stmt) = alloc_stmt();
+
+        assert_eq!(exec_direct(stmt, "NOT VALID SQL"), SqlReturn::ERROR);
+
+        // 6 u16 slots: 5 SQLSTATE chars + null terminator = 12 bytes.
+        let mut state_buf = [0u16; 6];
+        let mut str_len: i16 = 0;
+        let ret = ffi::diag::sql_get_diag_field_w::<TrinoBackend>(
+            HandleType::Stmt as i16,
+            stmt,
+            1, // first record
+            HeaderDiagnosticIdentifier::SqlState as i16,
+            state_buf.as_mut_ptr() as *mut c_void,
+            12, // buffer_length in bytes (6 u16s)
+            &mut str_len,
+        );
+        assert_eq!(ret, SqlReturn::SUCCESS);
+        // SQLSTATE is always exactly 5 characters = 10 bytes; StringLengthPtr
+        // is spec'd in bytes for SQLGetDiagField.
+        assert_eq!(str_len, 10);
+        let state = String::from_utf16_lossy(&state_buf[..5]);
+        assert_eq!(state.len(), 5, "SQLSTATE must be 5 chars");
+
+        cleanup_stmt(stmt);
+    }
+}
+
+#[test]
+#[serial]
+#[ignore = "requires Trino at localhost:8080 -- run test/trino/setup.sh first"]
+fn get_diag_field_native_error_after_error() {
+    // SQL_DIAG_NATIVE (5) returns the driver-specific native error code (i32).
+    unsafe {
+        let (_env, _conn, stmt) = alloc_stmt();
+
+        assert_eq!(exec_direct(stmt, "NOT VALID SQL"), SqlReturn::ERROR);
+
+        let mut native: i32 = -999;
+        let mut str_len: i16 = 0;
+        let ret = ffi::diag::sql_get_diag_field_w::<TrinoBackend>(
+            HandleType::Stmt as i16,
+            stmt,
+            1, // first record
+            HeaderDiagnosticIdentifier::Native as i16,
+            &mut native as *mut i32 as *mut c_void,
+            0,
+            &mut str_len,
+        );
+        assert_eq!(ret, SqlReturn::SUCCESS);
+        assert_eq!(str_len, 4); // i32 = 4 bytes
+        let _ = native;
+
+        cleanup_stmt(stmt);
+    }
+}
+
+#[test]
+#[serial]
+#[ignore = "requires Trino at localhost:8080 -- run test/trino/setup.sh first"]
+fn get_diag_field_message_text_after_error() {
+    // SQL_DIAG_MESSAGE_TEXT (6) returns the diagnostic message string.
+    // After an invalid-SQL error the message must be non-empty.
+    unsafe {
+        let (_env, _conn, stmt) = alloc_stmt();
+
+        assert_eq!(exec_direct(stmt, "NOT VALID SQL"), SqlReturn::ERROR);
+
+        let mut msg_buf = [0u16; 256];
+        let mut str_len: i16 = 0;
+        let buffer_length =
+            i16::try_from(std::mem::size_of_val(&msg_buf)).expect("msg_buf byte size fits in i16");
+        let ret = ffi::diag::sql_get_diag_field_w::<TrinoBackend>(
+            HandleType::Stmt as i16,
+            stmt,
+            1, // first record
+            SQL_DIAG_MESSAGE_TEXT,
+            msg_buf.as_mut_ptr() as *mut c_void,
+            buffer_length,
+            &mut str_len,
+        );
+        // SUCCESS_WITH_INFO is also valid when the message is longer than the buffer.
+        assert!(
+            matches!(ret, SqlReturn::SUCCESS | SqlReturn::SUCCESS_WITH_INFO),
+            "expected SUCCESS or SUCCESS_WITH_INFO, got {ret:?}"
+        );
+        assert!(str_len > 0, "diagnostic message must be non-empty");
+        // str_len is a BYTE count (SQLGetDiagField spec); convert to UTF-16
+        // code units and clamp to the buffer's element count before indexing:
+        // the untruncated byte count can exceed the buffer capacity.
+        let code_units =
+            (usize::try_from(str_len).expect("non-negative length") / 2).min(msg_buf.len());
+        let msg = String::from_utf16_lossy(&msg_buf[..code_units]);
+        assert!(!msg.is_empty());
+
+        cleanup_stmt(stmt);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Empty result set: WHERE 1=0 must return SUCCESS with zero rows
+// ---------------------------------------------------------------------------
+
+#[test]
+#[serial]
+#[ignore = "requires Trino at localhost:8080 -- run test/trino/setup.sh first"]
+fn empty_result_set_where_false() {
+    // A query that returns no rows (WHERE 1=0) must:
+    //   - exec_direct → SUCCESS (not ERROR)
+    //   - sql_num_result_cols → SUCCESS with count > 0 (columns are known)
+    //   - first sql_fetch → NO_DATA (not ERROR)
+    // This is the response-to-DM path: the DM reads column count before
+    // fetching rows, so metadata must survive even when the row list is empty.
+    unsafe {
+        let (_env, _conn, stmt) = alloc_stmt();
+
+        assert_eq!(
+            exec_direct(
+                stmt,
+                "SELECT c_customer_sk FROM tpcds.sf1.customer WHERE 1 = 0"
+            ),
+            SqlReturn::SUCCESS,
+            "exec_direct must succeed for an empty result set"
+        );
+
+        let mut col_count: i16 = -1;
+        assert_eq!(
+            ffi::cursor::sql_num_result_cols::<TrinoBackend>(stmt, &mut col_count),
+            SqlReturn::SUCCESS,
+            "SQLNumResultCols must succeed"
+        );
+        assert_eq!(col_count, 1, "one column even for empty result set");
+
+        assert_eq!(
+            ffi::fetch::sql_fetch::<TrinoBackend>(stmt),
+            SqlReturn::NO_DATA,
+            "first fetch on empty result set must return NO_DATA"
+        );
+
+        cleanup_stmt(stmt);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// P3: SQLGetEnvAttrW — ODBC version roundtrip (no Trino connection required)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn get_env_attr_odbc_version_roundtrip() {
+    // Set SQL_ATTR_ODBC_VERSION (200) to SQL_OV_ODBC3 (3), then read it back.
+    // Per spec HY010, SQLSetEnvAttr must be called before any connection handle
+    // is allocated on the environment. We use a bare env handle here.
+    unsafe {
+        let mut env: *mut c_void = std::ptr::null_mut();
+        assert_eq!(
+            ffi::handle::sql_alloc_handle::<TrinoBackend>(
+                HandleType::Env as i16,
+                std::ptr::null_mut(),
+                &mut env,
+            ),
+            SqlReturn::SUCCESS
+        );
+
+        // Set SQL_ATTR_ODBC_VERSION = SQL_OV_ODBC3 (3).
+        assert_eq!(
+            ffi::env::sql_set_env_attr::<TrinoBackend>(
+                env,
+                EnvironmentAttribute::OdbcVersion as i32,
+                AttrOdbcVersion::Odbc3 as usize as *mut c_void,
+                0,
+            ),
+            SqlReturn::SUCCESS
+        );
+
+        // Read it back.
+        let mut version: i32 = 0;
+        let mut str_len: i32 = 0;
+        assert_eq!(
+            ffi::env::sql_get_env_attr::<TrinoBackend>(
+                env,
+                EnvironmentAttribute::OdbcVersion as i32,
+                &mut version as *mut i32 as *mut c_void,
+                4,
+                &mut str_len,
+            ),
+            SqlReturn::SUCCESS
+        );
+        assert_eq!(version, AttrOdbcVersion::Odbc3 as i32);
+        assert_eq!(str_len, 4); // sizeof(i32)
+
+        let _ = ffi::handle::sql_free_handle::<TrinoBackend>(HandleType::Env as i16, env);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Array-fetch path (SQLBindCol + SQLFetch)
+// ---------------------------------------------------------------------------
+//
+// pyodbc retrieves column data via SQLGetData after each fetch; turbodbc and
+// other drivers that pre-allocate column buffers use SQLBindCol + SQLFetch
+// instead. This test exercises the bound-column path so regressions in
+// sql_bind_col or the write_column_value call inside sql_fetch are caught
+// independently of the sql_get_data path.
+
+#[test]
+#[serial]
+#[ignore = "requires Trino at localhost:8080 -- run test/trino/setup.sh first"]
+fn bind_col_and_fetch_reads_bound_column_values() {
+    // Exercises SQL_ATTR_ROW_ARRAY_SIZE (27) and SQL_ATTR_ROWS_FETCHED_PTR (26)
+    // attribute setting (accepted without error) plus the full SQLBindCol →
+    // SQLFetch data path.
+    //
+    // NOTE: batch INSERT (SQL_ATTR_PARAMSET_SIZE) is not tested here because
+    // the tpcds catalog is read-only; the writable postgresql catalog covers
+    // the full bind-parameter path elsewhere in this suite.
+    unsafe {
+        let (_env, _conn, stmt) = alloc_stmt();
+
+        // Set SQL_ATTR_ROW_ARRAY_SIZE = 1.
+        assert_eq!(
+            ffi::stmt_attr::sql_set_stmt_attr_w::<TrinoBackend>(
+                stmt,
+                StatementAttribute::RowArraySize as i32,
+                std::ptr::without_provenance_mut(1usize), // 1 row per fetch
+                0,
+            ),
+            SqlReturn::SUCCESS
+        );
+
+        // Set SQL_ATTR_ROWS_FETCHED_PTR to a usize variable.
+        let mut rows_fetched: usize = 0;
+        assert_eq!(
+            ffi::stmt_attr::sql_set_stmt_attr_w::<TrinoBackend>(
+                stmt,
+                StatementAttribute::RowsFetchedPtr as i32,
+                &mut rows_fetched as *mut usize as *mut c_void,
+                0,
+            ),
+            SqlReturn::SUCCESS
+        );
+
+        // Execute a SELECT that returns exactly 3 integer rows.
+        assert_eq!(
+            exec_direct(
+                stmt,
+                "SELECT c FROM (VALUES (10), (20), (30)) AS t(c) ORDER BY c"
+            ),
+            SqlReturn::SUCCESS
+        );
+
+        // Bind column 1 to an i32 buffer via SQLBindCol.
+        // Trino returns VALUES integer literals as INTEGER (32-bit).
+        let mut val_buf: i32 = 0;
+        let mut val_ind: isize = 0;
+        assert_eq!(
+            ffi::bind::sql_bind_col::<TrinoBackend>(
+                stmt,
+                1, // column 1
+                CDataType::SLong as i16,
+                &mut val_buf as *mut i32 as *mut c_void,
+                std::mem::size_of::<i32>() as isize,
+                &mut val_ind,
+            ),
+            SqlReturn::SUCCESS
+        );
+
+        // Fetch each row and verify the bound buffer is populated.
+        assert_eq!(
+            ffi::fetch::sql_fetch::<TrinoBackend>(stmt),
+            SqlReturn::SUCCESS
+        );
+        assert_eq!(val_buf, 10);
+        assert_eq!(
+            ffi::fetch::sql_fetch::<TrinoBackend>(stmt),
+            SqlReturn::SUCCESS
+        );
+        assert_eq!(val_buf, 20);
+        assert_eq!(
+            ffi::fetch::sql_fetch::<TrinoBackend>(stmt),
+            SqlReturn::SUCCESS
+        );
+        assert_eq!(val_buf, 30);
+
+        // Result set exhausted.
+        assert_eq!(
+            ffi::fetch::sql_fetch::<TrinoBackend>(stmt),
+            SqlReturn::NO_DATA
+        );
+
+        cleanup_stmt(stmt);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Batch parameter path (SQLBindParameter + SQLPrepare + SQLExecute)
+// ---------------------------------------------------------------------------
+//
+// The tpcds catalog is read-only, so DML runs against the writable PostgreSQL
+// catalog.
+
+#[test]
+#[serial]
+#[ignore = "requires Trino at localhost:8080 with PostgreSQL catalog -- run test/trino/setup.sh first"]
+fn paramset_size_and_bound_insert_into_postgresql() {
+    // Exercises SQL_ATTR_PARAMSET_SIZE (22) attribute setting plus the full
+    // SQLBindParameter -> SQLPrepare -> SQLExecute DML path.
+    unsafe {
+        let (_env, _conn, stmt) = alloc_stmt();
+        let table = "postgresql.public.h9_paramset_test";
+
+        // Each statement is closed before the next runs on the shared handle;
+        // otherwise SQLExecDirect returns 24000 (a cursor is already open).
+
+        // Start clean in case a previous run left the table behind.
+        let _ = exec_direct(stmt, &format!("DROP TABLE IF EXISTS {table}"));
+        let _ = ffi::cursor::sql_close_cursor::<TrinoBackend>(stmt);
+
+        assert_eq!(
+            exec_direct(stmt, &format!("CREATE TABLE {table} (id bigint)")),
+            SqlReturn::SUCCESS
+        );
+        let _ = ffi::cursor::sql_close_cursor::<TrinoBackend>(stmt);
+
+        // SQL_ATTR_PARAMSET_SIZE = 1: one parameter row per execute.
+        assert_eq!(
+            ffi::stmt_attr::sql_set_stmt_attr_w::<TrinoBackend>(
+                stmt,
+                StatementAttribute::ParamsetSize as i32,
+                std::ptr::without_provenance_mut(1usize),
+                0,
+            ),
+            SqlReturn::SUCCESS
+        );
+
+        // Prepare and run a bound INSERT.
+        let sql = format!("INSERT INTO {table} VALUES (?)");
+        let wide: Vec<u16> = sql.encode_utf16().collect();
+        assert_eq!(
+            ffi::execute::sql_prepare_w::<TrinoBackend>(stmt, wide.as_ptr(), wide.len() as i32),
+            SqlReturn::SUCCESS
+        );
+        let mut val: i64 = 42;
+        assert_eq!(bind_i64(stmt, 1, &mut val), SqlReturn::SUCCESS);
+        assert_eq!(
+            ffi::execute::sql_execute::<TrinoBackend>(stmt),
+            SqlReturn::SUCCESS
+        );
+        let _ = ffi::cursor::sql_close_cursor::<TrinoBackend>(stmt);
+
+        // The row landed.
+        assert_eq!(
+            exec_direct(stmt, &format!("SELECT COUNT(*) FROM {table} WHERE id = 42")),
+            SqlReturn::SUCCESS
+        );
+        assert_eq!(
+            fetch_one_i64(stmt),
+            1,
+            "bound INSERT did not persist the row"
+        );
+        let _ = ffi::cursor::sql_close_cursor::<TrinoBackend>(stmt);
+
+        // Clean up the table.
+        assert_eq!(
+            exec_direct(stmt, &format!("DROP TABLE {table}")),
+            SqlReturn::SUCCESS
+        );
+        cleanup_stmt(stmt);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SQLPrimaryKeysW tests
+// ---------------------------------------------------------------------------
+// NOTE: Trino's information_schema does not include table_constraints or
+// key_column_usage in any connector (PostgreSQL, tpcds, memory, etc.).
+// These tests verify that the driver returns SQL_SUCCESS with an empty
+// result set rather than SQL_ERROR.
+// When Trino adds constraint metadata support, these tests should be
+// updated to verify actual PK data.
+
+#[test]
+#[serial]
+#[ignore = "requires Trino at localhost:8080 with PostgreSQL catalog -- run test/trino/setup.sh first"]
+fn primary_keys_postgresql_returns_success() {
+    unsafe {
+        let (_env, _conn, stmt) = alloc_stmt();
+        let catalog: Vec<u16> = "postgresql".encode_utf16().collect();
+        let schema: Vec<u16> = "public".encode_utf16().collect();
+        let table: Vec<u16> = "customers".encode_utf16().collect();
+        let ret = ffi::metadata::sql_primary_keys_w::<TrinoBackend>(
+            stmt,
+            catalog.as_ptr(),
+            catalog.len() as i16,
+            schema.as_ptr(),
+            schema.len() as i16,
+            table.as_ptr(),
+            table.len() as i16,
+        );
+        assert_eq!(ret, SqlReturn::SUCCESS, "sql_primary_keys_w should succeed");
+        // Trino doesn't expose table_constraints: empty result expected
+        assert_eq!(
+            ffi::fetch::sql_fetch::<TrinoBackend>(stmt),
+            SqlReturn::NO_DATA,
+        );
+        cleanup_stmt(stmt);
+    }
+}
+
+#[test]
+#[serial]
+#[ignore = "requires Trino at localhost:8080 -- run test/trino/setup.sh first"]
+fn primary_keys_no_constraints_returns_empty() {
+    unsafe {
+        let (_env, _conn, stmt) = alloc_stmt();
+        let catalog: Vec<u16> = "tpcds".encode_utf16().collect();
+        let schema: Vec<u16> = "sf1".encode_utf16().collect();
+        let table: Vec<u16> = "customer".encode_utf16().collect();
+        let ret = ffi::metadata::sql_primary_keys_w::<TrinoBackend>(
+            stmt,
+            catalog.as_ptr(),
+            catalog.len() as i16,
+            schema.as_ptr(),
+            schema.len() as i16,
+            table.as_ptr(),
+            table.len() as i16,
+        );
+        assert_eq!(ret, SqlReturn::SUCCESS, "should succeed even with no PKs");
+        assert_eq!(
+            ffi::fetch::sql_fetch::<TrinoBackend>(stmt),
+            SqlReturn::NO_DATA,
+            "tpcds has no PK constraints — expect empty result"
+        );
+        cleanup_stmt(stmt);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SQLForeignKeysW tests
+// ---------------------------------------------------------------------------
+// NOTE: Same limitation as primary keys; Trino doesn't expose
+// referential_constraints. Tests verify SQL_SUCCESS with empty results.
+
+#[test]
+#[serial]
+#[ignore = "requires Trino at localhost:8080 with PostgreSQL catalog -- run test/trino/setup.sh first"]
+fn foreign_keys_postgresql_returns_success() {
+    unsafe {
+        let (_env, _conn, stmt) = alloc_stmt();
+        let catalog: Vec<u16> = "postgresql".encode_utf16().collect();
+        let schema: Vec<u16> = "public".encode_utf16().collect();
+        let fk_table: Vec<u16> = "orders".encode_utf16().collect();
+        let ret = ffi::metadata::sql_foreign_keys_w::<TrinoBackend>(
+            stmt,
+            std::ptr::null(),
+            0,
+            std::ptr::null(),
+            0,
+            std::ptr::null(),
+            0,
+            catalog.as_ptr(),
+            catalog.len() as i16,
+            schema.as_ptr(),
+            schema.len() as i16,
+            fk_table.as_ptr(),
+            fk_table.len() as i16,
+        );
+        assert_eq!(ret, SqlReturn::SUCCESS, "sql_foreign_keys_w should succeed");
+        // Trino doesn't expose referential_constraints: empty result expected
+        assert_eq!(
+            ffi::fetch::sql_fetch::<TrinoBackend>(stmt),
+            SqlReturn::NO_DATA,
+        );
+        cleanup_stmt(stmt);
+    }
+}
+
+#[test]
+#[serial]
+#[ignore = "requires Trino at localhost:8080 -- run test/trino/setup.sh first"]
+fn foreign_keys_no_constraints_returns_empty() {
+    unsafe {
+        let (_env, _conn, stmt) = alloc_stmt();
+        let catalog: Vec<u16> = "tpcds".encode_utf16().collect();
+        let schema: Vec<u16> = "sf1".encode_utf16().collect();
+        let table: Vec<u16> = "customer".encode_utf16().collect();
+        let ret = ffi::metadata::sql_foreign_keys_w::<TrinoBackend>(
+            stmt,
+            std::ptr::null(),
+            0,
+            std::ptr::null(),
+            0,
+            std::ptr::null(),
+            0,
+            catalog.as_ptr(),
+            catalog.len() as i16,
+            schema.as_ptr(),
+            schema.len() as i16,
+            table.as_ptr(),
+            table.len() as i16,
+        );
+        assert_eq!(ret, SqlReturn::SUCCESS, "should succeed even with no FKs");
+        assert_eq!(
+            ffi::fetch::sql_fetch::<TrinoBackend>(stmt),
+            SqlReturn::NO_DATA,
+        );
+        cleanup_stmt(stmt);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SQLStatisticsW test
+// ---------------------------------------------------------------------------
+
+#[test]
+#[serial]
+#[ignore = "requires Trino at localhost:8080 -- run test/trino/setup.sh first"]
+fn statistics_returns_empty_result_set() {
+    unsafe {
+        let (_env, _conn, stmt) = alloc_stmt();
+        let catalog: Vec<u16> = "postgresql".encode_utf16().collect();
+        let schema: Vec<u16> = "public".encode_utf16().collect();
+        let table: Vec<u16> = "customers".encode_utf16().collect();
+        let ret = ffi::metadata::sql_statistics_w::<TrinoBackend>(
+            stmt,
+            catalog.as_ptr(),
+            catalog.len() as i16,
+            schema.as_ptr(),
+            schema.len() as i16,
+            table.as_ptr(),
+            table.len() as i16,
+            SQL_INDEX_UNIQUE,
+            SQL_QUICK,
+        );
+        assert_eq!(ret, SqlReturn::SUCCESS, "sql_statistics_w should succeed");
+
+        // Verify it has columns (13 per ODBC spec) by checking num_result_cols
+        let mut col_count: i16 = 0;
+        let ret = ffi::cursor::sql_num_result_cols::<TrinoBackend>(stmt, &mut col_count);
+        assert_eq!(ret, SqlReturn::SUCCESS);
+        assert_eq!(
+            col_count, 13,
+            "statistics result set should have 13 columns"
+        );
+
+        // Verify empty
+        assert_eq!(
+            ffi::fetch::sql_fetch::<TrinoBackend>(stmt),
+            SqlReturn::NO_DATA,
+            "statistics should return empty result set"
+        );
+        cleanup_stmt(stmt);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SQLBulkOperations / SQLSetPos — HYC00 tests
+// ---------------------------------------------------------------------------
+
+#[test]
+#[serial]
+#[ignore = "requires Trino at localhost:8080 -- run test/trino/setup.sh first"]
+fn bulk_operations_returns_hyc00() {
+    unsafe {
+        let (_env, _conn, stmt) = alloc_stmt();
+        assert_eq!(exec_direct(stmt, "SELECT 1 AS n"), SqlReturn::SUCCESS);
+        assert_eq!(
+            ffi::fetch::sql_fetch::<TrinoBackend>(stmt),
+            SqlReturn::SUCCESS
+        );
+        let ret = ffi::cursor::sql_bulk_operations::<TrinoBackend>(stmt, SQL_ADD);
+        assert_eq!(
+            ret,
+            SqlReturn::ERROR,
+            "SQLBulkOperations should return ERROR"
+        );
+        cleanup_stmt(stmt);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SQLDescribeColW / SQLColumnsW type-metadata agreement
+// ---------------------------------------------------------------------------
+
+/// Describe every column of the current result set via `SQLDescribeColW`.
+unsafe fn collect_describe_col(stmt: *mut c_void) -> Vec<(String, i16, usize, i16)> {
+    let mut count: i16 = 0;
+    unsafe {
+        assert_eq!(
+            ffi::cursor::sql_num_result_cols::<TrinoBackend>(stmt, &mut count),
+            SqlReturn::SUCCESS
+        );
+    }
+    (1..=count)
+        .map(|col| {
+            let mut name = [0u16; 256];
+            let mut name_len: i16 = 0;
+            let mut data_type: i16 = 0;
+            let mut col_size: usize = 0;
+            let mut decimal_digits: i16 = 0;
+            let mut nullable: i16 = 0;
+            unsafe {
+                assert_eq!(
+                    ffi::metadata::sql_describe_col_w::<TrinoBackend>(
+                        stmt,
+                        u16::try_from(col).expect("column index fits u16"),
+                        name.as_mut_ptr(),
+                        i16::try_from(name.len()).expect("buffer fits i16"),
+                        &mut name_len,
+                        &mut data_type,
+                        &mut col_size,
+                        &mut decimal_digits,
+                        &mut nullable,
+                    ),
+                    SqlReturn::SUCCESS
+                );
+            }
+            let n = String::from_utf16_lossy(&name[..usize::try_from(name_len).unwrap_or(0)]);
+            (n, data_type, col_size, decimal_digits)
+        })
+        .collect()
+}
+
+/// The query path (`SQLDescribeColW`) and the catalog path (`SQLColumnsW`)
+/// must not derive type, size and scale independently and disagree: `char`
+/// (WVARCHAR vs WCHAR), `timestamp` (23 vs 29) and `varchar(n)` (0 vs n).
+/// Both derive from the same native Trino type text, so these columns of
+/// `postgresql.public.types_test` must agree between the two paths.
+///
+/// Covers `VARCHAR` / `CHAR` / `DECIMAL` / integer / floating-point columns
+/// plus `DATE` / `TIME` / `TIMESTAMP` / `BOOLEAN`. The latter four depend on
+/// `SQLColumns`' `COLUMN_SIZE` gate (`backend/metadata.rs`) reporting
+/// `type_name_precision`'s value for every type it can resolve one for,
+/// rather than a separately maintained "is_char || is_numeric" list that
+/// DATE/TIME/TIMESTAMP/BOOLEAN fall outside of, which would make the catalog
+/// path report `COLUMN_SIZE` as `NULL` for them regardless of what the query
+/// path said.
+///
+/// The catalog path needs the session's default catalog/schema switched to
+/// `postgresql`/`public` first: the generic `SQLColumnsW` query reads
+/// Trino's `information_schema.columns` unqualified, which Trino resolves
+/// against the *session's* default catalog. The shared connection defaults
+/// to `Catalog=tpcds`, so a `table_catalog='postgresql'` filter on that
+/// session returns zero rows even though the table exists: that's Trino's
+/// information_schema scoping, not a defect. `USE`
+/// switches it on the shared connection (and switches back afterwards)
+/// rather than opening a second connection: a second connection would open
+/// a second `reqwest` pool against the same coordinator, which is exactly
+/// the "intermittent TCP socket corruption" scenario this file's own docs
+/// warn about for `backend::tests`, reproducible here too. The query path
+/// has no such restriction (a fully qualified `SELECT` works from any
+/// session), so it runs before the catalog is switched.
+#[test]
+#[serial]
+#[ignore = "requires Trino at localhost:8080 -- run test/trino/setup.sh first"]
+fn describe_col_and_columns_agree_on_type_metadata() {
+    const CATALOG: &str = "postgresql";
+    const SCHEMA: &str = "public";
+    const TABLE: &str = "types_test";
+    const COLUMNS: &str = "id, col_smallint, col_integer, col_bigint, col_real, \
+         col_double, col_decimal, col_varchar, col_char, \
+         col_boolean, col_date, col_time, col_timestamp";
+
+    unsafe {
+        // Query path.
+        let (_, _, stmt) = alloc_stmt();
+        assert_eq!(
+            exec_direct(
+                stmt,
+                &format!("SELECT {COLUMNS} FROM {CATALOG}.{SCHEMA}.{TABLE} LIMIT 0")
+            ),
+            SqlReturn::SUCCESS
+        );
+        let described = collect_describe_col(stmt);
+        cleanup_stmt(stmt);
+        assert!(!described.is_empty(), "expected columns to describe");
+
+        // Catalog path: SQLColumns queries `information_schema.columns`
+        // unqualified, which Trino resolves against the *session's* default
+        // catalog: the shared connection defaults to `Catalog=tpcds`, so a
+        // filter on `table_catalog='postgresql'` would return zero rows on
+        // that session even though the table exists. Switch the shared
+        // connection's session catalog/schema with `USE` rather than opening
+        // a second connection: this file's own docs warn that two
+        // independent reqwest connection pools hitting the same Trino
+        // coordinator cause intermittent TCP socket corruption, and that was
+        // reproducible here too. `USE` restores the original session
+        // afterwards so later tests on the shared connection are unaffected.
+        let (_, _, use_stmt) = alloc_stmt();
+        assert_eq!(
+            exec_direct(use_stmt, &format!("USE {CATALOG}.{SCHEMA}")),
+            SqlReturn::SUCCESS,
+            "USE {CATALOG}.{SCHEMA} failed"
+        );
+        cleanup_stmt(use_stmt);
+
+        let (_, _, cat_stmt) = alloc_stmt();
+        let cat: Vec<u16> = CATALOG.encode_utf16().collect();
+        let sch: Vec<u16> = SCHEMA.encode_utf16().collect();
+        let tbl: Vec<u16> = TABLE.encode_utf16().collect();
+        assert_eq!(
+            ffi::metadata::sql_columns_w::<TrinoBackend>(
+                cat_stmt,
+                cat.as_ptr(),
+                i16::try_from(cat.len()).expect("fits i16"),
+                sch.as_ptr(),
+                i16::try_from(sch.len()).expect("fits i16"),
+                tbl.as_ptr(),
+                i16::try_from(tbl.len()).expect("fits i16"),
+                std::ptr::null(),
+                0,
+            ),
+            SqlReturn::SUCCESS
+        );
+
+        let mut cataloged: Vec<(String, i16, usize, i16)> = Vec::new();
+        while ffi::fetch::sql_fetch::<TrinoBackend>(cat_stmt) == SqlReturn::SUCCESS {
+            cataloged.push((
+                get_wchar_col(cat_stmt, 4),
+                i16::try_from(get_i64_col(cat_stmt, 5)).expect("DATA_TYPE fits i16"),
+                usize::try_from(get_i64_col(cat_stmt, 7)).unwrap_or(0),
+                i16::try_from(get_i64_col(cat_stmt, 9)).unwrap_or(0),
+            ));
+        }
+        cleanup_stmt(cat_stmt);
+
+        // Restore the shared connection's session catalog/schema so later
+        // tests that assume the original `Catalog=tpcds` connect-string
+        // default are unaffected.
+        let (_, _, restore_stmt) = alloc_stmt();
+        assert_eq!(
+            exec_direct(restore_stmt, "USE tpcds.sf1"),
+            SqlReturn::SUCCESS,
+            "restoring USE tpcds.sf1 failed"
+        );
+        cleanup_stmt(restore_stmt);
+
+        assert!(!cataloged.is_empty(), "expected SQLColumns to return rows");
+        for (name, sql_type, size, scale) in described {
+            let c = cataloged
+                .iter()
+                .find(|c| c.0 == name)
+                .unwrap_or_else(|| panic!("{name} missing from SQLColumns"));
+            assert_eq!(sql_type, c.1, "{name}: DATA_TYPE disagrees");
+            assert_eq!(size, c.2, "{name}: COLUMN_SIZE disagrees");
+            assert_eq!(scale, c.3, "{name}: DECIMAL_DIGITS disagrees");
+        }
+    }
+}
+
+#[test]
+#[serial]
+#[ignore = "requires Trino at localhost:8080 -- run test/trino/setup.sh first"]
+fn set_pos_returns_hyc00() {
+    unsafe {
+        let (_env, _conn, stmt) = alloc_stmt();
+        assert_eq!(exec_direct(stmt, "SELECT 1 AS n"), SqlReturn::SUCCESS);
+        assert_eq!(
+            ffi::fetch::sql_fetch::<TrinoBackend>(stmt),
+            SqlReturn::SUCCESS
+        );
+        let ret =
+            ffi::cursor::sql_set_pos::<TrinoBackend>(stmt, 1, SQL_POSITION, SQL_LOCK_NO_CHANGE);
+        assert_eq!(ret, SqlReturn::ERROR, "SQLSetPos should return ERROR");
+        cleanup_stmt(stmt);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Column-size round-trip matrix
+//
+// Verifies that DISPLAY_SIZE (not OCTET_LENGTH) is the right field to size a
+// text buffer from, across representative Trino types via ad hoc `SELECT`
+// literals (no table/DDL needed, matching this file's existing
+// `exec_direct_select_and_fetch` convention), plus the three cross-family
+// priority cases.
+//
+// Omitted from the metadata-sized backbone below, with reasons:
+// - BOOLEAN/TINYINT/SMALLINT: fixed-width types whose COLUMN_SIZE is a
+//   simple appendix constant, already covered by `column_size.rs`'s own
+//   spec-table test; a live-Trino round trip adds little over BIGINT/DOUBLE
+//   below for the same numeric shape.
+// - VARBINARY/JSON/UUID/INTERVAL/ARRAY: string-representable types whose
+//   rendering is already covered by existing tests in this file
+//   (`varbinary_get_data_returns_raw_bytes` etc.); not core to the temporal/
+//   DECIMAL sizing this matrix covers. VARBINARY specifically also
+//   cannot be given a bounded declared length: Trino's VARBINARY type has no
+//   length parameter at all, so any VARBINARY column's DISPLAY_SIZE is the
+//   "unbounded" convention (i32::MAX * 2, see `is_binary_type` in
+//   col_attr.rs), which is not an allocatable buffer size; an application
+//   reading it is expected to use chunked `SQLGetData` calls instead of
+//   sizing one buffer from COLUMN_SIZE, which is exactly what
+//   `varbinary_get_data_returns_raw_bytes` already does.
+
+/// Mirrors `odbc_sys::Timestamp` (`SQL_TIMESTAMP_STRUCT`)'s field layout so
+/// this test file can read a `SQL_C_TYPE_TIMESTAMP` buffer without adding
+/// `odbc-sys` as a direct (non-dev) dependency of this crate.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RawTimestamp {
+    year: i16,
+    month: u16,
+    day: u16,
+    hour: u16,
+    minute: u16,
+    second: u16,
+    fraction: u32,
+}
+
+/// Read `SQL_DESC_DISPLAY_SIZE` for one column via `SQLColAttributeW`.
+unsafe fn column_display_size(stmt: *mut c_void, column_number: u16) -> usize {
+    let mut chars: isize = 0;
+    unsafe {
+        assert_eq!(
+            ffi::metadata::sql_col_attribute_w::<TrinoBackend>(
+                stmt,
+                column_number,
+                Desc::DisplaySize as u16,
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null_mut(),
+                &mut chars,
+            ),
+            SqlReturn::SUCCESS
+        );
+    }
+    usize::try_from(chars).expect("DISPLAY_SIZE must not be negative")
+}
+
+/// Fetch column `column_number` as `SQL_C_WCHAR`, using a buffer sized
+/// exactly from `SQL_DESC_DISPLAY_SIZE` (plus one UTF-16 code unit of slack
+/// for the null terminator, which `DISPLAY_SIZE` does not include per spec).
+unsafe fn get_data_wchar_sized_from_metadata(
+    stmt: *mut c_void,
+    column_number: u16,
+) -> (SqlReturn, String) {
+    let chars = unsafe { column_display_size(stmt, column_number) };
+    let code_units = chars + 1;
+    let mut buf: Vec<u16> = vec![0u16; code_units];
+    let mut ind: isize = 0;
+    let ret = unsafe {
+        ffi::fetch::sql_get_data::<TrinoBackend>(
+            stmt,
+            column_number,
+            CDataType::WChar as i16,
+            buf.as_mut_ptr().cast(),
+            (buf.len() * 2) as isize,
+            &mut ind,
+        )
+    };
+    let char_count = if ind > 0 { (ind / 2) as usize } else { 0 };
+    (
+        ret,
+        String::from_utf16_lossy(&buf[..char_count.min(buf.len())]),
+    )
+}
+
+/// Read the first diagnostic record's 5-character SQLSTATE off `stmt`.
+unsafe fn last_sqlstate(stmt: *mut c_void) -> String {
+    let mut state = [0u16; 6];
+    let mut native: i32 = 0;
+    let mut msg = [0u16; 256];
+    let mut msg_len: i16 = 0;
+    unsafe {
+        assert_eq!(
+            ffi::diag::sql_get_diag_rec_w::<TrinoBackend>(
+                HandleType::Stmt as i16,
+                stmt,
+                1,
+                state.as_mut_ptr(),
+                &mut native,
+                msg.as_mut_ptr(),
+                msg.len() as i16,
+                &mut msg_len,
+            ),
+            SqlReturn::SUCCESS,
+            "no diagnostic record was pushed"
+        );
+    }
+    String::from_utf16_lossy(&state[..5])
+}
+
+#[test]
+#[serial]
+#[ignore = "requires Trino at localhost:8080 -- run test/trino/setup.sh first"]
+fn metadata_sized_wchar_round_trip_covers_representative_types() {
+    unsafe {
+        let (_env, _conn, stmt) = alloc_stmt();
+        // col_varchar is selected from the real `types_test` table (not a bare
+        // `CAST('...' AS VARCHAR)` literal) deliberately: a computed VARCHAR
+        // expression with no catalog entry has no declared length anywhere
+        // for `trino_ty_precision` to read (`TrinoTy::Varchar` isn't among
+        // its matched arms, so it falls to the `_ => 0` default), which
+        // under-reports DISPLAY_SIZE for that one shape, a real, separate
+        // gap unrelated to the temporal/DECIMAL sizing.
+        // Selecting a cataloged VARCHAR(200) column instead exercises the
+        // normal, intended path (information_schema-derived precision).
+        assert_eq!(
+            exec_direct(
+                stmt,
+                "SELECT \
+                     CAST(1234567890 AS BIGINT), \
+                     CAST(3.5 AS DOUBLE), \
+                     col_varchar, \
+                     DATE '2024-03-05', \
+                     TIME '13:30:15', \
+                     TIMESTAMP '2024-03-05 13:30:15', \
+                     CAST(123.45 AS DECIMAL(10,2)), \
+                     TIME '13:30:15.123', \
+                     TIMESTAMP '2024-03-05 13:30:15.123' \
+                 FROM postgresql.public.types_test WHERE id = 1"
+            ),
+            SqlReturn::SUCCESS
+        );
+        assert_eq!(
+            ffi::fetch::sql_fetch::<TrinoBackend>(stmt),
+            SqlReturn::SUCCESS
+        );
+
+        // Columns 8/9: every temporal fixture above them has a zero
+        // fraction, which does not exercise fractional-second rendering. A
+        // `time(3)`/`timestamp(3)` value must not be padded to a fixed 9
+        // nanosecond digits against a reported DISPLAY_SIZE of 12/23 (the
+        // ODBC "Column Size" appendix's `9 + s`/`20 + s` formula at `s` = 3).
+        // These two columns pin that: trailing zeros are trimmed, so the
+        // rendered text is exactly the 3 significant digits Trino sent, not 6
+        // fabricated zeros appended to them.
+        let expectations: &[(u16, &str)] = &[
+            (1, "1234567890"),
+            (2, "3.5"),
+            (3, "hello world"),
+            (4, "2024-03-05"),
+            (5, "13:30:15"),
+            (6, "2024-03-05 13:30:15"),
+            (7, "123.45"),
+            (8, "13:30:15.123"),
+            (9, "2024-03-05 13:30:15.123"),
+        ];
+
+        for &(col, expected) in expectations {
+            let (ret, text) = get_data_wchar_sized_from_metadata(stmt, col);
+            assert_eq!(
+                ret,
+                SqlReturn::SUCCESS,
+                "column {col}: DISPLAY_SIZE-sized buffer was not big enough \
+                 (metadata under-reported the size, or SUCCESS_WITH_INFO/ERROR \
+                 was otherwise returned)"
+            );
+            assert_eq!(text, expected, "column {col}: unexpected text rendering");
+        }
+
+        cleanup_stmt(stmt);
+    }
+}
+
+// --- Cross-family conversions ---
+
+/// A native Trino DECIMAL value (`ColumnValue::Decimal(String)`,
+/// see `type_conversion.rs`'s `json_to_column_value`) read as `SQL_C_DOUBLE`.
+/// DECIMAL arrives as text from Trino's JSON wire format and must go through
+/// `write_column_value`'s numeric-pivot (`parse_numeric_text`) arm to reach
+/// a `SQL_C_DOUBLE` buffer, rather than any native binary decimal
+/// representation.
+#[test]
+#[serial]
+#[ignore = "requires Trino at localhost:8080 -- run test/trino/setup.sh first"]
+fn decimal_column_read_as_double() {
+    unsafe {
+        let (_env, _conn, stmt) = alloc_stmt();
+        assert_eq!(
+            exec_direct(stmt, "SELECT CAST(123.45 AS DECIMAL(10,2))"),
+            SqlReturn::SUCCESS
+        );
+        assert_eq!(
+            ffi::fetch::sql_fetch::<TrinoBackend>(stmt),
+            SqlReturn::SUCCESS
+        );
+
+        let mut buf: f64 = 0.0;
+        let mut ind: isize = 0;
+        let ret = ffi::fetch::sql_get_data::<TrinoBackend>(
+            stmt,
+            1,
+            CDataType::Double as i16,
+            &mut buf as *mut f64 as *mut c_void,
+            std::mem::size_of::<f64>() as isize,
+            &mut ind,
+        );
+        assert_eq!(ret, SqlReturn::SUCCESS);
+        assert!((buf - 123.45).abs() < 1e-9, "got {buf}");
+
+        cleanup_stmt(stmt);
+    }
+}
+
+/// A VARCHAR value holding digit text, read as `SQL_C_SBIGINT`, must succeed
+/// (the ODBC conversion matrix requires CHAR/VARCHAR to convert to every C
+/// type); the same shape holding non-numeric text must fail with the
+/// specific SQLSTATE the spec defines (22018), not merely "some error".
+#[test]
+#[serial]
+#[ignore = "requires Trino at localhost:8080 -- run test/trino/setup.sh first"]
+fn numeric_looking_text_column_read_as_sbigint() {
+    unsafe {
+        let (_env, _conn, stmt) = alloc_stmt();
+
+        assert_eq!(
+            exec_direct(stmt, "SELECT CAST('12345' AS VARCHAR)"),
+            SqlReturn::SUCCESS
+        );
+        assert_eq!(
+            ffi::fetch::sql_fetch::<TrinoBackend>(stmt),
+            SqlReturn::SUCCESS
+        );
+        let mut buf: i64 = 0;
+        let mut ind: isize = 0;
+        let ret = ffi::fetch::sql_get_data::<TrinoBackend>(
+            stmt,
+            1,
+            CDataType::SBigInt as i16,
+            &mut buf as *mut i64 as *mut c_void,
+            std::mem::size_of::<i64>() as isize,
+            &mut ind,
+        );
+        assert_eq!(ret, SqlReturn::SUCCESS);
+        assert_eq!(buf, 12345);
+        cleanup_stmt(stmt);
+
+        let (_env, _conn, stmt) = alloc_stmt();
+        assert_eq!(
+            exec_direct(stmt, "SELECT CAST('not a number' AS VARCHAR)"),
+            SqlReturn::SUCCESS
+        );
+        assert_eq!(
+            ffi::fetch::sql_fetch::<TrinoBackend>(stmt),
+            SqlReturn::SUCCESS
+        );
+        let mut buf2: i64 = 0;
+        let mut ind2: isize = 0;
+        let ret2 = ffi::fetch::sql_get_data::<TrinoBackend>(
+            stmt,
+            1,
+            CDataType::SBigInt as i16,
+            &mut buf2 as *mut i64 as *mut c_void,
+            std::mem::size_of::<i64>() as isize,
+            &mut ind2,
+        );
+        assert_eq!(ret2, SqlReturn::ERROR);
+        assert_eq!(last_sqlstate(stmt), "22018");
+        cleanup_stmt(stmt);
+    }
+}
+
+/// A VARCHAR value holding timestamp-shaped text (e.g. the result of
+/// `CAST(... AS VARCHAR)` on a temporal expression, or any text column that
+/// happens to look like a timestamp), read as `SQL_C_TYPE_TIMESTAMP`. This
+/// is the Trino analogue of "a temporal column read as SQL_C_TYPE_TIMESTAMP
+/// where the stored value is text": Trino's native TIMESTAMP columns are
+/// already parsed to `ColumnValue::Timestamp` before `write_column_value`
+/// ever runs (see `type_conversion.rs`), so the case that actually exercises
+/// `write_column_value`'s `(ColumnValue::String, CDataType::TypeTimestamp)`
+/// arm end-to-end is a VARCHAR-typed source, not a native TIMESTAMP column.
+#[test]
+#[serial]
+#[ignore = "requires Trino at localhost:8080 -- run test/trino/setup.sh first"]
+fn timestamp_shaped_text_column_read_as_type_timestamp() {
+    unsafe {
+        let (_env, _conn, stmt) = alloc_stmt();
+        assert_eq!(
+            exec_direct(
+                stmt,
+                "SELECT CAST(TIMESTAMP '2024-03-05 13:30:15' AS VARCHAR)"
+            ),
+            SqlReturn::SUCCESS
+        );
+        assert_eq!(
+            ffi::fetch::sql_fetch::<TrinoBackend>(stmt),
+            SqlReturn::SUCCESS
+        );
+
+        let mut buf = RawTimestamp {
+            year: 0,
+            month: 0,
+            day: 0,
+            hour: 0,
+            minute: 0,
+            second: 0,
+            fraction: 0,
+        };
+        let mut ind: isize = 0;
+        let ret = ffi::fetch::sql_get_data::<TrinoBackend>(
+            stmt,
+            1,
+            CDataType::TypeTimestamp as i16,
+            &mut buf as *mut RawTimestamp as *mut c_void,
+            std::mem::size_of::<RawTimestamp>() as isize,
+            &mut ind,
+        );
+        assert_eq!(ret, SqlReturn::SUCCESS, "well-formed timestamp-shaped text");
+        assert_eq!((buf.year, buf.month, buf.day), (2024, 3, 5));
+        assert_eq!((buf.hour, buf.minute, buf.second), (13, 30, 15));
+        cleanup_stmt(stmt);
+
+        let (_env, _conn, stmt) = alloc_stmt();
+        assert_eq!(
+            exec_direct(stmt, "SELECT CAST('not-a-timestamp' AS VARCHAR)"),
+            SqlReturn::SUCCESS
+        );
+        assert_eq!(
+            ffi::fetch::sql_fetch::<TrinoBackend>(stmt),
+            SqlReturn::SUCCESS
+        );
+        let mut buf2 = buf;
+        let mut ind2: isize = 0;
+        let ret2 = ffi::fetch::sql_get_data::<TrinoBackend>(
+            stmt,
+            1,
+            CDataType::TypeTimestamp as i16,
+            &mut buf2 as *mut RawTimestamp as *mut c_void,
+            std::mem::size_of::<RawTimestamp>() as isize,
+            &mut ind2,
+        );
+        assert_eq!(ret2, SqlReturn::ERROR);
+        assert_eq!(last_sqlstate(stmt), "22018");
+        cleanup_stmt(stmt);
+    }
+}
