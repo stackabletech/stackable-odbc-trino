@@ -2,25 +2,27 @@
 //! literals, and the `{fn}` scalar-function remap for the names Trino spells
 //! differently from ODBC.
 //!
-//! The remap table is traceable to the `SQL_*_FUNCTIONS` bitmaps
-//! `src/backend/info.rs` advertises for Trino, and the two are kept in exact
-//! correspondence: a bit is advertised only if the escape survives
-//! translation, and `stackable_odbc_core::escape` only ever swaps the
-//! identifier in front of the parentheses — it never sees the arguments, so it
-//! cannot rewrite argument syntax or values.
+//! Both function hooks are traceable to the `SQL_*_FUNCTIONS` bitmaps
+//! `src/backend/info.rs` advertises for Trino, and the three are kept in exact
+//! correspondence: a bit is advertised only if `{fn NAME(...)}` translates
+//! into Trino SQL that runs. A bit without a translation is a capability an
+//! application is told it has and then cannot use.
 //!
-//! Every arm below is therefore one advertised `SQL_FN_*` bit whose ODBC name
-//! Trino spells differently but which a bare name substitution still turns
-//! into valid, semantically equivalent Trino SQL.
+//! There are two hooks because there are two kinds of difference:
 //!
-//! The names that a rename *cannot* fix are not remapped here and are not
-//! advertised either — `LOCATE`, `POSITION`, `CURDATE`, `CURTIME`,
-//! `CURRENT_DATE`, `CURRENT_TIME`, `CURRENT_TIMESTAMP`, `USERNAME`, `DBNAME`,
-//! `TIMESTAMPADD`, `TIMESTAMPDIFF` and `DAYOFWEEK`. Trino needs an `IN`
-//! keyword, no parentheses at all, a quoted interval argument, or (for
-//! `DAYOFWEEK`) a different day numbering. The `TRINO_STRING_FUNCTIONS` doc
-//! comment in `backend/info.rs` records what each escape reaches the
-//! coordinator as and how it fails there.
+//! - [`remap_scalar_fn`] swaps the identifier in front of the parentheses and
+//!   never sees the arguments. That is all a pure spelling difference needs —
+//!   `UCASE` → `upper`, `LOG` → `ln`.
+//! - [`rewrite_scalar_fn`] receives the whole call and returns its
+//!   replacement, for the functions where ODBC and Trino agree on the
+//!   capability but not on the syntax: `LOCATE(a, b)` → `position(a IN b)`,
+//!   the `CURDATE`/`USERNAME` family → bare keywords with the `()` removed,
+//!   `TIMESTAMPADD(SQL_TSI_DAY, ...)` → `date_add('day', ...)` with the unit
+//!   re-quoted, and `DAYOFWEEK` → an expression converting Trino's ISO day
+//!   numbering to ODBC's.
+//!
+//! `POSITION` needs neither: ODBC spells it `POSITION(exp IN exp)`, which is
+//! already Trino's syntax, so the escape passes through untouched.
 //!
 //! `NOW`, `MONTH`, `QUARTER`, `WEEK`, `YEAR`, `HOUR`, `MINUTE`, `SECOND`,
 //! `EXTRACT` and the numeric/string functions not listed as arms below are
@@ -49,10 +51,161 @@ pub(crate) fn remap_scalar_fn(name: &str) -> Option<&'static str> {
         "IFNULL" => Some("coalesce"),
         // SQL_FN_TD_DAYOFMONTH / SQL_FN_TD_DAYOFYEAR — same semantics as
         // ODBC (1-31 / 1-366), just spelled with underscores in Trino.
-        // DAYOFWEEK is deliberately NOT remapped here; see the module doc
-        // comment above.
+        // DAYOFWEEK is deliberately NOT remapped here: its numbering differs,
+        // so it goes through `rewrite_scalar_fn` instead.
         "DAYOFMONTH" => Some("day_of_month"),
         "DAYOFYEAR" => Some("day_of_year"),
+        _ => None,
+    }
+}
+
+/// ODBC interval keyword → the unit string Trino's `date_add` / `date_diff`
+/// take as their first argument.
+///
+/// `SQL_TSI_FRAC_SECOND` is absent: ODBC defines it as billionths of a second
+/// and Trino's finest unit is `millisecond`, which would silently be a
+/// million times coarser. That is why `SQL_FN_TSI_FRAC_SECOND` is left out of
+/// [`Backend::timedate_add_intervals`](stackable_odbc_core::backend::Backend::timedate_add_intervals)
+/// too — the two must agree.
+fn trino_interval_unit(keyword: &str) -> Option<&'static str> {
+    match keyword.trim().to_ascii_uppercase().as_str() {
+        "SQL_TSI_SECOND" => Some("second"),
+        "SQL_TSI_MINUTE" => Some("minute"),
+        "SQL_TSI_HOUR" => Some("hour"),
+        "SQL_TSI_DAY" => Some("day"),
+        "SQL_TSI_WEEK" => Some("week"),
+        "SQL_TSI_MONTH" => Some("month"),
+        "SQL_TSI_QUARTER" => Some("quarter"),
+        "SQL_TSI_YEAR" => Some("year"),
+        _ => None,
+    }
+}
+
+/// Split a `{fn ...}` argument list on its top-level commas.
+///
+/// Core hands the argument text over whole, deliberately: only the dialect
+/// knows each function's arity, and a naive split would corrupt
+/// `{fn LOCATE(',', x)}`. So this walks the text with the same awareness core
+/// applies to the statement — a comma inside a string literal, a quoted
+/// identifier, a comment or a nested parenthesis is not a separator.
+fn split_args(args: &str) -> Vec<&str> {
+    let bytes: Vec<char> = args.chars().collect();
+    let mut parts = Vec::new();
+    let mut depth = 0usize;
+    let mut start = 0usize;
+    let mut i = 0usize;
+    // Byte offsets, so the returned slices borrow from `args` directly.
+    let mut char_to_byte = vec![0usize; bytes.len() + 1];
+    let mut acc = 0usize;
+    for (n, c) in bytes.iter().enumerate() {
+        char_to_byte[n] = acc;
+        acc += c.len_utf8();
+    }
+    char_to_byte[bytes.len()] = acc;
+
+    while i < bytes.len() {
+        let c = bytes[i];
+        if c == '\'' || c == '"' {
+            let quote = c;
+            i += 1;
+            while i < bytes.len() {
+                if bytes[i] == quote {
+                    // A doubled quote stays inside the literal.
+                    if bytes.get(i + 1) == Some(&quote) {
+                        i += 2;
+                        continue;
+                    }
+                    break;
+                }
+                i += 1;
+            }
+            i += 1;
+        } else if c == '-' && bytes.get(i + 1) == Some(&'-') {
+            while i < bytes.len() && bytes[i] != '\n' {
+                i += 1;
+            }
+        } else if c == '/' && bytes.get(i + 1) == Some(&'*') {
+            i += 2;
+            while i < bytes.len() && !(bytes[i] == '*' && bytes.get(i + 1) == Some(&'/')) {
+                i += 1;
+            }
+            i += 2;
+        } else {
+            if c == '(' {
+                depth += 1;
+            } else if c == ')' {
+                depth = depth.saturating_sub(1);
+            } else if c == ',' && depth == 0 {
+                parts.push(args[char_to_byte[start]..char_to_byte[i]].trim());
+                start = i + 1;
+            }
+            i += 1;
+        }
+    }
+    parts.push(args[char_to_byte[start.min(bytes.len())]..].trim());
+    parts
+}
+
+/// Rewrite a whole `{fn NAME(args)}` escape into Trino SQL.
+///
+/// This is for the functions a rename alone cannot reach: ODBC and Trino
+/// agree on the capability but not on the argument syntax, the parentheses,
+/// or the numbering. Every one of them is advertised in the `SQL_*_FUNCTIONS`
+/// bitmaps in `backend/info.rs`, and the two must stay in step — a bit there
+/// without an arm here is a claim an application cannot use.
+///
+/// Returning `None` falls back to [`remap_scalar_fn`] plus verbatim
+/// arguments, which is the right answer for every function Trino spells the
+/// same way and for a call whose argument count this cannot honour.
+pub(crate) fn rewrite_scalar_fn(name: &str, args: &str) -> Option<String> {
+    let upper = name.to_ascii_uppercase();
+    let parts = split_args(args);
+    let empty = args.trim().is_empty();
+
+    match upper.as_str() {
+        // SQL_FN_STR_LOCATE_2 — `position(substring IN string)` takes ODBC's
+        // argument order. Only the two-argument form: ODBC's optional third
+        // argument is a *start offset*, where the third argument of Trino's
+        // `strpos` is an occurrence index, so there is nothing to rewrite it
+        // to. That is why `SQL_FN_STR_LOCATE` (the three-argument form) is not
+        // advertised while `SQL_FN_STR_LOCATE_2` is.
+        "LOCATE" if parts.len() == 2 => Some(format!("position({} IN {})", parts[0], parts[1])),
+
+        // SQL_FN_TD_CURDATE / CURTIME and the three ODBC 3.x CURRENT_* forms.
+        // Trino takes these as bare SQL-92 keywords, so the whole escape --
+        // trailing `()` included -- has to go. This is what `remap_scalar_fn`
+        // could not express.
+        "CURDATE" | "CURRENT_DATE" if empty => Some("current_date".into()),
+        "CURTIME" | "CURRENT_TIME" if empty => Some("current_time".into()),
+        "CURRENT_TIMESTAMP" if empty => Some("current_timestamp".into()),
+
+        // SQL_FN_SYS_USERNAME / SQL_FN_SYS_DBNAME — bare keywords again.
+        // `current_catalog` is NULL when the connection set no catalog, which
+        // is the honest answer to "which database am I in" in that case.
+        "USERNAME" if empty => Some("current_user".into()),
+        "DBNAME" if empty => Some("current_catalog".into()),
+
+        // SQL_FN_TD_TIMESTAMPADD / SQL_FN_TD_TIMESTAMPDIFF — ODBC passes the
+        // unit as an unquoted keyword and Trino wants a string literal, so
+        // the argument has to be re-quoted, not just the name swapped.
+        // Argument order matches: ODBC's TIMESTAMPDIFF(interval, ts1, ts2) is
+        // ts2 - ts1, and so is Trino's date_diff(unit, ts1, ts2).
+        "TIMESTAMPADD" if parts.len() == 3 => {
+            let unit = trino_interval_unit(parts[0])?;
+            Some(format!("date_add('{unit}', {}, {})", parts[1], parts[2]))
+        }
+        "TIMESTAMPDIFF" if parts.len() == 3 => {
+            let unit = trino_interval_unit(parts[0])?;
+            Some(format!("date_diff('{unit}', {}, {})", parts[1], parts[2]))
+        }
+
+        // SQL_FN_TD_DAYOFWEEK — Trino's `day_of_week` is ISO-numbered
+        // (1 = Monday .. 7 = Sunday) and ODBC specifies 1 = Sunday ..
+        // 7 = Saturday, so the *value* needs converting, not just the name:
+        // `(iso % 7) + 1` maps Monday 1 -> 2 and Sunday 7 -> 1.
+        // Renaming alone would have returned a plausible, silently wrong day.
+        "DAYOFWEEK" if parts.len() == 1 => Some(format!("((day_of_week({}) % 7) + 1)", parts[0])),
+
         _ => None,
     }
 }
@@ -73,6 +226,7 @@ pub(crate) fn dialect() -> EscapeDialect {
     EscapeDialect {
         identifier_quotes: &[('"', '"')],
         remap_scalar_fn,
+        rewrite_scalar_fn,
         render_date,
         render_time,
         render_timestamp,
@@ -82,6 +236,185 @@ pub(crate) fn dialect() -> EscapeDialect {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `split_args` is the one piece of parsing this crate does that core
+    /// deliberately declined to: core hands the argument text over whole
+    /// because only the dialect knows each function's arity, and warns that
+    /// splitting naively would corrupt `{fn LOCATE(',', x)}`. So the comma
+    /// cases below are the point of the function, not edge cases around it —
+    /// a separator that is really a character inside a literal, an
+    /// identifier, a comment or a nested call.
+    #[test]
+    fn split_args_splits_only_on_top_level_commas() {
+        for (input, expected) in [
+            // Nothing to split.
+            ("", vec![""]),
+            ("x", vec!["x"]),
+            ("a, b", vec!["a", "b"]),
+            // Whitespace around a separator is not part of the argument.
+            ("  a  ,  b  ", vec!["a", "b"]),
+            // A comma inside a string literal is data. This is core's own
+            // example of what a naive split destroys.
+            ("','", vec!["','"]),
+            ("',', x", vec!["','", "x"]),
+            ("'a,b', 'c,d'", vec!["'a,b'", "'c,d'"]),
+            // A doubled quote stays inside the literal, so the comma after it
+            // is still data.
+            ("'it''s, fine', x", vec!["'it''s, fine'", "x"]),
+            // Quoted identifiers follow the same rule as string literals.
+            ("\"a,b\", c", vec!["\"a,b\"", "c"]),
+            (
+                "\"say \"\"hi\"\", now\", c",
+                vec!["\"say \"\"hi\"\", now\"", "c"],
+            ),
+            // A nested call's own arguments are not this call's arguments.
+            ("f(a, b), c", vec!["f(a, b)", "c"]),
+            ("f(g(a, b), c), d", vec!["f(g(a, b), c)", "d"]),
+            // Comments can hide a comma too.
+            ("a -- one, two\n, b", vec!["a -- one, two", "b"]),
+            ("a /* one, two */, b", vec!["a /* one, two */", "b"]),
+            // An empty trailing argument is still an argument: the caller
+            // checks arity, so this must not silently look like one fewer.
+            ("a,", vec!["a", ""]),
+            (",a", vec!["", "a"]),
+            // Multi-byte characters must not shift the slice boundaries.
+            ("'héllo, wörld', x", vec!["'héllo, wörld'", "x"]),
+        ] {
+            assert_eq!(
+                split_args(input),
+                expected,
+                "split_args({input:?}) did not split on top-level commas only"
+            );
+        }
+    }
+
+    /// An unbalanced or unterminated argument list must not panic or lose
+    /// text. Core only offers the hook when the call's parentheses balance,
+    /// but the text between them is arbitrary and this must survive it.
+    #[test]
+    fn split_args_survives_malformed_input() {
+        assert_eq!(split_args("'unterminated, x"), vec!["'unterminated, x"]);
+        assert_eq!(split_args("\"unterminated, x"), vec!["\"unterminated, x"]);
+        assert_eq!(split_args("f(a, b"), vec!["f(a, b"]);
+        assert_eq!(split_args("a) , b"), vec!["a)", "b"]);
+        assert_eq!(split_args("/* unterminated, x"), vec!["/* unterminated, x"]);
+    }
+
+    /// Each rewrite, in the form core hands it over: the name, and the
+    /// argument text between the outer parentheses.
+    #[test]
+    fn rewrites_produce_trinos_spelling() {
+        for (name, args, expected) in [
+            // The IN keyword ODBC's LOCATE does not have.
+            ("LOCATE", "'b', 'ab'", "position('b' IN 'ab')"),
+            ("locate", "'b', 'ab'", "position('b' IN 'ab')"),
+            // Bare keywords: the escape's own `()` has to disappear.
+            ("CURDATE", "", "current_date"),
+            ("CURRENT_DATE", "", "current_date"),
+            ("CURTIME", "", "current_time"),
+            ("CURRENT_TIME", "", "current_time"),
+            ("CURRENT_TIMESTAMP", "", "current_timestamp"),
+            ("USERNAME", "", "current_user"),
+            ("DBNAME", "", "current_catalog"),
+            // The interval keyword becomes a quoted unit.
+            ("TIMESTAMPADD", "SQL_TSI_DAY, 1, t", "date_add('day', 1, t)"),
+            (
+                "TIMESTAMPDIFF",
+                "SQL_TSI_YEAR, a, b",
+                "date_diff('year', a, b)",
+            ),
+            // Value conversion, not a rename.
+            ("DAYOFWEEK", "d", "((day_of_week(d) % 7) + 1)"),
+        ] {
+            assert_eq!(
+                rewrite_scalar_fn(name, args).as_deref(),
+                Some(expected),
+                "{{fn {name}({args})}} rewrote wrongly"
+            );
+        }
+    }
+
+    /// Declining is how a call this cannot honour reaches the fallback path
+    /// unchanged, rather than being rewritten into something wrong.
+    #[test]
+    fn rewrites_decline_what_they_cannot_honour() {
+        // ODBC's three-argument LOCATE takes a start offset; the third
+        // argument of Trino's strpos() is an occurrence index, so there is
+        // nothing to rewrite it to. This is why SQL_FN_STR_LOCATE_2 is
+        // advertised and SQL_FN_STR_LOCATE is not.
+        assert_eq!(rewrite_scalar_fn("LOCATE", "'b', 'ab', 2"), None);
+        // FRAC_SECOND is billionths of a second in ODBC and Trino's finest
+        // unit is millisecond, so it must not be silently accepted.
+        assert_eq!(
+            rewrite_scalar_fn("TIMESTAMPADD", "SQL_TSI_FRAC_SECOND, 1, t"),
+            None
+        );
+        assert_eq!(
+            rewrite_scalar_fn("TIMESTAMPADD", "SQL_TSI_NONSENSE, 1, t"),
+            None
+        );
+        // Wrong arity falls through rather than producing malformed SQL.
+        assert_eq!(rewrite_scalar_fn("TIMESTAMPADD", "SQL_TSI_DAY, 1"), None);
+        assert_eq!(rewrite_scalar_fn("DAYOFWEEK", "a, b"), None);
+        // The precision forms of CURRENT_TIME/CURRENT_TIMESTAMP pass through
+        // instead: Trino accepts `CURRENT_TIMESTAMP(6)` as written.
+        assert_eq!(rewrite_scalar_fn("CURRENT_TIMESTAMP", "6"), None);
+        // A function with no rewrite is remap_scalar_fn's business.
+        assert_eq!(rewrite_scalar_fn("UCASE", "x"), None);
+    }
+
+    /// `SQL_TIMEDATE_ADD_INTERVALS` / `SQL_TIMEDATE_DIFF_INTERVALS` name the
+    /// units `TIMESTAMPADD`/`TIMESTAMPDIFF` accept, so every bit advertised
+    /// there must be a unit [`trino_interval_unit`] can actually rewrite --
+    /// otherwise the driver names an interval whose escape then falls through
+    /// untranslated.
+    ///
+    /// `FRAC_SECOND` is the one that must stay out: ODBC defines it as
+    /// billionths of a second, Trino's finest unit is `millisecond`, and
+    /// mapping one to the other would be a factor of a million out.
+    #[test]
+    fn advertised_intervals_are_all_rewritable() {
+        use stackable_odbc_core::types::{
+            SQL_FN_TSI_DAY, SQL_FN_TSI_FRAC_SECOND, SQL_FN_TSI_HOUR, SQL_FN_TSI_MINUTE,
+            SQL_FN_TSI_MONTH, SQL_FN_TSI_QUARTER, SQL_FN_TSI_SECOND, SQL_FN_TSI_WEEK,
+            SQL_FN_TSI_YEAR,
+        };
+
+        let advertised = crate::backend::TRINO_TIMESTAMP_INTERVALS;
+        for (flag, keyword) in [
+            (SQL_FN_TSI_SECOND, "SQL_TSI_SECOND"),
+            (SQL_FN_TSI_MINUTE, "SQL_TSI_MINUTE"),
+            (SQL_FN_TSI_HOUR, "SQL_TSI_HOUR"),
+            (SQL_FN_TSI_DAY, "SQL_TSI_DAY"),
+            (SQL_FN_TSI_WEEK, "SQL_TSI_WEEK"),
+            (SQL_FN_TSI_MONTH, "SQL_TSI_MONTH"),
+            (SQL_FN_TSI_QUARTER, "SQL_TSI_QUARTER"),
+            (SQL_FN_TSI_YEAR, "SQL_TSI_YEAR"),
+        ] {
+            assert_ne!(
+                advertised & flag,
+                0,
+                "{keyword} is rewritable but unclaimed"
+            );
+            assert!(
+                trino_interval_unit(keyword).is_some(),
+                "{keyword} is claimed but has no Trino unit"
+            );
+        }
+
+        assert_eq!(advertised & SQL_FN_TSI_FRAC_SECOND, 0);
+        assert_eq!(trino_interval_unit("SQL_TSI_FRAC_SECOND"), None);
+    }
+
+    /// A comma inside a literal must survive the whole rewrite, not just
+    /// `split_args` in isolation -- this is core's stated worst case.
+    #[test]
+    fn rewrite_preserves_a_comma_inside_a_literal() {
+        assert_eq!(
+            rewrite_scalar_fn("LOCATE", "',', x").as_deref(),
+            Some("position(',' IN x)")
+        );
+    }
 
     #[test]
     fn ucase_maps_to_upper() {

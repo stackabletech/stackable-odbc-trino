@@ -12,8 +12,12 @@ use stackable_odbc_core::{
     errors::OdbcError,
     types::{
         ColumnDescriptor, ColumnValue, ConnectParams, ExecuteOutcome, IdentifierType, InfoValue,
-        Nullable, SQL_CN_ANY, SQL_GB_GROUP_BY_CONTAINS_SELECT, SQL_NC_END, SQL_NNC_NON_NULL, Scope,
-        TypeInfoRow, format_odbc_version, parse_dotted_version,
+        Nullable, SQL_CB_NULL, SQL_CN_ANY, SQL_FN_CVT_CAST, SQL_FN_TSI_DAY, SQL_FN_TSI_HOUR,
+        SQL_FN_TSI_MINUTE, SQL_FN_TSI_MONTH, SQL_FN_TSI_QUARTER, SQL_FN_TSI_SECOND,
+        SQL_FN_TSI_WEEK, SQL_FN_TSI_YEAR, SQL_GB_GROUP_BY_CONTAINS_SELECT, SQL_NC_END,
+        SQL_NNC_NON_NULL, SQL_SQ_COMPARISON, SQL_SQ_CORRELATED_SUBQUERIES, SQL_SQ_EXISTS,
+        SQL_SQ_IN, SQL_SQ_QUANTIFIED, SQL_U_UNION, SQL_U_UNION_ALL, Scope, TypeInfoRow,
+        format_odbc_version, parse_dotted_version,
     },
 };
 use trino_rust_client::{Client, ClientBuilder, Trino, auth::Auth, ssl::Ssl};
@@ -31,6 +35,21 @@ mod info;
 mod metadata;
 mod params;
 mod types;
+
+/// The interval units Trino's `date_add` / `date_diff` accept, reported for
+/// both `SQL_TIMEDATE_ADD_INTERVALS` and `SQL_TIMEDATE_DIFF_INTERVALS`.
+///
+/// Kept in step with `crate::escape_dialect::trino_interval_unit`, which is
+/// what turns each of these into the quoted unit Trino wants;
+/// `advertised_intervals_are_all_rewritable` asserts the two agree.
+pub(crate) const TRINO_TIMESTAMP_INTERVALS: u32 = SQL_FN_TSI_SECOND
+    | SQL_FN_TSI_MINUTE
+    | SQL_FN_TSI_HOUR
+    | SQL_FN_TSI_DAY
+    | SQL_FN_TSI_WEEK
+    | SQL_FN_TSI_MONTH
+    | SQL_FN_TSI_QUARTER
+    | SQL_FN_TSI_YEAR;
 
 /// Maps a `trino_rust_client` error to the most appropriate [`TrinoError`] variant,
 /// preserving SQLSTATE semantics for link failures, timeouts, and auth errors.
@@ -257,6 +276,14 @@ pub struct TrinoConnection {
     /// off. Understating capability is the safe direction: a BI tool folds
     /// less than it could, rather than emitting SQL the server rejects.
     pub server_major: u32,
+    /// The catalog this connection was opened against, from the `Catalog`
+    /// connection-string key, or `None` when it named none.
+    ///
+    /// Reported as `SQL_DATABASE_NAME`, which the spec defines as the current
+    /// database in use and treats as the `SQLGetConnectAttr` /
+    /// `SQL_ATTR_CURRENT_CATALOG` value. Core's shared default is the empty
+    /// string, correct only for a backend that cannot answer -- this one can.
+    pub catalog: Option<String>,
 }
 
 pub struct TrinoStatement {
@@ -482,6 +509,7 @@ impl Backend for TrinoBackend {
             client: Arc::new(client),
             dbms_version: String::new(),
             server_major: 0,
+            catalog: p.catalog().map(str::to_owned),
         };
         validate_connection(&conn, p.catalog())?;
         let version = fetch_server_version(&conn);
@@ -633,28 +661,81 @@ impl Backend for TrinoBackend {
         0
     }
 
-    /// `0` for both interval bitmaps.
+    /// The units `{fn TIMESTAMPADD}` / `{fn TIMESTAMPDIFF}` accept, which is
+    /// every unit `crate::escape_dialect::trino_interval_unit` can rewrite —
+    /// the two lists are the same list, and a unit named here that the
+    /// dialect declines would be a claim an application cannot use.
     ///
-    /// The spec defines these as the intervals `TIMESTAMPADD` and
-    /// `TIMESTAMPDIFF` accept, and this driver does not advertise either
-    /// function in `SQL_TIMEDATE_FUNCTIONS` — `crate::escape_dialect` cannot
-    /// rewrite ODBC's unquoted `SQL_TSI_DAY` into the quoted `'day'` Trino's
-    /// `date_add`/`date_diff` require. Naming intervals for a function the
-    /// driver does not offer would be the same overclaim one step removed.
-    ///
-    /// Should core's `EscapeDialect` ever gain a hook that sees the whole
-    /// call, the honest value for both becomes
-    /// `SECOND | MINUTE | HOUR | DAY | WEEK | MONTH | QUARTER | YEAR`:
-    /// `date_add`/`date_diff` accept every one of those units and reject
-    /// `nanosecond`, so `SQL_FN_TSI_FRAC_SECOND` (billionths of a second)
-    /// must not be claimed even then. The finest unit Trino has is
-    /// `millisecond`, which ODBC has no bit for.
+    /// `SQL_FN_TSI_FRAC_SECOND` is deliberately absent. ODBC defines it as
+    /// billionths of a second; Trino's `date_add`/`date_diff` reject
+    /// `nanosecond` and their finest unit is `millisecond`, which ODBC has no
+    /// bit for. Claiming it would be a factor of a million out.
     fn timedate_add_intervals() -> u32 {
-        0
+        TRINO_TIMESTAMP_INTERVALS
     }
 
     fn timedate_diff_intervals() -> u32 {
-        0
+        TRINO_TIMESTAMP_INTERVALS
+    }
+
+    /// Every `SQL_SQ_*` predicate accepts a subquery, correlated ones
+    /// included — each of `= (SELECT ...)`, `= ANY (SELECT ...)`,
+    /// `<= ALL (SELECT ...)`, `IN (SELECT ...)` and `EXISTS (SELECT ...)`
+    /// runs, as does a subquery referencing the outer query's row.
+    fn subqueries() -> u32 {
+        SQL_SQ_COMPARISON
+            | SQL_SQ_EXISTS
+            | SQL_SQ_IN
+            | SQL_SQ_QUANTIFIED
+            | SQL_SQ_CORRELATED_SUBQUERIES
+    }
+
+    fn column_alias() -> bool {
+        true
+    }
+
+    /// `concat('a', NULL)` and `'a' || NULL` both evaluate to NULL, which is
+    /// `SQL_CB_NULL`.
+    fn concat_null_behavior() -> u16 {
+        SQL_CB_NULL
+    }
+
+    fn union_support() -> u32 {
+        SQL_U_UNION | SQL_U_UNION_ALL
+    }
+
+    /// `CAST` only. Trino has no `CONVERT` scalar function —
+    /// `CONVERT('1', INTEGER)` fails to resolve.
+    fn convert_functions() -> u32 {
+        SQL_FN_CVT_CAST
+    }
+
+    /// `false`: `SELECT b FROM t ORDER BY a` runs, so a column may be ordered
+    /// by without being selected.
+    fn order_by_columns_in_select() -> bool {
+        false
+    }
+
+    /// `false`. Trino *can* filter `information_schema` by privilege, but only
+    /// when the deployment configures access control — with the default
+    /// allow-all it does not, and the driver cannot tell which it is talking
+    /// to. `SQL_ACCESSIBLE_TABLES = "Y"` is a guarantee about the connected
+    /// principal, so it must not be made on a maybe.
+    fn accessible_tables() -> bool {
+        false
+    }
+
+    /// `false`: writes reach whichever connector backs the catalog —
+    /// `CREATE TABLE`, `INSERT` and `DROP TABLE` all run against the
+    /// PostgreSQL catalog in the test stack.
+    fn data_source_read_only() -> bool {
+        false
+    }
+
+    /// Backslash, which is what `metadata.rs` emits: a catalog-function
+    /// pattern containing a wildcard becomes `LIKE '...' ESCAPE '\'`.
+    fn search_pattern_escape() -> &'static str {
+        "\\"
     }
 
     /// `0`, the spec's value for a data source that does not support

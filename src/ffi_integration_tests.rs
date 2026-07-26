@@ -220,6 +220,9 @@ fn disconnected_trino_conn() -> TrinoConnection {
         // leave behind if `fetch_server_version` could not reach a coordinator.
         dbms_version: String::new(),
         server_major: 0,
+        // No `Catalog` key was supplied, which is the SQL_DATABASE_NAME
+        // "not available" case.
+        catalog: None,
     }
 }
 
@@ -683,6 +686,111 @@ fn escape_fn_and_date_literal_translate_for_trino() {
             "{{d '...'}} not rendered as Trino's DATE '...' literal"
         );
         cleanup_stmt(stmt);
+    }
+}
+
+/// Every `{fn ...}` escape the `SQL_*_FUNCTIONS` bitmaps advertise, executed
+/// against a real coordinator.
+///
+/// This is the check the bitmaps actually need. The unit tests assert that a
+/// rewrite exists and what text it produces, but only the server can say
+/// whether that text runs -- and each of these was, at one point, advertised
+/// while failing there with `FUNCTION_NOT_FOUND` or `COLUMN_NOT_FOUND`.
+///
+/// Where the value is deterministic it is asserted; where it is not (`now()`,
+/// `current_user`) executing without error is the whole point. `DAYOFWEEK` is
+/// asserted precisely, because a rename alone would return a *plausible*
+/// wrong answer: 2020-02-03 is a Monday, which is 2 in ODBC's numbering and 1
+/// in Trino's ISO one.
+#[test]
+#[serial]
+#[ignore = "requires Trino at localhost:8080 -- run test/setup.sh first"]
+fn every_advertised_scalar_function_escape_runs_on_trino() {
+    // (escape, expected value as text, or None for "must merely run")
+    let cases: &[(&str, Option<&str>)] = &[
+        // Rewritten: argument syntax.
+        ("{fn LOCATE('b', 'abc')}", Some("2")),
+        // Passed through: ODBC already spells POSITION Trino's way.
+        ("{fn POSITION('b' IN 'abc')}", Some("2")),
+        // Rewritten: bare keywords, the trailing () removed.
+        ("{fn CURDATE()}", None),
+        ("{fn CURTIME()}", None),
+        ("{fn CURRENT_DATE()}", None),
+        ("{fn CURRENT_TIME()}", None),
+        ("{fn CURRENT_TIMESTAMP()}", None),
+        ("{fn USERNAME()}", None),
+        // Rewritten: the interval keyword becomes a quoted unit.
+        (
+            "{fn TIMESTAMPADD(SQL_TSI_DAY, 1, TIMESTAMP '2020-01-01 00:00:00')}",
+            Some("2020-01-02 00:00:00"),
+        ),
+        (
+            "{fn TIMESTAMPDIFF(SQL_TSI_DAY, TIMESTAMP '2020-01-01 00:00:00', \
+             TIMESTAMP '2020-01-03 00:00:00')}",
+            Some("2"),
+        ),
+        // Rewritten: ISO numbering converted to ODBC's.
+        ("{fn DAYOFWEEK(DATE '2020-02-03')}", Some("2")),
+        // Remapped: a plain rename.
+        ("{fn UCASE('a')}", Some("A")),
+        ("{fn LCASE('A')}", Some("a")),
+        ("{fn CHAR(65)}", Some("A")),
+        ("{fn IFNULL(NULL, 'x')}", Some("x")),
+        ("{fn DAYOFMONTH(DATE '2020-02-03')}", Some("3")),
+        ("{fn DAYOFYEAR(DATE '2020-02-03')}", Some("34")),
+        ("{fn LOG(1)}", Some("0E0")),
+        // Passed through: spelled identically in Trino.
+        ("{fn CONCAT('a', 'b')}", Some("ab")),
+        ("{fn SUBSTRING('abc', 2, 1)}", Some("b")),
+        ("{fn LENGTH('ab')}", Some("2")),
+        ("{fn LTRIM(' a')}", Some("a")),
+        ("{fn RTRIM('a ')}", Some("a")),
+        ("{fn REPLACE('a', 'a', 'b')}", Some("b")),
+        ("{fn SOUNDEX('Robert')}", Some("R163")),
+        ("{fn NOW()}", None),
+        ("{fn MONTH(DATE '2020-02-03')}", Some("2")),
+        ("{fn QUARTER(DATE '2020-02-03')}", Some("1")),
+        ("{fn WEEK(DATE '2020-02-03')}", Some("6")),
+        ("{fn YEAR(DATE '2020-02-03')}", Some("2020")),
+        ("{fn HOUR(TIMESTAMP '2020-02-03 04:05:06')}", Some("4")),
+        ("{fn MINUTE(TIMESTAMP '2020-02-03 04:05:06')}", Some("5")),
+        ("{fn SECOND(TIMESTAMP '2020-02-03 04:05:06')}", Some("6")),
+        ("{fn EXTRACT(YEAR FROM DATE '2020-02-03')}", Some("2020")),
+        ("{fn ABS(-1)}", Some("1")),
+        ("{fn CEILING(1.2)}", Some("2")),
+        ("{fn FLOOR(1.8)}", Some("1")),
+        ("{fn MOD(5, 2)}", Some("1")),
+        ("{fn POWER(2, 3)}", Some("8.0E0")),
+        ("{fn ROUND(1.5, 0)}", Some("2.0")),
+        ("{fn SIGN(-2)}", Some("-1")),
+        ("{fn SQRT(4)}", Some("2.0E0")),
+        ("{fn TRUNCATE(1.9, 0)}", Some("1.0")),
+    ];
+
+    unsafe {
+        for (escape, expected) in cases {
+            let (_env, _conn, stmt) = alloc_stmt();
+            let sql = format!("SELECT CAST(({escape}) AS VARCHAR)");
+            assert_eq!(
+                exec_direct(stmt, &sql),
+                SqlReturn::SUCCESS,
+                "{escape} is advertised in a SQL_*_FUNCTIONS bitmap but did not \
+                 execute -- the translation is missing or produces invalid Trino SQL"
+            );
+            assert_eq!(
+                ffi::fetch::sql_fetch::<TrinoBackend>(stmt),
+                SqlReturn::SUCCESS,
+                "{escape} executed but returned no row"
+            );
+            if let Some(want) = expected {
+                assert_eq!(
+                    get_wchar_col(stmt, 1),
+                    *want,
+                    "{escape} returned the wrong value"
+                );
+            }
+            cleanup_stmt(stmt);
+        }
     }
 }
 

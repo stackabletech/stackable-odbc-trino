@@ -36,16 +36,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reports `SQL_TC_NONE` where entry level requires `COMMIT`/`ROLLBACK`.
 
 - `SQL_STRING_FUNCTIONS`, `SQL_SYSTEM_FUNCTIONS` and `SQL_TIMEDATE_FUNCTIONS`
-  no longer advertise `LOCATE`, `POSITION`, `USERNAME`, `DBNAME`, `CURDATE`,
-  `CURTIME`, `CURRENT_DATE`, `CURRENT_TIME`, `CURRENT_TIMESTAMP`,
-  `TIMESTAMPADD`, `TIMESTAMPDIFF` or `DAYOFWEEK`. The spec defines these
-  bitmaps in terms of the `{fn ...}` escape, and each of those escapes reached
-  the coordinator untranslated and failed there — a client that read the
-  bitmap and emitted `{fn CURDATE()}` got `FUNCTION_NOT_FOUND`. Trino can do
-  all of them, but only through syntax a name-only remap cannot produce, so
-  the bits return once the translator can rewrite the call rather than the
-  name. `DAYOFWEEK` was worse than an error: Trino's `day_of_week()` is
-  ISO-numbered where ODBC specifies 1 = Sunday.
+  now describe exactly the `{fn ...}` escapes the driver can translate, which
+  is what the spec defines those bitmaps to mean. Twelve functions were
+  previously advertised on the strength of Trino having an equivalent, while
+  the escape itself reached the coordinator untranslated and failed there — a
+  client that read the bitmap and emitted `{fn CURDATE()}` got
+  `FUNCTION_NOT_FOUND`. All twelve now translate: `LOCATE(a, b)` becomes
+  `position(a IN b)`, `CURDATE`/`CURTIME`/`CURRENT_DATE`/`CURRENT_TIME`/
+  `CURRENT_TIMESTAMP`/`USERNAME`/`DBNAME` become the bare keywords Trino takes
+  without parentheses, `TIMESTAMPADD`/`TIMESTAMPDIFF` become
+  `date_add`/`date_diff` with the interval keyword re-quoted as a unit string,
+  and `DAYOFWEEK` becomes an expression converting Trino's ISO day numbering
+  to ODBC's — a rename alone would have returned a plausible, silently wrong
+  day. Every advertised escape is executed against a real coordinator by
+  `every_advertised_scalar_function_escape_runs_on_trino`.
+- `SQL_STRING_FUNCTIONS` reports `SQL_FN_STR_LOCATE_2` rather than
+  `SQL_FN_STR_LOCATE`. The spec splits the two-argument and three-argument
+  forms across those flags, and only the two-argument one is supported: ODBC's
+  third argument is a start offset where the third argument of Trino's
+  `strpos()` is an occurrence index.
+- `SQL_TIMEDATE_ADD_INTERVALS` and `SQL_TIMEDATE_DIFF_INTERVALS` report
+  `SECOND | MINUTE | HOUR | DAY | WEEK | MONTH | QUARTER | YEAR` instead of
+  `0`, matching the units `TIMESTAMPADD`/`TIMESTAMPDIFF` now accept.
+  `SQL_FN_TSI_FRAC_SECOND` is not claimed: ODBC defines it as billionths of a
+  second and Trino's finest unit is `millisecond`.
+- `SQL_ACCESSIBLE_TABLES` now reports `"N"` instead of `"Y"`. `"Y"` guarantees
+  the connected user has `SELECT` on every table `SQLTables` returns, which
+  depends on the deployment's access control rather than on the driver.
+- `SQL_DATABASE_NAME` now reports the catalog the connection was opened
+  against, instead of the empty string.
 
 ### Fixed
 

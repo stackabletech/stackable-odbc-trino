@@ -13,22 +13,26 @@ use stackable_odbc_core::types::{
     SQL_AT_ADD_COLUMN_SINGLE, SQL_AT_ADD_CONSTRAINT, SQL_AT_DROP_COLUMN, SQL_CL_START,
     SQL_CODE_DATE, SQL_CODE_TIME, SQL_CODE_TIMESTAMP, SQL_CU_DML_STATEMENTS,
     SQL_CU_PRIVILEGE_DEFINITION, SQL_CU_PROCEDURE_INVOCATION, SQL_CU_TABLE_DEFINITION,
-    SQL_FN_NUM_ABS, SQL_FN_NUM_ACOS, SQL_FN_NUM_ASIN, SQL_FN_NUM_ATAN, SQL_FN_NUM_ATAN2,
-    SQL_FN_NUM_CEILING, SQL_FN_NUM_COS, SQL_FN_NUM_DEGREES, SQL_FN_NUM_EXP, SQL_FN_NUM_FLOOR,
-    SQL_FN_NUM_LOG, SQL_FN_NUM_LOG10, SQL_FN_NUM_MOD, SQL_FN_NUM_PI, SQL_FN_NUM_POWER,
-    SQL_FN_NUM_RADIANS, SQL_FN_NUM_RAND, SQL_FN_NUM_ROUND, SQL_FN_NUM_SIGN, SQL_FN_NUM_SIN,
-    SQL_FN_NUM_SQRT, SQL_FN_NUM_TAN, SQL_FN_NUM_TRUNCATE, SQL_FN_STR_CHAR, SQL_FN_STR_CONCAT,
-    SQL_FN_STR_LCASE, SQL_FN_STR_LENGTH, SQL_FN_STR_LTRIM, SQL_FN_STR_REPLACE, SQL_FN_STR_RTRIM,
-    SQL_FN_STR_SOUNDEX, SQL_FN_STR_SUBSTRING, SQL_FN_STR_UCASE, SQL_FN_SYS_IFNULL,
-    SQL_FN_TD_DAYOFMONTH, SQL_FN_TD_DAYOFYEAR, SQL_FN_TD_EXTRACT, SQL_FN_TD_HOUR, SQL_FN_TD_MINUTE,
-    SQL_FN_TD_MONTH, SQL_FN_TD_NOW, SQL_FN_TD_QUARTER, SQL_FN_TD_SECOND, SQL_FN_TD_WEEK,
-    SQL_FN_TD_YEAR, SQL_GD_ANY_COLUMN, SQL_GD_ANY_ORDER, SQL_GD_BOUND, SQL_IC_LOWER,
-    SQL_LIKE_ESCAPE_CLAUSE, SQL_NUMERIC_FUNCTIONS, SQL_OJ_ALL_COMPARISON_OPS, SQL_OJ_FULL,
-    SQL_OJ_INNER, SQL_OJ_LEFT, SQL_OJ_NESTED, SQL_OJ_NOT_ORDERED, SQL_OJ_RIGHT, SQL_OUTER_JOINS,
-    SQL_SEARCHABLE, SQL_SP_BETWEEN, SQL_SP_COMPARISON, SQL_SP_EXISTS, SQL_SP_IN, SQL_SP_ISNOTNULL,
-    SQL_SP_ISNULL, SQL_SP_LIKE, SQL_SP_MATCH_FULL, SQL_SP_MATCH_PARTIAL, SQL_SP_MATCH_UNIQUE_FULL,
-    SQL_SP_MATCH_UNIQUE_PARTIAL, SQL_SP_OVERLAPS, SQL_SP_QUANTIFIED_COMPARISON, SQL_SP_UNIQUE,
-    SQL_SQL92_PREDICATES, SQL_SQL92_RELATIONAL_JOIN_OPERATORS, SQL_SQL92_VALUE_EXPRESSIONS,
+    SQL_DATABASE_NAME, SQL_FN_NUM_ABS, SQL_FN_NUM_ACOS, SQL_FN_NUM_ASIN, SQL_FN_NUM_ATAN,
+    SQL_FN_NUM_ATAN2, SQL_FN_NUM_CEILING, SQL_FN_NUM_COS, SQL_FN_NUM_DEGREES, SQL_FN_NUM_EXP,
+    SQL_FN_NUM_FLOOR, SQL_FN_NUM_LOG, SQL_FN_NUM_LOG10, SQL_FN_NUM_MOD, SQL_FN_NUM_PI,
+    SQL_FN_NUM_POWER, SQL_FN_NUM_RADIANS, SQL_FN_NUM_RAND, SQL_FN_NUM_ROUND, SQL_FN_NUM_SIGN,
+    SQL_FN_NUM_SIN, SQL_FN_NUM_SQRT, SQL_FN_NUM_TAN, SQL_FN_NUM_TRUNCATE, SQL_FN_STR_CHAR,
+    SQL_FN_STR_CONCAT, SQL_FN_STR_LCASE, SQL_FN_STR_LENGTH, SQL_FN_STR_LOCATE_2, SQL_FN_STR_LTRIM,
+    SQL_FN_STR_POSITION, SQL_FN_STR_REPLACE, SQL_FN_STR_RTRIM, SQL_FN_STR_SOUNDEX,
+    SQL_FN_STR_SUBSTRING, SQL_FN_STR_UCASE, SQL_FN_SYS_DBNAME, SQL_FN_SYS_IFNULL,
+    SQL_FN_SYS_USERNAME, SQL_FN_TD_CURDATE, SQL_FN_TD_CURRENT_DATE, SQL_FN_TD_CURRENT_TIME,
+    SQL_FN_TD_CURRENT_TIMESTAMP, SQL_FN_TD_CURTIME, SQL_FN_TD_DAYOFMONTH, SQL_FN_TD_DAYOFWEEK,
+    SQL_FN_TD_DAYOFYEAR, SQL_FN_TD_EXTRACT, SQL_FN_TD_HOUR, SQL_FN_TD_MINUTE, SQL_FN_TD_MONTH,
+    SQL_FN_TD_NOW, SQL_FN_TD_QUARTER, SQL_FN_TD_SECOND, SQL_FN_TD_TIMESTAMPADD,
+    SQL_FN_TD_TIMESTAMPDIFF, SQL_FN_TD_WEEK, SQL_FN_TD_YEAR, SQL_GD_ANY_COLUMN, SQL_GD_ANY_ORDER,
+    SQL_GD_BOUND, SQL_IC_LOWER, SQL_LIKE_ESCAPE_CLAUSE, SQL_NUMERIC_FUNCTIONS,
+    SQL_OJ_ALL_COMPARISON_OPS, SQL_OJ_FULL, SQL_OJ_INNER, SQL_OJ_LEFT, SQL_OJ_NESTED,
+    SQL_OJ_NOT_ORDERED, SQL_OJ_RIGHT, SQL_OUTER_JOINS, SQL_SEARCHABLE, SQL_SP_BETWEEN,
+    SQL_SP_COMPARISON, SQL_SP_EXISTS, SQL_SP_IN, SQL_SP_ISNOTNULL, SQL_SP_ISNULL, SQL_SP_LIKE,
+    SQL_SP_MATCH_FULL, SQL_SP_MATCH_PARTIAL, SQL_SP_MATCH_UNIQUE_FULL, SQL_SP_MATCH_UNIQUE_PARTIAL,
+    SQL_SP_OVERLAPS, SQL_SP_QUANTIFIED_COMPARISON, SQL_SP_UNIQUE, SQL_SQL92_PREDICATES,
+    SQL_SQL92_RELATIONAL_JOIN_OPERATORS, SQL_SQL92_VALUE_EXPRESSIONS,
     SQL_SRJO_CORRESPONDING_CLAUSE, SQL_SRJO_CROSS_JOIN, SQL_SRJO_EXCEPT_JOIN,
     SQL_SRJO_FULL_OUTER_JOIN, SQL_SRJO_INNER_JOIN, SQL_SRJO_INTERSECT_JOIN,
     SQL_SRJO_LEFT_OUTER_JOIN, SQL_SRJO_RIGHT_OUTER_JOIN, SQL_STRING_FUNCTIONS,
@@ -884,58 +888,37 @@ pub(crate) const TRINO_NUMERIC_FUNCTIONS: u32 = SQL_FN_NUM_ABS
     | SQL_FN_NUM_ROUND
     | SQL_FN_NUM_TRUNCATE;
 
-/// What the `SQL_*_FUNCTIONS` bitmaps mean here, and why several obvious
-/// entries are missing.
+/// What the `SQL_*_FUNCTIONS` bitmaps mean here.
 ///
-/// The spec defines these bitmaps in terms of the ODBC scalar-function escape,
-/// not in terms of what the data source can do by some other spelling: "an
+/// The spec defines them in terms of the ODBC scalar-function escape, not in
+/// terms of what the data source can do by some other spelling: "an
 /// application can determine which string functions are supported by a driver
 /// by calling `SQLGetInfo` with an *information type* of
-/// `SQL_STRING_FUNCTIONS`", and the function it then emits is
-/// `{fn NAME(...)}`. So a bit may only be set when
-/// `stackable_odbc_core::escape::translate_escapes`, driven by
-/// [`crate::escape_dialect`], turns that escape into Trino SQL that runs.
+/// `SQL_STRING_FUNCTIONS`", and what it emits next is `{fn NAME(...)}`. So a
+/// bit may only be set when `stackable_odbc_core::escape::translate_escapes`,
+/// driven by [`crate::escape_dialect`], turns that escape into Trino SQL that
+/// runs. `untranslatable_escapes_are_never_advertised` holds the two in step.
 ///
-/// That rules out every name needing an argument-syntax change rather than a
-/// rename, because `EscapeDialect::remap_scalar_fn` only swaps the identifier
-/// in front of the parentheses -- it never sees the arguments. Each of these
-/// was advertised until it was checked against a live coordinator:
-///
-/// | Escape | Reaches Trino as | Result |
-/// |---|---|---|
-/// | `{fn LOCATE('b','ab')}` | `LOCATE('b','ab')` | `FUNCTION_NOT_FOUND` |
-/// | `{fn POSITION('b','ab')}` | `POSITION('b','ab')` | `FUNCTION_NOT_FOUND` |
-/// | `{fn CURDATE()}` | `CURDATE()` | `FUNCTION_NOT_FOUND` |
-/// | `{fn CURTIME()}` | `CURTIME()` | `FUNCTION_NOT_FOUND` |
-/// | `{fn CURRENT_DATE()}` | `CURRENT_DATE()` | `SYNTAX_ERROR` |
-/// | `{fn USERNAME()}` | `USERNAME()` | `FUNCTION_NOT_FOUND` |
-/// | `{fn DBNAME()}` | `DBNAME()` | `FUNCTION_NOT_FOUND` |
-/// | `{fn DAYOFWEEK(d)}` | `DAYOFWEEK(d)` | `FUNCTION_NOT_FOUND` |
-/// | `{fn TIMESTAMPADD(SQL_TSI_DAY, 1, t)}` | same | `COLUMN_NOT_FOUND` |
-///
-/// Trino *can* do all of them — `position(sub IN str)`, the bare
-/// `current_date` / `current_time` / `current_timestamp` / `current_user` /
-/// `current_catalog` keywords without parentheses, `day_of_week()`,
-/// `date_add('day', 1, t)` — but reaching them needs either a quoted argument
-/// (`SQL_TSI_DAY` → `'day'`), an `IN` keyword, or the parentheses removed.
-/// None of those is a rename. Advertising them made a BI tool emit an escape
-/// that failed at the coordinator; restoring the bits means giving core's
-/// `EscapeDialect` a hook that receives the whole call, not just the name.
-///
-/// `DAYOFWEEK` would be wrong even if it were renamed: Trino's
-/// `day_of_week()` is ISO-numbered (1 = Monday) where ODBC specifies
-/// 1 = Sunday, so it would return a plausible, silently wrong day.
+/// Twelve of these were dropped once it turned out their escapes reached the
+/// coordinator untranslated and failed there, and restored once
+/// `EscapeDialect::rewrite_scalar_fn` made the rewrites expressible.
+/// `crate::escape_dialect` records what each one becomes.
 ///
 /// `SQL_STRING_FUNCTIONS` — `LCASE` is `lower()`, `UCASE` is `upper()`,
-/// `CHAR` is `chr()`; the rest are spelled identically in Trino.
+/// `CHAR` is `chr()`; `LOCATE(a, b)` becomes `position(a IN b)`; the rest are
+/// spelled identically in Trino.
 ///
-/// Deliberately absent beyond the untranslatable set above:
-/// `LEFT`/`RIGHT`/`SPACE`/`INSERT` (no such function); `REPEAT` (Trino's
-/// `repeat` is an *array* function); `ASCII` (`codepoint()` requires exactly
-/// one character, where ODBC's `ASCII` takes the leftmost character of any
-/// string); `DIFFERENCE` (`levenshtein_distance()` is a different metric);
-/// `LOCATE_2` (the third argument of `strpos()` is an occurrence index, not a
-/// start offset); the four `*_LENGTH` variants, which Trino does not document.
+/// `SQL_FN_STR_LOCATE_2` rather than `SQL_FN_STR_LOCATE`: the spec splits the
+/// two forms, and only the two-argument one is claimed. ODBC's optional third
+/// argument is a start offset, where the third argument of Trino's `strpos()`
+/// is an occurrence index, so there is nothing to rewrite it to.
+///
+/// Deliberately absent: `LEFT`/`RIGHT`/`SPACE`/`INSERT` (no such function);
+/// `REPEAT` (Trino's `repeat` is an *array* function); `ASCII` (`codepoint()`
+/// requires exactly one character, where ODBC's `ASCII` takes the leftmost
+/// character of any string); `DIFFERENCE` (`levenshtein_distance()` is a
+/// different metric); the four `*_LENGTH` variants, which Trino does not
+/// document.
 ///
 /// `LENGTH` is claimed with one caveat: ODBC defines it as excluding trailing
 /// blanks and Trino's `length()` counts them.
@@ -944,6 +927,8 @@ pub(crate) const TRINO_STRING_FUNCTIONS: u32 = SQL_FN_STR_CONCAT
     | SQL_FN_STR_LTRIM
     | SQL_FN_STR_LENGTH
     | SQL_FN_STR_LCASE
+    | SQL_FN_STR_LOCATE_2
+    | SQL_FN_STR_POSITION
     | SQL_FN_STR_REPLACE
     | SQL_FN_STR_RTRIM
     | SQL_FN_STR_SUBSTRING
@@ -951,28 +936,39 @@ pub(crate) const TRINO_STRING_FUNCTIONS: u32 = SQL_FN_STR_CONCAT
     | SQL_FN_STR_CHAR
     | SQL_FN_STR_SOUNDEX;
 
-/// `SQL_SYSTEM_FUNCTIONS` — only `IFNULL`, which becomes `coalesce(a, b)`
+/// `SQL_SYSTEM_FUNCTIONS` — `USERNAME` is the bare `current_user` keyword,
+/// `DBNAME` the bare `current_catalog`, and `IFNULL` is `coalesce(a, b)`
 /// (Trino documents no `ifnull`/`nvl`, but two-argument `coalesce` is exactly
-/// equivalent). `USERNAME` and `DBNAME` are untranslatable; see the
-/// [`TRINO_STRING_FUNCTIONS`] doc comment.
+/// equivalent). The first two need the escape's `()` removed, which is
+/// [`crate::escape_dialect::rewrite_scalar_fn`]'s job.
+/// <https://trino.io/docs/current/functions/session.html>,
 /// <https://trino.io/docs/current/functions/conditional.html>
-pub(crate) const TRINO_SYSTEM_FUNCTIONS: u32 = SQL_FN_SYS_IFNULL;
+pub(crate) const TRINO_SYSTEM_FUNCTIONS: u32 =
+    SQL_FN_SYS_USERNAME | SQL_FN_SYS_DBNAME | SQL_FN_SYS_IFNULL;
 
-/// `SQL_TIMEDATE_FUNCTIONS` — the names Trino spells identically, plus
-/// `DAYOFMONTH`/`DAYOFYEAR` which differ only by underscores.
+/// `SQL_TIMEDATE_FUNCTIONS` — the names Trino spells identically, plus the
+/// rewritten ones: `CURDATE`/`CURTIME` and the three ODBC 3.x `CURRENT_*`
+/// forms become bare keywords, `TIMESTAMPADD`/`TIMESTAMPDIFF` become
+/// `date_add`/`date_diff` with the unit re-quoted, and `DAYOFWEEK` becomes an
+/// expression converting Trino's ISO numbering to ODBC's.
 ///
-/// `EXTRACT` is claimed because ODBC's `EXTRACT(field FROM source)` is already
+/// `EXTRACT` needs no rewrite: ODBC's `EXTRACT(field FROM source)` is already
 /// Trino's syntax, so the escape passes through untouched.
 ///
 /// One caveat: Trino's `week()` is ISO week numbering, so a client that
 /// trusts the ODBC convention can be off by one.
 ///
 /// Deliberately absent: `DAYNAME` and `MONTHNAME`, which Trino has no
-/// function for -- only `format_datetime()` with a pattern -- plus the
-/// untranslatable set in the [`TRINO_STRING_FUNCTIONS`] doc comment.
+/// function for -- only `format_datetime()` with a pattern.
 /// <https://trino.io/docs/current/functions/datetime.html>
 pub(crate) const TRINO_TIMEDATE_FUNCTIONS: u32 = SQL_FN_TD_NOW
+    | SQL_FN_TD_CURDATE
+    | SQL_FN_TD_CURTIME
+    | SQL_FN_TD_CURRENT_DATE
+    | SQL_FN_TD_CURRENT_TIME
+    | SQL_FN_TD_CURRENT_TIMESTAMP
     | SQL_FN_TD_DAYOFMONTH
+    | SQL_FN_TD_DAYOFWEEK
     | SQL_FN_TD_DAYOFYEAR
     | SQL_FN_TD_MONTH
     | SQL_FN_TD_QUARTER
@@ -981,6 +977,8 @@ pub(crate) const TRINO_TIMEDATE_FUNCTIONS: u32 = SQL_FN_TD_NOW
     | SQL_FN_TD_HOUR
     | SQL_FN_TD_MINUTE
     | SQL_FN_TD_SECOND
+    | SQL_FN_TD_TIMESTAMPADD
+    | SQL_FN_TD_TIMESTAMPDIFF
     | SQL_FN_TD_EXTRACT;
 
 /// `SQL_SQL92_PREDICATES` for a coordinator of major version `server_major`.
@@ -1082,6 +1080,14 @@ pub(super) fn get_info_raw(
         // Trino supports LIKE ... ESCAPE and full outer joins.
         SQL_LIKE_ESCAPE_CLAUSE => Some(Ok(InfoValue::String("Y".into()))),
         SQL_OUTER_JOINS => Some(Ok(InfoValue::String("Y".into()))),
+        // The catalog this connection was opened against. Answered here
+        // rather than left to `common_get_info_raw`, whose shared answer is
+        // the empty string -- correct only for a backend that cannot name its
+        // current database. The empty string still stands for a connection
+        // that named no catalog, which is the spec's "not available".
+        SQL_DATABASE_NAME => Some(Ok(InfoValue::String(
+            conn.catalog.clone().unwrap_or_default(),
+        ))),
         _ => common_get_info_raw::<TrinoBackend>(info_type).map(Ok),
     }
 }
@@ -1296,7 +1302,10 @@ mod tests {
         (InfoType::ServerName,                    Expected::Str("")),
         (InfoType::UserName,                      Expected::Str("")),
         (InfoType::DataSourceReadOnly,             Expected::Str("N")),
-        (InfoType::AccessibleTables,              Expected::Str("Y")),
+        // "N": Trino can filter information_schema by privilege, but only
+        // when the deployment configures access control -- see
+        // TrinoBackend::accessible_tables.
+        (InfoType::AccessibleTables,              Expected::Str("N")),
         (InfoType::AccessibleProcedures,          Expected::Str("N")),
         (InfoType::Integrity,                     Expected::Str("N")),
         (InfoType::SpecialCharacters,             Expected::Str("")),
@@ -1856,6 +1865,8 @@ mod tests {
                 | SQL_FN_STR_LTRIM
                 | SQL_FN_STR_LENGTH
                 | SQL_FN_STR_LCASE
+                | SQL_FN_STR_LOCATE_2
+                | SQL_FN_STR_POSITION
                 | SQL_FN_STR_REPLACE
                 | SQL_FN_STR_RTRIM
                 | SQL_FN_STR_SUBSTRING
@@ -1871,7 +1882,7 @@ mod tests {
             SQL_FN_STR_INSERT,
             SQL_FN_STR_DIFFERENCE,
             SQL_FN_STR_SPACE,
-            SQL_FN_STR_LOCATE_2,
+            SQL_FN_STR_LOCATE,
             SQL_FN_STR_BIT_LENGTH,
             SQL_FN_STR_CHAR_LENGTH,
             SQL_FN_STR_CHARACTER_LENGTH,
@@ -1881,88 +1892,136 @@ mod tests {
         }
     }
 
-    /// Only IFNULL: `USERNAME` and `DBNAME` are untranslatable, see
-    /// [`untranslatable_escapes_are_never_advertised`].
+    /// All three of USERNAME, DBNAME and IFNULL, each under its correct flag
+    /// (IFNULL is a distinct flag from DBNAME's 0x02). The first two are
+    /// rewrites rather than remaps; see
+    /// [`every_advertised_rewrite_has_a_translation`].
     #[test]
-    fn system_functions_claim_only_the_translatable_equivalent() {
-        assert_eq!(TRINO_SYSTEM_FUNCTIONS, SQL_FN_SYS_IFNULL);
+    fn system_functions_include_all_three_equivalents() {
+        assert_eq!(
+            TRINO_SYSTEM_FUNCTIONS,
+            SQL_FN_SYS_USERNAME | SQL_FN_SYS_DBNAME | SQL_FN_SYS_IFNULL
+        );
     }
 
     /// The invariant the `SQL_*_FUNCTIONS` bitmaps exist to keep: a bit is
     /// advertised only when `{fn NAME(...)}` survives translation into Trino
     /// SQL that runs.
     ///
-    /// Each name below needs an argument-syntax change that
-    /// `EscapeDialect::remap_scalar_fn` cannot make — it only swaps the
-    /// identifier in front of the parentheses. Advertising one made a client
-    /// emit an escape that failed at the coordinator
-    /// (`FUNCTION_NOT_FOUND: 'curdate'`, `COLUMN_NOT_FOUND: 'sql_tsi_day'`,
-    /// and so on; the full table is in the [`TRINO_STRING_FUNCTIONS`] doc
-    /// comment). `DAYOFWEEK` is worse than an error: renaming it to Trino's
-    /// `day_of_week()` would return a silently wrong, ISO-numbered day.
+    /// Every name below needs an argument-syntax change that
+    /// `EscapeDialect::remap_scalar_fn` cannot make -- it only swaps the
+    /// identifier in front of the parentheses. Each was advertised without a
+    /// translation once, and a client that read the bitmap and emitted the
+    /// escape got `FUNCTION_NOT_FOUND: \'curdate\'`,
+    /// `COLUMN_NOT_FOUND: \'sql_tsi_day\'` and the like. They are advertised
+    /// again only because `rewrite_scalar_fn` now handles each one, so this
+    /// asserts both halves together: the bit is set *and* the rewrite exists.
     ///
-    /// Restoring any of these means teaching the translator the rewrite
-    /// first, not setting the bit.
+    /// `DAYOFWEEK` is the one where the rewrite matters most. Trino has
+    /// `day_of_week()`, so a rename would have succeeded -- and returned a
+    /// silently wrong, ISO-numbered day.
     #[test]
-    fn untranslatable_escapes_are_never_advertised() {
-        for (bitmap, name, flag) in [
-            (TRINO_STRING_FUNCTIONS, "LOCATE", SQL_FN_STR_LOCATE),
-            (TRINO_STRING_FUNCTIONS, "POSITION", SQL_FN_STR_POSITION),
-            (TRINO_SYSTEM_FUNCTIONS, "USERNAME", SQL_FN_SYS_USERNAME),
-            (TRINO_SYSTEM_FUNCTIONS, "DBNAME", SQL_FN_SYS_DBNAME),
-            (TRINO_TIMEDATE_FUNCTIONS, "CURDATE", SQL_FN_TD_CURDATE),
-            (TRINO_TIMEDATE_FUNCTIONS, "CURTIME", SQL_FN_TD_CURTIME),
+    fn every_advertised_rewrite_has_a_translation() {
+        for (bitmap, name, flag, args) in [
+            (
+                TRINO_STRING_FUNCTIONS,
+                "LOCATE",
+                SQL_FN_STR_LOCATE_2,
+                "\'b\', \'ab\'",
+            ),
+            (TRINO_SYSTEM_FUNCTIONS, "USERNAME", SQL_FN_SYS_USERNAME, ""),
+            (TRINO_SYSTEM_FUNCTIONS, "DBNAME", SQL_FN_SYS_DBNAME, ""),
+            (TRINO_TIMEDATE_FUNCTIONS, "CURDATE", SQL_FN_TD_CURDATE, ""),
+            (TRINO_TIMEDATE_FUNCTIONS, "CURTIME", SQL_FN_TD_CURTIME, ""),
             (
                 TRINO_TIMEDATE_FUNCTIONS,
                 "CURRENT_DATE",
                 SQL_FN_TD_CURRENT_DATE,
+                "",
             ),
             (
                 TRINO_TIMEDATE_FUNCTIONS,
                 "CURRENT_TIME",
                 SQL_FN_TD_CURRENT_TIME,
+                "",
             ),
             (
                 TRINO_TIMEDATE_FUNCTIONS,
                 "CURRENT_TIMESTAMP",
                 SQL_FN_TD_CURRENT_TIMESTAMP,
+                "",
             ),
             (
                 TRINO_TIMEDATE_FUNCTIONS,
                 "TIMESTAMPADD",
                 SQL_FN_TD_TIMESTAMPADD,
+                "SQL_TSI_DAY, 1, t",
             ),
             (
                 TRINO_TIMEDATE_FUNCTIONS,
                 "TIMESTAMPDIFF",
                 SQL_FN_TD_TIMESTAMPDIFF,
+                "SQL_TSI_DAY, a, b",
             ),
-            (TRINO_TIMEDATE_FUNCTIONS, "DAYOFWEEK", SQL_FN_TD_DAYOFWEEK),
+            (
+                TRINO_TIMEDATE_FUNCTIONS,
+                "DAYOFWEEK",
+                SQL_FN_TD_DAYOFWEEK,
+                "d",
+            ),
         ] {
-            assert_eq!(
+            assert_ne!(
                 bitmap & flag,
                 0,
-                "{name} is advertised but `{{fn {name}(...)}}` does not \
-                 translate into runnable Trino SQL"
+                "{name} has a rewrite but is not advertised"
             );
-            assert_eq!(
-                crate::escape_dialect::remap_scalar_fn(name),
-                None,
-                "{name} has a remap arm, so it may be advertised again -- but \
-                 only if a rename alone produces correct Trino SQL"
+            assert!(
+                crate::escape_dialect::rewrite_scalar_fn(name, args).is_some(),
+                "{name} is advertised but `{{fn {name}({args})}}` has no rewrite"
             );
         }
     }
 
-    /// NOW, DAYOFMONTH, DAYOFYEAR, EXTRACT and the field extractors must all
-    /// be claimed. The `CURRENT_*`/`CUR*`/`TIMESTAMP*`/`DAYOFWEEK` flags must
-    /// not be; see [`untranslatable_escapes_are_never_advertised`].
+    /// `POSITION` is advertised with no translation at all, and that is
+    /// correct: ODBC spells it `POSITION(exp IN exp)`, which is already
+    /// Trino\'s syntax, so the escape passes through untouched.
+    ///
+    /// `SQL_FN_STR_LOCATE` -- the *three*-argument form -- must stay
+    /// unadvertised. ODBC\'s third argument is a start offset and the third
+    /// argument of Trino\'s `strpos()` is an occurrence index, so the rewrite
+    /// declines it; advertising the bit would promise a call that then falls
+    /// through untranslated.
+    #[test]
+    fn locate_advertises_only_the_two_argument_form() {
+        assert_ne!(TRINO_STRING_FUNCTIONS & SQL_FN_STR_POSITION, 0);
+        assert_eq!(
+            crate::escape_dialect::rewrite_scalar_fn("POSITION", "\'b\' IN \'ab\'"),
+            None,
+            "POSITION needs no rewrite -- ODBC already spells it Trino\'s way"
+        );
+
+        assert_eq!(TRINO_STRING_FUNCTIONS & SQL_FN_STR_LOCATE, 0);
+        assert_eq!(
+            crate::escape_dialect::rewrite_scalar_fn("LOCATE", "\'b\', \'ab\', 2"),
+            None,
+            "the three-argument LOCATE has no Trino equivalent"
+        );
+    }
+
+    /// NOW, every DAYOF*, EXTRACT, the field extractors, all three ODBC 3.x
+    /// CURRENT_* flags and both TIMESTAMP* flags must be claimed.
     #[test]
     fn timedate_functions_match_trinos_documented_set() {
         assert_eq!(
             TRINO_TIMEDATE_FUNCTIONS,
             SQL_FN_TD_NOW
+                | SQL_FN_TD_CURDATE
+                | SQL_FN_TD_CURTIME
+                | SQL_FN_TD_CURRENT_DATE
+                | SQL_FN_TD_CURRENT_TIME
+                | SQL_FN_TD_CURRENT_TIMESTAMP
                 | SQL_FN_TD_DAYOFMONTH
+                | SQL_FN_TD_DAYOFWEEK
                 | SQL_FN_TD_DAYOFYEAR
                 | SQL_FN_TD_MONTH
                 | SQL_FN_TD_QUARTER
@@ -1971,6 +2030,8 @@ mod tests {
                 | SQL_FN_TD_HOUR
                 | SQL_FN_TD_MINUTE
                 | SQL_FN_TD_SECOND
+                | SQL_FN_TD_TIMESTAMPADD
+                | SQL_FN_TD_TIMESTAMPDIFF
                 | SQL_FN_TD_EXTRACT
         );
         assert_eq!(TRINO_TIMEDATE_FUNCTIONS & SQL_FN_TD_DAYNAME, 0);
