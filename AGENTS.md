@@ -180,8 +180,12 @@ limitation, not a Trino one: Trino supports `START TRANSACTION` / `COMMIT` /
 `ROLLBACK` over the `X-Trino-Transaction-Id` headers, and `trino-rust-client`
 models them. Because no transaction ever begins, `Backend::cursor_commit_behavior`
 is correctly left at core's `CursorBehavior::Preserve` default, which is what
-`SQL_CURSOR_COMMIT_BEHAVIOR` reports. Implementing transactions means revisiting
-all four of those together. See `TrinoBackend::end_tran` for the full list.
+`SQL_CURSOR_COMMIT_BEHAVIOR` reports, and `default_txn_isolation` /
+`txn_isolation_options` are both `0` — the spec's value for a data source
+without transactions, which also makes core reject every
+`SQLSetConnectAttr(SQL_ATTR_TXN_ISOLATION)` with `HY024`. Implementing
+transactions means revisiting all of those together; see
+`TrinoBackend::end_tran` for the full list.
 
 ## Architecture of this crate
 

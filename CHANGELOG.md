@@ -25,8 +25,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   keeps the `CursorBehavior::Preserve` default: it reports `SQL_TC_NONE`, so no
   transaction ever closes a cursor.
 
+- `SQL_ALTER_TABLE` now reports `SQL_AT_ADD_COLUMN_SINGLE |
+  SQL_AT_ADD_CONSTRAINT | SQL_AT_DROP_COLUMN` instead of `0`, which claimed
+  Trino cannot `ALTER TABLE` at all. Each bit was confirmed against a live
+  coordinator; `DEFAULT`, `CASCADE`, `RESTRICT`, `SET DEFAULT` and `ADD
+  CONSTRAINT` are all rejected by Trino's grammar and stay unclaimed.
+- `SQL_SQL_CONFORMANCE` now reports `0` instead of `SQL_SC_SQL92_ENTRY`. Trino's
+  `CREATE TABLE` rejects `PRIMARY KEY`, `UNIQUE`, `CHECK` and `REFERENCES`, so
+  the referential integrity entry level requires is absent, and the driver
+  reports `SQL_TC_NONE` where entry level requires `COMMIT`/`ROLLBACK`.
+
 ### Fixed
 
+- `SQL_NULL_COLLATION` now reports `SQL_NC_END` instead of `SQL_NC_HIGH`.
+  Trino's default null ordering is `NULLS LAST` regardless of the ordering
+  direction, which is what `SQL_NC_END` means; `SQL_NC_HIGH` told applications
+  the position follows `ASC`/`DESC`.
+- `SQL_GROUP_BY` now reports `SQL_GB_GROUP_BY_CONTAINS_SELECT` instead of
+  `SQL_GB_NO_RELATION`. Trino requires every non-aggregated column in the
+  select list to appear in `GROUP BY`, and `SQL_GB_NO_RELATION` told
+  applications it did not.
+- `SQL_DEFAULT_TXN_ISOLATION` now reports `0` instead of
+  `SQL_TXN_READ_COMMITTED`. The spec defines `0` as the value for a data source
+  that does not support transactions, and this driver reports `SQL_TC_NONE`;
+  the previous value also named a level absent from the driver's own
+  `SQL_TXN_ISOLATION_OPTION` of `0`.
+- `SQL_CORRELATION_NAME` now reports `SQL_CN_ANY` and `SQL_NON_NULLABLE_COLUMNS`
+  reports `SQL_NNC_NON_NULL`, instead of the `0` (`SQL_CN_NONE` /
+  `SQL_NNC_NULL`) they defaulted to. Trino accepts `FROM ... AS x(a)` and
+  `ADD COLUMN f integer NOT NULL`.
+- `SQL_EXPRESSIONS_IN_ORDERBY` now reports `"Y"` instead of the empty string,
+  which is not one of its two spec-defined values. Trino accepts
+  `ORDER BY lower(s)`.
+- `SQLSetConnectAttr(SQL_ATTR_TXN_ISOLATION)` now rejects every isolation level
+  with `HY024` rather than accepting and silently discarding it, and
+  `SQLGetConnectAttr` reports the same `0` as `SQL_DEFAULT_TXN_ISOLATION`
+  instead of a hard-coded `SQL_TXN_READ_COMMITTED`.
 - `windows/WINDOWS.md` documented the connection string as accepting neither
   `AccessToken` / `Token` nor `QueryTimeout` / `LoginTimeout`, all four of which
   the driver has always accepted.

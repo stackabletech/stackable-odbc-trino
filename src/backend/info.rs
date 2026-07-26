@@ -9,7 +9,8 @@ use stackable_odbc_core::errors::OdbcError;
 use stackable_odbc_core::function_id::FunctionId;
 use stackable_odbc_core::types::{
     InfoType, InfoValue, MaxPrecision, MaxScale, Nullable, SQL_AF_ALL, SQL_AF_AVG, SQL_AF_COUNT,
-    SQL_AF_DISTINCT, SQL_AF_MAX, SQL_AF_MIN, SQL_AF_SUM, SQL_AGGREGATE_FUNCTIONS, SQL_CL_START,
+    SQL_AF_DISTINCT, SQL_AF_MAX, SQL_AF_MIN, SQL_AF_SUM, SQL_AGGREGATE_FUNCTIONS,
+    SQL_AT_ADD_COLUMN_SINGLE, SQL_AT_ADD_CONSTRAINT, SQL_AT_DROP_COLUMN, SQL_CL_START,
     SQL_CODE_DATE, SQL_CODE_TIME, SQL_CODE_TIMESTAMP, SQL_CU_DML_STATEMENTS,
     SQL_CU_PRIVILEGE_DEFINITION, SQL_CU_PROCEDURE_INVOCATION, SQL_CU_TABLE_DEFINITION,
     SQL_FN_NUM_ABS, SQL_FN_NUM_ACOS, SQL_FN_NUM_ASIN, SQL_FN_NUM_ATAN, SQL_FN_NUM_ATAN2,
@@ -25,20 +26,19 @@ use stackable_odbc_core::types::{
     SQL_FN_TD_HOUR, SQL_FN_TD_MINUTE, SQL_FN_TD_MONTH, SQL_FN_TD_NOW, SQL_FN_TD_QUARTER,
     SQL_FN_TD_SECOND, SQL_FN_TD_TIMESTAMPADD, SQL_FN_TD_TIMESTAMPDIFF, SQL_FN_TD_WEEK,
     SQL_FN_TD_YEAR, SQL_GD_ANY_COLUMN, SQL_GD_ANY_ORDER, SQL_GD_BOUND, SQL_IC_LOWER,
-    SQL_LIKE_ESCAPE_CLAUSE, SQL_NC_HIGH, SQL_NUMERIC_FUNCTIONS, SQL_OJ_ALL_COMPARISON_OPS,
-    SQL_OJ_FULL, SQL_OJ_INNER, SQL_OJ_LEFT, SQL_OJ_NESTED, SQL_OJ_NOT_ORDERED, SQL_OJ_RIGHT,
-    SQL_OUTER_JOINS, SQL_SEARCHABLE, SQL_SP_BETWEEN, SQL_SP_COMPARISON, SQL_SP_EXISTS, SQL_SP_IN,
-    SQL_SP_ISNOTNULL, SQL_SP_ISNULL, SQL_SP_LIKE, SQL_SP_MATCH_FULL, SQL_SP_MATCH_PARTIAL,
-    SQL_SP_MATCH_UNIQUE_FULL, SQL_SP_MATCH_UNIQUE_PARTIAL, SQL_SP_OVERLAPS,
-    SQL_SP_QUANTIFIED_COMPARISON, SQL_SP_UNIQUE, SQL_SQL92_PREDICATES,
-    SQL_SQL92_RELATIONAL_JOIN_OPERATORS, SQL_SQL92_VALUE_EXPRESSIONS,
+    SQL_LIKE_ESCAPE_CLAUSE, SQL_NUMERIC_FUNCTIONS, SQL_OJ_ALL_COMPARISON_OPS, SQL_OJ_FULL,
+    SQL_OJ_INNER, SQL_OJ_LEFT, SQL_OJ_NESTED, SQL_OJ_NOT_ORDERED, SQL_OJ_RIGHT, SQL_OUTER_JOINS,
+    SQL_SEARCHABLE, SQL_SP_BETWEEN, SQL_SP_COMPARISON, SQL_SP_EXISTS, SQL_SP_IN, SQL_SP_ISNOTNULL,
+    SQL_SP_ISNULL, SQL_SP_LIKE, SQL_SP_MATCH_FULL, SQL_SP_MATCH_PARTIAL, SQL_SP_MATCH_UNIQUE_FULL,
+    SQL_SP_MATCH_UNIQUE_PARTIAL, SQL_SP_OVERLAPS, SQL_SP_QUANTIFIED_COMPARISON, SQL_SP_UNIQUE,
+    SQL_SQL92_PREDICATES, SQL_SQL92_RELATIONAL_JOIN_OPERATORS, SQL_SQL92_VALUE_EXPRESSIONS,
     SQL_SRJO_CORRESPONDING_CLAUSE, SQL_SRJO_CROSS_JOIN, SQL_SRJO_EXCEPT_JOIN,
     SQL_SRJO_FULL_OUTER_JOIN, SQL_SRJO_INNER_JOIN, SQL_SRJO_INTERSECT_JOIN,
     SQL_SRJO_LEFT_OUTER_JOIN, SQL_SRJO_RIGHT_OUTER_JOIN, SQL_STRING_FUNCTIONS,
     SQL_SU_DML_STATEMENTS, SQL_SU_PRIVILEGE_DEFINITION, SQL_SU_PROCEDURE_INVOCATION,
     SQL_SU_TABLE_DEFINITION, SQL_SVE_CASE, SQL_SVE_CAST, SQL_SVE_COALESCE, SQL_SVE_NULLIF,
-    SQL_SYSTEM_FUNCTIONS, SQL_TC_NONE, SQL_TIMEDATE_FUNCTIONS, SQL_TXN_READ_COMMITTED, SqlDataType,
-    TypeInfoRow, catalog_column_size,
+    SQL_SYSTEM_FUNCTIONS, SQL_TC_NONE, SQL_TIMEDATE_FUNCTIONS, SqlDataType, TypeInfoRow,
+    catalog_column_size,
 };
 
 use super::TrinoBackend;
@@ -745,24 +745,17 @@ fn trino_get_info(info_type: InfoType) -> Result<InfoValue, TrinoError> {
                 SQL_GD_ANY_COLUMN | SQL_GD_ANY_ORDER | SQL_GD_BOUND,
             ));
         }
-        InfoType::CatalogName => return Ok(InfoValue::String("Y".into())),
         InfoType::IdentifierCase => return Ok(InfoValue::U16(SQL_IC_LOWER)),
-        InfoType::NullCollation => return Ok(InfoValue::U16(SQL_NC_HIGH)),
-        InfoType::DefaultTxnIsolation => return Ok(InfoValue::U32(SQL_TXN_READ_COMMITTED)),
-        InfoType::TransactionIsolationProtocol => return Ok(InfoValue::U32(0)),
-        // Trino supports LEFT, RIGHT, FULL, INNER, nested outer joins, all
-        // comparison operators, and NOT ORDERED. Override the default (0).
-        InfoType::OuterJoinCapabilities => {
-            return Ok(InfoValue::U32(
-                SQL_OJ_LEFT
-                    | SQL_OJ_RIGHT
-                    | SQL_OJ_FULL
-                    | SQL_OJ_NESTED
-                    | SQL_OJ_NOT_ORDERED
-                    | SQL_OJ_INNER
-                    | SQL_OJ_ALL_COMPARISON_OPS,
-            ));
-        }
+        // SQL_CATALOG_NAME, SQL_NULL_COLLATION, SQL_OJ_CAPABILITIES,
+        // SQL_DEFAULT_TXN_ISOLATION and SQL_TXN_ISOLATION_OPTION are
+        // deliberately *not* answered here. Core derives each from a
+        // `Backend` hook (`supports_catalogs`, `null_collation`,
+        // `outer_join_capabilities`, `default_txn_isolation`,
+        // `txn_isolation_options`), and an arm here would shadow the hook for
+        // `SQLGetInfo` while the hook still drove `SQLGetConnectAttr` and the
+        // `HY024` validation in `sql_set_connect_attr` -- the two answers
+        // could then disagree for the same connection. See the hook
+        // implementations in `crate::backend`.
         _ => {}
     }
 
@@ -799,6 +792,40 @@ pub(super) fn get_info_pre_connect(info_type: InfoType) -> Result<InfoValue, Odb
 const TRINO_CORRESPONDING_SINCE: u32 = 475;
 const TRINO_MATCH_AND_UNIQUE_SINCE: u32 = 482;
 const TRINO_OVERLAPS_SINCE: u32 = 483;
+
+/// `SQL_ALTER_TABLE` — the `ALTER TABLE` clauses Trino's grammar accepts,
+/// each confirmed against a live coordinator rather than read off the docs:
+///
+/// | Statement | Result |
+/// |---|---|
+/// | `ADD COLUMN d varchar` | accepted → `SQL_AT_ADD_COLUMN_SINGLE` |
+/// | `ADD COLUMN f integer NOT NULL` | accepted → `SQL_AT_ADD_CONSTRAINT` |
+/// | `DROP COLUMN c` | accepted → `SQL_AT_DROP_COLUMN` |
+/// | `ADD COLUMN e integer DEFAULT 1` | `SYNTAX_ERROR` |
+/// | `DROP COLUMN b CASCADE` / `RESTRICT` | `SYNTAX_ERROR` |
+/// | `ALTER COLUMN a SET DEFAULT 1` | `SYNTAX_ERROR` |
+/// | `ADD CONSTRAINT pk_a PRIMARY KEY (a)` | `SYNTAX_ERROR` |
+///
+/// `SQL_AT_DROP_COLUMN` is the ODBC 2.0 flag, used because ODBC 3.0 has no bit
+/// for a `DROP COLUMN` without `CASCADE`/`RESTRICT` — the only form Trino has.
+/// `SQL_AT_ADD_CONSTRAINT` *is* a live ODBC 3.0 bit (FIPS Transitional level)
+/// despite sitting in `sql.h` beside the two deprecated ones.
+///
+/// None of the four `SQL_AT_CONSTRAINT_*` deferrability bits are claimed:
+/// Trino has no `DEFERRABLE`/`INITIALLY DEFERRED` syntax.
+pub(super) const TRINO_ALTER_TABLE: u32 =
+    SQL_AT_ADD_COLUMN_SINGLE | SQL_AT_ADD_CONSTRAINT | SQL_AT_DROP_COLUMN;
+
+/// `SQL_OJ_CAPABILITIES` — Trino supports `LEFT`, `RIGHT`, `FULL` and `INNER`
+/// outer joins, nested outer joins, all comparison operators in the `ON`
+/// clause, and does not require the outer-join tables in any particular order.
+pub(super) const TRINO_OUTER_JOIN_CAPABILITIES: u32 = SQL_OJ_LEFT
+    | SQL_OJ_RIGHT
+    | SQL_OJ_FULL
+    | SQL_OJ_NESTED
+    | SQL_OJ_NOT_ORDERED
+    | SQL_OJ_INNER
+    | SQL_OJ_ALL_COMPARISON_OPS;
 
 /// `SQL_AGGREGATE_FUNCTIONS` — every ODBC aggregate has a Trino equivalent.
 /// `DISTINCT`/`ALL` come from the `setQuantifier` production in Trino's
@@ -1187,11 +1214,11 @@ mod tests {
     use super::*;
     use stackable_odbc_core::types::{
         DEFAULT_IDENTIFIER_LEN, InfoType, InfoValue, SQL_AM_NONE, SQL_CA1_NEXT, SQL_CB_PRESERVE,
-        SQL_DRIVER_ODBC_VER_STRING, SQL_FN_CVT_CAST, SQL_GB_NO_RELATION, SQL_GD_ANY_COLUMN,
-        SQL_GD_ANY_ORDER, SQL_GD_BOUND, SQL_IC_LOWER, SQL_INSENSITIVE, SQL_MAX_CURSOR_NAME_LEN,
-        SQL_NC_HIGH, SQL_OIC_CORE, SQL_SC_SQL92_ENTRY, SQL_SO_FORWARD_ONLY, SQL_SQ_COMPARISON,
-        SQL_SQ_CORRELATED_SUBQUERIES, SQL_SQ_EXISTS, SQL_SQ_IN, SQL_SQ_QUANTIFIED,
-        SQL_TXN_READ_COMMITTED, SQL_U_UNION, SQL_U_UNION_ALL,
+        SQL_DRIVER_ODBC_VER_STRING, SQL_FN_CVT_CAST, SQL_GB_GROUP_BY_CONTAINS_SELECT,
+        SQL_GD_ANY_COLUMN, SQL_GD_ANY_ORDER, SQL_GD_BOUND, SQL_IC_LOWER, SQL_INSENSITIVE,
+        SQL_MAX_CURSOR_NAME_LEN, SQL_NC_END, SQL_OIC_CORE, SQL_SO_FORWARD_ONLY, SQL_SQ_COMPARISON,
+        SQL_SQ_CORRELATED_SUBQUERIES, SQL_SQ_EXISTS, SQL_SQ_IN, SQL_SQ_QUANTIFIED, SQL_U_UNION,
+        SQL_U_UNION_ALL,
     };
 
     enum Expected {
@@ -1226,7 +1253,7 @@ mod tests {
         (InfoType::CollationSeq,                  Expected::Str("")),
         (InfoType::DescribeParameter,             Expected::Str("Y")),
         // --- U16 values ---
-        (InfoType::GroupBy,                       Expected::U16(SQL_GB_NO_RELATION)),
+        (InfoType::GroupBy,                       Expected::U16(SQL_GB_GROUP_BY_CONTAINS_SELECT)),
         (InfoType::MaxDriverConnections,          Expected::U16(0)),
         (InfoType::MaxConcurrentActivities,       Expected::U16(0)),
         (InfoType::ConcatNullBehavior,            Expected::U16(0)),
@@ -1240,7 +1267,7 @@ mod tests {
         (InfoType::MaxSchemaNameLen,              Expected::U16(DEFAULT_IDENTIFIER_LEN)),
         (InfoType::MaxCatalogNameLen,             Expected::U16(DEFAULT_IDENTIFIER_LEN)),
         (InfoType::MaxTableNameLen,               Expected::U16(DEFAULT_IDENTIFIER_LEN)),
-        (InfoType::NullCollation,                 Expected::U16(SQL_NC_HIGH)),
+        (InfoType::NullCollation,                 Expected::U16(SQL_NC_END)),
         (InfoType::MaxColumnsInGroupBy,           Expected::U16(0)),
         (InfoType::MaxColumnsInIndex,             Expected::U16(0)),
         (InfoType::MaxColumnsInOrderBy,           Expected::U16(0)),
@@ -1260,16 +1287,16 @@ mod tests {
         (InfoType::CursorSensitivity,             Expected::U32(SQL_INSENSITIVE as u32)),
         (InfoType::Subqueries,                    Expected::U32(SQL_SQ_COMPARISON | SQL_SQ_EXISTS | SQL_SQ_IN | SQL_SQ_QUANTIFIED | SQL_SQ_CORRELATED_SUBQUERIES)),
         (InfoType::UnionStatement,                Expected::U32(SQL_U_UNION | SQL_U_UNION_ALL)),
-        (InfoType::DefaultTxnIsolation,           Expected::U32(SQL_TXN_READ_COMMITTED)),
+        (InfoType::DefaultTxnIsolation,           Expected::U32(0)),
         (InfoType::ScrollOptions,                 Expected::U32(SQL_SO_FORWARD_ONLY)),
         (InfoType::ConvertFunctions,              Expected::U32(SQL_FN_CVT_CAST)),
         (InfoType::TransactionIsolationProtocol,  Expected::U32(0)),
-        (InfoType::AlterTable,                    Expected::U32(0)),
+        (InfoType::AlterTable,                    Expected::U32(SQL_AT_ADD_COLUMN_SINGLE | SQL_AT_ADD_CONSTRAINT | SQL_AT_DROP_COLUMN)),
         (InfoType::MaxIndexSize,                  Expected::U32(0)),
         (InfoType::MaxRowSize,                    Expected::U32(0)),
         (InfoType::MaxStatementLen,               Expected::U32(0)),
         (InfoType::OuterJoinCapabilities,         Expected::U32(SQL_OJ_LEFT | SQL_OJ_RIGHT | SQL_OJ_FULL | SQL_OJ_NESTED | SQL_OJ_NOT_ORDERED | SQL_OJ_INNER | SQL_OJ_ALL_COMPARISON_OPS)),
-        (InfoType::SqlConformance,                Expected::U32(SQL_SC_SQL92_ENTRY)),
+        (InfoType::SqlConformance,                Expected::U32(0)),
         (InfoType::OdbcInterfaceConformance,      Expected::U32(SQL_OIC_CORE)),
         (InfoType::AsyncMode,                     Expected::U32(SQL_AM_NONE)),
         (InfoType::AsyncDbcFunctions,             Expected::U32(0)),

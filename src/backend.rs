@@ -12,7 +12,8 @@ use stackable_odbc_core::{
     errors::OdbcError,
     types::{
         ColumnDescriptor, ColumnValue, ConnectParams, ExecuteOutcome, IdentifierType, InfoValue,
-        Nullable, Scope, TypeInfoRow, format_odbc_version, parse_dotted_version,
+        Nullable, SQL_CN_ANY, SQL_GB_GROUP_BY_CONTAINS_SELECT, SQL_NC_END, SQL_NNC_NON_NULL, Scope,
+        TypeInfoRow, format_odbc_version, parse_dotted_version,
     },
 };
 use trino_rust_client::{Client, ClientBuilder, Trino, auth::Auth, ssl::Ssl};
@@ -503,11 +504,20 @@ impl Backend for TrinoBackend {
     ///
     /// Trino itself does support transactions — `START TRANSACTION` / `COMMIT` /
     /// `ROLLBACK` over the `X-Trino-Transaction-Id` headers — so this is a
-    /// driver limitation, not a platform one. Implementing it means reporting
-    /// something other than `SQL_TC_NONE` from
-    /// [`Backend::get_info_raw`]'s `SQL_TXN_CAPABLE` arm, honouring
-    /// `SQL_ATTR_AUTOCOMMIT`, and declaring the real
-    /// `cursor_commit_behavior` / `cursor_rollback_behavior`.
+    /// driver limitation, not a platform one. Implementing it means changing
+    /// all of the following together, since each is observable and they must
+    /// agree:
+    ///
+    /// - `SQL_TXN_CAPABLE`, reported from `info::trino_get_info`, currently
+    ///   `SQL_TC_NONE`
+    /// - [`Backend::default_txn_isolation`] and
+    ///   [`Backend::txn_isolation_options`], both currently `0`
+    /// - [`Backend::set_txn_isolation`], whose default is unreachable while
+    ///   the options bitmask is `0`
+    /// - [`Backend::set_autocommit`], which currently reports `HYC00` for
+    ///   manual-commit mode
+    /// - [`Backend::cursor_commit_behavior`] / `cursor_rollback_behavior`,
+    ///   left at core's `Preserve` default because no transaction ever begins
     fn end_tran(_conn: &TrinoConnection, _commit: bool) -> Result<(), OdbcError> {
         tracing::debug!("TrinoBackend::end_tran (no-op: this driver has no transaction support)");
         Ok(())
@@ -533,6 +543,134 @@ impl Backend for TrinoBackend {
         params: &[ColumnValue],
     ) -> Result<ExecuteOutcome, TrinoError> {
         execute::execute(conn, stmt, params)
+    }
+
+    // --- Capability statements ---
+    //
+    // Core derives the matching `SQLGetInfo` values from these, so none of
+    // them may also be answered from `info::trino_get_info` -- an arm there
+    // would shadow the hook for `SQLGetInfo` while the hook kept driving
+    // `SQLGetConnectAttr` and the `HY024` validation in `sql_set_connect_attr`.
+    //
+    // Every value below was measured against a live coordinator, not read off
+    // the documentation; the probe for each is named in its doc comment.
+
+    /// Trino qualifies names as `catalog.schema.table`, and this driver's
+    /// catalog functions query `information_schema` in a named catalog.
+    fn supports_catalogs() -> bool {
+        true
+    }
+
+    fn supports_schemas() -> bool {
+        true
+    }
+
+    fn alter_table_support() -> u32 {
+        info::TRINO_ALTER_TABLE
+    }
+
+    fn outer_join_capabilities() -> u32 {
+        info::TRINO_OUTER_JOIN_CAPABILITIES
+    }
+
+    /// `GROUP BY` must contain every non-aggregated column in the select list,
+    /// and may contain columns that are not in it — `SELECT a, b ... GROUP BY a`
+    /// fails with `EXPRESSION_NOT_AGGREGATE`, while `SELECT a ... GROUP BY a, b`
+    /// succeeds. That is `SQL_GB_GROUP_BY_CONTAINS_SELECT` exactly.
+    fn group_by() -> u16 {
+        SQL_GB_GROUP_BY_CONTAINS_SELECT
+    }
+
+    /// Trino's default null ordering is `NULLS LAST` *regardless of the
+    /// ordering direction* — `ORDER BY x` and `ORDER BY x DESC` both place
+    /// NULLs last. `SQL_NC_END` is the value for that; `SQL_NC_HIGH`, which
+    /// this driver reported before, means the position follows `ASC`/`DESC`.
+    ///
+    /// <https://trino.io/docs/current/sql/select.html>
+    fn null_collation() -> u16 {
+        SQL_NC_END
+    }
+
+    /// Table correlation names are supported and unrestricted:
+    /// `FROM (VALUES 1) AS x(a)` binds a name unrelated to the table's own.
+    fn correlation_name() -> u16 {
+        SQL_CN_ANY
+    }
+
+    /// `ALTER TABLE ... ADD COLUMN f integer NOT NULL` is accepted, so the
+    /// `NOT NULL` column constraint is supported.
+    fn non_nullable_columns() -> u16 {
+        SQL_NNC_NON_NULL
+    }
+
+    /// `ORDER BY lower(s)` is accepted, not just bare column references.
+    fn expressions_in_order_by() -> bool {
+        true
+    }
+
+    /// Trino conforms to no SQL-92 level this info type can name.
+    ///
+    /// Entry level requires referential integrity in `CREATE TABLE`, and
+    /// Trino's grammar rejects all four constraint forms outright — `PRIMARY
+    /// KEY`, `UNIQUE`, `CHECK` and `REFERENCES` each fail with `SYNTAX_ERROR`
+    /// — which is also why this driver reports `SQL_INTEGRITY = "N"`. Entry
+    /// level further requires `COMMIT`/`ROLLBACK`, and this driver reports
+    /// `SQL_TC_NONE` (see [`TrinoBackend::end_tran`]).
+    ///
+    /// `0` is not one of the four `SQL_SC_*` values — the spec's list has no
+    /// "conforms to nothing" entry — but it is the only honest answer when the
+    /// lowest named level is not met. Claiming `SQL_SC_SQL92_ENTRY` would be
+    /// the overstatement the capability hooks exist to prevent.
+    ///
+    /// Note that [`Backend::group_by`] reporting
+    /// `SQL_GB_GROUP_BY_CONTAINS_SELECT` is *not* a reason to avoid entry
+    /// level: `CONTAINS_SELECT` is strictly more permissive than the
+    /// `EQUALS_SELECT` the spec names for an entry-level driver, and the spec
+    /// itself directs applications to read the general level here and "use the
+    /// other information types to determine variations from the stated
+    /// standards compliance level".
+    fn sql_conformance() -> u32 {
+        0
+    }
+
+    /// `0` for both interval bitmaps while the `{fn TIMESTAMPADD}` /
+    /// `{fn TIMESTAMPDIFF}` escapes remain untranslatable.
+    ///
+    /// The spec defines these as the intervals those two scalar functions
+    /// accept, so a non-zero value here is meaningful only once the escapes
+    /// work. They do not today: `crate::escape_dialect` cannot rewrite ODBC's
+    /// unquoted `SQL_TSI_DAY` into the quoted `'day'` that Trino's
+    /// `date_add`/`date_diff` require, so `{fn TIMESTAMPADD(SQL_TSI_DAY, ...)}`
+    /// reaches the coordinator as `TIMESTAMPADD(SQL_TSI_DAY, ...)` and fails
+    /// with `COLUMN_NOT_FOUND: 'sql_tsi_day'`.
+    ///
+    /// When that is fixed, the honest value for both is
+    /// `SECOND | MINUTE | HOUR | DAY | WEEK | MONTH | QUARTER | YEAR`:
+    /// `date_add`/`date_diff` accept every one of those units and reject
+    /// `nanosecond`, so `SQL_FN_TSI_FRAC_SECOND` (billionths of a second)
+    /// must not be claimed even then. The finest unit Trino has is
+    /// `millisecond`, which ODBC has no bit for.
+    fn timedate_add_intervals() -> u32 {
+        0
+    }
+
+    fn timedate_diff_intervals() -> u32 {
+        0
+    }
+
+    /// `0`, the spec's value for a data source that does not support
+    /// transactions, matching the `SQL_TC_NONE` this driver reports. See
+    /// [`TrinoBackend::end_tran`] for why that is a driver limitation rather
+    /// than a Trino one.
+    fn default_txn_isolation() -> u32 {
+        0
+    }
+
+    /// `0`: with no supported level, core's `validate_txn_isolation` rejects
+    /// every `SQLSetConnectAttr(SQL_ATTR_TXN_ISOLATION)` with `HY024`, and
+    /// [`Backend::set_txn_isolation`] is never reached.
+    fn txn_isolation_options() -> u32 {
+        0
     }
 
     fn get_info(
