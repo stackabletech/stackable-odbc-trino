@@ -32,7 +32,7 @@ repos:
       - id: cargo-test
         name: cargo-test
         language: system
-        entry: cargo test
+        entry: cargo test --locked
         stages: [pre-commit, pre-merge-commit]
         pass_filenames: false
         files: \.rs$|Cargo\.(toml|lock)
@@ -48,7 +48,7 @@ repos:
       - id: cargo-clippy
         name: cargo-clippy
         language: system
-        entry: cargo clippy --all-targets -- -D warnings
+        entry: cargo clippy --locked --all-targets -- -D warnings
         stages: [pre-commit, pre-merge-commit]
         pass_filenames: false
         files: \.rs$
@@ -64,7 +64,7 @@ repos:
       - id: cargo-deny
         name: cargo-deny
         language: system
-        entry: cargo deny check
+        entry: cargo deny --locked check
         stages: [pre-commit, pre-merge-commit]
         pass_filenames: false
         files: Cargo\.(toml|lock)|deny\.toml
