@@ -75,6 +75,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the SQL-92 capability bitmaps it is deliberately not version-gated, because
   over-reporting a keyword only causes a needless quote while under-reporting
   causes a parse error.
+- `SQLGetDiagRec` now reports Trino's own error code through `NativeErrorPtr`,
+  and its message carries the whole causal chain, where every failure
+  previously arrived as native error `0` with the client error flattened into
+  a string. A server-side rejection now reaches the application as its Trino
+  code — `SYNTAX_ERROR` as 1, `TABLE_NOT_FOUND` as 44, and so on — which is
+  the only value in that field an application can act on. Transport failures
+  keep `0`, the spec's "no native code", because Trino's taxonomy has no entry
+  for them; so does `PERMISSION_DENIED`, whose code `trino-rust-client`
+  discards before the driver sees it.
 - `SQLDescribeCol` and `SQLColAttribute` now report `SQL_NULLABLE_UNKNOWN` for
   a result column's nullability, instead of `SQL_NULLABLE`. Trino's REST
   protocol describes a result column with a name and a type and nothing else,

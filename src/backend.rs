@@ -81,9 +81,25 @@ pub(crate) fn map_trino_error(e: trino_rust_client::error::Error) -> TrinoError 
         Error::ReachMaxAttempt(n) => TrinoError::QueryTimeout {
             message: format!("query failed after {n} retry attempts"),
         },
-        other => TrinoError::General {
-            message: format!("query failed: {other}"),
-        },
+        // Everything else, which is where a server-side `Error::Query` lands.
+        // Its `QueryError` is the only shape carrying Trino's own error code;
+        // a transport failure has none, and `0` is the spec's "no native
+        // code".
+        //
+        // PERMISSION_DENIED (code 4) never reaches here: the client's
+        // `From<QueryError> for Error` turns it into `Error::Forbidden` and
+        // drops the code on the way, so that one maps to 28000 above with a
+        // native code of 0.
+        other => {
+            let native_error = match &other {
+                Error::Query(query_error) => query_error.error_code,
+                _ => 0,
+            };
+            TrinoError::Query {
+                source: other,
+                native_error,
+            }
+        }
     }
 }
 
@@ -358,6 +374,23 @@ pub enum TrinoError {
     /// over plain HTTP, or both a password and a token). Maps to SQLSTATE 28000.
     #[snafu(display("{message}"))]
     AuthConfig { message: String },
+    /// A failure from `trino-rust-client` that [`map_trino_error`] does not
+    /// classify into one of the specific variants above.
+    ///
+    /// The client error is kept as the cause rather than flattened into a
+    /// string, and `native_error` carries Trino's own error code when the
+    /// coordinator supplied one. `SQLGetDiagRec` reports that code verbatim
+    /// through `NativeErrorPtr`, where it is the only value an application can
+    /// act on; every failure reporting `0` tells it nothing.
+    ///
+    /// The message deliberately does not interpolate `source`: core walks the
+    /// whole causal chain when it builds the diagnostic record, so doing both
+    /// would print the client error twice.
+    #[snafu(display("query failed"))]
+    Query {
+        source: trino_rust_client::error::Error,
+        native_error: i32,
+    },
     /// An error core itself produced.
     ///
     /// `Backend::Error` is bounded by `From<OdbcError>` so that a defaulted
@@ -384,6 +417,12 @@ impl From<TrinoError> for OdbcError {
             // `From<OdbcError> for TrinoError`, and preserving the SQLSTATE
             // core already chose is the whole point of that variant.
             TrinoError::Odbc { source } => source,
+            TrinoError::Query {
+                source,
+                native_error,
+            } => OdbcError::general("query failed", SqlState::general_error())
+                .with_native_error(native_error)
+                .with_source(source),
             TrinoError::NotImplemented { ref feature } => OdbcError::NotImplemented {
                 feature: feature.clone(),
             },
@@ -636,6 +675,21 @@ impl Backend for TrinoBackend {
     /// `FROM (VALUES 1) AS x(a)` binds a name unrelated to the table's own.
     fn correlation_name() -> u16 {
         SQL_CN_ANY
+    }
+
+    /// The connection-string keywords whose values are bearer tokens.
+    ///
+    /// Core keeps a substring heuristic underneath that already catches all
+    /// three of this driver's secrets (`password`, and `token` for both spellings
+    /// below), so declaring them redacts nothing that leaked before. It states
+    /// the driver's own vocabulary explicitly instead of relying on another
+    /// crate's pattern list to keep matching it, and it is what makes a
+    /// `{:?}` on the `ConnectParams` handed to `connect` redact too.
+    ///
+    /// `Password` is core's own spec-defined keyword, redacted there by name.
+    fn sensitive_connect_keywords() -> &'static [&'static str] {
+        use types::connect_params::{PARAM_ACCESS_TOKEN, PARAM_TOKEN};
+        &[PARAM_ACCESS_TOKEN, PARAM_TOKEN]
     }
 
     /// Trino folds unquoted identifiers to lower case and stores them that
@@ -1157,6 +1211,80 @@ mod tests {
             OdbcError::from(err).sqlstate().as_str(),
             sql_state::CLIENT_UNABLE_TO_ESTABLISH_CONNECTION
         );
+    }
+
+    /// A declaration naming a keyword this driver does not actually read is a
+    /// silent no-op, so it is asserted against the constants the parser uses
+    /// rather than against string literals repeated here.
+    ///
+    /// `Password` is absent deliberately: it is core's own spec-defined
+    /// keyword, redacted there by name rather than by this hook.
+    #[test]
+    fn every_trino_specific_secret_keyword_is_declared_sensitive() {
+        use types::connect_params::{PARAM_ACCESS_TOKEN, PARAM_TOKEN};
+
+        let declared = TrinoBackend::sensitive_connect_keywords();
+        for key in [PARAM_ACCESS_TOKEN, PARAM_TOKEN] {
+            assert!(
+                declared.contains(&key),
+                "{key} carries a bearer token but is not declared sensitive; declared: {declared:?}"
+            );
+        }
+    }
+
+    /// Builds a Trino server-side query error with the given code and name.
+    fn query_error(error_code: i32, error_name: &str) -> trino_rust_client::models::QueryError {
+        trino_rust_client::models::QueryError {
+            message: "line 1:8: mismatched input 'FROM'".into(),
+            sql_state: None,
+            error_code,
+            error_name: error_name.into(),
+            error_type: "USER_ERROR".into(),
+            error_location: None,
+            failure_info: None,
+        }
+    }
+
+    /// `SQLGetDiagRec` reports the native error through `NativeErrorPtr`, and
+    /// Trino's own error taxonomy is the only thing that can meaningfully go
+    /// there. Zero for every failure tells an application nothing.
+    #[test]
+    fn a_query_error_carries_trinos_own_code_as_the_native_error() {
+        use stackable_odbc_core::errors::OdbcError;
+
+        // SYNTAX_ERROR is Trino error code 1.
+        let odbc_err = OdbcError::from(map_trino_error(query_error(1, "SYNTAX_ERROR").into()));
+
+        assert_eq!(odbc_err.native_error(), 1);
+    }
+
+    /// The diagnostic message is built from the whole causal chain, so the
+    /// client error has to stay attached rather than being flattened into a
+    /// string at the point of mapping.
+    #[test]
+    fn a_query_error_keeps_the_client_error_as_its_cause() {
+        use stackable_odbc_core::errors::OdbcError;
+
+        let odbc_err = OdbcError::from(map_trino_error(query_error(1, "SYNTAX_ERROR").into()));
+
+        let cause = odbc_err.cause().expect("the client error must be retained");
+        assert!(
+            cause.to_string().contains("SYNTAX_ERROR"),
+            "the cause must name the Trino error, got: {cause}"
+        );
+    }
+
+    /// A failure that never came from the coordinator has no Trino code, and
+    /// `0` is the spec's value for "no native code" rather than a made-up one.
+    #[test]
+    fn an_error_without_a_trino_code_reports_zero() {
+        use stackable_odbc_core::errors::OdbcError;
+
+        let odbc_err = OdbcError::from(TrinoError::General {
+            message: "no runtime available".into(),
+        });
+
+        assert_eq!(odbc_err.native_error(), 0);
     }
 
     #[test]

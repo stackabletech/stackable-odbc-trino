@@ -1922,6 +1922,72 @@ mod tests {
         assert!(f.contains(&FunctionId::PutData), "SQLPutData missing");
     }
 
+    /// `SQLGetFunctions` is what the Windows Driver Manager builds its dispatch
+    /// table from, so claiming a function core does not export hands it a null
+    /// pointer to call.
+    #[test]
+    fn no_advertised_function_is_one_core_does_not_export() {
+        use stackable_odbc_core::function_id::CORE_EXPORTED_FUNCTIONS;
+
+        for id in get_functions() {
+            assert!(
+                CORE_EXPORTED_FUNCTIONS.contains(id),
+                "{id:?} is advertised but core generates no entry point for it"
+            );
+        }
+    }
+
+    /// The other direction: core exports an entry point this driver chooses not
+    /// to advertise. Every one is deliberate, so the set is pinned rather than
+    /// left to drift -- when core exports something new it lands here as a
+    /// failure, which is the point at which someone has to decide whether the
+    /// driver supports it, instead of it going unadvertised unnoticed.
+    ///
+    /// `get_functions` is deliberately not just `CORE_EXPORTED_FUNCTIONS`:
+    /// core exporting a symbol says the entry point exists, not that this
+    /// driver implements the function behind it.
+    #[test]
+    fn the_functions_core_exports_but_this_driver_withholds_are_the_expected_ones() {
+        use stackable_odbc_core::function_id::{CORE_EXPORTED_FUNCTIONS, FunctionId};
+
+        // The ODBC 2.x functions superseded in 3.x (`SQLAllocHandle`,
+        // `SQLFreeHandle`, `SQLGetDiagRec`, `SQLGetConnectAttr` and friends
+        // replace them), plus the descriptor-field functions, which need a
+        // descriptor handle -- core allocates one for `SQLGetStmtAttr` but
+        // nothing yet accepts `SQL_HANDLE_DESC`.
+        let expected_withheld = [
+            FunctionId::AllocConnect,
+            FunctionId::AllocEnv,
+            FunctionId::AllocStmt,
+            FunctionId::Error,
+            FunctionId::ExtendedFetch,
+            FunctionId::FreeConnect,
+            FunctionId::FreeEnv,
+            FunctionId::GetConnectOption,
+            FunctionId::GetDescField,
+            FunctionId::GetStmtOption,
+            FunctionId::SetConnectOption,
+            FunctionId::SetDescField,
+            FunctionId::SetDescRec,
+            FunctionId::SetScrollOptions,
+            FunctionId::SetStmtOption,
+            FunctionId::Transact,
+        ];
+
+        let advertised = get_functions();
+        let mut withheld: Vec<_> = CORE_EXPORTED_FUNCTIONS
+            .iter()
+            .filter(|id| !advertised.contains(id))
+            .copied()
+            .collect();
+        withheld.sort_by_key(|id| format!("{id:?}"));
+
+        let mut expected = expected_withheld.to_vec();
+        expected.sort_by_key(|id| format!("{id:?}"));
+
+        assert_eq!(withheld, expected);
+    }
+
     #[test]
     fn get_functions_has_no_duplicates() {
         let f = get_functions();
