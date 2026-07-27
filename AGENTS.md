@@ -124,6 +124,34 @@ are already modelled, and all are re-exported from `stackable_odbc_core::types`:
 | `SQL_PARAM_INPUT`, … | `ParamType::Input as i16` |
 | `SQL_ATTR_*` | `StatementAttribute::*` / `ConnectionAttribute::*` |
 
+This crate declares no `odbc-sys` dependency of its own. Core re-exports it as
+`stackable_odbc_core::odbc_sys`, and that is the one to reach for when a type is
+needed that `types` does not re-export (`odbc_sys::Timestamp`, say). Declaring
+`odbc-sys` separately lets cargo resolve a different version, and two versions
+of a `#[repr(C)]` type are two different types to the compiler — with two
+layouts, for a struct read out of a buffer core wrote.
+
+### Non-exhaustive types from core
+
+`ColumnDescriptor`, `TypeInfoRow`, `EscapeDialect` and
+`CatalogResultColumnWidths` are `#[non_exhaustive]`, so struct-literal syntax
+does not compile here and `..Default::default()` is not an escape hatch either.
+Build them with the constructor plus `with_*` builders:
+
+```rust
+ColumnDescriptor::new(name, sql_type)
+    .with_type_name(type_name)
+    .with_precision_scale(precision, scale)
+
+EscapeDialect::ansi_default().with_identifier_quotes(&[('"', '"')])
+```
+
+`TypeInfoRow`'s constructor and builders are all `const`, because
+`Backend::get_type_info` returns `&'static [TypeInfoRow]` and `TRINO_TYPE_INFO`
+is a `static`. Set only what differs from the default — the omitted builders are
+the row claiming the least-committal value, which is why all 22 rows leave
+`nullable` and `searchable` alone.
+
 ### Type cast safety
 
 Use `T::try_from(x)` over a bare `as T` wherever truncation is possible. Trino
@@ -140,6 +168,18 @@ place that decides the SQLSTATE, and bypassing it silently degrades specific
 codes to `HY000`. It yields `08S01` for link failures, `HYT00` for timeouts and
 `28000` for auth errors.
 
+It also decides what reaches `SQLGetDiagRec` beyond the SQLSTATE. Anything it
+does not classify becomes `TrinoError::Query`, which keeps the client error as
+its `source` and lifts `QueryError::error_code` into the native error — so a
+server-side rejection reaches the application as its own Trino code rather than
+`0`. A variant that flattens the client error into a `String` throws both away,
+which is why the specific arms are the exception and not the pattern.
+
+Two of those arms are load-bearing beyond diagnostics: `validate_connection`
+matches on `AuthFailure` and `QueryTimeout` to keep them at their own SQLSTATE
+instead of reclassifying them as `08001`. Collapsing the classified variants
+into one would move that silently.
+
 Two shapes occur:
 
 ```rust
@@ -154,13 +194,22 @@ if let Some(error) = page.error.take() {
 }
 ```
 
-In functions returning `OdbcError`, wrap it:
-`.map_err(|e| OdbcError::from(map_trino_error(e)))?`.
+Every `Backend` and `StatementBackend` method returns `Self::Error`, which is
+`TrinoError` for both, so there is no second error type to convert to at a call
+site: `.map_err(map_trino_error)?` is the whole idiom.
 
 Hand-built errors are correct only for *internal* invariant violations that never
 came from the client ("get_data called before fetch", a missing runtime handle, a
 poisoned mutex), and for connection-setup failures where the call-site context
 ("failed to build Trino client") is more useful than the mapped variant.
+
+Build those as an `OdbcError` and convert with `.into()` when they need a
+SQLSTATE no `TrinoError` variant carries — `24000` on an abandoned result set,
+say. `TrinoError::Odbc` holds it and the reverse conversion unwraps it, so the
+SQLSTATE and message survive intact rather than being remapped to `HY000`. That
+variant is also what `From<OdbcError> for TrinoError` produces, which is the
+bound core requires so a defaulted trait body can construct an error and still
+name `Self::Error`.
 
 ### 08001 versus 08S01
 
@@ -254,6 +303,20 @@ column and parameter buffers, which Rust handles cleanly and Python does not.
 
 Tests needing a live Trino are `#[ignore]`d, so a bare `cargo test` stays
 self-contained.
+
+Core's `conformance` and `test_support` modules are behind its default-off
+`test-support` feature, enabled by the `[dev-dependencies]` entry on
+`stackable-odbc-core` so it never reaches the shipped `cdylib`. `conformance`
+supplies the `SQLGetInfo` return-shape checks; `test_support` supplies
+`attach_connection` / `detach_connection`, which put a network-free
+`TrinoConnection` into a connection handle so the *connected* `SQLGetInfo` path
+can be tested offline. Core's `handles` module is `pub(crate)`, so these are the
+supported way to do that — do not look for a way to reach the handle directly.
+
+`SQLFreeHandle` refuses a connection handle that still holds a connection
+(`HY010`), so such a test must `detach_connection` before freeing, which is what
+`cleanup_injected_conn` does. Calling `SQLDisconnect` instead would invoke
+`TrinoBackend::disconnect` on a connection that never opened a session.
 
 The FFI tests that do need a server share one ODBC connection (`OnceLock`) and
 are `#[serial]`. The backend tests use a separate `TrinoConnection` and must run

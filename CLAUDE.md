@@ -14,9 +14,14 @@ Read and follow @AGENTS.md — it contains architecture, patterns, and procedure
   SQLSTATEs are returned by the Driver Manager, not the driver.
 - **Route every client error through `map_trino_error`.** Never hand-build an
   `OdbcError` or `TrinoError` from a `trino-rust-client` error at the call site;
-  that function is the single place that decides the SQLSTATE.
+  that function is the single place that decides the SQLSTATE, and the only one
+  that carries Trino's native error code and the causal chain to
+  `SQLGetDiagRec`.
 - **Use `odbc-sys` types** — never redefine enums, structs, or constants it
-  already provides. They are re-exported from `stackable_odbc_core::types`.
+  already provides. They are re-exported from `stackable_odbc_core::types`, and
+  the crate itself as `stackable_odbc_core::odbc_sys`. Never add an `odbc-sys`
+  dependency to this crate's `Cargo.toml`: a second resolved version means two
+  incompatible layouts for the same `#[repr(C)]` type.
 - **Convert raw integers to typed enums at the boundary** — use the
   `xxx_from_raw()` functions from core, never `transmute`.
 - **Run `pre-commit run --all-files`** before every commit. This is the single
