@@ -223,14 +223,11 @@ fn render_timestamp(x: &str) -> String {
 /// Trino's `EscapeDialect`: `"`-quoted identifiers (Trino's ANSI-standard
 /// quoting) and Trino-spelled date/time/timestamp literals.
 pub(crate) fn dialect() -> EscapeDialect {
-    EscapeDialect {
-        identifier_quotes: &[('"', '"')],
-        remap_scalar_fn,
-        rewrite_scalar_fn,
-        render_date,
-        render_time,
-        render_timestamp,
-    }
+    EscapeDialect::ansi_default()
+        .with_identifier_quotes(&[('"', '"')])
+        .with_remap_scalar_fn(remap_scalar_fn)
+        .with_rewrite_scalar_fn(rewrite_scalar_fn)
+        .with_datetime_renderers(render_date, render_time, render_timestamp)
 }
 
 #[cfg(test)]

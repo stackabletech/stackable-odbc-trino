@@ -14,10 +14,10 @@ use stackable_odbc_core::{
         ColumnDescriptor, ColumnValue, ConnectParams, ExecuteOutcome, IdentifierType, InfoValue,
         Nullable, SQL_CB_NULL, SQL_CN_ANY, SQL_FN_CVT_CAST, SQL_FN_TSI_DAY, SQL_FN_TSI_HOUR,
         SQL_FN_TSI_MINUTE, SQL_FN_TSI_MONTH, SQL_FN_TSI_QUARTER, SQL_FN_TSI_SECOND,
-        SQL_FN_TSI_WEEK, SQL_FN_TSI_YEAR, SQL_GB_GROUP_BY_CONTAINS_SELECT, SQL_NC_END,
-        SQL_NNC_NON_NULL, SQL_SQ_COMPARISON, SQL_SQ_CORRELATED_SUBQUERIES, SQL_SQ_EXISTS,
-        SQL_SQ_IN, SQL_SQ_QUANTIFIED, SQL_U_UNION, SQL_U_UNION_ALL, Scope, TypeInfoRow,
-        format_odbc_version, parse_dotted_version,
+        SQL_FN_TSI_WEEK, SQL_FN_TSI_YEAR, SQL_GB_GROUP_BY_CONTAINS_SELECT, SQL_IC_LOWER,
+        SQL_NC_END, SQL_NNC_NON_NULL, SQL_SQ_COMPARISON, SQL_SQ_CORRELATED_SUBQUERIES,
+        SQL_SQ_EXISTS, SQL_SQ_IN, SQL_SQ_QUANTIFIED, SQL_U_UNION, SQL_U_UNION_ALL, Scope,
+        TypeInfoRow, format_odbc_version, parse_dotted_version,
     },
 };
 use trino_rust_client::{Client, ClientBuilder, Trino, auth::Auth, ssl::Ssl};
@@ -358,39 +358,52 @@ pub enum TrinoError {
     /// over plain HTTP, or both a password and a token). Maps to SQLSTATE 28000.
     #[snafu(display("{message}"))]
     AuthConfig { message: String },
+    /// An error core itself produced.
+    ///
+    /// `Backend::Error` is bounded by `From<OdbcError>` so that a defaulted
+    /// trait body can construct an error and still name `Self::Error`. This is
+    /// that conversion's landing site. It wraps rather than flattens: the
+    /// `From<TrinoError> for OdbcError` direction unwraps it unchanged, so the
+    /// SQLSTATE core chose survives a round trip through this type instead of
+    /// being degraded to `HY000`.
+    #[snafu(display("{source}"))]
+    Odbc { source: OdbcError },
+}
+
+impl From<OdbcError> for TrinoError {
+    fn from(source: OdbcError) -> Self {
+        TrinoError::Odbc { source }
+    }
 }
 
 impl From<TrinoError> for OdbcError {
     fn from(e: TrinoError) -> Self {
         use stackable_odbc_core::types::SqlState;
         match e {
+            // Unwrapped, not re-wrapped: this is the other half of
+            // `From<OdbcError> for TrinoError`, and preserving the SQLSTATE
+            // core already chose is the whole point of that variant.
+            TrinoError::Odbc { source } => source,
             TrinoError::NotImplemented { ref feature } => OdbcError::NotImplemented {
                 feature: feature.clone(),
             },
-            TrinoError::ConnectionFailed { ref message } => OdbcError::General {
-                message: message.clone(),
-                sqlstate: SqlState::client_unable_to_establish_connection(),
-            },
-            TrinoError::CommunicationLinkFailure { ref message } => OdbcError::General {
-                message: message.clone(),
-                sqlstate: SqlState::communication_link_failure(),
-            },
-            TrinoError::QueryTimeout { ref message } => OdbcError::General {
-                message: message.clone(),
-                sqlstate: SqlState::timeout_expired(),
-            },
-            TrinoError::AuthFailure { ref message } => OdbcError::General {
-                message: message.clone(),
-                sqlstate: SqlState::invalid_auth_spec(),
-            },
-            TrinoError::AuthConfig { ref message } => OdbcError::General {
-                message: message.clone(),
-                sqlstate: SqlState::invalid_auth_spec(),
-            },
-            _ => OdbcError::General {
-                message: e.to_string(),
-                sqlstate: SqlState::general_error(),
-            },
+            TrinoError::ConnectionFailed { ref message } => OdbcError::general(
+                message.clone(),
+                SqlState::client_unable_to_establish_connection(),
+            ),
+            TrinoError::CommunicationLinkFailure { ref message } => {
+                OdbcError::general(message.clone(), SqlState::communication_link_failure())
+            }
+            TrinoError::QueryTimeout { ref message } => {
+                OdbcError::general(message.clone(), SqlState::timeout_expired())
+            }
+            TrinoError::AuthFailure { ref message } => {
+                OdbcError::general(message.clone(), SqlState::invalid_auth_spec())
+            }
+            TrinoError::AuthConfig { ref message } => {
+                OdbcError::general(message.clone(), SqlState::invalid_auth_spec())
+            }
+            _ => OdbcError::general(e.to_string(), SqlState::general_error()),
         }
     }
 }
@@ -546,12 +559,12 @@ impl Backend for TrinoBackend {
     ///   manual-commit mode
     /// - [`Backend::cursor_commit_behavior`] / `cursor_rollback_behavior`,
     ///   left at core's `Preserve` default because no transaction ever begins
-    fn end_tran(_conn: &TrinoConnection, _commit: bool) -> Result<(), OdbcError> {
+    fn end_tran(_conn: &TrinoConnection, _commit: bool) -> Result<(), TrinoError> {
         tracing::debug!("TrinoBackend::end_tran (no-op: this driver has no transaction support)");
         Ok(())
     }
 
-    fn cancel(stmt: &mut TrinoStatement) -> Result<(), OdbcError> {
+    fn cancel(stmt: &mut TrinoStatement) -> Result<(), TrinoError> {
         execute::cancel(stmt)
     }
 
@@ -623,6 +636,24 @@ impl Backend for TrinoBackend {
     /// `FROM (VALUES 1) AS x(a)` binds a name unrelated to the table's own.
     fn correlation_name() -> u16 {
         SQL_CN_ANY
+    }
+
+    /// Trino folds unquoted identifiers to lower case and stores them that
+    /// way, so `SELECT * FROM Foo` and `SELECT * FROM foo` name the same
+    /// table and `SQLTables` reports it as `foo`.
+    ///
+    /// This is what an application reads to decide how to quote generated
+    /// SQL, which is why core requires the hook rather than defaulting it:
+    /// every one of the four `SQL_IC_*` values is a different claim about how
+    /// the data source folds identifiers, and no default can be legal.
+    ///
+    /// `SQL_QUOTED_IDENTIFIER_CASE` is separately `SQL_IC_SENSITIVE` — a
+    /// double-quoted identifier keeps its case — and is answered by core's
+    /// `common_get_info_raw`.
+    ///
+    /// <https://trino.io/docs/current/language/reserved.html>
+    fn identifier_case() -> u16 {
+        SQL_IC_LOWER
     }
 
     /// `ALTER TABLE ... ADD COLUMN f integer NOT NULL` is accepted, so the
@@ -769,7 +800,7 @@ impl Backend for TrinoBackend {
 
     fn get_info_pre_connect(
         info_type: stackable_odbc_core::types::InfoType,
-    ) -> Result<InfoValue, OdbcError> {
+    ) -> Result<InfoValue, TrinoError> {
         info::get_info_pre_connect(info_type)
     }
 
@@ -813,7 +844,7 @@ impl Backend for TrinoBackend {
         catalog: Option<&str>,
         schema: Option<&str>,
         table: Option<&str>,
-    ) -> Result<TrinoStatement, OdbcError> {
+    ) -> Result<TrinoStatement, TrinoError> {
         metadata::primary_keys(conn, catalog, schema, table)
     }
 
@@ -825,7 +856,7 @@ impl Backend for TrinoBackend {
         fk_catalog: Option<&str>,
         fk_schema: Option<&str>,
         fk_table: Option<&str>,
-    ) -> Result<TrinoStatement, OdbcError> {
+    ) -> Result<TrinoStatement, TrinoError> {
         metadata::foreign_keys(
             conn, pk_catalog, pk_schema, pk_table, fk_catalog, fk_schema, fk_table,
         )
@@ -837,7 +868,7 @@ impl Backend for TrinoBackend {
         schema: Option<&str>,
         table: Option<&str>,
         unique_only: bool,
-    ) -> Result<TrinoStatement, OdbcError> {
+    ) -> Result<TrinoStatement, TrinoError> {
         metadata::statistics(conn, catalog, schema, table, unique_only)
     }
 
@@ -850,7 +881,7 @@ impl Backend for TrinoBackend {
         table: Option<&str>,
         scope: Scope,
         nullable: Nullable,
-    ) -> Result<TrinoStatement, OdbcError> {
+    ) -> Result<TrinoStatement, TrinoError> {
         metadata::special_columns(
             conn,
             identifier_type,

@@ -5,7 +5,6 @@
 
 use stackable_odbc_core::{
     backend::Backend,
-    errors::OdbcError,
     types::{
         ColumnDescriptor, ColumnValue, ColumnsResultCol, ForeignKeysResultCol, IdentifierType,
         Nullable, PrimaryKeysResultCol, Scope, SqlDataType, TablesResultCol,
@@ -650,7 +649,7 @@ pub(super) fn primary_keys(
     catalog: Option<&str>,
     schema: Option<&str>,
     table: Option<&str>,
-) -> Result<TrinoStatement, OdbcError> {
+) -> Result<TrinoStatement, TrinoError> {
     tracing::debug!(
         catalog,
         schema,
@@ -679,7 +678,7 @@ pub(super) fn foreign_keys(
     fk_catalog: Option<&str>,
     fk_schema: Option<&str>,
     fk_table: Option<&str>,
-) -> Result<TrinoStatement, OdbcError> {
+) -> Result<TrinoStatement, TrinoError> {
     tracing::debug!(
         pk_catalog,
         pk_schema,
@@ -705,7 +704,7 @@ pub(super) fn statistics(
     schema: Option<&str>,
     table: Option<&str>,
     _unique_only: bool,
-) -> Result<TrinoStatement, OdbcError> {
+) -> Result<TrinoStatement, TrinoError> {
     tracing::debug!(
         catalog,
         schema,
@@ -732,7 +731,7 @@ pub(super) fn special_columns(
     table: Option<&str>,
     _scope: Scope,
     _nullable: Nullable,
-) -> Result<TrinoStatement, OdbcError> {
+) -> Result<TrinoStatement, TrinoError> {
     tracing::debug!(
         catalog,
         schema,

@@ -75,6 +75,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the SQL-92 capability bitmaps it is deliberately not version-gated, because
   over-reporting a keyword only causes a needless quote while under-reporting
   causes a parse error.
+- `SQLDescribeCol` and `SQLColAttribute` now report `SQL_NULLABLE_UNKNOWN` for
+  a result column's nullability, instead of `SQL_NULLABLE`. Trino's REST
+  protocol describes a result column with a name and a type and nothing else,
+  so the driver has no basis for either of the two definite answers, and the
+  spec defines the third value for exactly that case. `SQL_NULLABLE` was a
+  guess that is safe for a projection of a nullable base column and wrong for
+  a `COUNT(*)`. An application that branches on nullability should treat the
+  unknown as nullable, which is what it already had to do.
 
 ### Fixed
 

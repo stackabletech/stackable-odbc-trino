@@ -28,9 +28,14 @@ trino-rust-client = "0.11"
 
 [dev-dependencies]
 criterion = { version = "0.8", features = ["html_reports"] }
-odbc-sys = "0.31"
 proptest = "1"
 serial_test = "4"
+# The `test-support` feature gates core's `conformance` and `test_support`
+# modules: the info-type shape checks and the connection-injection hooks the
+# offline FFI tests need. It is default-off because it is test code, so it is
+# enabled here rather than on the [dependencies] entry above -- that keeps it
+# out of the shipped cdylib.
+stackable-odbc-core = { path = "../stackable-odbc-core", features = ["test-support"] }
 
 [lints.clippy]
 unwrap_in_result = "deny"

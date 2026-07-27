@@ -125,25 +125,35 @@ pub(super) fn exec_direct(conn: &TrinoConnection, sql: &str) -> Result<TrinoStat
             .map(|t| t.sql_type())
             .unwrap_or_else(|| trino_ty_to_sql_type(&ty));
 
-        columns.push(ColumnDescriptor {
-            name: column_name.clone(),
-            // Spec (SQL_DESC_TYPE_NAME / SQLColumns.TYPE_NAME): both list bare
-            // examples ("CHAR", "VARCHAR", ...), not parameterised
-            // declarations: "varchar(50)" is a *declaration*, and matches no
-            // `SQLGetTypeInfo` row. `trino_bare_type_name` returns the bare
-            // name that does (see its doc comment in `backend/info.rs`);
-            // precision/scale (below) still come from `native_name`, so the
-            // declared length is not lost, only moved out of the name.
-            type_name: trino_bare_type_name(&native_name, sql_type),
-            sql_type,
-            precision: type_name_precision(&native_name)
-                .and_then(|p| u32::try_from(p).ok())
-                .unwrap_or_else(|| trino_ty_precision(&ty)),
-            scale: type_name_scale(&native_name)
-                .and_then(|s| i16::try_from(s).ok())
-                .unwrap_or_else(|| trino_ty_scale(&ty)),
-            nullable: true,
-        });
+        let precision = type_name_precision(&native_name)
+            .and_then(|p| u32::try_from(p).ok())
+            .unwrap_or_else(|| trino_ty_precision(&ty));
+        let scale = type_name_scale(&native_name)
+            .and_then(|s| i16::try_from(s).ok())
+            .unwrap_or_else(|| trino_ty_scale(&ty));
+
+        // Nullability is left at `ColumnDescriptor::new`'s
+        // `SQL_NULLABLE_UNKNOWN`. Trino's REST protocol describes a result
+        // column with a name and a type and nothing else, so this driver cannot
+        // determine whether a column accepts NULL -- and the ODBC spec defines
+        // the third value for exactly that case. Claiming `SQL_NULLABLE`
+        // instead would be a guess that happens to be safe for a projection of
+        // a nullable base column and wrong for a `COUNT(*)`; claiming
+        // `SQL_NO_NULLS` would tell an application it may skip a NULL check it
+        // needs.
+        columns.push(
+            ColumnDescriptor::new(column_name.clone(), sql_type)
+                // Spec (SQL_DESC_TYPE_NAME / SQLColumns.TYPE_NAME): both list
+                // bare examples ("CHAR", "VARCHAR", ...), not parameterised
+                // declarations: "varchar(50)" is a *declaration*, and matches
+                // no `SQLGetTypeInfo` row. `trino_bare_type_name` returns the
+                // bare name that does (see its doc comment in
+                // `backend/info.rs`); precision/scale still come from
+                // `native_name`, so the declared length is not lost, only
+                // moved out of the name.
+                .with_type_name(trino_bare_type_name(&native_name, sql_type))
+                .with_precision_scale(precision, scale),
+        );
         trino_types.push((column_name, ty));
     }
 
@@ -240,25 +250,34 @@ pub(super) fn execute(
 }
 
 /// Cancel a running Trino query via the REST API.
-pub(super) fn cancel(stmt: &mut TrinoStatement) -> Result<(), OdbcError> {
+pub(super) fn cancel(stmt: &mut TrinoStatement) -> Result<(), TrinoError> {
     let Some(ref query_id) = stmt.query_id else {
         tracing::debug!("SQLCancel: no query ID available (query may be finished)");
         return Ok(());
     };
-    let client = stmt.client.as_ref().ok_or_else(|| OdbcError::General {
-        message: "no client available for cancel".into(),
-        sqlstate: SqlState::general_error(),
+    // These are internal invariant violations, not client failures, so they are
+    // hand-built rather than routed through `map_trino_error` (see AGENTS.md).
+    // They are built as `OdbcError` and converted, rather than as a
+    // `TrinoError` variant, because that carries the exact SQLSTATE and message
+    // through unchanged -- `TrinoError::Odbc` is unwrapped, not re-mapped.
+    let client = stmt.client.as_ref().ok_or_else(|| {
+        TrinoError::from(OdbcError::general(
+            "no client available for cancel",
+            SqlState::general_error(),
+        ))
     })?;
-    let runtime = stmt.runtime.as_ref().ok_or_else(|| OdbcError::General {
-        message: "no runtime available for cancel".into(),
-        sqlstate: SqlState::general_error(),
+    let runtime = stmt.runtime.as_ref().ok_or_else(|| {
+        TrinoError::from(OdbcError::general(
+            "no runtime available for cancel",
+            SqlState::general_error(),
+        ))
     })?;
 
     tracing::debug!(query_id = %query_id, "cancelling Trino query");
 
     runtime
         .block_on(client.cancel(query_id))
-        .map_err(|e| OdbcError::from(map_trino_error(e)))?;
+        .map_err(map_trino_error)?;
 
     // The query is now cancelled server-side. Clear next_uri so that
     // close_cursor (and Drop) do NOT try to poll get_next: after a
@@ -285,7 +304,7 @@ impl TrinoStatement {
     /// fetch fails. Leaving them in place would let `SQLGetData` keep returning
     /// data for a row the application was told it never received, so the batch
     /// is dropped, the cursor is rewound and the statement is marked failed.
-    fn abandon_result_set(&mut self, err: OdbcError) -> OdbcError {
+    fn abandon_result_set(&mut self, err: TrinoError) -> TrinoError {
         tracing::debug!(
             page = self.page_count,
             "abandoning Trino result set after a failed page fetch"
@@ -299,15 +318,18 @@ impl TrinoStatement {
 }
 
 impl StatementBackend for TrinoStatement {
-    fn fetch(&mut self) -> Result<FetchResult, OdbcError> {
+    type Error = TrinoError;
+
+    fn fetch(&mut self) -> Result<FetchResult, TrinoError> {
         // A previous page fetch failed, so the cursor position is undefined and
         // the result set cannot be resumed. Report that rather than the
         // `NoData` an exhausted `next_uri` would otherwise produce.
         if self.fetch_failed {
-            return Err(OdbcError::General {
-                message: "the result set was abandoned by an earlier fetch failure".into(),
-                sqlstate: SqlState::invalid_cursor_state(),
-            });
+            return Err(OdbcError::general(
+                "the result set was abandoned by an earlier fetch failure",
+                SqlState::invalid_cursor_state(),
+            )
+            .into());
         }
 
         // Looping rather than recursing: Trino emits empty data pages while a
@@ -328,13 +350,17 @@ impl StatementBackend for TrinoStatement {
                 None => return Ok(FetchResult::NoData), // No more pages.
             };
 
-            let client = self.client.as_ref().ok_or_else(|| OdbcError::General {
-                message: "no client available for streaming fetch".into(),
-                sqlstate: SqlState::general_error(),
+            let client = self.client.as_ref().ok_or_else(|| {
+                TrinoError::from(OdbcError::general(
+                    "no client available for streaming fetch",
+                    SqlState::general_error(),
+                ))
             })?;
-            let runtime = self.runtime.as_ref().ok_or_else(|| OdbcError::General {
-                message: "no runtime available for streaming fetch".into(),
-                sqlstate: SqlState::general_error(),
+            let runtime = self.runtime.as_ref().ok_or_else(|| {
+                TrinoError::from(OdbcError::general(
+                    "no runtime available for streaming fetch",
+                    SqlState::general_error(),
+                ))
             })?;
 
             tracing::debug!(url = %next_url, "fetching next page from Trino");
@@ -353,11 +379,11 @@ impl StatementBackend for TrinoStatement {
             // remain readable through `get_data` after the error was reported.
             let mut page: trino_rust_client::QueryResult<Row> = match fetched {
                 Ok(page) => page,
-                Err(e) => return Err(self.abandon_result_set(map_trino_error(e).into())),
+                Err(e) => return Err(self.abandon_result_set(map_trino_error(e))),
             };
 
             if let Some(error) = page.error.take() {
-                return Err(self.abandon_result_set(map_trino_error(error.into()).into()));
+                return Err(self.abandon_result_set(map_trino_error(error.into())));
             }
 
             log_page_stats(&page.stats, self.page_count);
@@ -396,73 +422,97 @@ impl StatementBackend for TrinoStatement {
         &mut self,
         col: u16,
         _target_type: CDataType,
-    ) -> Result<std::borrow::Cow<'_, ColumnValue>, OdbcError> {
+    ) -> Result<std::borrow::Cow<'_, ColumnValue>, TrinoError> {
         if self.batch_cursor == 0 {
-            return Err(OdbcError::General {
-                message: "get_data called before fetch".into(),
-                sqlstate: SqlState::general_error(),
-            });
+            return Err(OdbcError::general(
+                "get_data called before fetch",
+                SqlState::general_error(),
+            )
+            .into());
         }
-        let col_idx = (col as usize)
-            .checked_sub(1)
-            .ok_or_else(|| OdbcError::General {
-                message: "column index must be >= 1".into(),
-                sqlstate: SqlState::general_error(),
-            })?;
+        let col_idx = (col as usize).checked_sub(1).ok_or_else(|| {
+            TrinoError::from(OdbcError::general(
+                "column index must be >= 1",
+                SqlState::general_error(),
+            ))
+        })?;
         let row = &self.batch[self.batch_cursor - 1];
         row.get(col_idx)
             .map(std::borrow::Cow::Borrowed)
-            .ok_or_else(|| OdbcError::General {
-                message: format!("column {col} out of range (have {} columns)", row.len()),
-                sqlstate: SqlState::general_error(),
+            .ok_or_else(|| {
+                TrinoError::from(OdbcError::general(
+                    format!("column {col} out of range (have {} columns)", row.len()),
+                    SqlState::general_error(),
+                ))
             })
     }
 
-    fn column_count(&self) -> u16 {
-        self.columns.len() as u16
+    fn column_count(&self) -> i16 {
+        // `SQLNumResultCols` writes through a `SQLSMALLINT *`, so the count is
+        // narrowed here rather than in core: this is where the real number is
+        // known. Saturating is the only option the ABI leaves -- there is no
+        // `SQL_NO_TOTAL` for a column count -- and a Trino result set with more
+        // than 32767 columns is beyond anything the coordinator will plan.
+        i16::try_from(self.columns.len()).unwrap_or_else(|_| {
+            tracing::warn!(
+                columns = self.columns.len(),
+                "result set has more columns than SQLSMALLINT can express; reporting i16::MAX"
+            );
+            i16::MAX
+        })
     }
 
-    fn describe_col(&self, col: u16) -> Result<ColumnDescriptor, OdbcError> {
-        let idx = (col as usize)
-            .checked_sub(1)
-            .ok_or_else(|| OdbcError::General {
-                message: "column index must be >= 1".into(),
-                sqlstate: SqlState::general_error(),
-            })?;
+    fn describe_col(&self, col: u16) -> Result<std::borrow::Cow<'_, ColumnDescriptor>, TrinoError> {
+        let idx = (col as usize).checked_sub(1).ok_or_else(|| {
+            TrinoError::from(OdbcError::general(
+                "column index must be >= 1",
+                SqlState::general_error(),
+            ))
+        })?;
+        // Borrowed, not cloned: `SQLColAttribute` calls this once per column
+        // per attribute, and the descriptors live on the statement for as long
+        // as the result set does.
         self.columns
             .get(idx)
-            .cloned()
-            .ok_or_else(|| OdbcError::General {
-                message: format!("column {col} out of range (have {})", self.columns.len()),
-                sqlstate: SqlState::general_error(),
+            .map(std::borrow::Cow::Borrowed)
+            .ok_or_else(|| {
+                TrinoError::from(OdbcError::general(
+                    format!("column {col} out of range (have {})", self.columns.len()),
+                    SqlState::general_error(),
+                ))
             })
     }
 
-    fn row_count(&self) -> Option<usize> {
+    fn row_count(&self) -> Option<i64> {
         // With streaming, we don't know the total row count until exhausted.
         None
     }
 
-    fn close_cursor(&mut self) {
+    fn close_cursor(&mut self) -> Result<(), TrinoError> {
         // Drain remaining Trino response pages so the underlying HTTP
         // connection is cleanly returned to reqwest's connection pool.
         // Without this, residual bytes on the socket corrupt subsequent
         // queries that reuse the pooled connection.
+        let mut drain_failure = None;
         if let (Some(client), Some(runtime)) = (&self.client, &self.runtime) {
             let mut next = self.next_uri.take();
             while let Some(url) = next {
                 match runtime.block_on(client.get_next::<trino_rust_client::Row>(&url)) {
                     Ok(page) => next = page.next_uri,
                     Err(e) => {
-                        // The drain is best-effort (close_cursor has no way to
-                        // report a diagnostic) but a silent break hides the
-                        // fact that the pooled socket is now dirty, which
-                        // surfaces later as an unrelated query failing.
+                        // A failed drain leaves the pooled socket dirty, which
+                        // surfaces later as an unrelated query failing. Core
+                        // records what this returns on the statement's own
+                        // diagnostic queue, so it reaches the application
+                        // rather than only the log -- but the teardown below
+                        // still runs first, so one dirty socket does not also
+                        // strand the statement.
                         tracing::warn!(
                             error = %e,
                             "failed to drain remaining Trino pages; the pooled \
                              connection may carry residual bytes"
                         );
+                        drain_failure = Some(map_trino_error(e));
                         break;
                     }
                 }
@@ -475,6 +525,11 @@ impl StatementBackend for TrinoStatement {
         self.query_id = None;
         // The failed result set is gone; the handle is reusable for a new query.
         self.fetch_failed = false;
+
+        match drain_failure {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
     }
 }
 
@@ -499,8 +554,11 @@ impl Drop for TrinoStatement {
         }
 
         // Drain residual pages so reqwest's connection pool isn't corrupted.
+        // The result is discarded rather than propagated: there is nowhere for
+        // a drop to report a diagnostic, and `close_cursor` has already logged
+        // the failure at `warn!`.
         if self.next_uri.is_some() {
-            self.close_cursor();
+            let _ = self.close_cursor();
         }
     }
 }

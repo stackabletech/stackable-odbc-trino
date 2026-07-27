@@ -25,7 +25,12 @@ use stackable_odbc_core::conformance::{
     all_info_types, genuine_convert_info_types, observe_info_value_kind, observe_u32_value,
 };
 use stackable_odbc_core::ffi;
-use stackable_odbc_core::handles::{ConnectionHandle, as_handle_ref};
+// Core's re-export, not a dependency of this crate's own: `odbc-sys` appears in
+// the trait signatures core exposes, and two versions of a `#[repr(C)]` type
+// are two different types to the compiler. `Timestamp` below is read back out
+// of a buffer core wrote, so it has to be core's.
+use stackable_odbc_core::odbc_sys;
+use stackable_odbc_core::test_support::{attach_connection, detach_connection};
 use stackable_odbc_core::types::{
     AttrOdbcVersion, CDataType, Desc, EnvironmentAttribute, HandleType, HeaderDiagnosticIdentifier,
     InfoType, ParamType, SQL_ADD, SQL_DIAG_MESSAGE_TEXT, SQL_IC_SENSITIVE, SQL_INDEX_UNIQUE,
@@ -247,19 +252,22 @@ unsafe fn alloc_conn_with_injected_trino_connection() -> (*mut c_void, *mut c_vo
             ffi::handle::sql_alloc_handle::<TrinoBackend>(HandleType::Dbc as i16, env, &mut conn),
             SqlReturn::SUCCESS
         );
-        let handle =
-            as_handle_ref::<ConnectionHandle<TrinoBackend>>(conn).expect("valid conn handle");
-        handle.connection = Some(disconnected_trino_conn());
+        attach_connection::<TrinoBackend>(conn, disconnected_trino_conn())
+            .expect("valid conn handle");
         (env, conn)
     }
 }
 
 /// Frees handles allocated by `alloc_conn_with_injected_trino_connection`.
-/// `TrinoBackend::disconnect` is a no-op (the runtime drops on its own), so
-/// calling it here over the injected connection is safe.
+///
+/// The connection is taken back out with `detach_connection` rather than closed
+/// with `SQLDisconnect`: the spec has `SQLFreeHandle` refuse a connection handle
+/// that still holds a connection (`HY010`), so something must remove it, and
+/// this connection never opened a session for `TrinoBackend::disconnect` to
+/// close.
 unsafe fn cleanup_injected_conn(env: *mut c_void, conn: *mut c_void) {
     unsafe {
-        let _ = ffi::connect::sql_disconnect::<TrinoBackend>(conn);
+        let _ = detach_connection::<TrinoBackend>(conn);
         let _ = ffi::handle::sql_free_handle::<TrinoBackend>(HandleType::Dbc as i16, conn);
         let _ = ffi::handle::sql_free_handle::<TrinoBackend>(HandleType::Env as i16, env);
     }
