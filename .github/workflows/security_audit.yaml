@@ -17,8 +17,9 @@ jobs:
       - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
         with:
           persist-credentials: false
-          token: ${{ secrets.GITHUB_TOKEN }}
 
+      # This `token` is the action's own input, not checkout's: audit-check
+      # needs it to post the advisory annotations onto the run.
       - uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2.0.0
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
