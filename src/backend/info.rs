@@ -867,67 +867,164 @@ pub(super) fn get_info_raw(
     }
 }
 
+/// The functions this driver reports as supported through `SQLGetFunctions`.
+///
+/// Together with [`TRINO_WITHHELD_FUNCTIONS`] this partitions
+/// `CORE_EXPORTED_FUNCTIONS` exactly, which
+/// `every_core_exported_function_is_advertised_or_withheld` asserts. The list
+/// is opt-in rather than `CORE_EXPORTED_FUNCTIONS` minus the withheld set,
+/// and the direction matters: core exporting a symbol answers "does this entry
+/// point exist?", not "does this driver implement the function behind it?".
+/// Deriving the list would make a newly exported core function advertised
+/// without anyone deciding it works, and the Windows Driver Manager builds its
+/// dispatch table from this answer.
+const TRINO_ADVERTISED_FUNCTIONS: &[FunctionId] = &[
+    FunctionId::AllocHandle,
+    FunctionId::FreeHandle,
+    FunctionId::Connect,
+    FunctionId::DriverConnect,
+    FunctionId::Disconnect,
+    FunctionId::GetInfo,
+    FunctionId::GetFunctions,
+    FunctionId::GetDiagRec,
+    FunctionId::ExecDirect,
+    FunctionId::Prepare,
+    FunctionId::Execute,
+    FunctionId::Fetch,
+    FunctionId::GetData,
+    FunctionId::NumResultCols,
+    FunctionId::DescribeCol,
+    FunctionId::ColAttribute,
+    FunctionId::RowCount,
+    FunctionId::CloseCursor,
+    FunctionId::FreeStmt,
+    FunctionId::MoreResults,
+    FunctionId::Tables,
+    FunctionId::Columns,
+    FunctionId::GetTypeInfo,
+    // Attribute and diagnostic functions: the Windows DM uses these
+    // heavily. Missing from the 3.x bitmap causes NULL dispatch crashes.
+    FunctionId::SetEnvAttr,
+    FunctionId::GetEnvAttr,
+    FunctionId::SetConnectAttr,
+    FunctionId::GetConnectAttr,
+    FunctionId::SetStmtAttr,
+    FunctionId::GetStmtAttr,
+    FunctionId::GetDiagField,
+    FunctionId::BindCol,
+    FunctionId::Cancel,
+    FunctionId::EndTran,
+    FunctionId::FetchScroll,
+    FunctionId::BindParameter,
+    FunctionId::NativeSql,
+    FunctionId::NumParams,
+    FunctionId::PrimaryKeys,
+    FunctionId::ForeignKeys,
+    FunctionId::Statistics,
+    FunctionId::SpecialColumns,
+    FunctionId::Procedures,
+    FunctionId::ProcedureColumns,
+    FunctionId::GetCursorName,
+    FunctionId::SetCursorName,
+    FunctionId::ColumnPrivileges,
+    FunctionId::TablePrivileges,
+    FunctionId::DescribeParam,
+    // Data-at-execution (fully implemented in stackable-odbc-core) and the remaining
+    // exported entry points that delegate to a real implementation. Listed so
+    // the Windows DM 3.x dispatch bitmap has no gaps.
+    FunctionId::ParamData,
+    FunctionId::PutData,
+    FunctionId::BrowseConnect,
+    FunctionId::BulkOperations,
+    FunctionId::SetPos,
+];
+
+/// The functions core exports an entry point for that this driver deliberately
+/// does not advertise, each with the reason.
+///
+/// Reporting one of these supported is not merely optimistic: `SQLGetFunctions`
+/// is what the Windows Driver Manager builds its dispatch table from, and an
+/// application that reads the bitmap will call what it finds there.
+///
+/// The reasons live here rather than in the test that checks the partition,
+/// because the decision is the part worth reading.
+///
+/// Nothing reads this at runtime, and that is the point: `get_functions`
+/// returns [`TRINO_ADVERTISED_FUNCTIONS`] directly rather than subtracting this
+/// from `CORE_EXPORTED_FUNCTIONS`, so that a function core adds later is
+/// advertised only once someone says it works. What consumes this is
+/// `every_core_exported_function_is_advertised_or_withheld`, which is what
+/// turns "someone says so" into a build failure. `#[cfg(test)]` would compile
+/// it out of the driver, but it would also file the reasoning under test
+/// scaffolding, which is the opposite of why it is written down.
+// `allow` rather than `expect`: the lib is compiled both as a library, where
+// this is dead, and as a test target, where the partition test reads it -- so
+// an expectation would go unfulfilled in one of the two and fail the build.
+#[allow(dead_code)]
+const TRINO_WITHHELD_FUNCTIONS: &[(FunctionId, &str)] = &[
+    (
+        FunctionId::AllocConnect,
+        "ODBC 2.x, superseded by SQLAllocHandle",
+    ),
+    (
+        FunctionId::AllocEnv,
+        "ODBC 2.x, superseded by SQLAllocHandle",
+    ),
+    (
+        FunctionId::AllocStmt,
+        "ODBC 2.x, superseded by SQLAllocHandle",
+    ),
+    (FunctionId::Error, "ODBC 2.x, superseded by SQLGetDiagRec"),
+    (
+        FunctionId::ExtendedFetch,
+        "ODBC 2.x, superseded by SQLFetchScroll",
+    ),
+    (
+        FunctionId::FreeConnect,
+        "ODBC 2.x, superseded by SQLFreeHandle",
+    ),
+    (FunctionId::FreeEnv, "ODBC 2.x, superseded by SQLFreeHandle"),
+    (
+        FunctionId::GetConnectOption,
+        "ODBC 2.x, superseded by SQLGetConnectAttr",
+    ),
+    (
+        FunctionId::GetStmtOption,
+        "ODBC 2.x, superseded by SQLGetStmtAttr",
+    ),
+    (
+        FunctionId::SetConnectOption,
+        "ODBC 2.x, superseded by SQLSetConnectAttr",
+    ),
+    (
+        FunctionId::SetStmtOption,
+        "ODBC 2.x, superseded by SQLSetStmtAttr",
+    ),
+    (
+        FunctionId::SetScrollOptions,
+        "ODBC 2.x, superseded by the SQL_ATTR_CURSOR_* statement attributes",
+    ),
+    (FunctionId::Transact, "ODBC 2.x, superseded by SQLEndTran"),
+    // The descriptor-field functions need a descriptor handle to work on.
+    // Core allocates one for SQLGetStmtAttr(SQL_ATTR_APP_ROW_DESC) and friends,
+    // but nothing accepts SQL_HANDLE_DESC, so there is no handle an application
+    // could pass to these.
+    (
+        FunctionId::GetDescField,
+        "requires a descriptor handle; SQL_HANDLE_DESC is not accepted",
+    ),
+    (
+        FunctionId::SetDescField,
+        "requires a descriptor handle; SQL_HANDLE_DESC is not accepted",
+    ),
+    (
+        FunctionId::SetDescRec,
+        "requires a descriptor handle; SQL_HANDLE_DESC is not accepted",
+    ),
+];
+
 pub(super) fn get_functions() -> &'static [FunctionId] {
-    &[
-        FunctionId::AllocHandle,
-        FunctionId::FreeHandle,
-        FunctionId::Connect,
-        FunctionId::DriverConnect,
-        FunctionId::Disconnect,
-        FunctionId::GetInfo,
-        FunctionId::GetFunctions,
-        FunctionId::GetDiagRec,
-        FunctionId::ExecDirect,
-        FunctionId::Prepare,
-        FunctionId::Execute,
-        FunctionId::Fetch,
-        FunctionId::GetData,
-        FunctionId::NumResultCols,
-        FunctionId::DescribeCol,
-        FunctionId::ColAttribute,
-        FunctionId::RowCount,
-        FunctionId::CloseCursor,
-        FunctionId::FreeStmt,
-        FunctionId::MoreResults,
-        FunctionId::Tables,
-        FunctionId::Columns,
-        FunctionId::GetTypeInfo,
-        // Attribute and diagnostic functions: the Windows DM uses these
-        // heavily. Missing from the 3.x bitmap causes NULL dispatch crashes.
-        FunctionId::SetEnvAttr,
-        FunctionId::GetEnvAttr,
-        FunctionId::SetConnectAttr,
-        FunctionId::GetConnectAttr,
-        FunctionId::SetStmtAttr,
-        FunctionId::GetStmtAttr,
-        FunctionId::GetDiagField,
-        FunctionId::BindCol,
-        FunctionId::Cancel,
-        FunctionId::EndTran,
-        FunctionId::FetchScroll,
-        FunctionId::BindParameter,
-        FunctionId::NativeSql,
-        FunctionId::NumParams,
-        FunctionId::PrimaryKeys,
-        FunctionId::ForeignKeys,
-        FunctionId::Statistics,
-        FunctionId::SpecialColumns,
-        FunctionId::Procedures,
-        FunctionId::ProcedureColumns,
-        FunctionId::GetCursorName,
-        FunctionId::SetCursorName,
-        FunctionId::ColumnPrivileges,
-        FunctionId::TablePrivileges,
-        FunctionId::DescribeParam,
-        // Data-at-execution (fully implemented in stackable-odbc-core) and the remaining
-        // exported entry points that delegate to a real implementation. Listed so
-        // the Windows DM 3.x dispatch bitmap has no gaps.
-        FunctionId::ParamData,
-        FunctionId::PutData,
-        FunctionId::BrowseConnect,
-        FunctionId::BulkOperations,
-        FunctionId::SetPos,
-    ]
+    TRINO_ADVERTISED_FUNCTIONS
 }
 
 pub(super) fn get_type_info() -> &'static [TypeInfoRow] {
@@ -1937,55 +2034,48 @@ mod tests {
         }
     }
 
-    /// The other direction: core exports an entry point this driver chooses not
-    /// to advertise. Every one is deliberate, so the set is pinned rather than
-    /// left to drift -- when core exports something new it lands here as a
-    /// failure, which is the point at which someone has to decide whether the
-    /// driver supports it, instead of it going unadvertised unnoticed.
+    /// The two lists together are this driver's answer to "do you support this
+    /// function?" for every entry point core exports. A function in neither has
+    /// no answer, and that is exactly what a newly exported core function looks
+    /// like -- so this failing is the point at which someone decides whether
+    /// the driver implements it, rather than it going unadvertised unnoticed.
     ///
-    /// `get_functions` is deliberately not just `CORE_EXPORTED_FUNCTIONS`:
-    /// core exporting a symbol says the entry point exists, not that this
-    /// driver implements the function behind it.
+    /// Mirrors core's own `every_function_id_is_declared_exported_or_not`, one
+    /// level up.
     #[test]
-    fn the_functions_core_exports_but_this_driver_withholds_are_the_expected_ones() {
-        use stackable_odbc_core::function_id::{CORE_EXPORTED_FUNCTIONS, FunctionId};
+    fn every_core_exported_function_is_advertised_or_withheld() {
+        use stackable_odbc_core::function_id::CORE_EXPORTED_FUNCTIONS;
 
-        // The ODBC 2.x functions superseded in 3.x (`SQLAllocHandle`,
-        // `SQLFreeHandle`, `SQLGetDiagRec`, `SQLGetConnectAttr` and friends
-        // replace them), plus the descriptor-field functions, which need a
-        // descriptor handle -- core allocates one for `SQLGetStmtAttr` but
-        // nothing yet accepts `SQL_HANDLE_DESC`.
-        let expected_withheld = [
-            FunctionId::AllocConnect,
-            FunctionId::AllocEnv,
-            FunctionId::AllocStmt,
-            FunctionId::Error,
-            FunctionId::ExtendedFetch,
-            FunctionId::FreeConnect,
-            FunctionId::FreeEnv,
-            FunctionId::GetConnectOption,
-            FunctionId::GetDescField,
-            FunctionId::GetStmtOption,
-            FunctionId::SetConnectOption,
-            FunctionId::SetDescField,
-            FunctionId::SetDescRec,
-            FunctionId::SetScrollOptions,
-            FunctionId::SetStmtOption,
-            FunctionId::Transact,
-        ];
+        for id in CORE_EXPORTED_FUNCTIONS {
+            let advertised = TRINO_ADVERTISED_FUNCTIONS.contains(id);
+            let withheld = TRINO_WITHHELD_FUNCTIONS.iter().any(|(w, _)| w == id);
+            assert!(
+                advertised ^ withheld,
+                "{id:?} must appear in exactly one of TRINO_ADVERTISED_FUNCTIONS \
+                 (advertised={advertised}) and TRINO_WITHHELD_FUNCTIONS \
+                 (withheld={withheld})"
+            );
+        }
 
-        let advertised = get_functions();
-        let mut withheld: Vec<_> = CORE_EXPORTED_FUNCTIONS
-            .iter()
-            .filter(|id| !advertised.contains(id))
-            .copied()
-            .collect();
-        withheld.sort_by_key(|id| format!("{id:?}"));
+        // Catches an entry in either list that core does not export at all,
+        // which the loop above cannot see because it iterates core's list.
+        assert_eq!(
+            TRINO_ADVERTISED_FUNCTIONS.len() + TRINO_WITHHELD_FUNCTIONS.len(),
+            CORE_EXPORTED_FUNCTIONS.len(),
+            "the two lists must partition CORE_EXPORTED_FUNCTIONS exactly"
+        );
+    }
 
-        let mut expected = expected_withheld.to_vec();
-        expected.sort_by_key(|id| format!("{id:?}"));
-
-        assert_eq!(withheld, expected);
+    /// Every withheld entry carries a reason, because the reason is the whole
+    /// value of recording the decision.
+    #[test]
+    fn every_withheld_function_says_why() {
+        for (id, reason) in TRINO_WITHHELD_FUNCTIONS {
+            assert!(
+                !reason.trim().is_empty(),
+                "{id:?} is withheld with no reason"
+            );
+        }
     }
 
     #[test]
