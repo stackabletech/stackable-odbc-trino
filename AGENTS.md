@@ -457,6 +457,33 @@ been diagnosed and recorded rather than asserted, so the suite stays green
 until the owning crate changes; two currently name core's `SQLFreeStmt`
 diagnostic and `SQLFreeHandle` clearing behaviour.
 
+### Type-transform fuzz
+
+```bash
+python3 test/test_type_matrix.py    # needs a running Trino; standard library only
+```
+
+Drives every (Trino value, C data type) pair through `SQLGetData` — 37 values
+against 13 C types, plus 14 NULLs against all 13 — and checks the result
+against invariants rather than a transcribed copy of the ODBC conversion
+matrix. Transcribing the matrix would mostly test the transcription; these are
+the properties whose violation is an actual defect:
+
+1. The call returns — no pair may crash or hang.
+2. A failure carries a SQLSTATE. `SQL_ERROR` with no diagnostic record leaves
+   an application with an error it cannot interpret.
+3. NULL is reported as `SQL_NULL_DATA`, for every target type.
+4. A value that does not fit reports `22003`, not a truncated number.
+5. Text that is not a number reports `22018`, not a zero.
+6. A successful text conversion round-trips.
+
+Also covers the integer boundary values, the IEEE specials per float type, and
+the statement terminator and comment placements.
+
+A Trino `BOOLEAN` reads back as `"1"`/`"0"`, not `"true"`/`"false"`: it is
+described as `SQL_BIT`, and that is what the conversion matrix renders. Do not
+"fix" that expectation.
+
 ### Integration tests
 
 Requires Docker and docker-compose. **This suite does not run in CI** — the

@@ -84,6 +84,14 @@ uv run --with pyodbc python3 "$SCRIPT_DIR/test_sql_surface.py" \
 echo "=== Running raw C ABI pen test ==="
 python3 "$SCRIPT_DIR/test_c_abi.py" "$DRIVER_PATH"
 
+# --- Linux: type-transform fuzz (no Driver Manager) ---
+# Every (Trino value, C data type) pair through SQLGetData, checked against
+# invariants rather than a transcribed conversion matrix. Covers the integer
+# boundary values, the IEEE specials, NULL per target type, and the statement
+# terminator forms. Standard library only.
+echo "=== Running type-transform fuzz ==="
+python3 "$SCRIPT_DIR/test_type_matrix.py" "$DRIVER_PATH"
+
 # --- Linux: Rust FFI integration tests ---
 # Only FFI tests are run here. The backend::tests integration tests use a
 # separate TrinoConnection (with its own reqwest pool), and running both
