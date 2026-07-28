@@ -4,6 +4,9 @@
 //! Trino capability bitmaps (`TRINO_*`), several of which are version-gated on
 //! the coordinator's reported version.
 
+use std::borrow::Cow;
+use std::sync::OnceLock;
+
 use stackable_odbc_core::backend::{common_get_info_raw, default_get_info};
 use stackable_odbc_core::function_id::FunctionId;
 use stackable_odbc_core::types::{
@@ -89,267 +92,280 @@ const TRINO_TZ_TIMESTAMP_SPACE_LEN: i32 = 1;
 /// then ... TYPE_NAME" requirement. This invariant is asserted directly by
 /// `type_info_rows_sorted_by_data_type_then_type_name` below; keep new rows
 /// in the correct sorted position rather than appending them.
-static TRINO_TYPE_INFO: &[TypeInfoRow] = &[
-    // INTERVAL DAY TO SECOND — trino_ty_to_sql_type has no dedicated
-    // ODBC interval type for this (see the "String-representable types
-    // without a dedicated ODBC type" comment in type_conversion.rs); Trino
-    // interval values are rendered as text, so DATA_TYPE matches what is
-    // actually reported (EXT_W_VARCHAR), the same as INTERVAL YEAR TO
-    // MONTH/JSON/UUID/VARCHAR further down this list. TYPE_NAME is sourced
-    // from `TrinoTypeName::IntervalDayToSecond::name()` (not a hardcoded
-    // string) so this row and `trino_bare_type_name`'s parser cannot drift
-    // apart: without a matching `TrinoTypeName` variant, no real interval
-    // column could report this TYPE_NAME (`trino_bare_type_name` would fall
-    // through to "VARCHAR" instead); see `every_type_info_row_is_reachable_via_trino_bare_type_name`.
-    TypeInfoRow::new(
-        TrinoTypeName::IntervalDayToSecond.name(),
-        SqlDataType::EXT_W_VARCHAR,
-    )
-    .with_column_size(catalog_column_size(
-        SqlDataType::EXT_W_VARCHAR,
-        MaxPrecision(i32::MAX),
-        MaxScale(0),
-    ))
-    .with_literal_affixes(Some("'"), Some("'")),
-    // INTERVAL YEAR TO MONTH — same rationale as INTERVAL DAY TO SECOND
-    // above, including sourcing TYPE_NAME from `TrinoTypeName::name()`.
-    TypeInfoRow::new(
-        TrinoTypeName::IntervalYearToMonth.name(),
-        SqlDataType::EXT_W_VARCHAR,
-    )
-    .with_column_size(catalog_column_size(
-        SqlDataType::EXT_W_VARCHAR,
-        MaxPrecision(i32::MAX),
-        MaxScale(0),
-    ))
-    .with_literal_affixes(Some("'"), Some("'")),
-    // JSON — stored/returned as VARCHAR in ODBC context
-    TypeInfoRow::new(TrinoTypeName::Json.name(), SqlDataType::EXT_W_VARCHAR)
-        .with_column_size(catalog_column_size(
-            SqlDataType::EXT_W_VARCHAR,
-            MaxPrecision(i32::MAX),
-            MaxScale(0),
-        ))
-        .with_literal_affixes(Some("'"), Some("'"))
-        .with_case_sensitive(true),
-    // UUID — returned as 36-char VARCHAR string
-    TypeInfoRow::new(TrinoTypeName::Uuid.name(), SqlDataType::EXT_W_VARCHAR)
-        .with_column_size(catalog_column_size(
-            SqlDataType::EXT_W_VARCHAR,
-            MaxPrecision(36),
-            MaxScale(0),
-        ))
-        .with_literal_affixes(Some("'"), Some("'")),
-    // VARCHAR
-    TypeInfoRow::new(TrinoTypeName::Varchar.name(), SqlDataType::EXT_W_VARCHAR)
-        .with_column_size(catalog_column_size(
-            SqlDataType::EXT_W_VARCHAR,
-            MaxPrecision(i32::MAX),
-            MaxScale(0),
-        ))
-        .with_literal_affixes(Some("'"), Some("'"))
-        .with_create_params(Some("max length"))
-        .with_case_sensitive(true),
-    // CHAR
-    TypeInfoRow::new(TrinoTypeName::Char.name(), SqlDataType::EXT_W_CHAR)
-        .with_column_size(catalog_column_size(
-            SqlDataType::EXT_W_CHAR,
-            MaxPrecision(u16::MAX as i32),
-            MaxScale(0),
-        ))
-        .with_literal_affixes(Some("'"), Some("'"))
-        .with_create_params(Some("length"))
-        .with_case_sensitive(true),
-    // BOOLEAN
-    TypeInfoRow::new(TrinoTypeName::Boolean.name(), SqlDataType::EXT_BIT).with_column_size(
-        catalog_column_size(SqlDataType::EXT_BIT, MaxPrecision(0), MaxScale(0)),
-    ),
-    // TINYINT
-    TypeInfoRow::new(TrinoTypeName::TinyInt.name(), SqlDataType::EXT_TINY_INT)
-        .with_column_size(catalog_column_size(
-            SqlDataType::EXT_TINY_INT,
-            MaxPrecision(0),
-            MaxScale(0),
-        ))
-        .with_unsigned(Some(false))
-        .with_auto_unique_value(Some(false))
-        .with_scale_range(Some(0), Some(0))
-        .with_num_prec_radix(Some(10)),
-    // BIGINT
-    TypeInfoRow::new(TrinoTypeName::BigInt.name(), SqlDataType::EXT_BIG_INT)
-        .with_column_size(catalog_column_size(
-            SqlDataType::EXT_BIG_INT,
-            MaxPrecision(0),
-            MaxScale(0),
-        ))
-        .with_unsigned(Some(false))
-        .with_auto_unique_value(Some(false))
-        .with_scale_range(Some(0), Some(0))
-        .with_num_prec_radix(Some(10)),
-    // VARBINARY
-    TypeInfoRow::new(
-        TrinoTypeName::Varbinary.name(),
-        SqlDataType::EXT_LONG_VAR_BINARY,
-    )
-    .with_column_size(catalog_column_size(
-        SqlDataType::EXT_LONG_VAR_BINARY,
-        MaxPrecision(i32::MAX),
-        MaxScale(0),
-    ))
-    .with_literal_affixes(Some("X'"), Some("'")),
-    // SQL_CHAR (1) — ANSI alias. See the SQL_VARCHAR comment further down
-    // this list re TYPE_NAME.
-    TypeInfoRow::new("SQL_CHAR", SqlDataType::CHAR)
-        .with_column_size(catalog_column_size(
-            SqlDataType::CHAR,
-            MaxPrecision(u16::MAX as i32),
-            MaxScale(0),
-        ))
-        .with_literal_affixes(Some("'"), Some("'"))
-        .with_create_params(Some("length"))
-        .with_case_sensitive(true),
-    // DECIMAL
-    TypeInfoRow::new(TrinoTypeName::Decimal.name(), SqlDataType::DECIMAL)
-        .with_column_size(catalog_column_size(
-            SqlDataType::DECIMAL,
-            MaxPrecision(MAX_DECIMAL_PRECISION),
-            MaxScale(MAX_DECIMAL_SCALE),
-        ))
-        .with_create_params(Some("precision,scale"))
-        .with_unsigned(Some(false))
-        .with_auto_unique_value(Some(false))
-        .with_scale_range(Some(0), Some(MAX_DECIMAL_SCALE))
-        .with_num_prec_radix(Some(10)),
-    // INTEGER
-    TypeInfoRow::new(TrinoTypeName::Integer.name(), SqlDataType::INTEGER)
-        .with_column_size(catalog_column_size(
-            SqlDataType::INTEGER,
-            MaxPrecision(0),
-            MaxScale(0),
-        ))
-        .with_unsigned(Some(false))
-        .with_auto_unique_value(Some(false))
-        .with_scale_range(Some(0), Some(0))
-        .with_num_prec_radix(Some(10)),
-    // SMALLINT
-    TypeInfoRow::new(TrinoTypeName::SmallInt.name(), SqlDataType::SMALLINT)
-        .with_column_size(catalog_column_size(
-            SqlDataType::SMALLINT,
-            MaxPrecision(0),
-            MaxScale(0),
-        ))
-        .with_unsigned(Some(false))
-        .with_auto_unique_value(Some(false))
-        .with_scale_range(Some(0), Some(0))
-        .with_num_prec_radix(Some(10)),
-    // REAL
-    TypeInfoRow::new(TrinoTypeName::Real.name(), SqlDataType::REAL)
-        .with_column_size(catalog_column_size(
-            SqlDataType::REAL,
-            MaxPrecision(0),
-            MaxScale(0),
-        ))
-        .with_unsigned(Some(false))
-        .with_num_prec_radix(Some(2)),
-    // DOUBLE
-    TypeInfoRow::new(TrinoTypeName::Double.name(), SqlDataType::DOUBLE)
-        .with_column_size(catalog_column_size(
-            SqlDataType::DOUBLE,
-            MaxPrecision(0),
-            MaxScale(0),
-        ))
-        .with_unsigned(Some(false))
-        .with_num_prec_radix(Some(2)),
-    // SQL_VARCHAR (12) — ANSI alias needed by pyodbc/Windows DM.
-    // When the DM queries SQLGetTypeInfo(SQL_VARCHAR=12), it needs to find a
-    // matching row or it refuses to perform type conversions (e.g. bigint→string).
-    // TYPE_NAME must differ from the WVARCHAR entry ("VARCHAR") because Power
-    // Query builds a record keyed by TYPE_NAME and crashes on duplicates.
-    TypeInfoRow::new("SQL_VARCHAR", SqlDataType::VARCHAR)
-        .with_column_size(catalog_column_size(
-            SqlDataType::VARCHAR,
-            MaxPrecision(i32::MAX),
-            MaxScale(0),
-        ))
-        .with_literal_affixes(Some("'"), Some("'"))
-        .with_create_params(Some("max length"))
-        .with_case_sensitive(true),
-    // DATE
-    // DATA_TYPE=91 (SQL_TYPE_DATE), SQL_DATA_TYPE=9 (SQL_DATETIME), SQL_DATETIME_SUB=1 (SQL_CODE_DATE)
-    TypeInfoRow::new(TrinoTypeName::Date.name(), SqlDataType::DATE)
-        .with_column_size(catalog_column_size(
-            SqlDataType::DATE,
-            MaxPrecision(0),
-            MaxScale(0),
-        ))
-        .with_literal_affixes(Some("DATE '"), Some("'"))
-        .with_verbose_type(SqlDataType::DATETIME.0, Some(SQL_CODE_DATE)),
-    // TIME
-    // DATA_TYPE=92 (SQL_TYPE_TIME), SQL_DATA_TYPE=9 (SQL_DATETIME), SQL_DATETIME_SUB=2 (SQL_CODE_TIME)
-    TypeInfoRow::new(TrinoTypeName::Time.name(), SqlDataType::TIME)
-        .with_column_size(catalog_column_size(
-            SqlDataType::TIME,
-            MaxPrecision(0),
-            MaxScale(MAX_FRACTIONAL_SECONDS_PRECISION),
-        ))
-        .with_literal_affixes(Some("TIME '"), Some("'"))
-        .with_create_params(Some("precision"))
-        .with_scale_range(Some(0), Some(MAX_FRACTIONAL_SECONDS_PRECISION))
-        .with_verbose_type(SqlDataType::DATETIME.0, Some(SQL_CODE_TIME)),
-    // TIME WITH TIME ZONE — shares DATA_TYPE=92 with plain TIME above
-    // (see TrinoTypeName::sql_type); needs its own row so an application
-    // that looks up SQLGetTypeInfo by TYPE_NAME (e.g. building a CREATE
-    // TABLE statement) can find "TIME WITH TIME ZONE" at all, as it is a
-    // distinct, commonly-used Trino type. Grouped immediately after TIME
-    // to keep DATA_TYPE=92 rows adjacent per the spec's "ordered by
-    // DATA_TYPE" guidance.
-    TypeInfoRow::new(TrinoTypeName::TimeWithTimeZone.name(), SqlDataType::TIME)
-        .with_column_size(
-            catalog_column_size(
-                SqlDataType::TIME,
-                MaxPrecision(0),
-                MaxScale(MAX_FRACTIONAL_SECONDS_PRECISION),
-            ) + TRINO_TZ_OFFSET_SUFFIX_LEN,
-        )
-        .with_literal_affixes(Some("TIME '"), Some("'"))
-        .with_create_params(Some("precision"))
-        .with_scale_range(Some(0), Some(MAX_FRACTIONAL_SECONDS_PRECISION))
-        .with_verbose_type(SqlDataType::DATETIME.0, Some(SQL_CODE_TIME)),
-    // TIMESTAMP
-    // DATA_TYPE=93 (SQL_TYPE_TIMESTAMP), SQL_DATA_TYPE=9 (SQL_DATETIME), SQL_DATETIME_SUB=3 (SQL_CODE_TIMESTAMP)
-    TypeInfoRow::new(TrinoTypeName::Timestamp.name(), SqlDataType::TIMESTAMP)
-        .with_column_size(catalog_column_size(
-            SqlDataType::TIMESTAMP,
-            MaxPrecision(0),
-            MaxScale(MAX_FRACTIONAL_SECONDS_PRECISION),
-        ))
-        .with_literal_affixes(Some("TIMESTAMP '"), Some("'"))
-        .with_create_params(Some("precision"))
-        .with_scale_range(Some(0), Some(MAX_FRACTIONAL_SECONDS_PRECISION))
-        .with_verbose_type(SqlDataType::DATETIME.0, Some(SQL_CODE_TIMESTAMP)),
-    // TIMESTAMP WITH TIME ZONE — shares DATA_TYPE=93 with plain
-    // TIMESTAMP above; same rationale as TIME WITH TIME ZONE.
-    TypeInfoRow::new(
-        TrinoTypeName::TimestampWithTimeZone.name(),
-        SqlDataType::TIMESTAMP,
-    )
-    .with_column_size(
-        catalog_column_size(
-            SqlDataType::TIMESTAMP,
-            MaxPrecision(0),
-            MaxScale(MAX_FRACTIONAL_SECONDS_PRECISION),
-        ) + TRINO_TZ_TIMESTAMP_SPACE_LEN
-            + TRINO_TZ_OFFSET_SUFFIX_LEN,
-    )
-    .with_literal_affixes(Some("TIMESTAMP '"), Some("'"))
-    .with_create_params(Some("precision"))
-    .with_scale_range(Some(0), Some(MAX_FRACTIONAL_SECONDS_PRECISION))
-    .with_verbose_type(SqlDataType::DATETIME.0, Some(SQL_CODE_TIMESTAMP)),
-];
+fn trino_type_info() -> &'static [TypeInfoRow] {
+    static ROWS: OnceLock<Vec<TypeInfoRow>> = OnceLock::new();
+    ROWS.get_or_init(|| {
+        vec![
+            // INTERVAL DAY TO SECOND — trino_ty_to_sql_type has no dedicated
+            // ODBC interval type for this (see the "String-representable types
+            // without a dedicated ODBC type" comment in type_conversion.rs); Trino
+            // interval values are rendered as text, so DATA_TYPE matches what is
+            // actually reported (EXT_W_VARCHAR), the same as INTERVAL YEAR TO
+            // MONTH/JSON/UUID/VARCHAR further down this list. TYPE_NAME is sourced
+            // from `TrinoTypeName::IntervalDayToSecond::name()` (not a hardcoded
+            // string) so this row and `trino_bare_type_name`'s parser cannot drift
+            // apart: without a matching `TrinoTypeName` variant, no real interval
+            // column could report this TYPE_NAME (`trino_bare_type_name` would fall
+            // through to "VARCHAR" instead); see `every_type_info_row_is_reachable_via_trino_bare_type_name`.
+            TypeInfoRow::new(
+                TrinoTypeName::IntervalDayToSecond.name(),
+                SqlDataType::EXT_W_VARCHAR,
+            )
+            .with_column_size(catalog_column_size(
+                SqlDataType::EXT_W_VARCHAR,
+                MaxPrecision(i32::MAX),
+                MaxScale(0),
+            ))
+            .with_literal_affixes(Some("'"), Some("'")),
+            // INTERVAL YEAR TO MONTH — same rationale as INTERVAL DAY TO SECOND
+            // above, including sourcing TYPE_NAME from `TrinoTypeName::name()`.
+            TypeInfoRow::new(
+                TrinoTypeName::IntervalYearToMonth.name(),
+                SqlDataType::EXT_W_VARCHAR,
+            )
+            .with_column_size(catalog_column_size(
+                SqlDataType::EXT_W_VARCHAR,
+                MaxPrecision(i32::MAX),
+                MaxScale(0),
+            ))
+            .with_literal_affixes(Some("'"), Some("'")),
+            // JSON — stored/returned as VARCHAR in ODBC context
+            TypeInfoRow::new(TrinoTypeName::Json.name(), SqlDataType::EXT_W_VARCHAR)
+                .with_column_size(catalog_column_size(
+                    SqlDataType::EXT_W_VARCHAR,
+                    MaxPrecision(i32::MAX),
+                    MaxScale(0),
+                ))
+                .with_literal_affixes(Some("'"), Some("'"))
+                .with_case_sensitive(true),
+            // UUID — returned as 36-char VARCHAR string
+            TypeInfoRow::new(TrinoTypeName::Uuid.name(), SqlDataType::EXT_W_VARCHAR)
+                .with_column_size(catalog_column_size(
+                    SqlDataType::EXT_W_VARCHAR,
+                    MaxPrecision(36),
+                    MaxScale(0),
+                ))
+                .with_literal_affixes(Some("'"), Some("'")),
+            // VARCHAR
+            TypeInfoRow::new(TrinoTypeName::Varchar.name(), SqlDataType::EXT_W_VARCHAR)
+                .with_column_size(catalog_column_size(
+                    SqlDataType::EXT_W_VARCHAR,
+                    MaxPrecision(i32::MAX),
+                    MaxScale(0),
+                ))
+                .with_literal_affixes(Some("'"), Some("'"))
+                .with_create_params(Some("max length"))
+                .with_case_sensitive(true),
+            // CHAR
+            TypeInfoRow::new(TrinoTypeName::Char.name(), SqlDataType::EXT_W_CHAR)
+                .with_column_size(catalog_column_size(
+                    SqlDataType::EXT_W_CHAR,
+                    MaxPrecision(u16::MAX as i32),
+                    MaxScale(0),
+                ))
+                .with_literal_affixes(Some("'"), Some("'"))
+                .with_create_params(Some("length"))
+                .with_case_sensitive(true),
+            // BOOLEAN
+            TypeInfoRow::new(TrinoTypeName::Boolean.name(), SqlDataType::EXT_BIT).with_column_size(
+                catalog_column_size(SqlDataType::EXT_BIT, MaxPrecision(0), MaxScale(0)),
+            ),
+            // TINYINT
+            TypeInfoRow::new(TrinoTypeName::TinyInt.name(), SqlDataType::EXT_TINY_INT)
+                .with_column_size(catalog_column_size(
+                    SqlDataType::EXT_TINY_INT,
+                    MaxPrecision(0),
+                    MaxScale(0),
+                ))
+                .with_unsigned(Some(false))
+                .with_auto_unique_value(Some(false))
+                .with_scale_range(Some(0), Some(0))
+                .with_num_prec_radix(Some(10)),
+            // BIGINT
+            TypeInfoRow::new(TrinoTypeName::BigInt.name(), SqlDataType::EXT_BIG_INT)
+                .with_column_size(catalog_column_size(
+                    SqlDataType::EXT_BIG_INT,
+                    MaxPrecision(0),
+                    MaxScale(0),
+                ))
+                .with_unsigned(Some(false))
+                .with_auto_unique_value(Some(false))
+                .with_scale_range(Some(0), Some(0))
+                .with_num_prec_radix(Some(10)),
+            // VARBINARY
+            TypeInfoRow::new(
+                TrinoTypeName::Varbinary.name(),
+                SqlDataType::EXT_LONG_VAR_BINARY,
+            )
+            .with_column_size(catalog_column_size(
+                SqlDataType::EXT_LONG_VAR_BINARY,
+                MaxPrecision(i32::MAX),
+                MaxScale(0),
+            ))
+            .with_literal_affixes(Some("X'"), Some("'")),
+            // SQL_CHAR (1) — ANSI alias. See the SQL_VARCHAR comment further down
+            // this list re TYPE_NAME.
+            TypeInfoRow::new("SQL_CHAR", SqlDataType::CHAR)
+                .with_column_size(catalog_column_size(
+                    SqlDataType::CHAR,
+                    MaxPrecision(u16::MAX as i32),
+                    MaxScale(0),
+                ))
+                .with_literal_affixes(Some("'"), Some("'"))
+                .with_create_params(Some("length"))
+                .with_case_sensitive(true),
+            // DECIMAL
+            TypeInfoRow::new(TrinoTypeName::Decimal.name(), SqlDataType::DECIMAL)
+                .with_column_size(catalog_column_size(
+                    SqlDataType::DECIMAL,
+                    MaxPrecision(MAX_DECIMAL_PRECISION),
+                    MaxScale(MAX_DECIMAL_SCALE),
+                ))
+                .with_create_params(Some("precision,scale"))
+                .with_unsigned(Some(false))
+                .with_auto_unique_value(Some(false))
+                .with_scale_range(Some(0), Some(MAX_DECIMAL_SCALE))
+                .with_num_prec_radix(Some(10)),
+            // INTEGER
+            TypeInfoRow::new(TrinoTypeName::Integer.name(), SqlDataType::INTEGER)
+                .with_column_size(catalog_column_size(
+                    SqlDataType::INTEGER,
+                    MaxPrecision(0),
+                    MaxScale(0),
+                ))
+                .with_unsigned(Some(false))
+                .with_auto_unique_value(Some(false))
+                .with_scale_range(Some(0), Some(0))
+                .with_num_prec_radix(Some(10)),
+            // SMALLINT
+            TypeInfoRow::new(TrinoTypeName::SmallInt.name(), SqlDataType::SMALLINT)
+                .with_column_size(catalog_column_size(
+                    SqlDataType::SMALLINT,
+                    MaxPrecision(0),
+                    MaxScale(0),
+                ))
+                .with_unsigned(Some(false))
+                .with_auto_unique_value(Some(false))
+                .with_scale_range(Some(0), Some(0))
+                .with_num_prec_radix(Some(10)),
+            // REAL
+            TypeInfoRow::new(TrinoTypeName::Real.name(), SqlDataType::REAL)
+                .with_column_size(catalog_column_size(
+                    SqlDataType::REAL,
+                    MaxPrecision(0),
+                    MaxScale(0),
+                ))
+                .with_unsigned(Some(false))
+                .with_num_prec_radix(Some(2)),
+            // DOUBLE
+            TypeInfoRow::new(TrinoTypeName::Double.name(), SqlDataType::DOUBLE)
+                .with_column_size(catalog_column_size(
+                    SqlDataType::DOUBLE,
+                    MaxPrecision(0),
+                    MaxScale(0),
+                ))
+                .with_unsigned(Some(false))
+                .with_num_prec_radix(Some(2)),
+            // SQL_VARCHAR (12) — ANSI alias needed by pyodbc/Windows DM.
+            // When the DM queries SQLGetTypeInfo(SQL_VARCHAR=12), it needs to find a
+            // matching row or it refuses to perform type conversions (e.g. bigint→string).
+            // TYPE_NAME must differ from the WVARCHAR entry ("VARCHAR") because Power
+            // Query builds a record keyed by TYPE_NAME and crashes on duplicates.
+            TypeInfoRow::new("SQL_VARCHAR", SqlDataType::VARCHAR)
+                .with_column_size(catalog_column_size(
+                    SqlDataType::VARCHAR,
+                    MaxPrecision(i32::MAX),
+                    MaxScale(0),
+                ))
+                .with_literal_affixes(Some("'"), Some("'"))
+                .with_create_params(Some("max length"))
+                .with_case_sensitive(true),
+            // DATE
+            // DATA_TYPE=91 (SQL_TYPE_DATE), SQL_DATA_TYPE=9 (SQL_DATETIME), SQL_DATETIME_SUB=1 (SQL_CODE_DATE)
+            TypeInfoRow::new(TrinoTypeName::Date.name(), SqlDataType::DATE)
+                .with_column_size(catalog_column_size(
+                    SqlDataType::DATE,
+                    MaxPrecision(0),
+                    MaxScale(0),
+                ))
+                .with_literal_affixes(Some("DATE '"), Some("'"))
+                .with_verbose_type(SqlDataType::DATETIME.0, Some(SQL_CODE_DATE)),
+            // TIME
+            // DATA_TYPE=92 (SQL_TYPE_TIME), SQL_DATA_TYPE=9 (SQL_DATETIME), SQL_DATETIME_SUB=2 (SQL_CODE_TIME)
+            TypeInfoRow::new(TrinoTypeName::Time.name(), SqlDataType::TIME)
+                .with_column_size(catalog_column_size(
+                    SqlDataType::TIME,
+                    MaxPrecision(0),
+                    MaxScale(MAX_FRACTIONAL_SECONDS_PRECISION),
+                ))
+                .with_literal_affixes(Some("TIME '"), Some("'"))
+                .with_create_params(Some("precision"))
+                .with_scale_range(Some(0), Some(MAX_FRACTIONAL_SECONDS_PRECISION))
+                .with_verbose_type(SqlDataType::DATETIME.0, Some(SQL_CODE_TIME)),
+            // TIME WITH TIME ZONE — shares DATA_TYPE=92 with plain TIME above
+            // (see TrinoTypeName::sql_type); needs its own row so an application
+            // that looks up SQLGetTypeInfo by TYPE_NAME (e.g. building a CREATE
+            // TABLE statement) can find "TIME WITH TIME ZONE" at all, as it is a
+            // distinct, commonly-used Trino type. Grouped immediately after TIME
+            // to keep DATA_TYPE=92 rows adjacent per the spec's "ordered by
+            // DATA_TYPE" guidance.
+            TypeInfoRow::new(TrinoTypeName::TimeWithTimeZone.name(), SqlDataType::TIME)
+                .with_column_size(
+                    catalog_column_size(
+                        SqlDataType::TIME,
+                        MaxPrecision(0),
+                        MaxScale(MAX_FRACTIONAL_SECONDS_PRECISION),
+                    ) + TRINO_TZ_OFFSET_SUFFIX_LEN,
+                )
+                .with_literal_affixes(Some("TIME '"), Some("'"))
+                .with_create_params(Some("precision"))
+                .with_scale_range(Some(0), Some(MAX_FRACTIONAL_SECONDS_PRECISION))
+                .with_verbose_type(SqlDataType::DATETIME.0, Some(SQL_CODE_TIME)),
+            // TIMESTAMP
+            // DATA_TYPE=93 (SQL_TYPE_TIMESTAMP), SQL_DATA_TYPE=9 (SQL_DATETIME), SQL_DATETIME_SUB=3 (SQL_CODE_TIMESTAMP)
+            TypeInfoRow::new(TrinoTypeName::Timestamp.name(), SqlDataType::TIMESTAMP)
+                .with_column_size(catalog_column_size(
+                    SqlDataType::TIMESTAMP,
+                    MaxPrecision(0),
+                    MaxScale(MAX_FRACTIONAL_SECONDS_PRECISION),
+                ))
+                .with_literal_affixes(Some("TIMESTAMP '"), Some("'"))
+                .with_create_params(Some("precision"))
+                .with_scale_range(Some(0), Some(MAX_FRACTIONAL_SECONDS_PRECISION))
+                .with_verbose_type(SqlDataType::DATETIME.0, Some(SQL_CODE_TIMESTAMP)),
+            // TIMESTAMP WITH TIME ZONE — shares DATA_TYPE=93 with plain
+            // TIMESTAMP above; same rationale as TIME WITH TIME ZONE.
+            TypeInfoRow::new(
+                TrinoTypeName::TimestampWithTimeZone.name(),
+                SqlDataType::TIMESTAMP,
+            )
+            .with_column_size(
+                catalog_column_size(
+                    SqlDataType::TIMESTAMP,
+                    MaxPrecision(0),
+                    MaxScale(MAX_FRACTIONAL_SECONDS_PRECISION),
+                ) + TRINO_TZ_TIMESTAMP_SPACE_LEN
+                    + TRINO_TZ_OFFSET_SUFFIX_LEN,
+            )
+            .with_literal_affixes(Some("TIMESTAMP '"), Some("'"))
+            .with_create_params(Some("precision"))
+            .with_scale_range(Some(0), Some(MAX_FRACTIONAL_SECONDS_PRECISION))
+            .with_verbose_type(SqlDataType::DATETIME.0, Some(SQL_CODE_TIMESTAMP)),
+        ]
+    })
+}
 
-/// Connection-independent info lookup. All arms use `_conn` nowhere,
-/// so this can be called from unit tests without a live Trino connection.
-fn trino_get_info(info_type: InfoType) -> Result<InfoValue, TrinoError> {
+/// Info lookup shared by the connected and pre-connect paths.
+///
+/// Every arm below is connection-independent, so this can be called from unit
+/// tests without a live Trino connection. `conn` is threaded through solely for
+/// core's fall-through: the capability declarations `default_get_info` consults
+/// each take a connection now, so it answers the full set with `Some(conn)` and
+/// only what is knowable without a data source with `None`.
+fn trino_get_info(
+    conn: Option<&TrinoConnection>,
+    info_type: InfoType,
+) -> Result<InfoValue, TrinoError> {
     match info_type {
         InfoType::DriverName => return Ok(InfoValue::String("stackable-odbc-trino".into())),
         InfoType::DriverVer => {
@@ -446,7 +462,7 @@ fn trino_get_info(info_type: InfoType) -> Result<InfoValue, TrinoError> {
     // from `TrinoBackend::catalog_result_column_widths` on the type parameter,
     // so the `SQL_MAX_*_NAME_LEN` group cannot disagree with what this backend
     // reports everywhere else.
-    default_get_info::<TrinoBackend>(info_type).ok_or_else(|| TrinoError::NotImplemented {
+    default_get_info::<TrinoBackend>(conn, info_type).ok_or_else(|| TrinoError::NotImplemented {
         feature: format!("get_info({info_type:?})"),
     })
 }
@@ -459,7 +475,7 @@ pub(super) fn get_info(
     if info_type == InfoType::DbmsVer {
         return Ok(InfoValue::String(conn.dbms_version.clone()));
     }
-    trino_get_info(info_type)
+    trino_get_info(Some(conn), info_type)
 }
 
 pub(super) fn get_info_pre_connect(info_type: InfoType) -> Result<InfoValue, TrinoError> {
@@ -469,7 +485,7 @@ pub(super) fn get_info_pre_connect(info_type: InfoType) -> Result<InfoValue, Tri
     if info_type == InfoType::DbmsVer {
         return Ok(InfoValue::String(String::new()));
     }
-    trino_get_info(info_type)
+    trino_get_info(None, info_type)
 }
 
 /// Trino releases at which SQL-92 features this driver reports became available.
@@ -662,6 +678,24 @@ pub(crate) const TRINO_RESERVED_KEYWORDS: &[&str] = &[
     "WHERE",
     "WITH",
 ];
+
+/// [`TRINO_RESERVED_KEYWORDS`] in the `Cow` form [`Backend::keywords`] returns.
+///
+/// The const above stays a plain `&[&str]` so the list itself remains readable;
+/// wrapping each of the 83 entries in `Cow::Borrowed` at the literal would
+/// bury it. The lift is done once behind a `OnceLock` rather than per call
+/// because `SQL_KEYWORDS` is one of the info types BI tools query on every
+/// connect.
+pub(super) fn reserved_keywords() -> &'static [Cow<'static, str>] {
+    static KEYWORDS: OnceLock<Vec<Cow<'static, str>>> = OnceLock::new();
+    KEYWORDS.get_or_init(|| {
+        TRINO_RESERVED_KEYWORDS
+            .iter()
+            .copied()
+            .map(Cow::Borrowed)
+            .collect()
+    })
+}
 
 /// What the `SQL_*_FUNCTIONS` bitmaps mean here.
 ///
@@ -863,7 +897,7 @@ pub(super) fn get_info_raw(
         SQL_DATABASE_NAME => Some(Ok(InfoValue::String(
             conn.catalog.clone().unwrap_or_default(),
         ))),
-        _ => common_get_info_raw::<TrinoBackend>(info_type).map(Ok),
+        _ => common_get_info_raw::<TrinoBackend>(Some(conn), info_type).map(Ok),
     }
 }
 
@@ -1028,13 +1062,13 @@ pub(super) fn get_functions() -> &'static [FunctionId] {
 }
 
 pub(super) fn get_type_info() -> &'static [TypeInfoRow] {
-    TRINO_TYPE_INFO
+    trino_type_info()
 }
 
 /// Bare, uppercase data-source-dependent type name for a column, shared by
 /// `SQL_DESC_TYPE_NAME` (`SQLColAttributeW`, via `execute.rs`) and
 /// `SQLColumns.TYPE_NAME` (`metadata.rs`), so the two never disagree, and so
-/// that name always matches a row in [`TRINO_TYPE_INFO`] (the same table
+/// that name always matches a row in [`trino_type_info`] (the same table
 /// `SQLGetTypeInfo` returns via [`get_type_info`]).
 ///
 /// Spec (`SQL_DESC_TYPE_NAME`): "Data source-dependent data type name; for
@@ -1057,7 +1091,7 @@ pub(super) fn get_type_info() -> &'static [TypeInfoRow] {
 /// WITH TIME ZONE`): a reverse lookup from `sql_type` alone cannot recover
 /// which one a column actually is, only the native string can. When parsing
 /// fails, the function falls back to a deliberately chosen canonical name
-/// for `sql_type`, rather than "whichever `TRINO_TYPE_INFO` row happens to sort first under
+/// for `sql_type`, rather than "whichever `trino_type_info` row happens to sort first under
 /// this DATA_TYPE" (which would be `INTERVAL DAY TO SECOND`, an alphabetical
 /// accident of that table's required DATA_TYPE/TYPE_NAME sort order (see
 /// its doc comment), misnaming every compound type: ARRAY, MAP, ROW,
@@ -1122,7 +1156,7 @@ mod tests {
             SqlDataType::DATE,
         ];
 
-        for row in TRINO_TYPE_INFO {
+        for row in trino_type_info() {
             if !BACKEND_INDEPENDENT.contains(&row.data_type) {
                 continue;
             }
@@ -1245,10 +1279,18 @@ mod tests {
         (InfoType::StaticCursorAttributes2,       Expected::U32(0)),
     ];
 
+    /// Asserted on the *connected* path. Several of these answers come from
+    /// capability declarations that now take a `&TrinoConnection`, so
+    /// `default_get_info` declines them without one and core substitutes its
+    /// benign pre-connect default — which is what
+    /// `get_info_every_named_info_type_has_the_declared_shape_pre_connect`
+    /// covers. This table is about the values the driver reports to a connected
+    /// application.
     #[test]
     fn get_info_snapshot() {
+        let conn = crate::backend::disconnected_trino_conn();
         for (info_type, expected) in EXPECTED {
-            let actual = trino_get_info(*info_type)
+            let actual = trino_get_info(Some(&conn), *info_type)
                 .unwrap_or_else(|e| panic!("get_info returned error for {info_type:?}: {e:?}"));
             match (expected, &actual) {
                 (Expected::Str(s), InfoValue::String(v)) => {
@@ -1270,7 +1312,7 @@ mod tests {
     /// version. Assert the spec's shape instead.
     #[test]
     fn driver_ver_is_well_formed() {
-        let InfoValue::String(v) = trino_get_info(InfoType::DriverVer).unwrap() else {
+        let InfoValue::String(v) = trino_get_info(None, InfoType::DriverVer).unwrap() else {
             panic!("expected String for DriverVer");
         };
         let parts: Vec<&str> = v.split('.').collect();
@@ -1308,7 +1350,9 @@ mod tests {
             TrinoTypeName::assert_all_variants_listed(ty);
             let reported = ty.sql_type();
             assert!(
-                TRINO_TYPE_INFO.iter().any(|row| row.data_type == reported),
+                trino_type_info()
+                    .iter()
+                    .any(|row| row.data_type == reported),
                 "TrinoTypeName::{ty:?} is reported as {reported:?}, which has no \
                  SQLGetTypeInfo row"
             );
@@ -1326,7 +1370,9 @@ mod tests {
         for decl in ["ipaddress", "array(integer)", "row(x integer, y varchar)"] {
             let reported = crate::type_conversion::trino_type_name_to_sql_type(decl);
             assert!(
-                TRINO_TYPE_INFO.iter().any(|row| row.data_type == reported),
+                trino_type_info()
+                    .iter()
+                    .any(|row| row.data_type == reported),
                 "declared type {decl:?} is reported as {reported:?}, \
                  which has no SQLGetTypeInfo row"
             );
@@ -1399,7 +1445,7 @@ mod tests {
                 "trino_bare_type_name({native:?}, {sql_type:?}) returned an unexpected name"
             );
             assert!(
-                TRINO_TYPE_INFO
+                trino_type_info()
                     .iter()
                     .any(|row| row.type_name == name && row.data_type == sql_type),
                 "trino_bare_type_name({native:?}, {sql_type:?}) returned {name:?}, which is \
@@ -1411,10 +1457,10 @@ mod tests {
     #[test]
     fn type_info_rows_have_unique_data_types_per_name() {
         let mut seen = std::collections::HashSet::new();
-        for row in TRINO_TYPE_INFO {
+        for row in trino_type_info() {
             assert!(
-                seen.insert(row.type_name),
-                "duplicate type_name in TRINO_TYPE_INFO: {}",
+                seen.insert(row.type_name.as_ref()),
+                "duplicate type_name in trino_type_info(): {}",
                 row.type_name
             );
         }
@@ -1438,7 +1484,7 @@ mod tests {
             "INTERVAL YEAR TO MONTH",
         ] {
             assert!(
-                TRINO_TYPE_INFO.iter().any(|row| row.type_name == name),
+                trino_type_info().iter().any(|row| row.type_name == name),
                 "missing SQLGetTypeInfo row for {name:?}"
             );
         }
@@ -1449,7 +1495,7 @@ mod tests {
         // Inverse of `every_reportable_type_has_a_type_info_row` above: that
         // test guards that every `TrinoTypeName` variant maps to *some* row;
         // this one guards the opposite direction: that every
-        // `TRINO_TYPE_INFO` row's TYPE_NAME can actually be *produced* by
+        // `trino_type_info` row's TYPE_NAME can actually be *produced* by
         // `trino_bare_type_name` for a real column, not merely advertised in
         // the catalog. A row that fails this check reintroduces the interval
         // bug: an application enumerating SQLGetTypeInfo would see a type
@@ -1467,22 +1513,22 @@ mod tests {
         // Exceptions: SQL_CHAR (1) and SQL_VARCHAR (12) are ANSI-alias rows
         // present *only* so the Windows DM/pyodbc can find a match when
         // querying `SQLGetTypeInfo` by those legacy ANSI type codes (see
-        // their own doc comments in `TRINO_TYPE_INFO` above).
+        // their own doc comments in `trino_type_info` above).
         // `trino_bare_type_name` never returns "SQL_CHAR"/"SQL_VARCHAR" for
         // any real column: every text-affinity column resolves to "CHAR"
         // or "VARCHAR" (the WCHAR-based rows) instead, so these two names
         // are unreachable by design, not by omission.
         const DM_COMPAT_ONLY: &[&str] = &["SQL_CHAR", "SQL_VARCHAR"];
 
-        for row in TRINO_TYPE_INFO {
-            if DM_COMPAT_ONLY.contains(&row.type_name) {
+        for row in trino_type_info() {
+            if DM_COMPAT_ONLY.contains(&row.type_name.as_ref()) {
                 continue;
             }
             let native = row.type_name.to_lowercase();
             let produced = trino_bare_type_name(&native, row.data_type);
             assert_eq!(
                 produced, row.type_name,
-                "TRINO_TYPE_INFO row {:?} (DATA_TYPE={:?}) is not reachable via \
+                "trino_type_info() row {:?} (DATA_TYPE={:?}) is not reachable via \
                  trino_bare_type_name (got {produced:?} instead) — no real column can \
                  ever be reported under this TYPE_NAME",
                 row.type_name, row.data_type
@@ -1536,7 +1582,7 @@ mod tests {
     }
 
     fn find_row(type_name: &str) -> &'static TypeInfoRow {
-        TRINO_TYPE_INFO
+        trino_type_info()
             .iter()
             .find(|row| row.type_name == type_name)
             .unwrap_or_else(|| panic!("no SQLGetTypeInfo row for {type_name:?}"))
@@ -1549,11 +1595,11 @@ mod tests {
         // extension types), so the comparison must not treat it as unsigned.
         // This walks adjacent pairs rather than asserting a fixed sequence,
         // so it keeps holding as rows are added or reordered.
-        for pair in TRINO_TYPE_INFO.windows(2) {
+        for pair in trino_type_info().windows(2) {
             let (prev, next) = (&pair[0], &pair[1]);
             assert!(
                 prev.data_type.0 <= next.data_type.0,
-                "TRINO_TYPE_INFO not sorted by DATA_TYPE: {:?} (DATA_TYPE={}) \
+                "trino_type_info() not sorted by DATA_TYPE: {:?} (DATA_TYPE={}) \
                  appears before {:?} (DATA_TYPE={})",
                 prev.type_name,
                 prev.data_type.0,
@@ -1954,14 +2000,16 @@ mod tests {
         use stackable_odbc_core::backend::Backend;
         use stackable_odbc_core::types::ODBC_RESERVED_KEYWORDS;
 
-        let reported: Vec<&str> = TrinoBackend::keywords()
+        let conn = crate::backend::disconnected_trino_conn();
+        let keywords = TrinoBackend::keywords(&conn);
+        let reported: Vec<&str> = keywords
             .iter()
+            .map(Cow::as_ref)
             .filter(|k| {
                 !ODBC_RESERVED_KEYWORDS
                     .iter()
                     .any(|r| r.eq_ignore_ascii_case(k))
             })
-            .copied()
             .collect();
 
         assert_eq!(

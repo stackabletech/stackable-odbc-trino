@@ -18,7 +18,7 @@
 //! `cargo test -- --ignored backend`
 
 use std::ffi::c_void;
-use std::sync::{Arc, OnceLock};
+use std::sync::OnceLock;
 
 use serial_test::serial;
 use stackable_odbc_core::conformance::{
@@ -37,13 +37,12 @@ use stackable_odbc_core::types::{
     SQL_LOCK_NO_CHANGE, SQL_NTS, SQL_NULL_DATA, SQL_POSITION, SQL_QUICK, SqlDataType, SqlReturn,
     StatementAttribute, expected_kind,
 };
-use trino_rust_client::ClientBuilder;
 
 use crate::backend::info::{
     TRINO_AGGREGATE_FUNCTIONS, TRINO_NUMERIC_FUNCTIONS, TRINO_SQL92_VALUE_EXPRESSIONS,
     TRINO_STRING_FUNCTIONS, TRINO_SYSTEM_FUNCTIONS, TRINO_TIMEDATE_FUNCTIONS,
 };
-use crate::backend::{TrinoBackend, TrinoConnection};
+use crate::backend::{TrinoBackend, disconnected_trino_conn};
 
 const CONN_STR: &str =
     "Host=localhost;Port=8080;User=admin;Password=admin;Protocol=http;Catalog=tpcds";
@@ -202,34 +201,6 @@ unsafe fn cleanup(env: *mut c_void, conn: *mut c_void, stmt: *mut c_void) {
 // synchronously (see TrinoBackend::connect in backend.rs, which performs no
 // I/O until the separate validate_connection call), so this test needs no
 // live server and is not `#[ignore]`d like the rest of this file.
-
-/// Builds a `TrinoConnection` that performs no network I/O: `ClientBuilder::build()`
-/// only assembles a `reqwest::Client` (URL parsing, timeout config, etc.), and
-/// building a `tokio::runtime::Runtime` is a local operation. Neither talks to a
-/// server -- validation only happens in the separate `validate_connection` call
-/// that `TrinoBackend::connect` makes after building the connection.
-fn disconnected_trino_conn() -> TrinoConnection {
-    let client = ClientBuilder::new("test", "localhost")
-        .port(8080)
-        .build()
-        .expect("ClientBuilder::build performs no I/O and cannot fail here");
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("Runtime::build performs no I/O and cannot fail here");
-    TrinoConnection {
-        runtime: Arc::new(runtime),
-        client: Arc::new(client),
-        // No live server was contacted, so no version was probed either --
-        // this mirrors the "probe failed" state `TrinoBackend::connect` would
-        // leave behind if `fetch_server_version` could not reach a coordinator.
-        dbms_version: String::new(),
-        server_major: 0,
-        // No `Catalog` key was supplied, which is the SQL_DATABASE_NAME
-        // "not available" case.
-        catalog: None,
-    }
-}
 
 /// Allocates env + conn handles and injects a network-free `TrinoConnection`
 /// directly into the connection handle, bypassing `TrinoBackend::connect`

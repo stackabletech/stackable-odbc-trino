@@ -19,6 +19,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- `SQLCancel` can now interrupt a query from a thread other than the one
+  executing it, which is the case the ODBC spec singles out and the one that
+  matters to a BI tool with a cancel button. `stackable-odbc-core` replaced
+  `Backend::cancel(&mut Self::Statement)` — a signature that could not be
+  satisfied while another thread held the statement — with a `CancelToken` built
+  once per statement from the connection. This driver's token carries the Trino
+  client, the runtime and the query id, which `SQLExecDirect`/`SQLExecute`
+  publish as soon as the coordinator accepts the query, so a cancel arriving
+  while the query is still queued or planning now reaches it.
+
+  A statement whose query was cancelled reports `SQL_NO_DATA` from the next
+  `SQLFetch`, as before. The six catalog functions remain uncancellable: four
+  perform no I/O, and `SQLTables`/`SQLColumns` page inside the Trino client,
+  which never surfaces the query id a cancel needs.
+- `SQLGetInfo` called before `SQLDriverConnectW` no longer answers the info
+  types derived from this driver's capability declarations, and returns
+  `stackable-odbc-core`'s benign default for them instead. Those declarations
+  now take a connection — `SQLGetInfo` is a per-connection call, so what a data
+  source can do is a property of the connection — and core skips the ones that
+  need one when there is no connection yet rather than answering from an
+  invented value.
+
+  Twenty-two of this driver's documented answers are affected:
+  `SQL_SEARCH_PATTERN_ESCAPE`, `SQL_IDENTIFIER_QUOTE_CHAR`, `SQL_CATALOG_TERM`,
+  `SQL_SCHEMA_TERM`, `SQL_CATALOG_NAME_SEPARATOR`, `SQL_COLUMN_ALIAS`,
+  `SQL_ORDER_BY_COLUMNS_IN_SELECT`, `SQL_CATALOG_NAME`,
+  `SQL_DATA_SOURCE_READ_ONLY`, `SQL_ACCESSIBLE_TABLES`, `SQL_GROUP_BY`,
+  `SQL_CONCAT_NULL_BEHAVIOR`, `SQL_IDENTIFIER_CASE`, `SQL_NULL_COLLATION`,
+  `SQL_SUBQUERIES`, `SQL_UNION`, `SQL_DEFAULT_TXN_ISOLATION`,
+  `SQL_CONVERT_FUNCTIONS`, `SQL_TXN_ISOLATION_OPTION`, `SQL_ALTER_TABLE`,
+  `SQL_OUTER_JOIN_CAPABILITIES` and `SQL_SQL_CONFORMANCE`.
+
+  The connected answers are unchanged, and no call that previously succeeded
+  now returns `SQL_ERROR` — core substitutes a default rather than failing, so
+  an application that queries these before connecting reads a conservative
+  value instead of Trino's.
+- `SQLGetTypeInfo` now requires an open connection, inherited from core: the
+  type list belongs to the data source.
 - `SQL_CURSOR_COMMIT_BEHAVIOR` now reports `SQL_CB_PRESERVE` instead of
   `SQL_CB_DELETE`. `stackable-odbc-core` derives it from
   `Backend::cursor_commit_behavior` rather than hard-coding it, and this driver

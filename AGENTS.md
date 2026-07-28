@@ -146,11 +146,63 @@ ColumnDescriptor::new(name, sql_type)
 EscapeDialect::ansi_default().with_identifier_quotes(&[('"', '"')])
 ```
 
-`TypeInfoRow`'s constructor and builders are all `const`, because
-`Backend::get_type_info` returns `&'static [TypeInfoRow]` and `TRINO_TYPE_INFO`
-is a `static`. Set only what differs from the default — the omitted builders are
-the row claiming the least-committal value, which is why all 22 rows leave
-`nullable` and `searchable` alone.
+`TypeInfoRow`'s string-setting builders (`new`, `with_literal_affixes`,
+`with_create_params`, `with_local_type_name`) take `impl Into<Cow<'static,
+str>>`, and `Into` cannot run in a const context, so those four are not `const`.
+The rows therefore live in `info::trino_type_info()`, built once behind a
+`OnceLock`, rather than in a `static`. The remaining builders touch no string
+field and stay `const`.
+
+Set only what differs from the default — the omitted builders are the row
+claiming the least-committal value, which is why all 22 rows leave `nullable`
+and `searchable` alone. `nullable` is a `Nullable`, not a raw `i16`, matching
+`ColumnDescriptor::nullable`.
+
+### Capability declarations take a connection
+
+The 25 required capability methods, plus `get_type_info` and `escape_dialect`,
+take `&Self::Connection`: `SQLGetInfo` is a per-connection call, so what the
+data source can do belongs to the connection rather than to the driver binary.
+This driver answers all of them without reading it — every value is a fact about
+Trino-the-engine or about this driver's own SQL generation — but
+`TrinoConnection::server_major` is there for the ones that should eventually
+gate on the coordinator's version.
+
+`cursor_commit_behavior`, `cursor_rollback_behavior` and
+`catalog_result_column_widths` deliberately keep no connection, because they are
+consumed on paths that have none.
+
+Pre-connect, core passes `None` and skips every declaration that needs a
+connection, substituting its own benign default — so a value this driver reports
+when connected is not necessarily what `SQLGetInfo` returns before
+`SQLDriverConnectW`. `info::get_info_snapshot` asserts the connected answers;
+`get_info_every_named_info_type_has_the_declared_shape_pre_connect` covers the
+other side.
+
+### Cancellation
+
+`Backend::cancel` receives a `TrinoCancelToken`, never a statement: `SQLCancel`
+may run on a thread holding no lock on the connection while another thread
+executes on the same statement, and a `&mut Self::Statement` cannot exist under
+that constraint.
+
+The token carries the client and runtime, captured from the connection when core
+builds it, plus a shared `CancelState`. Trino names a query only once the
+coordinator accepts it, so `exec_direct` fills the state's `query_id` slot as
+soon as the submit returns — before the metadata-polling loop, since a queued
+query is exactly when an application reaches for `SQLCancel`.
+
+`CancelState::cancelled` is the return path. A cancelled query cannot be paged
+any further: `get_next` fails after a server-side cancel and leaves the pooled
+TCP socket carrying residual bytes, which surfaces later as an unrelated query
+failing. `fetch` and `close_cursor` read the flag and stop touching `next_uri`.
+Core never replaces a statement's token, including across a re-execute, so
+`begin_query` clears the flag as well as setting the id.
+
+The six catalog functions take the token but record nothing in it, so
+`SQLCancel` cannot interrupt them. Four do no I/O at all; `tables` and `columns`
+go through `query_all_rows` → `Client::get_all`, which pages to exhaustion
+inside the client and never surfaces a query id.
 
 ### Type cast safety
 

@@ -1606,7 +1606,7 @@ mod tests {
 
     // --- TrinoTypeName::parse: INTERVAL types ---
     //
-    // `TRINO_TYPE_INFO` (backend/info.rs) advertises
+    // `trino_type_info` (backend/info.rs) advertises
     // "INTERVAL DAY TO SECOND"/"INTERVAL YEAR TO MONTH" rows. Without a
     // `TrinoTypeName::parse` variant for either, no real interval column
     // could be reported under the name its own SQLGetTypeInfo row

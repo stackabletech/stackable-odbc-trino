@@ -3,6 +3,7 @@
 //! rows back through the shared `stackable-odbc-core` fetch path.
 
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::Instant;
 
 use stackable_odbc_core::backend::StatementBackend;
@@ -13,7 +14,9 @@ use stackable_odbc_core::types::{
 use trino_rust_client::{Row, TrinoTy};
 
 use super::info::trino_bare_type_name;
-use super::{TrinoConnection, TrinoError, TrinoStatement, log_page_stats, map_trino_error};
+use super::{
+    TrinoCancelToken, TrinoConnection, TrinoError, TrinoStatement, log_page_stats, map_trino_error,
+};
 use crate::type_conversion::{
     TrinoTypeName, json_to_column_value, trino_ty_precision, trino_ty_scale, trino_ty_to_sql_type,
     type_name_precision, type_name_scale,
@@ -43,7 +46,11 @@ fn convert_rows(
         .collect()
 }
 
-pub(super) fn exec_direct(conn: &TrinoConnection, sql: &str) -> Result<TrinoStatement, TrinoError> {
+pub(super) fn exec_direct(
+    conn: &TrinoConnection,
+    cancel: &TrinoCancelToken,
+    sql: &str,
+) -> Result<TrinoStatement, TrinoError> {
     tracing::debug!(%sql, "TrinoBackend::exec_direct");
 
     // Submit the query to Trino.
@@ -55,6 +62,13 @@ pub(super) fn exec_direct(conn: &TrinoConnection, sql: &str) -> Result<TrinoStat
             .map_err(map_trino_error)?
     };
     let submit_elapsed = submit_start.elapsed();
+
+    // Publish the id before polling for metadata rather than after. A query
+    // that is queued or planning emits metadata-less pages for as long as the
+    // coordinator is busy, and that wait is precisely when an application
+    // reaches for `SQLCancel`; recording the id only once the loop below breaks
+    // would leave the whole wait uncancellable.
+    cancel.state.begin_query(page.id.clone());
 
     log_page_stats(&page.stats, 1);
 
@@ -188,6 +202,7 @@ pub(super) fn exec_direct(conn: &TrinoConnection, sql: &str) -> Result<TrinoStat
         query_id: Some(query_id),
         client: Some(Arc::clone(&conn.client)),
         runtime: Some(Arc::clone(&conn.runtime)),
+        cancel_state: Some(Arc::clone(&cancel.state)),
         page_count,
         empty_page_count,
         total_rows_fetched,
@@ -196,7 +211,16 @@ pub(super) fn exec_direct(conn: &TrinoConnection, sql: &str) -> Result<TrinoStat
     })
 }
 
-pub(super) fn prepare(_conn: &TrinoConnection, sql: &str) -> Result<TrinoStatement, TrinoError> {
+/// Store the SQL for a later `SQLExecute`.
+///
+/// The cancel token is untouched: preparing runs no query on the coordinator,
+/// so there is nothing yet for `SQLCancel` to name. `execute` fills the token's
+/// slot when it submits.
+pub(super) fn prepare(
+    _conn: &TrinoConnection,
+    _cancel: &TrinoCancelToken,
+    sql: &str,
+) -> Result<TrinoStatement, TrinoError> {
     tracing::debug!(sql, "TrinoBackend::prepare");
     Ok(TrinoStatement {
         pending_sql: Some(sql.to_string()),
@@ -209,6 +233,7 @@ pub(super) fn prepare(_conn: &TrinoConnection, sql: &str) -> Result<TrinoStateme
         query_id: None,
         client: None,
         runtime: None,
+        cancel_state: None,
         page_count: 0,
         empty_page_count: 0,
         total_rows_fetched: 0,
@@ -219,6 +244,7 @@ pub(super) fn prepare(_conn: &TrinoConnection, sql: &str) -> Result<TrinoStateme
 
 pub(super) fn execute(
     conn: &TrinoConnection,
+    cancel: &TrinoCancelToken,
     stmt: &mut TrinoStatement,
     params: &[ColumnValue],
 ) -> Result<ExecuteOutcome, TrinoError> {
@@ -237,7 +263,7 @@ pub(super) fn execute(
     let sql = super::params::interpolate_params(&template, params)?;
     tracing::debug!(sql, "TrinoBackend::execute");
 
-    let mut result = exec_direct(conn, &sql)?;
+    let mut result = exec_direct(conn, cancel, &sql)?;
     // Swap into the existing statement handle. The old `stmt` fields are moved
     // into `result` which is then dropped; its Drop impl will drain any
     // residual pages from the *previous* query.
@@ -250,54 +276,71 @@ pub(super) fn execute(
 }
 
 /// Cancel a running Trino query via the REST API.
-pub(super) fn cancel(stmt: &mut TrinoStatement) -> Result<(), TrinoError> {
-    let Some(ref query_id) = stmt.query_id else {
+///
+/// Called by `SQLCancel`, possibly from a thread holding no lock on the
+/// connection while another thread executes on the same statement. Everything
+/// this needs is therefore reached through the token: the statement itself may
+/// be under `&mut` on the other thread and is not touchable from here.
+pub(super) fn cancel(token: &TrinoCancelToken) -> Result<(), TrinoError> {
+    // Taken, not read: a second SQLCancel for the same query has nothing left
+    // to do, and Trino answers a DELETE for an already-cancelled query with an
+    // error that is not worth surfacing.
+    let query_id = match token.state.query_id.lock() {
+        Ok(mut slot) => slot.take(),
+        // A poisoned lock is an internal invariant violation rather than a
+        // client failure, so it is hand-built rather than routed through
+        // `map_trino_error` (see AGENTS.md), and built as an `OdbcError` so its
+        // SQLSTATE and message reach `SQLGetDiagRec` unchanged -- a
+        // `TrinoError::Odbc` is unwrapped, not re-mapped.
+        Err(_) => {
+            return Err(TrinoError::from(OdbcError::general(
+                "cancel state was poisoned by an earlier panic",
+                SqlState::general_error(),
+            )));
+        }
+    };
+
+    let Some(query_id) = query_id else {
         tracing::debug!("SQLCancel: no query ID available (query may be finished)");
         return Ok(());
     };
-    // These are internal invariant violations, not client failures, so they are
-    // hand-built rather than routed through `map_trino_error` (see AGENTS.md).
-    // They are built as `OdbcError` and converted, rather than as a
-    // `TrinoError` variant, because that carries the exact SQLSTATE and message
-    // through unchanged -- `TrinoError::Odbc` is unwrapped, not re-mapped.
-    let client = stmt.client.as_ref().ok_or_else(|| {
-        TrinoError::from(OdbcError::general(
-            "no client available for cancel",
-            SqlState::general_error(),
-        ))
-    })?;
-    let runtime = stmt.runtime.as_ref().ok_or_else(|| {
-        TrinoError::from(OdbcError::general(
-            "no runtime available for cancel",
-            SqlState::general_error(),
-        ))
-    })?;
 
     tracing::debug!(query_id = %query_id, "cancelling Trino query");
 
-    runtime
-        .block_on(client.cancel(query_id))
+    token
+        .runtime
+        .block_on(token.client.cancel(&query_id))
         .map_err(map_trino_error)?;
 
-    // The query is now cancelled server-side. Clear next_uri so that
-    // close_cursor (and Drop) do NOT try to poll get_next: after a
-    // server-side cancel, get_next will fail and leave the pooled TCP
-    // socket with residual bytes, corrupting subsequent queries on the
-    // same reqwest connection pool.
+    // Publish the cancellation so `fetch`, `close_cursor` and `Drop` stay off
+    // `next_uri`: after a server-side cancel, `get_next` fails and leaves the
+    // pooled TCP socket carrying residual bytes, corrupting subsequent queries
+    // that reuse it from the same reqwest pool.
     //
-    // This means the pooled connection may have unread response bytes.
-    // Callers that share a connection pool across queries should be
-    // aware that a cancel may leave a dirty socket in the pool. The
-    // socket will eventually be evicted by reqwest's idle timeout (90s).
-    stmt.next_uri = None;
-    stmt.query_id = None;
-    stmt.batch.clear();
-    stmt.batch_cursor = 0;
+    // The flag is set only once the DELETE has succeeded. A failed cancel means
+    // the query is still running server-side, so the result set is still
+    // legitimately drainable and suppressing the drain would strand it.
+    //
+    // The pooled connection may still carry unread response bytes for the
+    // request that was in flight when the cancel landed. reqwest evicts such a
+    // socket on its idle timeout (90s).
+    token.state.cancelled.store(true, Ordering::SeqCst);
 
     Ok(())
 }
 
 impl TrinoStatement {
+    /// Whether a `SQLCancel` on another thread has already stopped this
+    /// statement's query server-side.
+    ///
+    /// `false` for a statement built without a cancel state — the in-memory
+    /// catalog results, which hold no `next_uri` and so have nothing to stop.
+    fn is_cancelled(&self) -> bool {
+        self.cancel_state
+            .as_ref()
+            .is_some_and(|state| state.is_cancelled())
+    }
+
     /// Discard the result set after a failed page fetch and return `err`.
     ///
     /// The rows of the last successfully fetched page are still buffered when a
@@ -338,6 +381,17 @@ impl StatementBackend for TrinoStatement {
         // empty page exhausts the stack, and a stack overflow aborts the host
         // process rather than unwinding into panic_safe.
         loop {
+            // A concurrent SQLCancel has already stopped this query
+            // server-side. Discard what is left rather than serving rows from a
+            // result set the application asked to abandon, and above all do not
+            // poll `next_uri` -- see `cancel` for why that dirties the socket.
+            if self.is_cancelled() {
+                self.batch.clear();
+                self.batch_cursor = 0;
+                self.next_uri = None;
+                return Ok(FetchResult::NoData);
+            }
+
             // Try to advance within the current batch.
             if self.batch_cursor < self.batch.len() {
                 self.batch_cursor += 1;
@@ -493,8 +547,14 @@ impl StatementBackend for TrinoStatement {
         // connection is cleanly returned to reqwest's connection pool.
         // Without this, residual bytes on the socket corrupt subsequent
         // queries that reuse the pooled connection.
+        //
+        // Skipped entirely once the query has been cancelled server-side:
+        // `get_next` then fails and leaves exactly the residual bytes this
+        // drain exists to avoid.
         let mut drain_failure = None;
-        if let (Some(client), Some(runtime)) = (&self.client, &self.runtime) {
+        if self.is_cancelled() {
+            self.next_uri = None;
+        } else if let (Some(client), Some(runtime)) = (&self.client, &self.runtime) {
             let mut next = self.next_uri.take();
             while let Some(url) = next {
                 match runtime.block_on(client.get_next::<trino_rust_client::Row>(&url)) {

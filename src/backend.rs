@@ -4,7 +4,9 @@
 //! Statement execution, catalog metadata, `SQLGetInfo`, and parameter binding
 //! live in the submodules.
 
-use std::sync::Arc;
+use std::borrow::Cow;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 use snafu::Snafu;
 use stackable_odbc_core::{
@@ -302,6 +304,109 @@ pub struct TrinoConnection {
     pub catalog: Option<String>,
 }
 
+/// The state a `SQLCancel` on one thread and the executing statement on
+/// another both reach.
+///
+/// Held behind an `Arc` by both [`TrinoCancelToken`] and the
+/// [`TrinoStatement`] the token's statement produced, which is what lets
+/// `cancel` communicate with a statement it has no reference to.
+#[derive(Debug, Default)]
+pub(crate) struct CancelState {
+    /// The Trino query id of the work currently in flight, or `None` when
+    /// nothing cancellable is running.
+    ///
+    /// Trino only names a query once the coordinator has accepted it, so this
+    /// is empty for the duration of the submitting request. A `SQLCancel`
+    /// landing in that window finds nothing to cancel and succeeds, which is
+    /// what the spec asks for when there is no processing to interrupt.
+    query_id: Mutex<Option<String>>,
+    /// Set once a query has been cancelled server-side, and read by the fetch
+    /// and teardown paths to keep them off `next_uri`.
+    ///
+    /// After a server-side cancel, polling `get_next` fails and leaves the
+    /// pooled TCP socket carrying residual bytes, which surfaces later as an
+    /// unrelated query failing on the same reqwest pool. Before core moved
+    /// cancellation onto a token, `cancel` held `&mut TrinoStatement` and
+    /// cleared `next_uri` directly; it no longer has one, so the statement has
+    /// to observe the cancellation itself.
+    cancelled: AtomicBool,
+}
+
+impl CancelState {
+    /// Record the query the statement just submitted, and clear any earlier
+    /// cancellation.
+    ///
+    /// Called at the point a statement-producing call learns its query id. The
+    /// reset matters because core builds one token per *statement* and never
+    /// replaces it: a re-execute of the same prepared handle reuses the token
+    /// that a previous `SQLCancel` may already have marked.
+    pub(crate) fn begin_query(&self, query_id: String) {
+        self.cancelled.store(false, Ordering::SeqCst);
+        match self.query_id.lock() {
+            Ok(mut slot) => *slot = Some(query_id),
+            // A poisoned lock means a panic while the slot was held. Losing the
+            // id costs cancellability for this query; it must not also fail the
+            // query, which is running perfectly well.
+            Err(_) => {
+                tracing::warn!("cancel state was poisoned; this query will not be cancellable")
+            }
+        }
+    }
+
+    /// Whether the statement's query has been cancelled server-side.
+    pub(crate) fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::SeqCst)
+    }
+}
+
+/// The value [`Backend::cancel`] receives, and the only handle it gets on the
+/// query it is asked to interrupt.
+///
+/// The client and runtime are captured from the connection at construction
+/// rather than resolved inside `cancel`, which is the rule
+/// [`Backend::cancel_token`] states: MariaDB's ODBC-401 assembled its cancel
+/// channel lazily, after the originating connection's TLS settings were gone,
+/// and silently failed to cancel encrypted connections.
+pub struct TrinoCancelToken {
+    client: Arc<Client>,
+    runtime: Arc<tokio::runtime::Runtime>,
+    state: Arc<CancelState>,
+}
+
+/// Builds a `TrinoConnection` that performs no network I/O.
+///
+/// `ClientBuilder::build` only assembles a `reqwest::Client` (URL parsing,
+/// timeout config), and building a `tokio::runtime::Runtime` is a local
+/// operation; neither talks to a server. Validation happens in the separate
+/// `validate_connection` call [`TrinoBackend::connect`] makes afterwards.
+///
+/// Every capability declaration takes a `&TrinoConnection` now, so the offline
+/// tests that assert what this driver reports need one. They assert values that
+/// do not depend on the coordinator, which is exactly what this stands in for.
+#[cfg(test)]
+pub(crate) fn disconnected_trino_conn() -> TrinoConnection {
+    let client = ClientBuilder::new("test", "localhost")
+        .port(8080)
+        .build()
+        .expect("ClientBuilder::build performs no I/O and cannot fail here");
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("Runtime::build performs no I/O and cannot fail here");
+    TrinoConnection {
+        runtime: Arc::new(runtime),
+        client: Arc::new(client),
+        // No live server was contacted, so no version was probed either --
+        // this mirrors the "probe failed" state `TrinoBackend::connect` would
+        // leave behind if `fetch_server_version` could not reach a coordinator.
+        dbms_version: String::new(),
+        server_major: 0,
+        // No `Catalog` key was supplied, which is the SQL_DATABASE_NAME
+        // "not available" case.
+        catalog: None,
+    }
+}
+
 pub struct TrinoStatement {
     /// SQL stored by SQLPrepare, consumed by SQLExecute.
     pending_sql: Option<String>,
@@ -325,6 +430,12 @@ pub struct TrinoStatement {
     client: Option<Arc<Client>>,
     /// Shared reference to the tokio runtime (for block_on in fetch).
     runtime: Option<Arc<tokio::runtime::Runtime>>,
+    /// The half of the cancel token this statement can see.
+    ///
+    /// `None` for the statements built entirely in memory — the catalog
+    /// results and `tables_list_table_types` — which hold no `next_uri` and so
+    /// have nothing for a cancellation to stop.
+    pub(crate) cancel_state: Option<Arc<CancelState>>,
 
     // --- Profiling counters (always present; ~48 bytes, negligible overhead) ---
     /// Total number of Trino REST API pages fetched for this query.
@@ -482,6 +593,7 @@ fn resolve_auth(
 }
 
 impl Backend for TrinoBackend {
+    type CancelToken = TrinoCancelToken;
     type Connection = TrinoConnection;
     type Error = TrinoError;
     type Statement = TrinoStatement;
@@ -574,8 +686,12 @@ impl Backend for TrinoBackend {
         Ok(()) // runtime drops on its own
     }
 
-    fn browse_connect_attrs() -> &'static [&'static str] {
-        &["host", "port", "user"]
+    fn browse_connect_attrs() -> Cow<'static, [Cow<'static, str>]> {
+        Cow::Borrowed(&[
+            Cow::Borrowed("host"),
+            Cow::Borrowed("port"),
+            Cow::Borrowed("user"),
+        ])
     }
 
     /// This driver does not implement transactions, so every connection behaves
@@ -603,26 +719,48 @@ impl Backend for TrinoBackend {
         Ok(())
     }
 
-    fn cancel(stmt: &mut TrinoStatement) -> Result<(), TrinoError> {
-        execute::cancel(stmt)
+    /// Trino names a query only once the coordinator accepts it, so the token
+    /// is the empty shared slot [`Backend::cancel_token`] describes for exactly
+    /// that case: the client and runtime are captured here, and whichever
+    /// statement-producing call submits the query fills in the id.
+    fn cancel_token(conn: &TrinoConnection) -> TrinoCancelToken {
+        tracing::debug!("TrinoBackend::cancel_token");
+        TrinoCancelToken {
+            client: Arc::clone(&conn.client),
+            runtime: Arc::clone(&conn.runtime),
+            state: Arc::new(CancelState::default()),
+        }
+    }
+
+    fn cancel(token: &TrinoCancelToken) -> Result<(), TrinoError> {
+        execute::cancel(token)
     }
 
     // --- Delegations ---
 
-    fn exec_direct(conn: &TrinoConnection, sql: &str) -> Result<TrinoStatement, TrinoError> {
-        execute::exec_direct(conn, sql)
+    fn exec_direct(
+        conn: &TrinoConnection,
+        cancel: &TrinoCancelToken,
+        sql: &str,
+    ) -> Result<TrinoStatement, TrinoError> {
+        execute::exec_direct(conn, cancel, sql)
     }
 
-    fn prepare(conn: &TrinoConnection, sql: &str) -> Result<TrinoStatement, TrinoError> {
-        execute::prepare(conn, sql)
+    fn prepare(
+        conn: &TrinoConnection,
+        cancel: &TrinoCancelToken,
+        sql: &str,
+    ) -> Result<TrinoStatement, TrinoError> {
+        execute::prepare(conn, cancel, sql)
     }
 
     fn execute(
         conn: &TrinoConnection,
+        cancel: &TrinoCancelToken,
         stmt: &mut TrinoStatement,
         params: &[ColumnValue],
     ) -> Result<ExecuteOutcome, TrinoError> {
-        execute::execute(conn, stmt, params)
+        execute::execute(conn, cancel, stmt, params)
     }
 
     // --- Capability statements ---
@@ -637,19 +775,19 @@ impl Backend for TrinoBackend {
 
     /// Trino qualifies names as `catalog.schema.table`, and this driver's
     /// catalog functions query `information_schema` in a named catalog.
-    fn supports_catalogs() -> bool {
+    fn supports_catalogs(_conn: &TrinoConnection) -> bool {
         true
     }
 
-    fn supports_schemas() -> bool {
+    fn supports_schemas(_conn: &TrinoConnection) -> bool {
         true
     }
 
-    fn alter_table_support() -> u32 {
+    fn alter_table_support(_conn: &TrinoConnection) -> u32 {
         info::TRINO_ALTER_TABLE
     }
 
-    fn outer_join_capabilities() -> u32 {
+    fn outer_join_capabilities(_conn: &TrinoConnection) -> u32 {
         info::TRINO_OUTER_JOIN_CAPABILITIES
     }
 
@@ -657,7 +795,7 @@ impl Backend for TrinoBackend {
     /// and may contain columns that are not in it — `SELECT a, b ... GROUP BY a`
     /// fails with `EXPRESSION_NOT_AGGREGATE`, while `SELECT a ... GROUP BY a, b`
     /// succeeds. That is `SQL_GB_GROUP_BY_CONTAINS_SELECT` exactly.
-    fn group_by() -> u16 {
+    fn group_by(_conn: &TrinoConnection) -> u16 {
         SQL_GB_GROUP_BY_CONTAINS_SELECT
     }
 
@@ -667,13 +805,13 @@ impl Backend for TrinoBackend {
     /// this driver reported before, means the position follows `ASC`/`DESC`.
     ///
     /// <https://trino.io/docs/current/sql/select.html>
-    fn null_collation() -> u16 {
+    fn null_collation(_conn: &TrinoConnection) -> u16 {
         SQL_NC_END
     }
 
     /// Table correlation names are supported and unrestricted:
     /// `FROM (VALUES 1) AS x(a)` binds a name unrelated to the table's own.
-    fn correlation_name() -> u16 {
+    fn correlation_name(_conn: &TrinoConnection) -> u16 {
         SQL_CN_ANY
     }
 
@@ -687,9 +825,12 @@ impl Backend for TrinoBackend {
     /// `{:?}` on the `ConnectParams` handed to `connect` redact too.
     ///
     /// `Password` is core's own spec-defined keyword, redacted there by name.
-    fn sensitive_connect_keywords() -> &'static [&'static str] {
+    fn sensitive_connect_keywords() -> Cow<'static, [Cow<'static, str>]> {
         use types::connect_params::{PARAM_ACCESS_TOKEN, PARAM_TOKEN};
-        &[PARAM_ACCESS_TOKEN, PARAM_TOKEN]
+        Cow::Borrowed(&[
+            Cow::Borrowed(PARAM_ACCESS_TOKEN),
+            Cow::Borrowed(PARAM_TOKEN),
+        ])
     }
 
     /// Trino folds unquoted identifiers to lower case and stores them that
@@ -706,18 +847,18 @@ impl Backend for TrinoBackend {
     /// `common_get_info_raw`.
     ///
     /// <https://trino.io/docs/current/language/reserved.html>
-    fn identifier_case() -> u16 {
+    fn identifier_case(_conn: &TrinoConnection) -> u16 {
         SQL_IC_LOWER
     }
 
     /// `ALTER TABLE ... ADD COLUMN f integer NOT NULL` is accepted, so the
     /// `NOT NULL` column constraint is supported.
-    fn non_nullable_columns() -> u16 {
+    fn non_nullable_columns(_conn: &TrinoConnection) -> u16 {
         SQL_NNC_NON_NULL
     }
 
     /// `ORDER BY lower(s)` is accepted, not just bare column references.
-    fn expressions_in_order_by() -> bool {
+    fn expressions_in_order_by(_conn: &TrinoConnection) -> bool {
         true
     }
 
@@ -742,7 +883,7 @@ impl Backend for TrinoBackend {
     /// itself directs applications to read the general level here and "use the
     /// other information types to determine variations from the stated
     /// standards compliance level".
-    fn sql_conformance() -> u32 {
+    fn sql_conformance(_conn: &TrinoConnection) -> u32 {
         0
     }
 
@@ -755,11 +896,11 @@ impl Backend for TrinoBackend {
     /// billionths of a second; Trino's `date_add`/`date_diff` reject
     /// `nanosecond` and their finest unit is `millisecond`, which ODBC has no
     /// bit for. Claiming it would be a factor of a million out.
-    fn timedate_add_intervals() -> u32 {
+    fn timedate_add_intervals(_conn: &TrinoConnection) -> u32 {
         TRINO_TIMESTAMP_INTERVALS
     }
 
-    fn timedate_diff_intervals() -> u32 {
+    fn timedate_diff_intervals(_conn: &TrinoConnection) -> u32 {
         TRINO_TIMESTAMP_INTERVALS
     }
 
@@ -767,7 +908,7 @@ impl Backend for TrinoBackend {
     /// included — each of `= (SELECT ...)`, `= ANY (SELECT ...)`,
     /// `<= ALL (SELECT ...)`, `IN (SELECT ...)` and `EXISTS (SELECT ...)`
     /// runs, as does a subquery referencing the outer query's row.
-    fn subqueries() -> u32 {
+    fn subqueries(_conn: &TrinoConnection) -> u32 {
         SQL_SQ_COMPARISON
             | SQL_SQ_EXISTS
             | SQL_SQ_IN
@@ -775,29 +916,29 @@ impl Backend for TrinoBackend {
             | SQL_SQ_CORRELATED_SUBQUERIES
     }
 
-    fn column_alias() -> bool {
+    fn column_alias(_conn: &TrinoConnection) -> bool {
         true
     }
 
     /// `concat('a', NULL)` and `'a' || NULL` both evaluate to NULL, which is
     /// `SQL_CB_NULL`.
-    fn concat_null_behavior() -> u16 {
+    fn concat_null_behavior(_conn: &TrinoConnection) -> u16 {
         SQL_CB_NULL
     }
 
-    fn union_support() -> u32 {
+    fn union_support(_conn: &TrinoConnection) -> u32 {
         SQL_U_UNION | SQL_U_UNION_ALL
     }
 
     /// `CAST` only. Trino has no `CONVERT` scalar function —
     /// `CONVERT('1', INTEGER)` fails to resolve.
-    fn convert_functions() -> u32 {
+    fn convert_functions(_conn: &TrinoConnection) -> u32 {
         SQL_FN_CVT_CAST
     }
 
     /// `false`: `SELECT b FROM t ORDER BY a` runs, so a column may be ordered
     /// by without being selected.
-    fn order_by_columns_in_select() -> bool {
+    fn order_by_columns_in_select(_conn: &TrinoConnection) -> bool {
         false
     }
 
@@ -806,42 +947,42 @@ impl Backend for TrinoBackend {
     /// allow-all it does not, and the driver cannot tell which it is talking
     /// to. `SQL_ACCESSIBLE_TABLES = "Y"` is a guarantee about the connected
     /// principal, so it must not be made on a maybe.
-    fn accessible_tables() -> bool {
+    fn accessible_tables(_conn: &TrinoConnection) -> bool {
         false
     }
 
     /// `false`: writes reach whichever connector backs the catalog —
     /// `CREATE TABLE`, `INSERT` and `DROP TABLE` all run against the
     /// PostgreSQL catalog in the test stack.
-    fn data_source_read_only() -> bool {
+    fn data_source_read_only(_conn: &TrinoConnection) -> bool {
         false
     }
 
     /// Backslash, which is what `metadata.rs` emits: a catalog-function
     /// pattern containing a wildcard becomes `LIKE '...' ESCAPE '\'`.
-    fn search_pattern_escape() -> &'static str {
-        "\\"
+    fn search_pattern_escape(_conn: &TrinoConnection) -> Cow<'static, str> {
+        Cow::Borrowed("\\")
     }
 
     /// Trino's reserved words, raw — core subtracts ODBC's own, sorts and
     /// joins them into `SQL_KEYWORDS`. See [`info::TRINO_RESERVED_KEYWORDS`]
     /// for where the list comes from and why it is static rather than probed.
-    fn keywords() -> &'static [&'static str] {
-        info::TRINO_RESERVED_KEYWORDS
+    fn keywords(_conn: &TrinoConnection) -> Cow<'static, [Cow<'static, str>]> {
+        Cow::Borrowed(info::reserved_keywords())
     }
 
     /// `0`, the spec's value for a data source that does not support
     /// transactions, matching the `SQL_TC_NONE` this driver reports. See
     /// [`TrinoBackend::end_tran`] for why that is a driver limitation rather
     /// than a Trino one.
-    fn default_txn_isolation() -> u32 {
+    fn default_txn_isolation(_conn: &TrinoConnection) -> u32 {
         0
     }
 
     /// `0`: with no supported level, core's `validate_txn_isolation` rejects
     /// every `SQLSetConnectAttr(SQL_ATTR_TXN_ISOLATION)` with `HY024`, and
     /// [`Backend::set_txn_isolation`] is never reached.
-    fn txn_isolation_options() -> u32 {
+    fn txn_isolation_options(_conn: &TrinoConnection) -> u32 {
         0
     }
 
@@ -865,16 +1006,26 @@ impl Backend for TrinoBackend {
         info::get_info_raw(conn, info_type)
     }
 
-    fn get_functions() -> &'static [stackable_odbc_core::function_id::FunctionId] {
-        info::get_functions()
+    fn get_functions() -> Cow<'static, [stackable_odbc_core::function_id::FunctionId]> {
+        Cow::Borrowed(info::get_functions())
     }
 
-    fn get_type_info() -> &'static [TypeInfoRow] {
-        info::get_type_info()
+    fn get_type_info(_conn: &TrinoConnection) -> Cow<'static, [TypeInfoRow]> {
+        Cow::Borrowed(info::get_type_info())
     }
 
+    // The six catalog functions take a cancel token they do not record
+    // anything in, so `SQLCancel` cannot interrupt them.
+    //
+    // Four of them (`primary_keys`, `foreign_keys`, `statistics`,
+    // `special_columns`) return a fixed empty result set without touching the
+    // network, so there is nothing to cancel. `tables` and `columns` do query
+    // Trino, but through `query_all_rows` -> `Client::get_all`, which pages to
+    // exhaustion inside the client and never surfaces the query id a DELETE
+    // needs. Making them cancellable means replacing that with manual paging.
     fn tables(
         conn: &TrinoConnection,
+        _cancel: &TrinoCancelToken,
         catalog: Option<&str>,
         schema: Option<&str>,
         table: Option<&str>,
@@ -885,6 +1036,7 @@ impl Backend for TrinoBackend {
 
     fn columns(
         conn: &TrinoConnection,
+        _cancel: &TrinoCancelToken,
         catalog: Option<&str>,
         schema: Option<&str>,
         table: Option<&str>,
@@ -895,6 +1047,7 @@ impl Backend for TrinoBackend {
 
     fn primary_keys(
         conn: &TrinoConnection,
+        _cancel: &TrinoCancelToken,
         catalog: Option<&str>,
         schema: Option<&str>,
         table: Option<&str>,
@@ -902,8 +1055,10 @@ impl Backend for TrinoBackend {
         metadata::primary_keys(conn, catalog, schema, table)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn foreign_keys(
         conn: &TrinoConnection,
+        _cancel: &TrinoCancelToken,
         pk_catalog: Option<&str>,
         pk_schema: Option<&str>,
         pk_table: Option<&str>,
@@ -918,6 +1073,7 @@ impl Backend for TrinoBackend {
 
     fn statistics(
         conn: &TrinoConnection,
+        _cancel: &TrinoCancelToken,
         catalog: Option<&str>,
         schema: Option<&str>,
         table: Option<&str>,
@@ -929,6 +1085,7 @@ impl Backend for TrinoBackend {
     #[allow(clippy::too_many_arguments)]
     fn special_columns(
         conn: &TrinoConnection,
+        _cancel: &TrinoCancelToken,
         identifier_type: IdentifierType,
         catalog: Option<&str>,
         schema: Option<&str>,
@@ -950,7 +1107,7 @@ impl Backend for TrinoBackend {
     /// Trino's `{fn}`/`{d}`/`{t}`/`{ts}` escape-translation dialect. See
     /// `crate::escape_dialect` for the remap table and its justification
     /// against the `SQL_*_FUNCTIONS` bitmaps in `backend/info.rs`.
-    fn escape_dialect() -> stackable_odbc_core::escape::EscapeDialect {
+    fn escape_dialect(_conn: &TrinoConnection) -> stackable_odbc_core::escape::EscapeDialect {
         crate::escape_dialect::dialect()
     }
 }
@@ -1013,10 +1170,11 @@ mod tests {
 
     #[test]
     fn get_type_info_returns_all_trino_types() {
-        let types = TrinoBackend::get_type_info();
+        let conn = disconnected_trino_conn();
+        let types = TrinoBackend::get_type_info(&conn);
         assert!(!types.is_empty(), "should return at least one type");
 
-        let names: Vec<&str> = types.iter().map(|t| t.type_name).collect();
+        let names: Vec<&str> = types.iter().map(|t| t.type_name.as_ref()).collect();
         for expected in &[
             "BOOLEAN",
             "TINYINT",
@@ -1226,7 +1384,7 @@ mod tests {
         let declared = TrinoBackend::sensitive_connect_keywords();
         for key in [PARAM_ACCESS_TOKEN, PARAM_TOKEN] {
             assert!(
-                declared.contains(&key),
+                declared.iter().any(|d| d == key),
                 "{key} carries a bearer token but is not declared sensitive; declared: {declared:?}"
             );
         }
@@ -1366,7 +1524,9 @@ mod tests {
     fn exec_direct_select_and_fetch() {
         use stackable_odbc_core::types::CDataType;
         let conn = shared_trino_conn();
-        let mut stmt = TrinoBackend::exec_direct(conn, "SELECT 1 AS n").expect("exec_direct");
+        let cancel = TrinoBackend::cancel_token(conn);
+        let mut stmt =
+            TrinoBackend::exec_direct(conn, &cancel, "SELECT 1 AS n").expect("exec_direct");
 
         assert_eq!(stmt.column_count(), 1);
         assert_eq!(stmt.describe_col(1).expect("describe_col").name, "n");
@@ -1386,8 +1546,10 @@ mod tests {
     fn streaming_large_result_fetches_all_pages() {
         use stackable_odbc_core::types::CDataType;
         let conn = shared_trino_conn();
+        let cancel = TrinoBackend::cancel_token(conn);
         let mut stmt = TrinoBackend::exec_direct(
             conn,
+            &cancel,
             "SELECT c_customer_sk FROM tpcds.sf1.customer WHERE c_customer_sk <= 15000",
         )
         .expect("exec_direct");
@@ -1420,9 +1582,13 @@ mod tests {
         )
         .expect("parse params");
         let conn = TrinoBackend::connect(&params).expect("connect");
-        let mut stmt =
-            TrinoBackend::exec_direct(&conn, "SELECT c_customer_sk FROM tpcds.sf1.customer")
-                .expect("exec_direct");
+        let cancel = TrinoBackend::cancel_token(&conn);
+        let mut stmt = TrinoBackend::exec_direct(
+            &conn,
+            &cancel,
+            "SELECT c_customer_sk FROM tpcds.sf1.customer",
+        )
+        .expect("exec_direct");
 
         // Fetch a few rows to ensure the query is running.
         for _ in 0..5 {
@@ -1430,14 +1596,78 @@ mod tests {
         }
 
         // Cancel should succeed.
-        assert!(stmt.query_id.is_some(), "expected a query ID for cancel");
-        let result = TrinoBackend::cancel(&mut stmt);
+        let result = TrinoBackend::cancel(&cancel);
         assert!(result.is_ok(), "cancel failed: {result:?}");
 
-        // After cancel, next_uri should be cleared so close_cursor/Drop
-        // don't try to drain a cancelled query (which would corrupt the
-        // connection pool).
-        assert!(stmt.next_uri.is_none(), "cancel should clear next_uri");
+        // `cancel` no longer holds the statement, so it publishes the
+        // cancellation through the token instead of clearing `next_uri`
+        // directly. The statement must observe that on its next fetch and stop
+        // polling: draining a cancelled query is what corrupts the pool.
+        assert_eq!(
+            stmt.fetch().expect("fetch after cancel"),
+            FetchResult::NoData,
+            "a cancelled statement must report NoData rather than resume paging"
+        );
+        assert!(
+            stmt.next_uri.is_none(),
+            "the cancelled statement must have dropped its next page URI"
+        );
+    }
+
+    /// The scenario `Backend::CancelToken` exists for: `SQLCancel` arriving on
+    /// a different thread from the one executing the statement.
+    ///
+    /// The previous `cancel(&mut Self::Statement)` signature could not express
+    /// this at all — the executing thread holds that `&mut`. It also exercises
+    /// two threads inside `block_on` on the same *current-thread* runtime,
+    /// which is the shape this driver's Tokio bridge has and the one place
+    /// this design could plausibly deadlock rather than cancel.
+    #[test]
+    #[serial(backend)]
+    #[ignore = "requires Trino -- run in isolation: cargo test -- --ignored backend"]
+    fn cancel_from_another_thread_while_fetching() {
+        // Its own connection, for the dirty-socket reason `cancel_mid_stream`
+        // documents above.
+        let params = ConnectParams::parse(
+            "Host=localhost;Port=8080;User=admin;Password=admin;Catalog=tpcds",
+        )
+        .expect("parse params");
+        let conn = TrinoBackend::connect(&params).expect("connect");
+        let cancel = Arc::new(TrinoBackend::cancel_token(&conn));
+
+        // A query large enough that it is still streaming when the cancel
+        // lands, so the cancelling thread really does contend for the runtime.
+        let mut stmt = TrinoBackend::exec_direct(
+            &conn,
+            &cancel,
+            "SELECT c_customer_sk FROM tpcds.sf1.customer",
+        )
+        .expect("exec_direct");
+
+        assert_eq!(stmt.fetch().expect("first fetch"), FetchResult::Row);
+
+        let canceller = {
+            let cancel = Arc::clone(&cancel);
+            std::thread::spawn(move || TrinoBackend::cancel(&cancel))
+        };
+
+        // Keep fetching until the cancellation is observed. This must
+        // terminate: either the rows run out or the cancel flag stops the
+        // loop. A hang here is the deadlock this test is looking for.
+        let mut rows = 0u64;
+        while let FetchResult::Row = stmt.fetch().expect("fetch during cancel") {
+            rows += 1;
+        }
+
+        let cancelled = canceller.join().expect("cancelling thread panicked");
+        assert!(
+            cancelled.is_ok(),
+            "cross-thread cancel failed: {cancelled:?}"
+        );
+        assert!(
+            stmt.next_uri.is_none(),
+            "the statement must not be left holding a next page URI, {rows} rows in"
+        );
     }
 
     /// Guards SQL_DBMS_VER: it must be queried from the server, not a frozen
