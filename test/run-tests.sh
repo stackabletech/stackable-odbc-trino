@@ -76,6 +76,14 @@ echo "=== Running SQL surface pen test ==="
 uv run --with pyodbc python3 "$SCRIPT_DIR/test_sql_surface.py" \
     "Driver=$DRIVER_PATH;Host=localhost;Port=8080;User=admin;Password=admin;Protocol=http;Catalog=tpcds"
 
+# --- Linux: Power Query folding contract ---
+# The connector's SQL declarations against the driver and Trino. Nothing else
+# loads the .pq, and the only other check on folding is a human clicking
+# "View Native Query" one step at a time.
+echo "=== Running folding contract test ==="
+uv run --with pyodbc python3 "$SCRIPT_DIR/test_folding_contract.py" \
+    "Driver=$DRIVER_PATH;Host=localhost;Port=8080;User=admin;Password=admin;Protocol=http;Catalog=tpcds"
+
 # --- Linux: raw C ABI pen test (no Driver Manager) ---
 # Calls the driver's exported entry points directly with ctypes. unixODBC
 # answers a large part of the ODBC state machine itself, so the driver's own

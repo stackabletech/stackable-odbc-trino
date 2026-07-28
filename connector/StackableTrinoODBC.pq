@@ -139,22 +139,38 @@ shared StackableTrinoODBC.Contents = (
         SQLColumns = (catalogName, schemaName, tableName, columnName, source) =>
             source,
 
-        // Trino uses LIMIT x OFFSET y — the AstVisitor tells Power Query
-        // how to emit this syntax. Without it, query folding fails even
-        // though LimitClauseKind.LimitOffset is set in SqlCapabilities.
+        // The AstVisitor tells Power Query how to emit row limiting; without
+        // it, folding fails even though LimitClauseKind.LimitOffset is set in
+        // SqlCapabilities.
+        //
+        // Trino's grammar is `OFFSET count LIMIT count`, in that order --
+        // `LIMIT 2 OFFSET 2` is rejected outright with "mismatched input
+        // 'OFFSET'". Only a fold carrying both a skip and a take emits the
+        // pair, which is why take-only folding worked regardless.
+        // `test_folding_contract.py` runs whatever this builds.
         AstVisitor = [
             LimitClause = (skip, take) =>
                 let
-                    limit = if take <> null then Text.Format("LIMIT #{0}", {take}) else "",
-                    offset = if skip <> null and skip > 0 then Text.Format(" OFFSET #{0}", {skip}) else ""
+                    offset = if skip <> null and skip > 0 then Text.Format("OFFSET #{0}", {skip}) else "",
+                    separator = if offset <> "" and take <> null then " " else "",
+                    limit = if take <> null then Text.Format("LIMIT #{0}", {take}) else ""
                 in
                     [
-                        Text = limit & offset,
+                        Text = offset & separator & limit,
                         Location = "AfterQuerySpecification"
                     ],
             // Tell Power Query how to emit CAST expressions for typed
             // literals. Required for aggregation folding on non-SQL-Server
             // databases (from the PostgreSQL DirectQuery reference connector).
+            //
+            // Each record field is looked up by `typeInfo[TYPE_NAME]`, which is
+            // this driver's own SQLGetTypeInfo output — so the field names are
+            // Trino type names, not the reference connector's PostgreSQL ones.
+            // `TEXT`, `TIMESTAMPTZ`, `TIMETZ`, `NUMERIC` and `FLOAT` came from
+            // that connector and matched nothing here, so a string, timestamp
+            // or time constant folded through none of them.
+            // `test_folding_contract.py` asserts every field name against
+            // SQLGetTypeInfo and every cast target against Trino.
             Constant =
                 let
                     Quote = each Text.Format("'#{0}'", { _ }),
@@ -162,16 +178,14 @@ shared StackableTrinoODBC.Contents = (
                         Text = Text.Format("CAST(#{0} as #{1})", { value, typeName })
                     ],
                     Visitor = [
-                        NUMERIC = each Cast(_, "NUMERIC"),
                         DECIMAL = each Cast(_, "DECIMAL"),
                         INTEGER = each Cast(_, "INTEGER"),
-                        FLOAT = each Cast(_, "FLOAT"),
                         REAL = each Cast(_, "REAL"),
                         DOUBLE = each Cast(_, "DOUBLE PRECISION"),
                         DATE = each Cast(Quote(Date.ToText(_, "yyyy-MM-dd")), "DATE"),
-                        TEXT = each Cast(_, "VARCHAR"),
-                        TIMESTAMPTZ = each Cast(Quote(DateTime.ToText(_, "yyyy-MM-dd HH:mm:ss.sssssss")), "TIMESTAMP"),
-                        TIMETZ = each Cast(Quote(Time.ToText(_, "HH:mm:ss.sssssss")), "TIME")
+                        VARCHAR = each Cast(_, "VARCHAR"),
+                        TIMESTAMP = each Cast(Quote(DateTime.ToText(_, "yyyy-MM-dd HH:mm:ss.sssssss")), "TIMESTAMP"),
+                        TIME = each Cast(Quote(Time.ToText(_, "HH:mm:ss.sssssss")), "TIME")
                     ]
                 in
                     (typeInfo, ast) => Record.FieldOrDefault(Visitor, typeInfo[TYPE_NAME], each null)(ast[Value])

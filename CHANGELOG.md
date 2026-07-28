@@ -232,6 +232,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- The Power Query connector emitted `LIMIT x OFFSET y`, which Trino rejects
+  outright — its grammar is `OFFSET count LIMIT count`, in that order. Only a
+  fold carrying both a skip and a take produced the pair, so take-only folding
+  was unaffected and this went unnoticed.
+- The connector's `Constant` visitor was keyed on PostgreSQL type names
+  inherited from the reference connector. Power Query looks each field up by
+  the driver's own `SQLGetTypeInfo` `TYPE_NAME`, so `TEXT`, `TIMESTAMPTZ` and
+  `TIMETZ` never matched and string, timestamp and time constants folded
+  through none of them; `NUMERIC` and `FLOAT` named types Trino does not have.
+  Re-keyed to `VARCHAR`, `TIMESTAMP` and `TIME`, and the two unusable entries
+  removed.
 - A trailing statement terminator no longer fails the statement. Trino's REST
   API takes one statement per request and its grammar has no terminator, so
   `SELECT 1;` was rejected with `SYNTAX_ERROR` at the semicolon — every query

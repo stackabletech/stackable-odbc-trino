@@ -569,6 +569,39 @@ return unbounded `varchar` columns, so the driver has to describe a column
 whose size it cannot know, and an application sizes its buffers from what it
 says.
 
+### Folding contract test
+
+```bash
+uv run --with pyodbc python3 test/test_folding_contract.py "<connection-string>"
+```
+
+The Power Query connector's SQL declarations, checked against the driver and
+Trino. Nothing else loads the `.pq`: every other suite drives the driver
+directly, and the only other check on folding is a human clicking "View Native
+Query" in Power BI Desktop, one step at a time. A connector declaration can
+therefore drift from what the driver reports or what Trino accepts with nothing
+noticing — which is how both of the bugs this test was written to catch got in.
+
+It parses the connector rather than transcribing it, so the two cannot drift:
+
+- **Every `Constant` visitor field name is a driver `TYPE_NAME`.** Power Query
+  looks each one up by `typeInfo[TYPE_NAME]` from `SQLGetTypeInfo`, so a name
+  matching nothing can never fire — and a dead name hides the absence of the
+  live one it should have been. Five were PostgreSQL names inherited from the
+  reference connector.
+- **Every CAST target is a type Trino has.** `NUMERIC` and `FLOAT` are not.
+- **The row-limiting clause the `AstVisitor` builds is run**, including the
+  order it concatenates `OFFSET` and `LIMIT` in. Trino's grammar is
+  `OFFSET count LIMIT count` and rejects the reverse, so only a fold carrying
+  both a skip and a take exposed it.
+- **`SupportsDerivedTable` and `SupportsTop`** are checked against what Trino
+  actually does.
+
+A `NOTE` lists driver `TYPE_NAME`s with no visitor entry. That is not a
+failure — Power Query evaluates such a constant locally instead of folding it —
+but nothing in the connector lists the types it does not handle, so the gap is
+otherwise invisible.
+
 ### Raw C ABI pen test
 
 ```bash
@@ -606,11 +639,20 @@ a statement can be allocated before connecting, because `SQLAllocHandle`'s
 `08003` for that case is Driver-Manager-owned.
 
 A `NOTE` may also be marked `KNOWN`, for a gap diagnosed and recorded rather
-than asserted so the suite stays green until the owning crate changes. There are
-none at present: the two that named core's `SQLFreeStmt` diagnostic and
-`SQLFreeHandle` clearing behaviour were fixed in core and are now assertions.
-Tighten a `KNOWN` into a `check` as soon as its fix lands, or it becomes a
-permanent blind spot.
+than asserted so the suite stays green until the owning crate changes. Tighten
+a `KNOWN` into a `check` as soon as its fix lands, or it becomes a permanent
+blind spot. Two are open, both `stackable-odbc-core` gaps reached through this
+driver:
+
+- **`SQLBindParameter`'s declared SQL type is discarded.** Core's
+  `read_param_value` matches on the C type alone, so `SQL_C_CHAR` +
+  `SQL_NUMERIC` — what a client sends for a numeric delivered as text — becomes
+  a string. `WHERE decimal_col = ?` then fails with
+  `TYPE_MISMATCH: decimal(10,2) = varchar(5)`, which is an ordinary BI filter.
+- **An unbound parameter marker is padded with NULL.** The spec's answer is
+  `07002`; core's `collect_params` substitutes `NULL` and the application is
+  never told. This is why `SQLExecDirect("PREPARE p FROM ... ?")` registers a
+  statement with no parameters — see `backend/describe_param.rs`.
 
 ### Type-transform fuzz
 

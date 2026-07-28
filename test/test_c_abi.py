@@ -74,6 +74,10 @@ SQL_TXN_SERIALIZABLE = 8
 
 SQL_C_CHAR = 1
 
+# SQLBindParameter arguments used by the bound-parameter probes.
+SQL_PARAM_INPUT = 1
+SQL_NUMERIC = 2
+
 DEFAULT_CONN_STR = (
     "Host=localhost;Port=8080;User=admin;Password=admin;Protocol=http;Catalog=tpcds"
 )
@@ -121,6 +125,10 @@ def load(path):
         ),
         "SQLCancel": ([P], S),
         "SQLNumParams": ([P, ctypes.POINTER(S)], S),
+        "SQLBindParameter": (
+            [P, ctypes.c_uint16, S, S, S, ctypes.c_size_t, S, P, L, ctypes.POINTER(L)],
+            S,
+        ),
         # SQLRETURN is a 16-bit SQLSMALLINT. Every entry point called here
         # needs its restype declared, or ctypes reads the return register as a
         # 32-bit int and SQL_ERROR (-1) arrives as 65535.
@@ -640,6 +648,63 @@ def main():
     lib.SQLNumResultCols(stmt, ctypes.byref(ncols))
     check("procedure columns describes 19 columns", ncols.value, 19)
     check("procedure columns is empty", lib.SQLFetch(stmt), SQL_NO_DATA)
+    lib.SQLFreeStmt(stmt, SQL_CLOSE)
+
+    # ---------------------------------------------------------------
+    print("\n--- bound parameter types ---")
+    # Both of these are stackable-odbc-core gaps reached through this driver,
+    # recorded as KNOWN so the suite stays green until core changes. Tighten
+    # each into a `check` as soon as its fix lands.
+    #
+    # 1. SQLBindParameter's declared SQL type is discarded. core's
+    #    read_param_value matches on the C type alone, so SQL_C_CHAR +
+    #    SQL_NUMERIC -- what every client sends for a numeric delivered as
+    #    text -- becomes a string, and Trino refuses to compare it to a
+    #    decimal column.
+    dec = ctypes.create_string_buffer(b"12.34")
+    dec_ind = ctypes.c_longlong(SQL_NTS)
+    sql, _kd = w("SELECT CAST(? AS VARCHAR)")
+    lib.SQLFreeStmt(stmt, SQL_CLOSE)
+    r = lib.SQLBindParameter(
+        stmt, 1, SQL_PARAM_INPUT, SQL_C_CHAR, SQL_NUMERIC, 10, 2,
+        ctypes.cast(dec, P), 0, ctypes.byref(dec_ind),
+    )
+    check("bind a NUMERIC parameter delivered as characters", r, SQL_SUCCESS)
+    typed, _kt = w("SELECT typeof(?)")
+    r = lib.SQLExecDirectW(stmt, typed, SQL_NTS)
+    if r in (SQL_SUCCESS, SQL_SUCCESS_WITH_INFO) and lib.SQLFetch(stmt) == SQL_SUCCESS:
+        got = ctypes.create_string_buffer(64)
+        got_ind = ctypes.c_longlong(0)
+        lib.SQLGetData(stmt, 1, SQL_C_CHAR, ctypes.cast(got, P), 64, ctypes.byref(got_ind))
+        trino_type = got.value.decode(errors="replace")
+        if trino_type.startswith("decimal"):
+            check("NUMERIC parameter reaches Trino as a decimal", True, SQL_SUCCESS)
+        else:
+            note(
+                "NUMERIC parameter type",
+                f"KNOWN: arrives as {trino_type!r}, not a decimal; core's "
+                "read_param_value ignores ParameterBinding.sql_type",
+            )
+    else:
+        note("NUMERIC parameter type", "KNOWN: could not read the parameter's type back")
+    lib.SQLFreeStmt(stmt, SQL_RESET_PARAMS)
+    lib.SQLFreeStmt(stmt, SQL_CLOSE)
+
+    # 2. A statement with a parameter marker and nothing bound. The spec's
+    #    answer is 07002 (COUNT field incorrect); core's collect_params pads
+    #    every unbound marker with NULL instead, so the statement runs with
+    #    NULLs substituted and the application is never told.
+    unbound, _ku = w("SELECT 1 WHERE 2 = ?")
+    r = lib.SQLExecDirectW(stmt, unbound, SQL_NTS)
+    state = sqlstate(lib, SQL_HANDLE_STMT, stmt)
+    if r == SQL_ERROR and state == "07002":
+        check("unbound parameter marker", r, SQL_ERROR, state="07002", got_state=state)
+    else:
+        note(
+            "unbound parameter marker",
+            f"KNOWN: got {rname(r)} (SQLSTATE {state or 'none'}); core's collect_params "
+            "substitutes NULL for an unbound marker instead of reporting 07002",
+        )
     lib.SQLFreeStmt(stmt, SQL_CLOSE)
 
     print("\n--- cancel with nothing running ---")
