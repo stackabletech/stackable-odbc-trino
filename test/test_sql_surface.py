@@ -225,6 +225,43 @@ def main():
     run("SQLGetTypeInfo", lambda: (
         cur.getTypeInfo().fetchall() or
         (_ for _ in ()).throw(AssertionError("no type info"))))
+
+    def datetime_columns_report_the_verbose_type():
+        """SQLColumns and SQLGetTypeInfo must not disagree about a datetime.
+
+        The spec has SQL_DATA_TYPE carry the *verbose* type -- SQL_DATETIME (9)
+        -- with the concise type in DATA_TYPE and the subcode in
+        SQL_DATETIME_SUB. SQLGetTypeInfo has always answered that way, so
+        reporting the concise type from SQLColumns made the driver contradict
+        itself about the same column.
+        """
+        SQL_DATETIME = 9
+        # SQLGetTypeInfo columns: DATA_TYPE 2, SQL_DATA_TYPE 16, SQL_DATETIME_SUB 17.
+        by_concise = {r[1]: (r[15], r[16]) for r in cur.getTypeInfo().fetchall()}
+        # SQLColumns columns: DATA_TYPE 5, SQL_DATA_TYPE 14, SQL_DATETIME_SUB 15.
+        #
+        # The connected catalog, not a named one: the driver resolves
+        # `information_schema` through the session catalog, so asking for a
+        # different catalog's columns returns nothing. tpcds carries DATE
+        # columns; TIME and TIMESTAMP are covered by the unit tests on
+        # `metadata::verbose_type`.
+        rows = cur.columns(schema="sf1", table="date_dim").fetchall()
+        assert rows, "no columns returned for the connected catalog"
+        seen = 0
+        for r in rows:
+            concise, verbose, sub = r[4], r[13], r[14]
+            if concise not in by_concise:
+                continue
+            assert (verbose, sub) == by_concise[concise], (
+                f"{r[3]}: SQLColumns says ({verbose}, {sub}), "
+                f"SQLGetTypeInfo says {by_concise[concise]}")
+            if verbose == SQL_DATETIME:
+                seen += 1
+                assert sub is not None, f"{r[3]}: SQL_DATETIME with no subcode"
+        assert seen >= 1, f"expected at least one datetime column, saw {seen}"
+
+    run("SQLColumns datetime verbose type agrees with SQLGetTypeInfo",
+        datetime_columns_report_the_verbose_type)
     # Trino exposes no key or index metadata, so an empty result set is the
     # correct answer and the assertion is that the call succeeds and describes
     # its columns rather than erroring.

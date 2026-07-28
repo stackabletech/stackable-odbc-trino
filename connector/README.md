@@ -77,7 +77,7 @@ Key settings in `StackableTrinoODBC.pq` (top of file):
 | `Config_DriverName` | `stackable_odbc_trino` | ODBC driver name as registered |
 | `Config_SqlConformance` | `SQL_SC_SQL92_FULL` (8) | Overrides driver's reported conformance |
 | `Config_LimitClauseKind` | `LimitClauseKind.LimitOffset` | SQL syntax for row limits |
-| `Config_UseParameterBindings` | `false` | Inline literals (parameter binding incomplete) |
+| `Config_UseParameterBindings` | `true` | Bind parameters rather than inlining literals |
 | `Config_UseCastInsteadOfConvert` | `true` | Trino uses CAST, not CONVERT |
 | `Config_EnableDirectQuery` | `true` | Enables DirectQuery mode in PowerBI |
 

@@ -196,6 +196,24 @@ def main():
             check("SupportsTop = false", True, "  (Trino rejects TOP, as declared)")
 
     # ------------------------------------------------------------------
+    print("\n--- the connector does not disable what the driver supports ---")
+    # The connector's own rule is that an override is for what the driver gets
+    # *wrong*, because it silently wins and cannot be corrected by fixing the
+    # driver. Setting `Config_UseParameterBindings = false` declares
+    # `SQL_API_SQLBINDPARAMETER = false`, which contradicts the driver:
+    # `get_functions` lists `BindParameter`, and test_sql_surface.py exercises
+    # parameters in every clause that takes one.
+    #
+    # Asserted on the flag rather than on the string `SQL_API_SQLBINDPARAMETER
+    # = false`, which also appears in the branch the flag makes unreachable.
+    bindings_on = re.search(r"Config_UseParameterBindings\s*=\s*true", source) is not None
+    check(
+        "Config_UseParameterBindings leaves SQLBindParameter enabled",
+        bindings_on,
+        "" if bindings_on else "  (set false, which disables a function the driver declares)",
+    )
+
+    # ------------------------------------------------------------------
     print("\n--- driver types with no Constant visitor entry ---")
     # Not a failure: an absent key makes Power Query evaluate that constant
     # locally rather than fold it. It is still worth naming, because a missing

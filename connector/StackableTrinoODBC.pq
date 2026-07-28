@@ -39,8 +39,19 @@ Config_SqlConformance = ODBC[SQL_SC][SQL_SC_SQL92_FULL]; // 8
 // Trino uses LIMIT x OFFSET y syntax.
 Config_LimitClauseKind = LimitClauseKind.LimitOffset;
 
-// Parameter bindings are not yet fully supported. Inline literals instead.
-Config_UseParameterBindings = false;
+// Let Power Query bind parameters rather than inlining literals.
+//
+// This was `false` while the driver's parameter binding was incomplete. It is
+// not any more: the declared `ParameterType` is honoured, so a numeric
+// delivered as characters reaches Trino as a decimal instead of a string, and
+// an unbound marker is reported rather than silently substituted.
+//
+// Setting it back to `false` re-adds `SQL_API_SQLBINDPARAMETER = false`, which
+// contradicts the driver — `get_functions` declares `BindParameter` — and this
+// file's rule is that an override is for what the driver gets *wrong*. It also
+// puts every constant back through the `Constant` visitor, the part that had
+// been keyed on PostgreSQL type names and folded nothing.
+Config_UseParameterBindings = true;
 
 // Trino uses single-quote escaping for string literals.
 Config_StringLiteralEscapeCharacters = { "'" };

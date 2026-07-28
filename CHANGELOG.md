@@ -67,6 +67,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- The Power Query connector binds parameters instead of inlining literals
+  (`Config_UseParameterBindings`). It was off while the driver's parameter
+  binding was incomplete, and turning it off also declared
+  `SQL_API_SQLBINDPARAMETER = false` — contradicting the driver, which lists
+  `BindParameter` among its supported functions.
 - **`Protocol` now defaults to `https`** rather than `http`. A connection
   string that names no protocol is encrypted; an unencrypted connection has to
   be asked for with `Protocol=http`.
@@ -232,6 +237,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `SQLColumns` reported the *concise* type in `SQL_DATA_TYPE` for datetime
+  columns, contradicting `SQLGetTypeInfo`, which has always reported the
+  verbose one. A `DATE` column came back as `SQL_DATA_TYPE` 91 with a NULL
+  `SQL_DATETIME_SUB`, where the spec has that column carry `SQL_DATETIME` (9)
+  with the subcode in `SQL_DATETIME_SUB` — 1, 2 and 3 for date, time and
+  timestamp. Trino's interval types are unaffected: they map to `SQL_WVARCHAR`
+  rather than to an ODBC interval type, so they report no subcode.
 - The Power Query connector emitted `LIMIT x OFFSET y`, which Trino rejects
   outright — its grammar is `OFFSET count LIMIT count`, in that order. Only a
   fold carrying both a skip and a take produced the pair, so take-only folding

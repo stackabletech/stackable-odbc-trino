@@ -18,8 +18,8 @@ use std::borrow::Cow;
 
 use stackable_odbc_core::types::{
     ColumnPrivilegeRow, ColumnRow, ForeignKeyRow, IdentifierType, Nullable, PrimaryKeyRow,
-    ProcedureColumnRow, ProcedureRow, Scope, SpecialColumnRow, SqlDataType, StatisticsRow,
-    TablePrivilegeRow, TableRow,
+    ProcedureColumnRow, ProcedureRow, SQL_CODE_DATE, SQL_CODE_TIME, SQL_CODE_TIMESTAMP, Scope,
+    SpecialColumnRow, SqlDataType, StatisticsRow, TablePrivilegeRow, TableRow,
 };
 
 use super::{TrinoConnection, TrinoError, info::trino_bare_type_name, query_all_rows};
@@ -145,6 +145,32 @@ const BYTES_PER_CHAR: i32 = 4;
 /// `NUM_PREC_RADIX` for a numeric column: Trino reports precision for every
 /// numeric type in decimal digits, including `REAL` and `DOUBLE`.
 const NUM_PREC_RADIX_DECIMAL: i16 = 10;
+
+/// A column's `SQL_DATA_TYPE` and `SQL_DATETIME_SUB` from its concise type.
+///
+/// Spec (`SQLColumns`): `SQL_DATA_TYPE` is the *verbose* type, which differs
+/// from `DATA_TYPE` only for datetimes and intervals — "For datetime and
+/// interval data types, this column returns `SQL_DATETIME` or `SQL_INTERVAL`,
+/// and the `SQL_DATETIME_SUB` field returns the subcode. For other data types,
+/// this column returns a NULL."
+///
+/// `SQLGetTypeInfo` already answers this way for the same types, through
+/// `TypeInfoRow::with_verbose_type` in `info`. Reporting the concise type here
+/// made the driver contradict itself about, say, a `DATE` column: `91` from
+/// `SQLColumns` against `9` plus subcode `1` from `SQLGetTypeInfo`.
+///
+/// Trino's two interval types are deliberately absent. They map to
+/// `SQL_WVARCHAR`, not to an ODBC interval type — see
+/// `type_conversion::trino_ty_to_sql_type` — so `SQL_INTERVAL` would be a
+/// claim this driver's own type mapping does not make.
+fn verbose_type(concise: SqlDataType) -> (i16, Option<i16>) {
+    match concise {
+        SqlDataType::DATE => (SqlDataType::DATETIME.0, Some(SQL_CODE_DATE)),
+        SqlDataType::TIME => (SqlDataType::DATETIME.0, Some(SQL_CODE_TIME)),
+        SqlDataType::TIMESTAMP => (SqlDataType::DATETIME.0, Some(SQL_CODE_TIMESTAMP)),
+        other => (other.0, None),
+    }
+}
 
 /// `CHAR_OCTET_LENGTH` for a column: the maximum length in bytes of a
 /// character column. All other data types, including binary, return NULL.
@@ -438,6 +464,7 @@ pub(super) fn columns(
                 None
             };
             let char_octet = char_octet_length(sql_type, ty_precision);
+            let (verbose, datetime_sub) = verbose_type(sql_type);
 
             Some(ColumnRow {
                 catalog: table_cat,
@@ -453,8 +480,8 @@ pub(super) fn columns(
                 nullable: nullable.into(),
                 remarks: None,
                 column_def: col_def,
-                sql_data_type: sql_type.0,
-                sql_datetime_sub: None,
+                sql_data_type: verbose,
+                sql_datetime_sub: datetime_sub,
                 char_octet_length: char_octet,
                 ordinal_position: ordinal,
                 is_nullable: Some(nullable.as_is_nullable_str().to_string()),
@@ -854,6 +881,40 @@ mod tests {
         // A truncated row must not panic on the index.
         assert!(table_privilege_row(&[]).is_none());
         assert!(table_privilege_row(&privilege_json(serde_json::Value::Null)[..3]).is_none());
+    }
+
+    #[test]
+    fn a_datetime_column_reports_the_verbose_type_and_its_subcode() {
+        // Spec, SQLColumns: "SQL_DATA_TYPE ... For datetime and interval data
+        // types, this column returns SQL_DATETIME or SQL_INTERVAL, and the
+        // SQL_DATETIME_SUB field returns the subcode." `SQLGetTypeInfo`
+        // already answers this way for the same types, so reporting the
+        // concise type here makes the driver contradict itself.
+        for (concise, sub) in [
+            (SqlDataType::DATE, SQL_CODE_DATE),
+            (SqlDataType::TIME, SQL_CODE_TIME),
+            (SqlDataType::TIMESTAMP, SQL_CODE_TIMESTAMP),
+        ] {
+            assert_eq!(
+                verbose_type(concise),
+                (SqlDataType::DATETIME.0, Some(sub)),
+                "{concise:?} must report SQL_DATETIME plus its subcode"
+            );
+        }
+    }
+
+    #[test]
+    fn a_non_datetime_column_reports_its_own_type_and_a_null_subcode() {
+        // Same spec paragraph: "For other data types, this column returns a
+        // NULL." Anything else would have an application read a subcode that
+        // means nothing.
+        for concise in [
+            SqlDataType::EXT_BIG_INT,
+            SqlDataType::EXT_W_VARCHAR,
+            SqlDataType::DECIMAL,
+        ] {
+            assert_eq!(verbose_type(concise), (concise.0, None));
+        }
     }
 
     #[test]
