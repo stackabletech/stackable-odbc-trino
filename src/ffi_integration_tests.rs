@@ -829,6 +829,97 @@ fn every_advertised_scalar_function_escape_runs_on_trino() {
     }
 }
 
+/// The `{fn CONVERT}` counterpart to
+/// `every_advertised_scalar_function_escape_runs_on_trino`.
+///
+/// That test walks the `SQL_*_FUNCTIONS` bitmaps, and `CONVERT` is not in any
+/// of them — it is advertised through `SQL_CONVERT_FUNCTIONS` reporting
+/// `SQL_FN_CVT_CAST` instead. Which is exactly how the escape stayed advertised
+/// and untranslated: `SELECT {fn CONVERT('1', SQL_INTEGER)}` reached Trino as a
+/// two-argument function call and failed with `COLUMN_NOT_FOUND` on
+/// `sql_integer`, and no test walked the bitmap that promised it.
+///
+/// Every ODBC type keyword with a mapping is exercised, because a client
+/// reading the bitmap may send any of them, and only the server can say whether
+/// the `CAST` this produces is one Trino accepts.
+#[test]
+#[serial]
+#[ignore = "requires Trino at localhost:8080 -- run test/setup.sh first"]
+fn every_convert_escape_target_runs_on_trino() {
+    // (value expression, ODBC type keyword, expected text, or None for "must
+    // merely run")
+    let cases: &[(&str, &str, Option<&str>)] = &[
+        ("'1'", "SQL_BIGINT", Some("1")),
+        ("'1'", "SQL_INTEGER", Some("1")),
+        ("'1'", "SQL_SMALLINT", Some("1")),
+        ("'1'", "SQL_TINYINT", Some("1")),
+        ("'1'", "SQL_DOUBLE", Some("1.0E0")),
+        ("'1'", "SQL_FLOAT", Some("1.0E0")),
+        ("'1'", "SQL_REAL", Some("1.0E0")),
+        ("'1'", "SQL_DECIMAL", Some("1")),
+        ("'1'", "SQL_NUMERIC", Some("1")),
+        ("'true'", "SQL_BIT", Some("true")),
+        // The truncation guard: a bare CHAR in Trino is CHAR(1), so a wrong
+        // mapping here returns "h" rather than failing loudly.
+        ("'hello world'", "SQL_CHAR", Some("hello world")),
+        ("'hello world'", "SQL_VARCHAR", Some("hello world")),
+        ("'hello world'", "SQL_LONGVARCHAR", Some("hello world")),
+        ("'hello world'", "SQL_WCHAR", Some("hello world")),
+        ("'hello world'", "SQL_WVARCHAR", Some("hello world")),
+        ("'hello world'", "SQL_WLONGVARCHAR", Some("hello world")),
+        // Trino rejects CAST(varbinary AS VARCHAR), so these are read back
+        // through to_hex instead of the shared wrapper below. 0x61 is 'a'.
+        ("'a'", "SQL_BINARY", Some("61")),
+        ("'a'", "SQL_VARBINARY", Some("61")),
+        ("'a'", "SQL_LONGVARBINARY", Some("61")),
+        ("'2020-02-03'", "SQL_DATE", Some("2020-02-03")),
+        ("'2020-02-03'", "SQL_TYPE_DATE", Some("2020-02-03")),
+        ("'04:05:06'", "SQL_TIME", None),
+        ("'04:05:06'", "SQL_TYPE_TIME", None),
+        ("'2020-02-03 04:05:06'", "SQL_TIMESTAMP", None),
+        ("'2020-02-03 04:05:06'", "SQL_TYPE_TIMESTAMP", None),
+        (
+            "'12151fd2-7586-11e9-8f9e-2a86e4085a59'",
+            "SQL_GUID",
+            Some("12151fd2-7586-11e9-8f9e-2a86e4085a59"),
+        ),
+    ];
+
+    unsafe {
+        for (value, keyword, expected) in cases {
+            let (_env, _conn, stmt) = alloc_stmt();
+            let escape = format!("{{fn CONVERT({value}, {keyword})}}");
+            // The result has to come back as text to be compared, and Trino
+            // has no VARBINARY -> VARCHAR cast, so those read through to_hex.
+            let sql = if keyword.contains("BINARY") {
+                format!("SELECT to_hex({escape})")
+            } else {
+                format!("SELECT CAST(({escape}) AS VARCHAR)")
+            };
+            assert_eq!(
+                exec_direct(stmt, &sql),
+                SqlReturn::SUCCESS,
+                "{escape} is advertised through SQL_CONVERT_FUNCTIONS but did \
+                 not execute -- the translation is missing or produces invalid \
+                 Trino SQL"
+            );
+            assert_eq!(
+                ffi::fetch::sql_fetch::<TrinoBackend>(stmt),
+                SqlReturn::SUCCESS,
+                "{escape} executed but returned no row"
+            );
+            if let Some(want) = expected {
+                assert_eq!(
+                    get_wchar_col(stmt, 1),
+                    *want,
+                    "{escape} returned the wrong value"
+                );
+            }
+            cleanup_stmt(stmt);
+        }
+    }
+}
+
 #[test]
 #[serial]
 #[ignore = "requires Trino at localhost:8080 -- run test/setup.sh first"]

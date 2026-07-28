@@ -81,6 +81,50 @@ fn trino_interval_unit(keyword: &str) -> Option<&'static str> {
     }
 }
 
+/// ODBC type keyword → the Trino type `{fn CONVERT(value, SQL_type)}` casts to.
+///
+/// The keywords are the ones the spec defines for the conversion escape, and
+/// the whole set is covered because `SQL_CONVERT_FUNCTIONS` reports
+/// `SQL_FN_CVT_CAST`: a client reading that bitmap may send any of them, and
+/// one without an arm here reaches Trino as a bare identifier and fails with
+/// `COLUMN_NOT_FOUND`.
+///
+/// Two mappings are worth their own note, both measured against a live
+/// coordinator rather than read off the documentation:
+///
+/// - `SQL_CHAR` maps to `VARCHAR`, not to Trino's `CHAR`. A bare `CHAR` in
+///   Trino is `CHAR(1)`, so `CAST('hello world' AS CHAR)` returns `"h"` — the
+///   escape would silently truncate every conversion to one character. ODBC's
+///   `{fn CONVERT}` carries no length to give `CHAR(n)` instead.
+/// - `SQL_FLOAT` maps to `DOUBLE`. ODBC's `SQL_FLOAT` is double precision;
+///   Trino's `REAL` is the single-precision type, which is `SQL_REAL`.
+///
+/// The `SQL_INTERVAL_*` keywords are deliberately absent. Trino's interval
+/// types cannot be reached by a bare `CAST` from an arbitrary expression, so
+/// there is nothing honest to rewrite them to, and declining leaves the call
+/// on the fallback path instead of casting to something the application did
+/// not ask for.
+fn trino_convert_target(keyword: &str) -> Option<&'static str> {
+    match keyword.trim().to_ascii_uppercase().as_str() {
+        "SQL_BIGINT" => Some("BIGINT"),
+        "SQL_INTEGER" => Some("INTEGER"),
+        "SQL_SMALLINT" => Some("SMALLINT"),
+        "SQL_TINYINT" => Some("TINYINT"),
+        "SQL_DOUBLE" | "SQL_FLOAT" => Some("DOUBLE"),
+        "SQL_REAL" => Some("REAL"),
+        "SQL_DECIMAL" | "SQL_NUMERIC" => Some("DECIMAL"),
+        "SQL_BIT" => Some("BOOLEAN"),
+        "SQL_CHAR" | "SQL_VARCHAR" | "SQL_LONGVARCHAR" | "SQL_WCHAR" | "SQL_WVARCHAR"
+        | "SQL_WLONGVARCHAR" => Some("VARCHAR"),
+        "SQL_BINARY" | "SQL_VARBINARY" | "SQL_LONGVARBINARY" => Some("VARBINARY"),
+        "SQL_DATE" | "SQL_TYPE_DATE" => Some("DATE"),
+        "SQL_TIME" | "SQL_TYPE_TIME" => Some("TIME"),
+        "SQL_TIMESTAMP" | "SQL_TYPE_TIMESTAMP" => Some("TIMESTAMP"),
+        "SQL_GUID" => Some("UUID"),
+        _ => None,
+    }
+}
+
 /// Split a `{fn ...}` argument list on its top-level commas.
 ///
 /// Core hands the argument text over whole, deliberately: only the dialect
@@ -197,6 +241,22 @@ pub(crate) fn rewrite_scalar_fn(name: &str, args: &str) -> Option<String> {
         "TIMESTAMPDIFF" if parts.len() == 3 => {
             let unit = trino_interval_unit(parts[0])?;
             Some(format!("date_diff('{unit}', {}, {})", parts[1], parts[2]))
+        }
+
+        // SQL_FN_CVT_CAST — ODBC passes the target as an unquoted `SQL_*`
+        // keyword in an argument position, which is neither a Trino type name
+        // nor even valid there: `CONVERT(x, SQL_INTEGER)` reaches the server as
+        // a two-argument function call and fails resolving `sql_integer` as a
+        // column. The whole call has to become a `CAST`.
+        "CONVERT" if parts.len() == 2 => {
+            let target = trino_convert_target(parts[1]).or_else(|| {
+                tracing::warn!(
+                    odbc_type = parts[1],
+                    "no Trino type for this ODBC CONVERT target; leaving the escape untranslated"
+                );
+                None
+            })?;
+            Some(format!("CAST({} AS {target})", parts[0]))
         }
 
         // SQL_FN_TD_DAYOFWEEK — Trino's `day_of_week` is ISO-numbered
@@ -331,6 +391,80 @@ mod tests {
         }
     }
 
+    /// `{fn CONVERT(value, SQL_type)}` becomes a `CAST`, which is what
+    /// `SQL_CONVERT_FUNCTIONS` reporting `SQL_FN_CVT_CAST` promises.
+    ///
+    /// Every ODBC type keyword the spec defines for this escape is covered,
+    /// because a client reading the bitmap is entitled to send any of them.
+    #[test]
+    fn convert_becomes_a_cast_for_every_odbc_type_keyword() {
+        for (keyword, trino) in [
+            ("SQL_BIGINT", "BIGINT"),
+            ("SQL_INTEGER", "INTEGER"),
+            ("SQL_SMALLINT", "SMALLINT"),
+            ("SQL_TINYINT", "TINYINT"),
+            ("SQL_DOUBLE", "DOUBLE"),
+            ("SQL_FLOAT", "DOUBLE"),
+            ("SQL_REAL", "REAL"),
+            ("SQL_DECIMAL", "DECIMAL"),
+            ("SQL_NUMERIC", "DECIMAL"),
+            ("SQL_BIT", "BOOLEAN"),
+            ("SQL_CHAR", "VARCHAR"),
+            ("SQL_VARCHAR", "VARCHAR"),
+            ("SQL_LONGVARCHAR", "VARCHAR"),
+            ("SQL_WCHAR", "VARCHAR"),
+            ("SQL_WVARCHAR", "VARCHAR"),
+            ("SQL_WLONGVARCHAR", "VARCHAR"),
+            ("SQL_BINARY", "VARBINARY"),
+            ("SQL_VARBINARY", "VARBINARY"),
+            ("SQL_LONGVARBINARY", "VARBINARY"),
+            ("SQL_DATE", "DATE"),
+            ("SQL_TYPE_DATE", "DATE"),
+            ("SQL_TIME", "TIME"),
+            ("SQL_TYPE_TIME", "TIME"),
+            ("SQL_TIMESTAMP", "TIMESTAMP"),
+            ("SQL_TYPE_TIMESTAMP", "TIMESTAMP"),
+            ("SQL_GUID", "UUID"),
+        ] {
+            assert_eq!(
+                rewrite_scalar_fn("CONVERT", &format!("x, {keyword}")).as_deref(),
+                Some(format!("CAST(x AS {trino})").as_str()),
+                "{{fn CONVERT(x, {keyword})}} rewrote wrongly"
+            );
+        }
+    }
+
+    /// The keyword is matched case-insensitively and with surrounding space
+    /// tolerated, the same as `TIMESTAMPADD`'s interval keyword.
+    #[test]
+    fn convert_keyword_is_case_and_space_insensitive() {
+        assert_eq!(
+            rewrite_scalar_fn("CONVERT", "x,  sql_integer ").as_deref(),
+            Some("CAST(x AS INTEGER)")
+        );
+        assert_eq!(
+            rewrite_scalar_fn("convert", "x, Sql_Integer").as_deref(),
+            Some("CAST(x AS INTEGER)")
+        );
+    }
+
+    /// `SQL_CHAR` maps to `VARCHAR`, not to Trino's `CHAR`.
+    ///
+    /// Measured, not assumed: `CAST('hello world' AS CHAR)` returns `"h"` on a
+    /// live coordinator, because a bare `CHAR` in Trino is `CHAR(1)`. Mapping
+    /// the ODBC keyword to it would silently truncate every conversion to one
+    /// character, which is worse than not translating at all.
+    #[test]
+    fn convert_to_char_does_not_map_to_trinos_truncating_char() {
+        let rewritten = rewrite_scalar_fn("CONVERT", "'hello world', SQL_CHAR")
+            .expect("SQL_CHAR is a mapped keyword");
+        assert!(
+            !rewritten.contains("AS CHAR)"),
+            "SQL_CHAR must not become Trino's CHAR(1): {rewritten}"
+        );
+        assert_eq!(rewritten, "CAST('hello world' AS VARCHAR)");
+    }
+
     /// Declining is how a call this cannot honour reaches the fallback path
     /// unchanged, rather than being rewritten into something wrong.
     #[test]
@@ -358,6 +492,17 @@ mod tests {
         assert_eq!(rewrite_scalar_fn("CURRENT_TIMESTAMP", "6"), None);
         // A function with no rewrite is remap_scalar_fn's business.
         assert_eq!(rewrite_scalar_fn("UCASE", "x"), None);
+        // An ODBC type keyword with no Trino equivalent, and a value that is
+        // not a type keyword at all. Guessing a target type would produce a
+        // cast the application never asked for.
+        assert_eq!(
+            rewrite_scalar_fn("CONVERT", "x, SQL_INTERVAL_DAY_TO_SECOND"),
+            None
+        );
+        assert_eq!(rewrite_scalar_fn("CONVERT", "x, NOT_A_TYPE"), None);
+        // Wrong arity falls through rather than producing malformed SQL.
+        assert_eq!(rewrite_scalar_fn("CONVERT", "x"), None);
+        assert_eq!(rewrite_scalar_fn("CONVERT", "x, SQL_INTEGER, y"), None);
     }
 
     /// `SQL_TIMEDATE_ADD_INTERVALS` / `SQL_TIMEDATE_DIFF_INTERVALS` name the

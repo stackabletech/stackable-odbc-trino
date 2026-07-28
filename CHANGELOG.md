@@ -156,6 +156,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `{fn CONVERT(value, SQL_type)}` is now translated to `CAST(value AS type)`.
+  `SQL_CONVERT_FUNCTIONS` has always reported `SQL_FN_CVT_CAST`, advertising the
+  escape, but nothing translated it: the ODBC type keyword reached Trino as a
+  bare identifier, so `SELECT {fn CONVERT('1', SQL_INTEGER)}` failed with
+  `COLUMN_NOT_FOUND` on `sql_integer`. All 26 ODBC type keywords with a Trino
+  equivalent are mapped and exercised against a live coordinator.
+
+  `SQL_CHAR` maps to `VARCHAR` rather than to Trino's `CHAR`, which is `CHAR(1)`
+  when written without a length — `CAST('hello world' AS CHAR)` returns `"h"`,
+  and `{fn CONVERT}` carries no length to give `CHAR(n)` instead. The
+  `SQL_INTERVAL_*` keywords stay untranslated, since no bare `CAST` reaches
+  Trino's interval types; the escape is left alone rather than cast to something
+  the application did not ask for.
+
 - The Power Query connector no longer overrides `SQL_SQL92_PREDICATES` and
   `SQL_SQL92_RELATIONAL_JOIN_OPERATORS` with every bit set. The driver gates
   both on the coordinator's version — `MATCH` and `UNIQUE` arrived in Trino
