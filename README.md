@@ -53,9 +53,11 @@ Keys are case-insensitive. The authoritative list is
 | `Port` | Yes | Coordinator port |
 | `User` | Yes | Username (Basic Auth) |
 | `Password` | No | Password (Basic Auth) |
-| `Protocol` | No | `http` (default) or `https` |
+| `Protocol` | No | `https` (default) or `http` |
 | `Catalog` | No | Default catalog |
 | `Schema` | No | Default schema |
+| `Source` | No | Query source Trino records and can route on. Default `stackable-odbc-trino/<version>` |
+| `ClientTags` | No | Comma-separated Trino client tags, which select a resource group |
 | `TlsVerify` | No | `true` (default) or `false` |
 | `Certificate` | No | Path to a PEM CA certificate for server verification |
 | `AccessToken` | No | JWT bearer token. Alias: `Token` |

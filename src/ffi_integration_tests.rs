@@ -45,7 +45,7 @@ use crate::backend::info::{
 use crate::backend::{TrinoBackend, disconnected_trino_conn};
 
 const CONN_STR: &str =
-    "Host=localhost;Port=8080;User=admin;Password=admin;Protocol=http;Catalog=tpcds";
+    "Host=localhost;Port=8080;Protocol=http;User=admin;Password=admin;Catalog=tpcds";
 
 // ---------------------------------------------------------------------------
 // Shared connection infrastructure
@@ -2725,6 +2725,75 @@ fn statistics_returns_empty_result_set() {
             SqlReturn::NO_DATA,
             "statistics should return empty result set"
         );
+        cleanup_stmt(stmt);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Query attribution
+//
+// `source` and `client_tags` are the two things a Trino operator uses to tell
+// one client's traffic from another's and to route it to a resource group.
+// Neither is observable through ODBC, so the assertion has to come from the
+// server: `system.runtime.queries` records the source of every query.
+// ---------------------------------------------------------------------------
+
+#[test]
+#[serial]
+#[ignore = "requires Trino at localhost:8080 -- run test/setup.sh first"]
+fn queries_reach_trino_tagged_with_the_drivers_source() {
+    unsafe {
+        let (_env, _conn, stmt) = alloc_stmt();
+        // The shared connection names no Source, so this is the default.
+        let sql = "SELECT source FROM system.runtime.queries \
+                   WHERE query_id = (SELECT max(query_id) FROM system.runtime.queries \
+                                     WHERE query LIKE 'SELECT 41 + 1%')";
+        let seed: Vec<u16> = "SELECT 41 + 1".encode_utf16().collect();
+        assert_eq!(
+            ffi::execute::sql_exec_direct_w::<TrinoBackend>(stmt, seed.as_ptr(), seed.len() as i32),
+            SqlReturn::SUCCESS
+        );
+        while ffi::fetch::sql_fetch::<TrinoBackend>(stmt) == SqlReturn::SUCCESS {}
+        assert_eq!(
+            ffi::cursor::sql_close_cursor::<TrinoBackend>(stmt),
+            SqlReturn::SUCCESS
+        );
+
+        let wide: Vec<u16> = sql.encode_utf16().collect();
+        assert_eq!(
+            ffi::execute::sql_exec_direct_w::<TrinoBackend>(stmt, wide.as_ptr(), wide.len() as i32),
+            SqlReturn::SUCCESS,
+            "{}",
+            diag_message(stmt)
+        );
+        assert_eq!(
+            ffi::fetch::sql_fetch::<TrinoBackend>(stmt),
+            SqlReturn::SUCCESS,
+            "no query found in system.runtime.queries"
+        );
+
+        let mut buf = [0u16; 128];
+        let mut len: isize = 0;
+        assert_eq!(
+            ffi::fetch::sql_get_data::<TrinoBackend>(
+                stmt,
+                1,
+                CDataType::WChar as i16,
+                buf.as_mut_ptr() as *mut c_void,
+                (buf.len() * 2) as isize,
+                &mut len,
+            ),
+            SqlReturn::SUCCESS
+        );
+        let source = String::from_utf16_lossy(&buf[..(len as usize) / 2]);
+        // `env!` rather than a literal, so bumping the crate version cannot
+        // leave this asserting a version the driver no longer reports.
+        assert_eq!(
+            source,
+            format!("stackable-odbc-trino/{}", env!("CARGO_PKG_VERSION")),
+            "Trino recorded the query under a source that does not name this driver and build"
+        );
+
         cleanup_stmt(stmt);
     }
 }

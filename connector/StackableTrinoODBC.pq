@@ -65,7 +65,11 @@ shared StackableTrinoODBC.Contents = (
     optional protocol as text
 ) as table =>
     let
-        effectiveProtocol = if protocol <> null then protocol else "http",
+        // Matches the driver's own default. An unencrypted connection should
+        // be something the user chose, not what they got by leaving the
+        // optional protocol argument out; a plaintext coordinator takes
+        // protocol = "http".
+        effectiveProtocol = if protocol <> null then protocol else "https",
         effectiveUser = if user <> null then user else "trino",
 
         ConnectionString = [

@@ -2,6 +2,7 @@
 //! password, protocol, catalog, schema, TLS and JWT options) parsed from the
 //! generic `stackable-odbc-core` connection-string key/value map.
 
+use std::collections::HashSet;
 use std::time::Duration;
 
 use stackable_odbc_core::types::{ConnectParams, Redacted};
@@ -14,7 +15,7 @@ use super::super::TrinoError;
 
 pub(crate) const PARAM_HOST: &str = "host";
 pub(crate) const PARAM_PORT: &str = "port";
-/// Transport protocol: `"http"` (default) or `"https"`.
+/// Transport protocol: `"https"` (default) or `"http"`.
 pub(crate) const PARAM_PROTOCOL: &str = "protocol";
 /// TLS certificate verification: `"true"` (default) or `"false"`.
 pub(crate) const PARAM_TLS_VERIFY: &str = "tlsverify";
@@ -26,13 +27,36 @@ pub(crate) const PARAM_QUERY_TIMEOUT: &str = "querytimeout";
 pub(crate) const PARAM_LOGIN_TIMEOUT: &str = "logintimeout";
 pub(crate) const PARAM_CATALOG: &str = "catalog";
 pub(crate) const PARAM_SCHEMA: &str = "schema";
+/// Name this connection reports as Trino's query source.
+pub(crate) const PARAM_SOURCE: &str = "source";
+/// Comma-separated Trino client tags, which select a resource group.
+pub(crate) const PARAM_CLIENT_TAGS: &str = "clienttags";
 /// Trino JWT bearer token (sent as `Authorization: Bearer <token>`).
 pub(crate) const PARAM_ACCESS_TOKEN: &str = "accesstoken";
 /// Alias for [`PARAM_ACCESS_TOKEN`].
 pub(crate) const PARAM_TOKEN: &str = "token";
 
-const DEFAULT_PROTOCOL: &str = "http";
+/// Transport used when the connection string names none.
+///
+/// `https`, so that an unencrypted connection is something an application
+/// asked for rather than something it got by staying silent. A coordinator
+/// serving plaintext needs an explicit `Protocol=http`.
+const DEFAULT_PROTOCOL: &str = "https";
 const DEFAULT_QUERY_TIMEOUT_SECS: u64 = 30;
+
+/// Query source reported when the connection string names none.
+///
+/// Trino shows this in its query history and can route on it, so a default
+/// that names the driver is what lets an operator tell this driver's traffic
+/// apart. `ClientBuilder::new` would otherwise leave it as the client
+/// library's own name, which identifies neither the driver nor the
+/// application.
+///
+/// The Cargo version rides along, `name/version`, matching how HTTP
+/// user-agents are conventionally spelled. An operator reading the query log
+/// after a rollout can then tell one driver build from another, which is
+/// exactly when the question gets asked.
+pub(crate) const DEFAULT_SOURCE: &str = concat!("stackable-odbc-trino/", env!("CARGO_PKG_VERSION"));
 
 // ---------------------------------------------------------------------------
 // Typed connection parameters
@@ -52,6 +76,8 @@ pub(crate) struct TrinoConnectParams {
     query_timeout: Duration,
     catalog: Option<String>,
     schema: Option<String>,
+    source: String,
+    client_tags: HashSet<String>,
 }
 
 impl TrinoConnectParams {
@@ -77,6 +103,14 @@ impl TrinoConnectParams {
 
     pub fn secure(&self) -> bool {
         self.secure
+    }
+
+    pub fn source(&self) -> &str {
+        &self.source
+    }
+
+    pub fn client_tags(&self) -> &HashSet<String> {
+        &self.client_tags
     }
 
     pub fn tls_verify(&self) -> bool {
@@ -179,6 +213,24 @@ impl TryFrom<&ConnectParams> for TrinoConnectParams {
             query_timeout: Duration::from_secs(query_timeout_secs),
             catalog: params.get(PARAM_CATALOG).map(str::to_string),
             schema: params.get(PARAM_SCHEMA).map(str::to_string),
+            source: params
+                .get(PARAM_SOURCE)
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or(DEFAULT_SOURCE)
+                .to_string(),
+            // Trino matches resource-group selectors against whole tags, so
+            // surrounding space would make " bi" miss a rule written for "bi".
+            // An empty element is dropped rather than sent as an empty tag.
+            client_tags: params
+                .get(PARAM_CLIENT_TAGS)
+                .map(|raw| {
+                    raw.split(',')
+                        .map(str::trim)
+                        .filter(|tag| !tag.is_empty())
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_default(),
         })
     }
 }
@@ -195,6 +247,42 @@ mod tests {
     fn parse_err(s: &str) -> TrinoError {
         let params = ConnectParams::parse(s).unwrap();
         TrinoConnectParams::try_from(&params).unwrap_err()
+    }
+
+    #[test]
+    fn source_defaults_to_the_driver_name_and_version() {
+        // Trino's query history shows this. Left unset, every query from this
+        // driver is indistinguishable from any other client's -- and without
+        // the version, one driver build is indistinguishable from another,
+        // which is what an operator needs when a regression appears in the
+        // query log after a rollout.
+        let p = parse("Host=localhost;Port=8080;User=admin");
+        assert_eq!(
+            p.source(),
+            format!("stackable-odbc-trino/{}", env!("CARGO_PKG_VERSION"))
+        );
+    }
+
+    #[test]
+    fn source_can_be_overridden() {
+        let p = parse("Host=localhost;Port=8080;User=admin;Source=powerbi");
+        assert_eq!(p.source(), "powerbi");
+    }
+
+    #[test]
+    fn client_tags_are_split_on_commas_and_trimmed() {
+        // Trino selects a resource group from these, so " bi , adhoc " has to
+        // reach the coordinator as two clean tags, not one padded string.
+        let p = parse("Host=localhost;Port=8080;User=admin;ClientTags= bi , adhoc ");
+        let mut tags: Vec<&str> = p.client_tags().iter().map(String::as_str).collect();
+        tags.sort_unstable();
+        assert_eq!(tags, vec!["adhoc", "bi"]);
+    }
+
+    #[test]
+    fn client_tags_are_empty_when_unset() {
+        let p = parse("Host=localhost;Port=8080;User=admin");
+        assert!(p.client_tags().is_empty());
     }
 
     #[test]
@@ -233,8 +321,17 @@ mod tests {
     }
 
     #[test]
-    fn protocol_defaults_to_http() {
+    fn protocol_defaults_to_https() {
+        // The safe direction for an omitted value: an unencrypted connection
+        // should be something an application asked for, not something it got
+        // by saying nothing. A plaintext coordinator needs `Protocol=http`.
         let p = parse("Host=localhost;Port=8080;User=admin");
+        assert!(p.secure());
+    }
+
+    #[test]
+    fn protocol_http_opts_out_of_tls() {
+        let p = parse("Host=localhost;Port=8080;User=admin;Protocol=http");
         assert!(!p.secure());
     }
 

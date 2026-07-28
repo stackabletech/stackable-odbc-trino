@@ -30,6 +30,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Trino's do. `SQLColumnPrivileges` additionally returns `HY009` for a null
   `TableName` unconditionally; it is the only one of the ten whose spec page
   states that without a **(DM)** marker.
+- `Source` and `ClientTags` connection-string keys. `Source` is what Trino
+  records as the query's source and shows in `system.runtime.queries`, and it
+  defaults to `stackable-odbc-trino/<version>`, carrying the driver's Cargo
+  version so one build can be told from another after a rollout — queries
+  previously reached the
+  coordinator under `trino-rust-client`, the client library's name, which
+  identified neither the driver nor the application. `ClientTags` takes a
+  comma-separated list, which Trino matches when selecting a resource group,
+  so an operator can queue this driver's traffic separately.
 - `SQLDescribeParam` reports the type Trino infers for each parameter, read
   from `DESCRIBE INPUT` on the prepared statement. Every parameter of every
   statement was previously described as `VARCHAR(4000)` — a generic answer that
@@ -58,6 +67,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **`Protocol` now defaults to `https`** rather than `http`. A connection
+  string that names no protocol is encrypted; an unencrypted connection has to
+  be asked for with `Protocol=http`.
+
+  This is the safe direction for an omitted value — plaintext should be a
+  choice, not a silence — but it changes what an existing connection string
+  means. Any application pointing at a plaintext coordinator without naming a
+  protocol must add `Protocol=http`. The failure is a connection error at
+  `SQLDriverConnect`, not a silent downgrade.
+
+  The Power Query connector's optional `protocol` argument defaults to `https`
+  to match, so both entry points agree.
 - A server-side error's `SQLGetDiagRec` message no longer carries Trino's
   `failure_info`. The coordinator's Java stack was reaching the application
   through the diagnostic's causal chain, putting between 1,700 and 15,000

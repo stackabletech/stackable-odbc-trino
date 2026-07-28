@@ -96,7 +96,7 @@ fn shape_a_query(rows: usize, cols: usize) -> String {
     )
 }
 
-/// Build the connection string. Trino setup.sh uses `Host=localhost;Port=8080;User=admin;Protocol=http`.
+/// Build the connection string. Trino setup.sh uses `Host=localhost;Port=8080;Protocol=http;User=admin`.
 fn connect_string(url: &str) -> String {
     // Parse `http://host:port` minimally; reject unsupported forms loudly.
     let (proto, rest) = url.split_once("://").unwrap_or(("http", url));
