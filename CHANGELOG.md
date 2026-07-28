@@ -30,6 +30,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Trino's do. `SQLColumnPrivileges` additionally returns `HY009` for a null
   `TableName` unconditionally; it is the only one of the ten whose spec page
   states that without a **(DM)** marker.
+- `SQLDescribeParam` reports the type Trino infers for each parameter, read
+  from `DESCRIBE INPUT` on the prepared statement. Every parameter of every
+  statement was previously described as `VARCHAR(4000)` — a generic answer that
+  makes a client sizing its buffers from it send a number as text and get a
+  type error back from the coordinator.
+
+  Parametric types carry their precision and scale, so a `char(20)` parameter
+  reports a size of 20 and a `decimal(10,2)` reports 10 and 2. A statement
+  Trino declines to prepare still falls back to the generic answer rather than
+  failing the call.
 - `SQLTablePrivileges` reports Trino's table-level privileges, read from the
   connected catalog's `information_schema.table_privileges`. It previously
   returned an empty result set for every data source.

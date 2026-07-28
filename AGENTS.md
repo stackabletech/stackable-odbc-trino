@@ -264,6 +264,37 @@ consistent with the `SQL_ACCESSIBLE_PROCEDURES` = `"N"` already reported from
 
 [trino#22408]: https://github.com/trinodb/trino/issues/22408
 
+### Describing parameters
+
+`SQLDescribeParam` is answered from Trino, not guessed: `DESCRIBE INPUT` on a
+prepared statement returns a type per parameter. Three things about the path
+are load-bearing, and `src/backend/describe_param.rs` documents each at its
+site:
+
+- **The `PREPARE` goes through `Client::execute`, never the bound-parameter
+  path.** `params::interpolate` would replace the statement's own `?` markers
+  with the absent parameter values, registering a statement with no parameters
+  — which is exactly what `SQLExecDirect("PREPARE p FROM ... ?")` does today,
+  and why `DESCRIBE INPUT` reads empty when driven that way.
+- **`PREPARE` and `DEALLOCATE` are not `query_all_rows`.** They declare no
+  columns, and `query_all_rows` deserialises rows, so it fails on them.
+- **`DEALLOCATE` is not housekeeping.** A session's prepared statements ride on
+  every subsequent request as an `X-Trino-Prepared-Statement` header, so a
+  leaked entry grows every later request by the whole query text.
+
+`Backend::describe_param` is called once per *parameter* and gets no statement
+handle, so the result is cached on `TrinoConnection`, keyed by SQL text. Core
+walks a statement's parameters consecutively, so one entry is enough to collapse
+n round trips into one. The key is what stops a second statement being answered
+from the first one's entry — the failure mode being a *wrong specific type*,
+which an application cannot distinguish from a real answer, and which
+`describe_param_re_describes_when_the_statement_changes` pins.
+
+Anything unanswerable returns `Ok(None)` and lets core report its documented
+`VARCHAR` guess. That is deliberate: Trino declines to prepare plenty of
+legitimate statements, and a uniform documented guess beats both a failed call
+and an invented type.
+
 ### Cancellation
 
 `Backend::cancel` receives a `TrinoCancelToken`, never a statement: `SQLCancel`
@@ -416,6 +447,7 @@ transactions means revisiting all of those together; see
 | `src/backend/execute.rs` | `exec_direct`, `execute`, paging, `StatementBackend` (fetch, `column_count`, `describe_col`, `close_cursor`) |
 | `src/backend/info.rs` | `SQLGetInfo` answers — the largest module. Typed `get_info` plus the raw `get_info_raw` path for info types with no `InfoType` variant |
 | `src/backend/metadata.rs` | All ten catalog functions, plus the catalog / schema / table-type enumerations. Each returns typed rows; core builds and sorts the result set |
+| `src/backend/describe_param.rs` | `SQLDescribeParam`, answered from `DESCRIBE INPUT` on a prepared statement, plus the per-connection cache that keeps it to one round trip per statement |
 | `src/backend/params.rs` | Parameter interpolation. Trino has no wire-level parameter binding, so bound values are rendered into the SQL as literals — the escaping rules live here |
 | `src/backend/types/connect_params.rs` | Connection-string parsing, with `Redacted` secrets |
 | `src/escape_dialect.rs` | ODBC escape sequences (`{fn ...}`, `{d ...}`, `{oj ...}`) → Trino SQL |

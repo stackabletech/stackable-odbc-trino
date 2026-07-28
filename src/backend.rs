@@ -14,9 +14,9 @@ use stackable_odbc_core::{
     errors::OdbcError,
     types::{
         ColumnDescriptor, ColumnPrivilegeRow, ColumnRow, ColumnValue, ConnectParams,
-        ExecuteOutcome, ForeignKeyRow, IdentifierType, InfoValue, Nullable, PrimaryKeyRow,
-        ProcedureColumnRow, ProcedureRow, SQL_CB_NULL, SQL_CN_ANY, SQL_FN_CVT_CAST, SQL_FN_TSI_DAY,
-        SQL_FN_TSI_HOUR, SQL_FN_TSI_MINUTE, SQL_FN_TSI_MONTH, SQL_FN_TSI_QUARTER,
+        ExecuteOutcome, ForeignKeyRow, IdentifierType, InfoValue, Nullable, ParamDescriptor,
+        PrimaryKeyRow, ProcedureColumnRow, ProcedureRow, SQL_CB_NULL, SQL_CN_ANY, SQL_FN_CVT_CAST,
+        SQL_FN_TSI_DAY, SQL_FN_TSI_HOUR, SQL_FN_TSI_MINUTE, SQL_FN_TSI_MONTH, SQL_FN_TSI_QUARTER,
         SQL_FN_TSI_SECOND, SQL_FN_TSI_WEEK, SQL_FN_TSI_YEAR, SQL_GB_GROUP_BY_CONTAINS_SELECT,
         SQL_IC_LOWER, SQL_NC_END, SQL_NNC_NON_NULL, SQL_SQ_COMPARISON,
         SQL_SQ_CORRELATED_SUBQUERIES, SQL_SQ_EXISTS, SQL_SQ_IN, SQL_SQ_QUANTIFIED, SQL_U_UNION,
@@ -26,6 +26,7 @@ use stackable_odbc_core::{
 };
 use trino_rust_client::{Client, ClientBuilder, Trino, auth::Auth, ssl::Ssl};
 
+mod describe_param;
 mod execute;
 // `pub(crate)` only under `cfg(test)`: the FFI integration tests
 // (`ffi_integration_tests.rs`, a sibling of this module under `lib.rs`) need to
@@ -385,6 +386,15 @@ pub struct TrinoConnection {
     /// `SQL_ATTR_CURRENT_CATALOG` value. Core's shared default is the empty
     /// string, correct only for a backend that cannot answer -- this one can.
     pub catalog: Option<String>,
+    /// The most recent `SQLDescribeParam` answer, keyed by the statement it
+    /// describes.
+    ///
+    /// `Backend::describe_param` is called once per *parameter* and receives
+    /// no statement handle, so without this a ten-parameter statement would
+    /// cost ten round trips to answer what one `DESCRIBE INPUT` already said.
+    /// Core walks a statement's parameters consecutively, so a single entry
+    /// keyed on the SQL text collapses that to one.
+    pub describe_param_cache: Mutex<Option<describe_param::CachedParams>>,
 }
 
 /// The state a `SQLCancel` on one thread and the executing statement on
@@ -487,6 +497,7 @@ pub(crate) fn disconnected_trino_conn() -> TrinoConnection {
         // No `Catalog` key was supplied, which is the SQL_DATABASE_NAME
         // "not available" case.
         catalog: None,
+        describe_param_cache: Mutex::new(None),
     }
 }
 
@@ -787,6 +798,7 @@ impl Backend for TrinoBackend {
             dbms_version: String::new(),
             server_major: 0,
             catalog: p.catalog().map(str::to_owned),
+            describe_param_cache: Mutex::new(None),
         };
         validate_connection(&conn, p.catalog())?;
         let version = fetch_server_version(&conn);
@@ -1243,6 +1255,18 @@ impl Backend for TrinoBackend {
             scope,
             nullable,
         )
+    }
+
+    /// Answered from Trino's `DESCRIBE INPUT`, so a client sizing its buffers
+    /// from `SQLDescribeParam` gets the type Trino actually inferred rather
+    /// than core's generic `VARCHAR`. See `backend::describe_param` for the
+    /// round trip and why it cannot go through the bound-parameter path.
+    fn describe_param(
+        conn: &TrinoConnection,
+        sql: &str,
+        parameter_number: u16,
+    ) -> Result<Option<ParamDescriptor>, TrinoError> {
+        describe_param::describe_param(conn, sql, parameter_number)
     }
 
     // The four catalog functions core defaults to an empty result set. Only

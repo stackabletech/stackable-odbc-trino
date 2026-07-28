@@ -2730,6 +2730,121 @@ fn statistics_returns_empty_result_set() {
 }
 
 // ---------------------------------------------------------------------------
+// SQLDescribeParam tests
+//
+// Core's fallback describes every parameter as VARCHAR(SQL_DEFAULT_PARAM_SIZE),
+// which is what makes a client send a number as text. Trino can be asked:
+// `DESCRIBE INPUT` on a prepared statement returns a type per parameter.
+// ---------------------------------------------------------------------------
+
+#[test]
+#[serial]
+#[ignore = "requires Trino at localhost:8080 -- run test/setup.sh first"]
+fn describe_param_reports_the_type_trino_infers_for_each_parameter() {
+    unsafe {
+        let (_env, _conn, stmt) = alloc_stmt();
+        // Two parameters of different types, so a generic answer cannot pass
+        // by coincidence: the WHERE comparison makes the first a bigint and
+        // the second a char(20), which is c_first_name's declared type.
+        let sql = "SELECT c_customer_sk FROM tpcds.sf1.customer \
+                   WHERE c_customer_sk = ? AND c_first_name = ?";
+        let wide: Vec<u16> = sql.encode_utf16().collect();
+        assert_eq!(
+            ffi::execute::sql_prepare_w::<TrinoBackend>(stmt, wide.as_ptr(), wide.len() as i32),
+            SqlReturn::SUCCESS
+        );
+
+        let describe = |n: u16| -> (i16, usize, i16, i16) {
+            let (mut ty, mut size, mut digits, mut nullable) = (0i16, 0usize, 0i16, 0i16);
+            let ret = ffi::params::sql_describe_param::<TrinoBackend>(
+                stmt,
+                n,
+                &mut ty,
+                &mut size,
+                &mut digits,
+                &mut nullable,
+            );
+            assert_eq!(
+                ret,
+                SqlReturn::SUCCESS,
+                "sql_describe_param({n}) failed: {}",
+                diag_message(stmt)
+            );
+            (ty, size, digits, nullable)
+        };
+
+        let (ty1, _, _, _) = describe(1);
+        assert_eq!(
+            ty1,
+            SqlDataType::EXT_BIG_INT.0,
+            "parameter 1 compares against a bigint column"
+        );
+
+        let (ty2, size2, _, _) = describe(2);
+        assert_eq!(
+            ty2,
+            SqlDataType::EXT_W_CHAR.0,
+            "parameter 2 compares against a char(20) column"
+        );
+        assert_eq!(
+            size2, 20,
+            "char(20) must carry its length for buffer sizing"
+        );
+
+        cleanup_stmt(stmt);
+    }
+}
+
+#[test]
+#[serial]
+#[ignore = "requires Trino at localhost:8080 -- run test/setup.sh first"]
+fn describe_param_re_describes_when_the_statement_changes() {
+    // The descriptors are cached on the connection, keyed by SQL text, because
+    // `Backend::describe_param` is called once per parameter and gets no
+    // statement handle. If that key were ignored, a second statement would be
+    // answered with the first one's types -- a wrong specific type, which is
+    // the one outcome worse than no answer at all.
+    unsafe {
+        let describe_first_param_of = |sql: &str| -> i16 {
+            let (_env, _conn, stmt) = alloc_stmt();
+            let wide: Vec<u16> = sql.encode_utf16().collect();
+            assert_eq!(
+                ffi::execute::sql_prepare_w::<TrinoBackend>(stmt, wide.as_ptr(), wide.len() as i32),
+                SqlReturn::SUCCESS
+            );
+            let (mut ty, mut size, mut digits, mut nullable) = (0i16, 0usize, 0i16, 0i16);
+            assert_eq!(
+                ffi::params::sql_describe_param::<TrinoBackend>(
+                    stmt,
+                    1,
+                    &mut ty,
+                    &mut size,
+                    &mut digits,
+                    &mut nullable,
+                ),
+                SqlReturn::SUCCESS,
+                "{}",
+                diag_message(stmt)
+            );
+            cleanup_stmt(stmt);
+            ty
+        };
+
+        let bigint_param =
+            describe_first_param_of("SELECT 1 FROM tpcds.sf1.customer WHERE c_customer_sk = ?");
+        assert_eq!(bigint_param, SqlDataType::EXT_BIG_INT.0);
+
+        let char_param =
+            describe_first_param_of("SELECT 1 FROM tpcds.sf1.customer WHERE c_first_name = ?");
+        assert_eq!(
+            char_param,
+            SqlDataType::EXT_W_CHAR.0,
+            "the second statement was answered from the first one's cache entry"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
 // SQLTablePrivilegesW / SQLColumnPrivilegesW / SQLProceduresW /
 // SQLProcedureColumnsW tests
 //
