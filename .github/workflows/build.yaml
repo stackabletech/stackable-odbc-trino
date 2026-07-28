@@ -102,6 +102,53 @@ jobs:
       - name: Run unit tests
         run: cargo test --locked
 
+  unit-tests-windows:
+    name: Unit Tests (Windows)
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          persist-credentials: false
+
+      # aws-lc-sys reaches this crate through trino-rust-client -> reqwest ->
+      # rustls, and its build script assembles x86_64 code with NASM.
+      # Installed explicitly rather than relied on from the runner image, so a
+      # future image change cannot turn this job red for a reason unrelated to
+      # the driver.
+      - name: Install NASM (required to build aws-lc-sys)
+        run: choco install nasm --no-progress -y
+
+      - name: Add NASM to PATH
+        run: echo "C:\Program Files\NASM" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+      - name: Install Rust ${{ env.RUST_TOOLCHAIN_VERSION }} toolchain
+        uses: dtolnay/rust-toolchain@b3b07ba8b418998c39fb20f53e8b695cdcc8de1b
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN_VERSION }}
+          targets: x86_64-pc-windows-gnu
+
+      # A separate cache key: the Linux job's artefacts are a different target
+      # triple and sharing the key would thrash both.
+      - name: Setup Rust Cache
+        uses: Swatinem/rust-cache@98c8021b550208e191a6a3145459bfc9fb29c4c0 # v2.8.0
+        with:
+          key: windows-gnu-test
+
+      # The GNU target's linker. windows-latest ships MSYS2, but its mingw64
+      # bin directory is not on PATH by default.
+      - name: Add MinGW to PATH
+        run: echo "C:\msys64\mingw64\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+      # `--target x86_64-pc-windows-gnu`, not the runner's default MSVC triple.
+      # That is the target release.yaml builds and packaging/build-archives.sh
+      # ships, and a suite passing against a toolchain nobody receives is only
+      # evidence about that toolchain. odbc-sys links odbc32, which comes with
+      # the Windows SDK already on the runner, so there is no equivalent of the
+      # unixodbc-dev install the Linux jobs need.
+      - name: Run unit tests
+        run: cargo test --locked --target x86_64-pc-windows-gnu
+
   windows-cross-compile:
     name: Cross-compile Windows DLL
     runs-on: ubuntu-latest
@@ -140,6 +187,7 @@ jobs:
     needs:
       - pre-commit
       - unit-tests
+      - unit-tests-windows
       - windows-cross-compile
     runs-on: ubuntu-latest
     timeout-minutes: 5
