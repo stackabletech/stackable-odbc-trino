@@ -3140,6 +3140,77 @@ fn decimal_column_read_as_double() {
     }
 }
 
+/// The three IEEE specials must be readable as `SQL_C_DOUBLE` from both a
+/// `DOUBLE` and a `REAL` column.
+///
+/// Trino has no JSON literal for them and sends `"NaN"`, `"Infinity"` and
+/// `"-Infinity"` as strings, so they used to reach the application as text and
+/// fail the C conversion with `22018` — the value was simply unreadable as a
+/// number. Only a live coordinator can confirm the wire encoding this depends
+/// on, which is why this is not left to the unit tests over `json_to_column_value`.
+#[test]
+#[serial]
+#[ignore = "requires Trino at localhost:8080 -- run test/setup.sh first"]
+fn ieee_special_floats_are_readable_as_c_double() {
+    /// Predicate on the `f64` read back, since the specials do not compare
+    /// equal to themselves and cannot be asserted with `assert_eq!`.
+    type Check = fn(f64) -> bool;
+
+    // (Trino expression, predicate on the value read back)
+    let cases: &[(&str, Check)] = &[
+        ("CAST(nan() AS DOUBLE)", |v| v.is_nan()),
+        ("CAST(infinity() AS DOUBLE)", |v| {
+            v.is_infinite() && v.is_sign_positive()
+        }),
+        ("CAST(-infinity() AS DOUBLE)", |v| {
+            v.is_infinite() && v.is_sign_negative()
+        }),
+        ("CAST(nan() AS REAL)", |v| v.is_nan()),
+        ("CAST(infinity() AS REAL)", |v| {
+            v.is_infinite() && v.is_sign_positive()
+        }),
+        ("CAST(-infinity() AS REAL)", |v| {
+            v.is_infinite() && v.is_sign_negative()
+        }),
+    ];
+
+    unsafe {
+        for (expr, ok) in cases {
+            let (_env, _conn, stmt) = alloc_stmt();
+            assert_eq!(
+                exec_direct(stmt, &format!("SELECT {expr}")),
+                SqlReturn::SUCCESS,
+                "{expr} did not execute"
+            );
+            assert_eq!(
+                ffi::fetch::sql_fetch::<TrinoBackend>(stmt),
+                SqlReturn::SUCCESS,
+                "{expr} returned no row"
+            );
+
+            let mut buf: f64 = 0.0;
+            let mut ind: isize = 0;
+            let ret = ffi::fetch::sql_get_data::<TrinoBackend>(
+                stmt,
+                1,
+                CDataType::Double as i16,
+                &mut buf as *mut f64 as *mut c_void,
+                std::mem::size_of::<f64>() as isize,
+                &mut ind,
+            );
+            assert_eq!(
+                ret,
+                SqlReturn::SUCCESS,
+                "{expr} could not be read as SQL_C_DOUBLE -- this is the 22018 \
+                 that made IEEE specials unreadable"
+            );
+            assert!(ok(buf), "{expr} read back as {buf}");
+
+            cleanup_stmt(stmt);
+        }
+    }
+}
+
 /// A VARCHAR value holding digit text, read as `SQL_C_SBIGINT`, must succeed
 /// (the ODBC conversion matrix requires CHAR/VARCHAR to convert to every C
 /// type); the same shape holding non-numeric text must fail with the

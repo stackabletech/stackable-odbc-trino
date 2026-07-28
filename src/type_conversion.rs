@@ -973,6 +973,39 @@ fn parse_numeric_offset(sign: i32, hhmm: &str) -> Option<chrono::TimeDelta> {
     chrono::TimeDelta::try_seconds(total_seconds)
 }
 
+/// The `f64` Trino means by a string-valued float, or `None` for any other
+/// string.
+///
+/// JSON has no literal for the IEEE specials, so Trino sends them as strings:
+/// a `DOUBLE` or `REAL` column carrying one arrives as `"NaN"`, `"Infinity"` or
+/// `"-Infinity"` rather than as a number. Read off the wire, not from the
+/// documentation — see `ieee_specials_are_read_as_floats_not_strings`.
+///
+/// The spellings are matched exactly rather than case-insensitively: these are
+/// the three Trino emits, and accepting looser forms would mean silently
+/// turning some other data source's text into a number.
+fn trino_special_float(s: &str) -> Option<f64> {
+    match s {
+        "NaN" => Some(f64::NAN),
+        "Infinity" => Some(f64::INFINITY),
+        "-Infinity" => Some(f64::NEG_INFINITY),
+        _ => None,
+    }
+}
+
+/// The text of a JSON value, without re-encoding a string as JSON.
+///
+/// `Value::to_string()` renders `Value::String("abc")` as `"\"abc\""`, quote
+/// characters and all. Every fallback arm in [`json_to_column_value`] hands its
+/// result to the application as data, so a value that failed to convert must
+/// arrive as the text Trino sent, not as its JSON encoding.
+fn json_as_text(val: &Value) -> String {
+    match val {
+        Value::String(s) => s.clone(),
+        other => other.to_string(),
+    }
+}
+
 /// Convert a JSON value from Trino to an ODBC ColumnValue, guided by the column type.
 pub fn json_to_column_value(val: Value, ty: &TrinoTy) -> ColumnValue {
     if val.is_null() {
@@ -983,7 +1016,7 @@ pub fn json_to_column_value(val: Value, ty: &TrinoTy) -> ColumnValue {
             .as_i64()
             .or_else(|| val.as_str().and_then(|s| s.parse().ok()))
             .map(ColumnValue::I64)
-            .unwrap_or_else(|| ColumnValue::String(val.to_string())),
+            .unwrap_or_else(|| ColumnValue::String(json_as_text(&val))),
         TrinoTy::TrinoInt(TrinoInt::I32) => match val.as_i64() {
             Some(n) => i32::try_from(n).map(ColumnValue::I32).unwrap_or_else(|_| {
                 tracing::warn!(
@@ -991,9 +1024,9 @@ pub fn json_to_column_value(val: Value, ty: &TrinoTy) -> ColumnValue {
                     declared_type = ?ty,
                     "value does not fit the declared INTEGER column; returning it as text"
                 );
-                ColumnValue::String(val.to_string())
+                ColumnValue::String(json_as_text(&val))
             }),
-            None => ColumnValue::String(val.to_string()),
+            None => ColumnValue::String(json_as_text(&val)),
         },
         TrinoTy::TrinoInt(TrinoInt::I16) => match val.as_i64() {
             Some(n) => i16::try_from(n).map(ColumnValue::I16).unwrap_or_else(|_| {
@@ -1002,9 +1035,9 @@ pub fn json_to_column_value(val: Value, ty: &TrinoTy) -> ColumnValue {
                     declared_type = ?ty,
                     "value does not fit the declared SMALLINT column; returning it as text"
                 );
-                ColumnValue::String(val.to_string())
+                ColumnValue::String(json_as_text(&val))
             }),
-            None => ColumnValue::String(val.to_string()),
+            None => ColumnValue::String(json_as_text(&val)),
         },
         TrinoTy::TrinoInt(TrinoInt::I8) => match val.as_i64() {
             Some(n) => i8::try_from(n).map(ColumnValue::I8).unwrap_or_else(|_| {
@@ -1013,16 +1046,18 @@ pub fn json_to_column_value(val: Value, ty: &TrinoTy) -> ColumnValue {
                     declared_type = ?ty,
                     "value does not fit the declared TINYINT column; returning it as text"
                 );
-                ColumnValue::String(val.to_string())
+                ColumnValue::String(json_as_text(&val))
             }),
-            None => ColumnValue::String(val.to_string()),
+            None => ColumnValue::String(json_as_text(&val)),
         },
         TrinoTy::TrinoFloat(TrinoFloat::F64) => val
             .as_f64()
+            .or_else(|| val.as_str().and_then(trino_special_float))
             .map(ColumnValue::F64)
-            .unwrap_or_else(|| ColumnValue::String(val.to_string())),
+            .unwrap_or_else(|| ColumnValue::String(json_as_text(&val))),
         TrinoTy::TrinoFloat(TrinoFloat::F32) => val
             .as_f64()
+            .or_else(|| val.as_str().and_then(trino_special_float))
             .map(|f| {
                 let n = f as f32;
                 if n.is_finite() || !f.is_finite() {
@@ -1033,14 +1068,14 @@ pub fn json_to_column_value(val: Value, ty: &TrinoTy) -> ColumnValue {
                         declared_type = ?ty,
                         "value overflows the declared REAL column; returning it as text"
                     );
-                    ColumnValue::String(val.to_string())
+                    ColumnValue::String(json_as_text(&val))
                 }
             })
-            .unwrap_or_else(|| ColumnValue::String(val.to_string())),
+            .unwrap_or_else(|| ColumnValue::String(json_as_text(&val))),
         TrinoTy::Boolean => val
             .as_bool()
             .map(ColumnValue::Bool)
-            .unwrap_or_else(|| ColumnValue::String(val.to_string())),
+            .unwrap_or_else(|| ColumnValue::String(json_as_text(&val))),
         // Date / time types: Trino serialises these as ISO-8601 strings.
         TrinoTy::Date => {
             if let Value::String(ref s) = val {
@@ -1389,12 +1424,76 @@ mod tests {
             serde_json::json!(1e300f64),
             &TrinoTy::TrinoFloat(TrinoFloat::F32),
         );
-        // Not "1e300": serde_json's `Value::to_string()` renders the exponent
-        // with an explicit sign ("1e+300"), which is what `val.to_string()`
-        // (used by every other fallback arm in this function) actually
-        // produces; verified by running this assertion against the real
+        // Not "1e300": serde_json renders the exponent with an explicit sign
+        // ("1e+300"), which is what `json_as_text` produces for a non-string
+        // value; verified by running this assertion against the real
         // implementation rather than trusting the task brief's guessed value.
         assert_eq!(val, ColumnValue::String("1e+300".to_string()));
+    }
+
+    /// Trino encodes the three IEEE specials as JSON *strings*, not numbers —
+    /// `["NaN", "Infinity", "-Infinity"]`, confirmed off the wire — because
+    /// JSON has no literal for them. Without an arm for a string-valued float
+    /// column they fell through to `ColumnValue::String`, and core then refused
+    /// `String -> Double` with `22018`, making the values unreadable.
+    #[test]
+    fn ieee_specials_are_read_as_floats_not_strings() {
+        for (raw, want) in [
+            ("NaN", f64::NAN),
+            ("Infinity", f64::INFINITY),
+            ("-Infinity", f64::NEG_INFINITY),
+        ] {
+            let val = json_to_column_value(
+                serde_json::json!(raw),
+                &TrinoTy::TrinoFloat(TrinoFloat::F64),
+            );
+            match val {
+                ColumnValue::F64(got) => assert!(
+                    (got.is_nan() && want.is_nan()) || got == want,
+                    "DOUBLE {raw:?} became {got}, expected {want}"
+                ),
+                other => panic!("DOUBLE {raw:?} did not convert to a float: {other:?}"),
+            }
+        }
+    }
+
+    /// The same three, for `REAL`. They reached the F32 arm through the same
+    /// `as_f64()` that returns `None` for a string, so both arms were affected.
+    #[test]
+    fn ieee_specials_are_read_as_floats_for_real_too() {
+        for (raw, want) in [
+            ("NaN", f32::NAN),
+            ("Infinity", f32::INFINITY),
+            ("-Infinity", f32::NEG_INFINITY),
+        ] {
+            let val = json_to_column_value(
+                serde_json::json!(raw),
+                &TrinoTy::TrinoFloat(TrinoFloat::F32),
+            );
+            match val {
+                ColumnValue::F32(got) => assert!(
+                    (got.is_nan() && want.is_nan()) || got == want,
+                    "REAL {raw:?} became {got}, expected {want}"
+                ),
+                other => panic!("REAL {raw:?} did not convert to a float: {other:?}"),
+            }
+        }
+    }
+
+    /// A string Trino sends for a float column that is *not* one of the three
+    /// specials still falls back to text — but as the text itself, not as its
+    /// JSON encoding.
+    ///
+    /// `Value::to_string()` on a `Value::String` re-adds the quote characters,
+    /// so the fallback used to yield `"\"abc\""`: an application reading the
+    /// column as text got two literal quote marks it never sent.
+    #[test]
+    fn unparseable_float_string_falls_back_without_json_quotes() {
+        let val = json_to_column_value(
+            serde_json::json!("abc"),
+            &TrinoTy::TrinoFloat(TrinoFloat::F64),
+        );
+        assert_eq!(val, ColumnValue::String("abc".to_string()));
     }
 
     #[test]

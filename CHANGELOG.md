@@ -156,6 +156,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `NaN`, `Infinity` and `-Infinity` in a `DOUBLE` or `REAL` column are now
+  readable. JSON has no literal for the IEEE specials, so Trino sends them as
+  strings; the conversion had no arm for a string-valued float column, so they
+  fell through as text and core then refused `String -> Double` with `22018`.
+  An application reading the column as text fared no better: the value arrived
+  as `"NaN"` with the JSON quote characters still attached.
+
+  The quoting was not specific to floats. Every fallback in
+  `json_to_column_value` rendered its value with `Value::to_string()`, which
+  re-encodes a string as JSON, so any value that failed to convert reached the
+  application with two quote marks it never sent. Those paths now yield the
+  text Trino actually sent.
 - `{fn CONVERT(value, SQL_type)}` is now translated to `CAST(value AS type)`.
   `SQL_CONVERT_FUNCTIONS` has always reported `SQL_FN_CVT_CAST`, advertising the
   escape, but nothing translated it: the ODBC type keyword reached Trino as a
