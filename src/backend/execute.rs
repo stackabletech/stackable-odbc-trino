@@ -46,11 +46,47 @@ fn convert_rows(
         .collect()
 }
 
+/// Remove the statement terminator an application left on the end.
+///
+/// Trino's REST API takes one statement per request and its grammar has no
+/// terminator, so a trailing `;` is a syntax error rather than a no-op:
+/// `SELECT 1;` fails with `SYNTAX_ERROR` at the semicolon's own column. ODBC
+/// applications and query tools routinely send one — `isql` submits the line as
+/// typed, and SQL editors commonly append it — so a driver that passes it
+/// through rejects statements every other client accepts.
+///
+/// Only the *trailing* run is removed, after trailing whitespace. That is
+/// enough to be safe without parsing: a statement whose last token is a string
+/// literal or quoted identifier ends with the closing quote, so a semicolon
+/// inside one is never the final character and never seen here. An embedded
+/// semicolon is left alone, and Trino rejects it — correctly, since it does not
+/// accept multiple statements per request.
+///
+/// A comment *after* the terminator (`SELECT 1; -- done`) is not handled: the
+/// trailing character is then the comment, not the semicolon. Recognising it
+/// would mean parsing comments, which is a larger change than the case
+/// justifies.
+fn strip_trailing_semicolons(sql: &str) -> &str {
+    let mut trimmed = sql.trim_end();
+    while let Some(rest) = trimmed.strip_suffix(';') {
+        trimmed = rest.trim_end();
+    }
+    trimmed
+}
+
 pub(super) fn exec_direct(
     conn: &TrinoConnection,
     cancel: &TrinoCancelToken,
     sql: &str,
 ) -> Result<TrinoStatement, TrinoError> {
+    // Every path carrying application SQL funnels through here -- `execute`
+    // calls this after interpolating parameters -- so this is the one place the
+    // terminator has to be dropped.
+    let stripped = strip_trailing_semicolons(sql);
+    if stripped.len() != sql.len() {
+        tracing::debug!("stripped a trailing statement terminator; Trino's grammar has none");
+    }
+    let sql = stripped;
     tracing::debug!(%sql, "TrinoBackend::exec_direct");
 
     // Submit the query to Trino.
@@ -647,5 +683,64 @@ impl Drop for TrinoStatement {
         if self.next_uri.is_some() {
             let _ = self.close_cursor();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_trailing_semicolon_is_removed() {
+        assert_eq!(strip_trailing_semicolons("SELECT 1;"), "SELECT 1");
+        assert_eq!(strip_trailing_semicolons("SELECT 1 ;  "), "SELECT 1");
+        assert_eq!(strip_trailing_semicolons("SELECT 1;\n"), "SELECT 1");
+        // Repeated, because one strip leaving a second terminator behind would
+        // fail exactly as the original did.
+        assert_eq!(strip_trailing_semicolons("SELECT 1;;"), "SELECT 1");
+        assert_eq!(strip_trailing_semicolons("SELECT 1 ; ; "), "SELECT 1");
+    }
+
+    #[test]
+    fn a_statement_without_one_is_untouched() {
+        assert_eq!(strip_trailing_semicolons("SELECT 1"), "SELECT 1");
+        assert_eq!(
+            strip_trailing_semicolons("SELECT * FROM t"),
+            "SELECT * FROM t"
+        );
+    }
+
+    /// A semicolon inside a literal is data, not a terminator.
+    ///
+    /// These are safe for free rather than by special handling: a statement
+    /// ending in a literal ends with the closing quote, so the trailing
+    /// character is never the semicolon. The test pins that reasoning, because
+    /// a future "smarter" strip that scanned for any semicolon would corrupt
+    /// every one of them.
+    #[test]
+    fn a_semicolon_inside_a_literal_survives() {
+        assert_eq!(strip_trailing_semicolons("SELECT ';'"), "SELECT ';'");
+        assert_eq!(strip_trailing_semicolons("SELECT 'a;b'"), "SELECT 'a;b'");
+        assert_eq!(
+            strip_trailing_semicolons("SELECT * FROM t WHERE x = ';'"),
+            "SELECT * FROM t WHERE x = ';'"
+        );
+        assert_eq!(
+            strip_trailing_semicolons(r#"SELECT "weird;name" FROM t"#),
+            r#"SELECT "weird;name" FROM t"#
+        );
+        // A literal that ends the statement *and* is followed by a terminator:
+        // the terminator goes, the literal does not.
+        assert_eq!(strip_trailing_semicolons("SELECT ';';"), "SELECT ';'");
+    }
+
+    /// Nothing sensible is left to send, so nothing is invented: the empty
+    /// statement reaches Trino and is reported as its own syntax error rather
+    /// than being turned into something the application did not write.
+    #[test]
+    fn a_statement_of_only_semicolons_reduces_to_empty() {
+        assert_eq!(strip_trailing_semicolons(";"), "");
+        assert_eq!(strip_trailing_semicolons("  ;; "), "");
+        assert_eq!(strip_trailing_semicolons(""), "");
     }
 }

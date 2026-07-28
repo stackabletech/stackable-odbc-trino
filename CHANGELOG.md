@@ -156,6 +156,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A trailing statement terminator no longer fails the statement. Trino's REST
+  API takes one statement per request and its grammar has no terminator, so
+  `SELECT 1;` was rejected with `SYNTAX_ERROR` at the semicolon — every query
+  from a tool that appends one, `isql` included, failed. The driver now strips
+  the trailing run before submitting.
+
+  Only the trailing run, after trailing whitespace: a statement whose last token
+  is a string literal or quoted identifier ends with the closing quote, so a
+  semicolon inside one is never the final character and is left intact. An
+  embedded semicolon is also left alone, and Trino still rejects it — correctly,
+  since it accepts only one statement per request. A comment after the
+  terminator (`SELECT 1; -- done`) is not recognised.
 - `NaN`, `Infinity` and `-Infinity` in a `DOUBLE` or `REAL` column are now
   readable. JSON has no literal for the IEEE specials, so Trino sends them as
   strings; the conversion had no arm for a string-valued float column, so they

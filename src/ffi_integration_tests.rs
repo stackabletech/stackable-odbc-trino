@@ -3211,6 +3211,78 @@ fn ieee_special_floats_are_readable_as_c_double() {
     }
 }
 
+/// A statement terminator must not fail the statement.
+///
+/// Trino's REST API takes one statement per request and its grammar has no
+/// terminator, so `SELECT 1;` is a `SYNTAX_ERROR` at the semicolon. ODBC tools
+/// send one routinely — `isql` submits the line as typed — so this covers both
+/// entry points that carry application SQL, including the prepared path where
+/// the terminator survives parameter interpolation.
+#[test]
+#[serial]
+#[ignore = "requires Trino at localhost:8080 -- run test/setup.sh first"]
+fn a_trailing_semicolon_does_not_fail_the_statement() {
+    unsafe {
+        for sql in ["SELECT 1 AS n;", "SELECT 1 AS n ;  ", "SELECT 1 AS n;;"] {
+            let (_env, _conn, stmt) = alloc_stmt();
+            assert_eq!(
+                exec_direct(stmt, sql),
+                SqlReturn::SUCCESS,
+                "{sql:?} did not execute"
+            );
+            assert_eq!(
+                ffi::fetch::sql_fetch::<TrinoBackend>(stmt),
+                SqlReturn::SUCCESS,
+                "{sql:?} returned no row"
+            );
+            assert_eq!(
+                get_wchar_col(stmt, 1),
+                "1",
+                "{sql:?} returned the wrong value"
+            );
+            cleanup_stmt(stmt);
+        }
+
+        // The prepared path: the terminator is still on the template when
+        // parameters are interpolated into it.
+        let (_env, _conn, stmt) = alloc_stmt();
+        let sql = "SELECT CAST(? AS VARCHAR) AS s;";
+        let wide: Vec<u16> = sql.encode_utf16().collect();
+        assert_eq!(
+            ffi::execute::sql_prepare_w::<TrinoBackend>(stmt, wide.as_ptr(), wide.len() as i32),
+            SqlReturn::SUCCESS
+        );
+        let mut buf: Vec<u8> = b"hi".to_vec();
+        let mut ind_in: isize = buf.len() as isize;
+        assert_eq!(
+            ffi::params::sql_bind_parameter::<TrinoBackend>(
+                stmt,
+                1,
+                ParamType::Input as i16,
+                CDataType::Char as i16,
+                SqlDataType::VARCHAR.0,
+                buf.len(),
+                0,
+                buf.as_mut_ptr().cast(),
+                buf.len() as isize,
+                &mut ind_in,
+            ),
+            SqlReturn::SUCCESS
+        );
+        assert_eq!(
+            ffi::execute::sql_execute::<TrinoBackend>(stmt),
+            SqlReturn::SUCCESS,
+            "a prepared statement with a terminator did not execute"
+        );
+        assert_eq!(
+            ffi::fetch::sql_fetch::<TrinoBackend>(stmt),
+            SqlReturn::SUCCESS
+        );
+        assert_eq!(get_wchar_col(stmt, 1), "hi");
+        cleanup_stmt(stmt);
+    }
+}
+
 /// A VARCHAR value holding digit text, read as `SQL_C_SBIGINT`, must succeed
 /// (the ODBC conversion matrix requires CHAR/VARCHAR to convert to every C
 /// type); the same shape holding non-numeric text must fail with the
