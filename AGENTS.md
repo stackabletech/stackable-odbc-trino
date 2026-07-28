@@ -467,10 +467,17 @@ component rather than the presence of a behaviour. `SQLExecDirect` answering
 `HY010` rather than `08003` on an unconnected connection is correct for this
 reason, not a defect.
 
-Output is `PASS` / `FAIL` / `NOTE`. A `NOTE` marked `KNOWN` is a gap that has
-been diagnosed and recorded rather than asserted, so the suite stays green
-until the owning crate changes; two currently name core's `SQLFreeStmt`
-diagnostic and `SQLFreeHandle` clearing behaviour.
+Output is `PASS` / `FAIL` / `NOTE`. A `NOTE` is an observation the driver is
+entitled to make either way, not a gap — the one currently emitted records that
+a statement can be allocated before connecting, because `SQLAllocHandle`'s
+`08003` for that case is Driver-Manager-owned.
+
+A `NOTE` may also be marked `KNOWN`, for a gap diagnosed and recorded rather
+than asserted so the suite stays green until the owning crate changes. There are
+none at present: the two that named core's `SQLFreeStmt` diagnostic and
+`SQLFreeHandle` clearing behaviour were fixed in core and are now assertions.
+Tighten a `KNOWN` into a `check` as soon as its fix lands, or it becomes a
+permanent blind spot.
 
 ### Type-transform fuzz
 

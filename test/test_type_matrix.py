@@ -239,6 +239,16 @@ class Driver:
         self.lib.SQLFreeHandle(SQL_HANDLE_ENV, self.env)
 
 
+def i32_max_as_u64():
+    """The largest column size a driver may honestly report as a number.
+
+    `i32::MAX` is the established "unbounded but reportable" convention;
+    anything above it means a signed sentinel was written into an unsigned
+    out-parameter and wrapped.
+    """
+    return 2**31 - 1
+
+
 def as_text(raw, c_type):
     if c_type == C_WCHAR:
         u = ctypes.cast(raw, ctypes.POINTER(ctypes.c_uint16))
@@ -358,6 +368,64 @@ def main():
                 # Refusing the conversion outright is legitimate; reporting the
                 # NULL as data is not, and that is what the branch above checks.
                 ok()
+
+    # -- the IEEE specials as text ------------------------------------
+    # Their spelling is Trino's and Java's, not Rust's Display: an application
+    # reading a DOUBLE as text must not see `inf` where every other Trino client
+    # says `Infinity`, and a value that round-trips through two clients should
+    # not change spelling on the way.
+    print("\n--- IEEE specials render with Trino's spelling ---")
+    for expr, want in [
+        ("CAST(infinity() AS DOUBLE)", "Infinity"),
+        ("CAST(-infinity() AS DOUBLE)", "-Infinity"),
+        ("CAST(nan() AS DOUBLE)", "NaN"),
+        ("CAST(infinity() AS REAL)", "Infinity"),
+    ]:
+        ret, state, ind, raw = d.fetch_as(expr, C_CHAR)
+        if ret not in (SQL_SUCCESS, SQL_SUCCESS_WITH_INFO):
+            fail("special not readable as text", f"{expr}: {state or ret}")
+            continue
+        got = as_text(raw, C_CHAR)
+        if got != want:
+            fail("wrong spelling", f"{expr}: read {got!r}, expected {want!r}")
+        else:
+            ok()
+
+    # -- an undeterminable column size is 0, not a wrapped -1 ----------
+    # SQLDescribeCol's ColumnSizePtr is a SQLULEN, and the spec's answer for a
+    # size the driver cannot determine is 0. Reporting SQL_NO_TOTAL there
+    # instead surfaced as 18,446,744,073,709,551,612, which an application
+    # sizing a buffer from would try to allocate.
+    print("\n--- undeterminable column sizes report 0 ---")
+    lib = d.lib
+    lib.SQLDescribeColW.argtypes = [
+        P, ctypes.c_uint16, ctypes.POINTER(ctypes.c_uint16), ctypes.c_int16,
+        ctypes.POINTER(ctypes.c_int16), ctypes.POINTER(ctypes.c_int16),
+        ctypes.POINTER(ctypes.c_uint64), ctypes.POINTER(ctypes.c_int16),
+        ctypes.POINTER(ctypes.c_int16),
+    ]
+    lib.SQLDescribeColW.restype = ctypes.c_int16
+    for stmt_sql in ("DESCRIBE tpcds.sf1.customer", "SHOW TABLES FROM tpcds.sf1"):
+        stmt = P(); lib.SQLAllocHandle(SQL_HANDLE_STMT, d.dbc, ctypes.byref(stmt))
+        wsql, _k = w(stmt_sql)
+        if lib.SQLExecDirectW(stmt, wsql, SQL_NTS) in (SQL_SUCCESS, SQL_SUCCESS_WITH_INFO):
+            nm = (ctypes.c_uint16 * 64)(); nl = ctypes.c_int16(0); dt = ctypes.c_int16(0)
+            sz = ctypes.c_uint64(0); dd = ctypes.c_int16(0); nu = ctypes.c_int16(0)
+            lib.SQLDescribeColW(
+                stmt, 1, ctypes.cast(nm, ctypes.POINTER(ctypes.c_uint16)), 64,
+                ctypes.byref(nl), ctypes.byref(dt), ctypes.byref(sz),
+                ctypes.byref(dd), ctypes.byref(nu),
+            )
+            if sz.value > i32_max_as_u64():
+                fail(
+                    "absurd column size",
+                    f"{stmt_sql}: SQLDescribeCol reported {sz.value:,}",
+                )
+            else:
+                ok()
+        else:
+            fail("query failed", stmt_sql)
+        lib.SQLFreeHandle(SQL_HANDLE_STMT, stmt)
 
     # -- trailing semicolons and comment placement --------------------
     print(f"\n--- {len(TERMINATORS)} statement terminator forms ---")

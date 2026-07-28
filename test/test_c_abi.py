@@ -327,30 +327,29 @@ def main():
     r = lib.SQLAllocHandle(SQL_HANDLE_STMT, dbc, ctypes.byref(stmt))
     check("alloc statement", r, SQL_SUCCESS)
 
-    # The failed second connect above left 08002 on the queue. A function is
-    # supposed to clear the handle's diagnostics at entry, so the HY010 this
-    # call posts should be record 1 -- demonstrated here before the queue is
-    # cleared by hand for the assertion that follows.
-    stale = sqlstate(lib, SQL_HANDLE_DBC, dbc)
-    lib.SQLFreeHandle(SQL_HANDLE_DBC, dbc)
-    if sqlstate(lib, SQL_HANDLE_DBC, dbc) == stale:
-        note(
-            "SQLFreeHandle clears diagnostics at entry",
-            f"KNOWN: record 1 is still {stale} from the previous call, with the "
-            "HY010 queued behind it. Other entry points do clear -- see the "
-            "probe further down -- so this is specific to SQLFreeHandle, and it "
-            "only shows when the free itself fails",
-        )
-
-    # Clear the queue by hand so the assertion below reads the record it means.
-    scratch = ctypes.c_int32(0)
-    scratch_len = ctypes.c_int32(0)
-    lib.SQLGetConnectAttrW(
-        dbc, SQL_ATTR_AUTOCOMMIT, ctypes.byref(scratch), 4, ctypes.byref(scratch_len)
+    # Dirty the connection's diagnostic queue immediately before the free, with
+    # no call in between: this driver reports SQL_TC_NONE, so every isolation
+    # level is invalid and this leaves HY024 as record 1.
+    #
+    # It has to be immediately before. The 08002 from the failed second connect
+    # above is already gone by here, because SQLAllocHandle clears at entry too
+    # and the statement allocation sits between the two.
+    r = lib.SQLSetConnectAttrW(dbc, SQL_ATTR_TXN_ISOLATION, P(SQL_TXN_SERIALIZABLE), 0)
+    check(
+        "set SQL_ATTR_TXN_ISOLATION on a transaction-less driver",
+        r,
+        SQL_ERROR,
+        state="HY024",
+        got_state=sqlstate(lib, SQL_HANDLE_DBC, dbc),
     )
+
+    # A function clears the handle's diagnostics at entry, so the HY010 this
+    # posts must be record 1 rather than sitting behind the HY024 above. An
+    # application reading the first record after a failed free would otherwise
+    # act on the previous call's SQLSTATE.
     r = lib.SQLFreeHandle(SQL_HANDLE_DBC, dbc)
     check(
-        "free connection while still connected",
+        "free connection while still connected, over a dirty queue",
         r,
         SQL_ERROR,
         state="HY010",
@@ -452,15 +451,16 @@ def main():
     check("free_stmt SQL_UNBIND", r, SQL_SUCCESS)
     r = lib.SQLFreeStmt(stmt, SQL_RESET_PARAMS)
     check("free_stmt SQL_RESET_PARAMS", r, SQL_SUCCESS)
+    # The SQLSTATE matters as much as the return code: an SQL_ERROR carrying no
+    # diagnostic record leaves an application with an error it cannot interpret.
     r = lib.SQLFreeStmt(stmt, 99)
-    check("free_stmt with an undefined option", r, SQL_ERROR)
-    if not sqlstate(lib, SQL_HANDLE_STMT, stmt):
-        note(
-            "free_stmt with an undefined option",
-            "KNOWN: SQL_ERROR with no diagnostic record; the spec requires "
-            "HY092. Core returns before entering the handle scope, so nothing "
-            "posts one and SQLGetDiagRec reports SQL_NO_DATA",
-        )
+    check(
+        "free_stmt with an undefined option",
+        r,
+        SQL_ERROR,
+        state="HY092",
+        got_state=sqlstate(lib, SQL_HANDLE_STMT, stmt),
+    )
 
     # ---------------------------------------------------------------
     print("\n--- attribute round-trips ---")
@@ -506,16 +506,6 @@ def main():
         dbc, SQL_ATTR_AUTOCOMMIT, ctypes.byref(val), 4, ctypes.byref(outlen32)
     )
     check("get SQL_ATTR_AUTOCOMMIT", r, SQL_SUCCESS)
-
-    # This driver reports SQL_TC_NONE, so every isolation level is invalid.
-    r = lib.SQLSetConnectAttrW(dbc, SQL_ATTR_TXN_ISOLATION, P(SQL_TXN_SERIALIZABLE), 0)
-    check(
-        "set SQL_ATTR_TXN_ISOLATION on a transaction-less driver",
-        r,
-        SQL_ERROR,
-        state="HY024",
-        got_state=sqlstate(lib, SQL_HANDLE_DBC, dbc),
-    )
 
     # ---------------------------------------------------------------
     print("\n--- diagnostics are cleared at function entry ---")
