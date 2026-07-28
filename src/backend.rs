@@ -13,13 +13,14 @@ use stackable_odbc_core::{
     backend::Backend,
     errors::OdbcError,
     types::{
-        ColumnDescriptor, ColumnValue, ConnectParams, ExecuteOutcome, IdentifierType, InfoValue,
-        Nullable, SQL_CB_NULL, SQL_CN_ANY, SQL_FN_CVT_CAST, SQL_FN_TSI_DAY, SQL_FN_TSI_HOUR,
-        SQL_FN_TSI_MINUTE, SQL_FN_TSI_MONTH, SQL_FN_TSI_QUARTER, SQL_FN_TSI_SECOND,
-        SQL_FN_TSI_WEEK, SQL_FN_TSI_YEAR, SQL_GB_GROUP_BY_CONTAINS_SELECT, SQL_IC_LOWER,
-        SQL_NC_END, SQL_NNC_NON_NULL, SQL_SQ_COMPARISON, SQL_SQ_CORRELATED_SUBQUERIES,
-        SQL_SQ_EXISTS, SQL_SQ_IN, SQL_SQ_QUANTIFIED, SQL_U_UNION, SQL_U_UNION_ALL, Scope,
-        TypeInfoRow, format_odbc_version, parse_dotted_version,
+        ColumnDescriptor, ColumnRow, ColumnValue, ConnectParams, ExecuteOutcome, ForeignKeyRow,
+        IdentifierType, InfoValue, Nullable, PrimaryKeyRow, SQL_CB_NULL, SQL_CN_ANY,
+        SQL_FN_CVT_CAST, SQL_FN_TSI_DAY, SQL_FN_TSI_HOUR, SQL_FN_TSI_MINUTE, SQL_FN_TSI_MONTH,
+        SQL_FN_TSI_QUARTER, SQL_FN_TSI_SECOND, SQL_FN_TSI_WEEK, SQL_FN_TSI_YEAR,
+        SQL_GB_GROUP_BY_CONTAINS_SELECT, SQL_IC_LOWER, SQL_NC_END, SQL_NNC_NON_NULL,
+        SQL_SQ_COMPARISON, SQL_SQ_CORRELATED_SUBQUERIES, SQL_SQ_EXISTS, SQL_SQ_IN,
+        SQL_SQ_QUANTIFIED, SQL_U_UNION, SQL_U_UNION_ALL, Scope, SpecialColumnRow, StatisticsRow,
+        TableRow, TypeInfoRow, format_odbc_version, parse_dotted_version,
     },
 };
 use trino_rust_client::{Client, ClientBuilder, Trino, auth::Auth, ssl::Ssl};
@@ -1125,15 +1126,17 @@ impl Backend for TrinoBackend {
         Cow::Borrowed(info::get_type_info())
     }
 
-    // The six catalog functions take a cancel token they do not record
-    // anything in, so `SQLCancel` cannot interrupt them.
+    // The six catalog functions, and the two enumerations that do I/O, take a
+    // cancel token they do not record anything in, so `SQLCancel` cannot
+    // interrupt them.
     //
     // Four of them (`primary_keys`, `foreign_keys`, `statistics`,
-    // `special_columns`) return a fixed empty result set without touching the
-    // network, so there is nothing to cancel. `tables` and `columns` do query
-    // Trino, but through `query_all_rows` -> `Client::get_all`, which pages to
-    // exhaustion inside the client and never surfaces the query id a DELETE
-    // needs. Making them cancellable means replacing that with manual paging.
+    // `special_columns`) return no rows without touching the network, so there
+    // is nothing to cancel. `tables`, `columns`, `catalogs` and `schemas` do
+    // query Trino, but through `query_all_rows` -> `Client::get_all`, which
+    // pages to exhaustion inside the client and never surfaces the query id a
+    // DELETE needs. Making them cancellable means replacing that with manual
+    // paging.
     fn tables(
         conn: &TrinoConnection,
         _cancel: &TrinoCancelToken,
@@ -1141,8 +1144,34 @@ impl Backend for TrinoBackend {
         schema: Option<&str>,
         table: Option<&str>,
         table_type: Option<&str>,
-    ) -> Result<TrinoStatement, TrinoError> {
+    ) -> Result<Vec<TableRow>, TrinoError> {
         metadata::tables(conn, catalog, schema, table, table_type)
+    }
+
+    /// The two `information_schema.tables.table_type` values `metadata::tables`
+    /// maps to an ODBC `TABLE_TYPE`; it drops every other row, so this is the
+    /// complete list of types a `SQLTables` result set can carry.
+    fn table_types(_conn: &TrinoConnection) -> Vec<Cow<'static, str>> {
+        metadata::table_types()
+    }
+
+    /// Required rather than defaulted because [`Self::supports_catalogs`]
+    /// answers `true`: a backend that claims catalogs and leaves this alone
+    /// answers `HYC00` to `SQLTables`' `SQL_ALL_CATALOGS` enumeration.
+    fn catalogs(
+        conn: &TrinoConnection,
+        _cancel: &TrinoCancelToken,
+    ) -> Result<Vec<String>, TrinoError> {
+        metadata::catalogs(conn)
+    }
+
+    /// Required for the same reason as [`Self::catalogs`], against
+    /// [`Self::supports_schemas`].
+    fn schemas(
+        conn: &TrinoConnection,
+        _cancel: &TrinoCancelToken,
+    ) -> Result<Vec<String>, TrinoError> {
+        metadata::schemas(conn)
     }
 
     fn columns(
@@ -1152,7 +1181,7 @@ impl Backend for TrinoBackend {
         schema: Option<&str>,
         table: Option<&str>,
         column: Option<&str>,
-    ) -> Result<TrinoStatement, TrinoError> {
+    ) -> Result<Vec<ColumnRow>, TrinoError> {
         metadata::columns(conn, catalog, schema, table, column)
     }
 
@@ -1162,7 +1191,7 @@ impl Backend for TrinoBackend {
         catalog: Option<&str>,
         schema: Option<&str>,
         table: Option<&str>,
-    ) -> Result<TrinoStatement, TrinoError> {
+    ) -> Result<Vec<PrimaryKeyRow>, TrinoError> {
         metadata::primary_keys(conn, catalog, schema, table)
     }
 
@@ -1176,7 +1205,7 @@ impl Backend for TrinoBackend {
         fk_catalog: Option<&str>,
         fk_schema: Option<&str>,
         fk_table: Option<&str>,
-    ) -> Result<TrinoStatement, TrinoError> {
+    ) -> Result<Vec<ForeignKeyRow>, TrinoError> {
         metadata::foreign_keys(
             conn, pk_catalog, pk_schema, pk_table, fk_catalog, fk_schema, fk_table,
         )
@@ -1189,7 +1218,7 @@ impl Backend for TrinoBackend {
         schema: Option<&str>,
         table: Option<&str>,
         unique_only: bool,
-    ) -> Result<TrinoStatement, TrinoError> {
+    ) -> Result<Vec<StatisticsRow>, TrinoError> {
         metadata::statistics(conn, catalog, schema, table, unique_only)
     }
 
@@ -1203,7 +1232,7 @@ impl Backend for TrinoBackend {
         table: Option<&str>,
         scope: Scope,
         nullable: Nullable,
-    ) -> Result<TrinoStatement, TrinoError> {
+    ) -> Result<Vec<SpecialColumnRow>, TrinoError> {
         metadata::special_columns(
             conn,
             identifier_type,
@@ -1330,31 +1359,15 @@ mod tests {
     // ODBC special catalog enumeration mode tests
     // -----------------------------------------------------------------------
 
-    /// tables_list_table_types() is static and needs no Trino connection.
+    /// The `SQL_ALL_TABLE_TYPES` enumeration is a static declaration and needs
+    /// no Trino connection. Core turns these into the result set — every
+    /// column but `TABLE_TYPE` NULL — so this pins the values, not the shape.
+    ///
+    /// Upper case is spec-mandated: applications specify table types in upper
+    /// case and the driver maps them to whatever the data source needs.
     #[test]
-    fn tables_list_table_types_returns_table_and_view() {
-        let stmt = metadata::tables_list_table_types().unwrap();
-        assert_eq!(stmt.column_count(), 5, "must have 5 columns per ODBC spec");
-
-        // Two rows: TABLE, VIEW
-        assert_eq!(stmt.batch.len(), 2);
-
-        let type_col = 3; // TABLE_TYPE is the 4th column (0-indexed)
-        let row0_type = &stmt.batch[0][type_col];
-        let row1_type = &stmt.batch[1][type_col];
-        assert!(
-            matches!(row0_type, ColumnValue::String(s) if s == "TABLE"),
-            "first row should be TABLE, got {row0_type:?}"
-        );
-        assert!(
-            matches!(row1_type, ColumnValue::String(s) if s == "VIEW"),
-            "second row should be VIEW, got {row1_type:?}"
-        );
-
-        // In the table_type enumeration mode, catalog/schema/table_name must be NULL.
-        assert!(matches!(stmt.batch[0][0], ColumnValue::Null));
-        assert!(matches!(stmt.batch[0][1], ColumnValue::Null));
-        assert!(matches!(stmt.batch[0][2], ColumnValue::Null));
+    fn table_types_are_table_and_view_in_upper_case() {
+        assert_eq!(metadata::table_types(), vec!["TABLE", "VIEW"]);
     }
 
     /// The `LIKE ''` filter must return nothing even for a catalog with many

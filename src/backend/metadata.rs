@@ -1,30 +1,23 @@
 //! Catalog metadata for the Trino backend (`tables`, `columns`,
-//! `primary_keys`, `foreign_keys`, `statistics`, `special_columns`), built by
-//! querying Trino's `information_schema`, plus the private WHERE-clause and
+//! `primary_keys`, `foreign_keys`, `statistics`, `special_columns`, plus the
+//! `catalogs` / `schemas` / `table_types` enumerations), built by querying
+//! Trino's `information_schema`, plus the private WHERE-clause and
 //! ODBC-wildcard helpers those queries share.
+//!
+//! Every function here returns rows, never a statement: core converts them to
+//! `ColumnValue`s in spec column order, sorts them into the order each
+//! function's spec page defines, and serves the result set. That is why none
+//! of the queries below carries an `ORDER BY`.
 
-use stackable_odbc_core::{
-    backend::Backend,
-    types::{
-        ColumnDescriptor, ColumnValue, ColumnsResultCol, ForeignKeysResultCol, IdentifierType,
-        Nullable, PrimaryKeysResultCol, Scope, SqlDataType, TablesResultCol,
-        special_columns_columns, statistics_columns,
-    },
+use std::borrow::Cow;
+
+use stackable_odbc_core::types::{
+    ColumnRow, ForeignKeyRow, IdentifierType, Nullable, PrimaryKeyRow, Scope, SpecialColumnRow,
+    SqlDataType, StatisticsRow, TableRow,
 };
 
-use super::{
-    TrinoBackend, TrinoConnection, TrinoError, TrinoStatement, info::trino_bare_type_name,
-    query_all_rows,
-};
+use super::{TrinoConnection, TrinoError, info::trino_bare_type_name, query_all_rows};
 use crate::type_conversion::{trino_type_name_to_sql_type, type_name_precision, type_name_scale};
-
-fn tables_columns() -> Vec<ColumnDescriptor> {
-    TablesResultCol::all_descriptors(&TrinoBackend::catalog_result_column_widths())
-}
-
-fn columns_result_columns() -> Vec<ColumnDescriptor> {
-    ColumnsResultCol::all_descriptors(&TrinoBackend::catalog_result_column_widths())
-}
 
 /// Check whether a string contains unescaped ODBC wildcard characters.
 ///
@@ -143,6 +136,10 @@ fn parse_trino_precision_scale(data_type: &str) -> (Option<i32>, Option<i32>) {
 /// in at most 4 bytes (a surrogate pair).
 const BYTES_PER_CHAR: i32 = 4;
 
+/// `NUM_PREC_RADIX` for a numeric column: Trino reports precision for every
+/// numeric type in decimal digits, including `REAL` and `DOUBLE`.
+const NUM_PREC_RADIX_DECIMAL: i16 = 10;
+
 /// `CHAR_OCTET_LENGTH` for a column: the maximum length in bytes of a
 /// character column. All other data types, including binary, return NULL.
 ///
@@ -162,7 +159,7 @@ const BYTES_PER_CHAR: i32 = 4;
 /// for `EXT_LONG_VAR_BINARY`, the branch could never execute: NULL was, and
 /// remains, the honest answer for Trino `CHAR_OCTET_LENGTH` on binary
 /// columns.
-fn char_octet_length(sql_type: SqlDataType, ty_precision: Option<i32>) -> ColumnValue {
+fn char_octet_length(sql_type: SqlDataType, ty_precision: Option<i32>) -> Option<i32> {
     let is_character = matches!(
         sql_type,
         SqlDataType::EXT_W_VARCHAR
@@ -172,134 +169,61 @@ fn char_octet_length(sql_type: SqlDataType, ty_precision: Option<i32>) -> Column
     );
 
     if is_character {
-        return ty_precision
-            .and_then(|n| n.checked_mul(BYTES_PER_CHAR))
-            .map(ColumnValue::I32)
-            .unwrap_or(ColumnValue::Null);
+        return ty_precision.and_then(|n| n.checked_mul(BYTES_PER_CHAR));
     }
-    ColumnValue::Null
+    None
 }
 
-/// ODBC special mode: return list of distinct catalogs.
+/// The catalog names, for `SQLTables`' `SQL_ALL_CATALOGS` enumeration.
 ///
-/// Called when SQLTablesW receives catalog="%" + schema="" + table="".
-/// Uses `system.jdbc.catalogs` which works without a default session catalog.
-fn tables_list_catalogs(conn: &TrinoConnection) -> Result<TrinoStatement, TrinoError> {
-    let sql = "SELECT table_cat FROM system.jdbc.catalogs ORDER BY table_cat";
+/// Uses `system.jdbc.catalogs`, which works without a default session catalog —
+/// `information_schema` does not, and this is exactly the call an application
+/// makes before it has picked one.
+pub(super) fn catalogs(conn: &TrinoConnection) -> Result<Vec<String>, TrinoError> {
+    tracing::debug!("TrinoBackend::catalogs");
+
+    let sql = "SELECT table_cat FROM system.jdbc.catalogs";
     let rows = query_all_rows(conn, sql.to_string())?;
-    let result_rows = rows
+    Ok(rows
         .into_iter()
-        .filter_map(|row| {
-            let cat = row.into_json().into_iter().next()?.as_str()?.to_string();
-            Some(vec![
-                ColumnValue::String(cat),
-                ColumnValue::Null,
-                ColumnValue::Null,
-                ColumnValue::Null,
-                ColumnValue::Null,
-            ])
-        })
-        .collect();
-    Ok(TrinoStatement {
-        pending_sql: None,
-        columns: tables_columns(),
-        trino_types: Vec::new(),
-        batch: result_rows,
-        batch_cursor: 0,
-        fetch_failed: false,
-        next_uri: None,
-        query_id: None,
-        client: None,
-        runtime: None,
-        cancel_state: None,
-        page_count: 0,
-        empty_page_count: 0,
-        total_rows_fetched: 0,
-        total_fetch_time: std::time::Duration::ZERO,
-        total_convert_time: std::time::Duration::ZERO,
-    })
+        .filter_map(|row| Some(row.into_json().into_iter().next()?.as_str()?.to_string()))
+        .collect())
 }
 
-/// ODBC special mode: return list of distinct schemas.
+/// The schema names, for `SQLTables`' `SQL_ALL_SCHEMAS` enumeration.
 ///
-/// Called when SQLTablesW receives schema="%" + catalog="" + table="".
-/// Uses `system.jdbc.schemas` which works without a default session catalog.
-/// Per the ODBC spec, TABLE_CAT must be NULL in schema-enumeration mode.
-fn tables_list_schemas(conn: &TrinoConnection) -> Result<TrinoStatement, TrinoError> {
-    let sql = "SELECT table_schem FROM system.jdbc.schemas ORDER BY table_schem";
+/// Uses `system.jdbc.schemas` for the same reason as [`catalogs`]. Core NULLs
+/// out every column but `TABLE_SCHEM`, which is what the spec requires of this
+/// enumeration.
+pub(super) fn schemas(conn: &TrinoConnection) -> Result<Vec<String>, TrinoError> {
+    tracing::debug!("TrinoBackend::schemas");
+
+    let sql = "SELECT table_schem FROM system.jdbc.schemas";
     let rows = query_all_rows(conn, sql.to_string())?;
-    let result_rows = rows
+    Ok(rows
         .into_iter()
-        .filter_map(|row| {
-            let sch = row.into_json().into_iter().next()?.as_str()?.to_string();
-            Some(vec![
-                ColumnValue::Null,
-                ColumnValue::String(sch),
-                ColumnValue::Null,
-                ColumnValue::Null,
-                ColumnValue::Null,
-            ])
-        })
-        .collect();
-    Ok(TrinoStatement {
-        pending_sql: None,
-        columns: tables_columns(),
-        trino_types: Vec::new(),
-        batch: result_rows,
-        batch_cursor: 0,
-        fetch_failed: false,
-        next_uri: None,
-        query_id: None,
-        client: None,
-        runtime: None,
-        cancel_state: None,
-        page_count: 0,
-        empty_page_count: 0,
-        total_rows_fetched: 0,
-        total_fetch_time: std::time::Duration::ZERO,
-        total_convert_time: std::time::Duration::ZERO,
-    })
+        .filter_map(|row| Some(row.into_json().into_iter().next()?.as_str()?.to_string()))
+        .collect())
 }
 
-/// ODBC special mode: return the supported table types.
+/// The table types Trino has, for `SQLTables`' `SQL_ALL_TABLE_TYPES`
+/// enumeration.
 ///
-/// Called when SQLTablesW receives table_type="%" + catalog="" + schema="" + table="".
-pub(super) fn tables_list_table_types() -> Result<TrinoStatement, TrinoError> {
-    let rows = vec![
-        vec![
-            ColumnValue::Null,
-            ColumnValue::Null,
-            ColumnValue::Null,
-            ColumnValue::String("TABLE".into()),
-            ColumnValue::Null,
-        ],
-        vec![
-            ColumnValue::Null,
-            ColumnValue::Null,
-            ColumnValue::Null,
-            ColumnValue::String("VIEW".into()),
-            ColumnValue::Null,
-        ],
-    ];
-    Ok(TrinoStatement {
-        pending_sql: None,
-        columns: tables_columns(),
-        trino_types: Vec::new(),
-        batch: rows,
-        batch_cursor: 0,
-        fetch_failed: false,
-        next_uri: None,
-        query_id: None,
-        client: None,
-        runtime: None,
-        cancel_state: None,
-        page_count: 0,
-        empty_page_count: 0,
-        total_rows_fetched: 0,
-        total_fetch_time: std::time::Duration::ZERO,
-        total_convert_time: std::time::Duration::ZERO,
-    })
+/// These are the two `information_schema.tables.table_type` values [`tables`]
+/// maps and reports; anything else is dropped there, so listing more here
+/// would advertise a type no row can ever carry.
+pub(super) fn table_types() -> Vec<Cow<'static, str>> {
+    vec![
+        Cow::Borrowed(TABLE_TYPE_TABLE),
+        Cow::Borrowed(TABLE_TYPE_VIEW),
+    ]
 }
+
+/// ODBC's `TABLE_TYPE` for Trino's `BASE TABLE`.
+const TABLE_TYPE_TABLE: &str = "TABLE";
+
+/// ODBC's `TABLE_TYPE` for Trino's `VIEW`.
+const TABLE_TYPE_VIEW: &str = "VIEW";
 
 pub(super) fn tables(
     conn: &TrinoConnection,
@@ -307,29 +231,15 @@ pub(super) fn tables(
     schema: Option<&str>,
     table: Option<&str>,
     table_type: Option<&str>,
-) -> Result<TrinoStatement, TrinoError> {
+) -> Result<Vec<TableRow>, TrinoError> {
     tracing::debug!(catalog, schema, table, table_type, "TrinoBackend::tables");
 
-    // ODBC special enumeration modes (ODBC spec §SQLTables):
-    // These are used by tools like PowerBI to browse the catalog tree.
-    //
-    // • catalog="%" + schema="" + table="" → return list of distinct catalogs.
-    // • schema="%" + catalog="" + table="" → return list of distinct schemas.
-    // • table_type="%" + catalog="" + schema="" + table="" → return list of table types.
-    if catalog == Some("%") && schema == Some("") && table == Some("") {
-        return tables_list_catalogs(conn);
-    }
-    if schema == Some("%") && catalog == Some("") && table == Some("") {
-        return tables_list_schemas(conn);
-    }
-    if table_type == Some("%") && catalog == Some("") && schema == Some("") && table == Some("") {
-        return tables_list_table_types();
-    }
-
+    // No ORDER BY: core sorts the result set into the spec's order. The three
+    // `SQL_ALL_*` enumerations never reach here either — core serves them from
+    // `catalogs`, `schemas` and `table_types` above.
     let sql = format!(
         "SELECT table_catalog, table_schema, table_name, table_type \
-         FROM information_schema.tables{} \
-         ORDER BY table_type, table_catalog, table_schema, table_name",
+         FROM information_schema.tables{}",
         build_tables_where_clause(catalog, schema, table)
     );
 
@@ -342,7 +252,7 @@ pub(super) fn tables(
             .collect()
     });
 
-    let result_rows: Vec<Vec<ColumnValue>> = rows
+    Ok(rows
         .into_iter()
         .filter_map(|row| {
             let mut vals = row.into_json().into_iter();
@@ -352,8 +262,8 @@ pub(super) fn tables(
             let raw_type = vals.next()?.as_str()?.to_uppercase();
             // Trino reports "BASE TABLE"; ODBC expects "TABLE".
             let odbc_type = match raw_type.as_str() {
-                "BASE TABLE" => "TABLE",
-                "VIEW" => "VIEW",
+                "BASE TABLE" => TABLE_TYPE_TABLE,
+                "VIEW" => TABLE_TYPE_VIEW,
                 other => {
                     tracing::warn!(other, "unknown table_type from Trino, skipping row");
                     return None;
@@ -367,42 +277,15 @@ pub(super) fn tables(
                 return None;
             }
 
-            Some(vec![
-                if cat_val.is_null() {
-                    ColumnValue::Null
-                } else {
-                    ColumnValue::String(cat_val.as_str()?.to_string())
-                },
-                if sch_val.is_null() {
-                    ColumnValue::Null
-                } else {
-                    ColumnValue::String(sch_val.as_str()?.to_string())
-                },
-                ColumnValue::String(name),
-                ColumnValue::String(odbc_type.to_string()),
-                ColumnValue::Null, // REMARKS
-            ])
+            Some(TableRow {
+                catalog: cat_val.as_str().map(str::to_string),
+                schema: sch_val.as_str().map(str::to_string),
+                name: Some(name),
+                table_type: Some(odbc_type.to_string()),
+                remarks: None,
+            })
         })
-        .collect();
-
-    Ok(TrinoStatement {
-        pending_sql: None,
-        columns: tables_columns(),
-        trino_types: Vec::new(),
-        batch: result_rows,
-        batch_cursor: 0,
-        fetch_failed: false,
-        next_uri: None,
-        query_id: None,
-        client: None,
-        runtime: None,
-        cancel_state: None,
-        page_count: 0,
-        empty_page_count: 0,
-        total_rows_fetched: 0,
-        total_fetch_time: std::time::Duration::ZERO,
-        total_convert_time: std::time::Duration::ZERO,
-    })
+        .collect())
 }
 
 pub(super) fn columns(
@@ -411,7 +294,7 @@ pub(super) fn columns(
     schema: Option<&str>,
     table: Option<&str>,
     column: Option<&str>,
-) -> Result<TrinoStatement, TrinoError> {
+) -> Result<Vec<ColumnRow>, TrinoError> {
     tracing::debug!(catalog, schema, table, column, "TrinoBackend::columns");
 
     // 0-based column positions in the SELECT list below.
@@ -437,17 +320,19 @@ pub(super) fn columns(
     // character_maximum_length, numeric_precision, or numeric_scale.
     // Precision and scale are derived from the data_type string instead
     // (e.g. "varchar(100)" → precision 100, "decimal(10,2)" → prec 10 scale 2).
+    //
+    // No ORDER BY: core sorts the result set into the spec's order
+    // (TABLE_CAT, TABLE_SCHEM, TABLE_NAME, ORDINAL_POSITION).
     let sql = format!(
         "SELECT table_catalog, table_schema, table_name, column_name, \
                 ordinal_position, column_default, is_nullable, data_type \
-         FROM information_schema.columns{} \
-         ORDER BY table_catalog, table_schema, table_name, ordinal_position",
+         FROM information_schema.columns{}",
         build_columns_where_clause(catalog, schema, table, column)
     );
 
     let rows = query_all_rows(conn, sql)?;
 
-    let result_rows: Vec<Vec<ColumnValue>> = rows
+    Ok(rows
         .into_iter()
         .filter_map(|row| {
             let vals: Vec<serde_json::Value> = row.into_json().into_iter().collect();
@@ -460,12 +345,8 @@ pub(super) fn columns(
                     .and_then(|v| i32::try_from(v).ok())
             };
 
-            let table_cat = get_str(QueryCol::TableCatalog)
-                .map(ColumnValue::String)
-                .unwrap_or(ColumnValue::Null);
-            let table_sch = get_str(QueryCol::TableSchema)
-                .map(ColumnValue::String)
-                .unwrap_or(ColumnValue::Null);
+            let table_cat = get_str(QueryCol::TableCatalog);
+            let table_sch = get_str(QueryCol::TableSchema);
             let table_name = match get_str(QueryCol::TableName) {
                 Some(s) => s,
                 None => {
@@ -487,9 +368,7 @@ pub(super) fn columns(
                     return None;
                 }
             };
-            let col_def = get_str(QueryCol::ColumnDefault)
-                .map(ColumnValue::String)
-                .unwrap_or(ColumnValue::Null);
+            let col_def = get_str(QueryCol::ColumnDefault);
             let is_null_str = get_str(QueryCol::IsNullable).unwrap_or_default();
             let data_type_raw = get_str(QueryCol::DataType).unwrap_or_default();
 
@@ -533,13 +412,11 @@ pub(super) fn columns(
             // second enumeration to keep in sync (see: this exact class of
             // bug for DATE/TIME/TIMESTAMP/BOOLEAN, and CHAR_OCTET_LENGTH's
             // separate VARBINARY miss below).
-            let col_size = ty_precision
-                .map(ColumnValue::I32)
-                .unwrap_or(ColumnValue::Null);
+            let col_size = ty_precision;
             let num_prec_radix = if is_numeric {
-                ColumnValue::I16(10)
+                Some(NUM_PREC_RADIX_DECIMAL)
             } else {
-                ColumnValue::Null
+                None
             };
             // DECIMAL_DIGITS. Spec (SQLColumns): "The total number of
             // significant digits to the right of the decimal point. For
@@ -555,87 +432,34 @@ pub(super) fn columns(
                 sql_type,
                 SqlDataType::DECIMAL | SqlDataType::TIME | SqlDataType::TIMESTAMP
             ) {
-                ty_scale
-                    .and_then(|s| i16::try_from(s).ok())
-                    .map(ColumnValue::I16)
-                    .unwrap_or(ColumnValue::Null)
+                ty_scale.and_then(|s| i16::try_from(s).ok())
             } else {
-                ColumnValue::Null
+                None
             };
             let char_octet = char_octet_length(sql_type, ty_precision);
 
-            Some(vec![
-                table_cat,                                                      //  1 TABLE_CAT
-                table_sch,                                                      //  2 TABLE_SCHEM
-                ColumnValue::String(table_name),                                //  3 TABLE_NAME
-                ColumnValue::String(col_name),                                  //  4 COLUMN_NAME
-                ColumnValue::I16(sql_type.0),                                   //  5 DATA_TYPE
-                ColumnValue::String(data_type),                                 //  6 TYPE_NAME
-                col_size,                                                       //  7 COLUMN_SIZE
-                ColumnValue::Null,                                              //  8 BUFFER_LENGTH
-                decimal_digits,                                                 //  9 DECIMAL_DIGITS
-                num_prec_radix,                                                 // 10 NUM_PREC_RADIX
-                ColumnValue::I16(nullable.into()),                              // 11 NULLABLE
-                ColumnValue::Null,                                              // 12 REMARKS
-                col_def,                                                        // 13 COLUMN_DEF
-                ColumnValue::I16(sql_type.0),                                   // 14 SQL_DATA_TYPE
-                ColumnValue::Null,         // 15 SQL_DATETIME_SUB
-                char_octet,                // 16 CHAR_OCTET_LENGTH
-                ColumnValue::I32(ordinal), // 17 ORDINAL_POSITION
-                ColumnValue::String(nullable.as_is_nullable_str().to_string()), // 18 IS_NULLABLE
-            ])
+            Some(ColumnRow {
+                catalog: table_cat,
+                schema: table_sch,
+                table_name,
+                column_name: col_name,
+                data_type: sql_type.0,
+                type_name: data_type,
+                column_size: col_size,
+                buffer_length: None,
+                decimal_digits,
+                num_prec_radix,
+                nullable: nullable.into(),
+                remarks: None,
+                column_def: col_def,
+                sql_data_type: sql_type.0,
+                sql_datetime_sub: None,
+                char_octet_length: char_octet,
+                ordinal_position: ordinal,
+                is_nullable: Some(nullable.as_is_nullable_str().to_string()),
+            })
         })
-        .collect();
-
-    Ok(TrinoStatement {
-        pending_sql: None,
-        columns: columns_result_columns(),
-        trino_types: Vec::new(),
-        batch: result_rows,
-        batch_cursor: 0,
-        fetch_failed: false,
-        next_uri: None,
-        query_id: None,
-        client: None,
-        runtime: None,
-        cancel_state: None,
-        page_count: 0,
-        empty_page_count: 0,
-        total_rows_fetched: 0,
-        total_fetch_time: std::time::Duration::ZERO,
-        total_convert_time: std::time::Duration::ZERO,
-    })
-}
-
-/// A completed statement carrying only the given column schema and no rows.
-///
-/// Trino cannot answer several ODBC catalog functions (keys, index statistics,
-/// special columns), and the spec's defined response for "the data source does
-/// not expose this" is `SQL_SUCCESS` with the correct schema and zero rows, not
-/// an error. This builds exactly that.
-fn empty_result(columns: Vec<ColumnDescriptor>) -> TrinoStatement {
-    TrinoStatement {
-        pending_sql: None,
-        columns,
-        trino_types: Vec::new(),
-        batch: vec![],
-        batch_cursor: 0,
-        fetch_failed: false,
-        next_uri: None,
-        query_id: None,
-        client: None,
-        runtime: None,
-        cancel_state: None,
-        page_count: 0,
-        empty_page_count: 0,
-        total_rows_fetched: 0,
-        total_fetch_time: std::time::Duration::ZERO,
-        total_convert_time: std::time::Duration::ZERO,
-    }
-}
-
-fn primary_keys_columns() -> Vec<ColumnDescriptor> {
-    PrimaryKeysResultCol::all_descriptors(&TrinoBackend::catalog_result_column_widths())
+        .collect())
 }
 
 /// Return primary key columns for the given table.
@@ -645,8 +469,8 @@ fn primary_keys_columns() -> Vec<ColumnDescriptor> {
 /// The official Trino JDBC driver returns an empty result set from
 /// `DatabaseMetaData.getPrimaryKeys()` using `WHERE false`.
 ///
-/// We match that behavior: return SQL_SUCCESS with an empty result set and
-/// the correct 6-column schema. This allows BI tools (PowerBI, Tableau) to
+/// We match that behavior: no rows, which core serves as `SQL_SUCCESS` with
+/// the spec's 6-column schema. This allows BI tools (PowerBI, Tableau) to
 /// proceed with schema discovery without error.
 ///
 /// Ref: <https://github.com/trinodb/trino/issues/22408>
@@ -655,25 +479,20 @@ pub(super) fn primary_keys(
     catalog: Option<&str>,
     schema: Option<&str>,
     table: Option<&str>,
-) -> Result<TrinoStatement, TrinoError> {
+) -> Result<Vec<PrimaryKeyRow>, TrinoError> {
     tracing::debug!(
         catalog,
         schema,
         table,
         "TrinoBackend::primary_keys (empty — Trino has no PK metadata)"
     );
-    Ok(empty_result(primary_keys_columns()))
-}
-
-fn foreign_keys_columns() -> Vec<ColumnDescriptor> {
-    ForeignKeysResultCol::all_descriptors(&TrinoBackend::catalog_result_column_widths())
+    Ok(Vec::new())
 }
 
 /// Return foreign key relationships.
 ///
 /// Trino has no concept of foreign keys, same limitation as primary keys.
 /// No connector exposes `information_schema.referential_constraints`.
-/// Return SQL_SUCCESS with an empty result set and the correct 14-column schema.
 ///
 /// Ref: <https://github.com/trinodb/trino/issues/22408>
 pub(super) fn foreign_keys(
@@ -684,7 +503,7 @@ pub(super) fn foreign_keys(
     fk_catalog: Option<&str>,
     fk_schema: Option<&str>,
     fk_table: Option<&str>,
-) -> Result<TrinoStatement, TrinoError> {
+) -> Result<Vec<ForeignKeyRow>, TrinoError> {
     tracing::debug!(
         pk_catalog,
         pk_schema,
@@ -694,7 +513,7 @@ pub(super) fn foreign_keys(
         fk_table,
         "TrinoBackend::foreign_keys (empty — Trino has no FK metadata)"
     );
-    Ok(empty_result(foreign_keys_columns()))
+    Ok(Vec::new())
 }
 
 /// Return index statistics for a table.
@@ -710,16 +529,14 @@ pub(super) fn statistics(
     schema: Option<&str>,
     table: Option<&str>,
     _unique_only: bool,
-) -> Result<TrinoStatement, TrinoError> {
+) -> Result<Vec<StatisticsRow>, TrinoError> {
     tracing::debug!(
         catalog,
         schema,
         table,
         "TrinoBackend::statistics (empty — Trino exposes no index metadata)"
     );
-    Ok(empty_result(statistics_columns(
-        &TrinoBackend::catalog_result_column_widths(),
-    )))
+    Ok(Vec::new())
 }
 
 /// Return the optimal row-identifier or row-version columns for a table.
@@ -737,16 +554,14 @@ pub(super) fn special_columns(
     table: Option<&str>,
     _scope: Scope,
     _nullable: Nullable,
-) -> Result<TrinoStatement, TrinoError> {
+) -> Result<Vec<SpecialColumnRow>, TrinoError> {
     tracing::debug!(
         catalog,
         schema,
         table,
         "TrinoBackend::special_columns (empty — Trino has no rowid/row-version metadata)"
     );
-    Ok(empty_result(special_columns_columns(
-        &TrinoBackend::catalog_result_column_widths(),
-    )))
+    Ok(Vec::new())
 }
 
 #[cfg(test)]
@@ -760,7 +575,7 @@ mod tests {
         // panics in debug.
         assert_eq!(
             char_octet_length(SqlDataType::EXT_W_VARCHAR, Some(i32::MAX)),
-            ColumnValue::Null
+            None
         );
     }
 
@@ -775,7 +590,7 @@ mod tests {
         // `Some(_)` input.
         assert_eq!(
             char_octet_length(SqlDataType::EXT_LONG_VAR_BINARY, None),
-            ColumnValue::Null
+            None
         );
     }
 
@@ -783,25 +598,19 @@ mod tests {
     fn char_octet_length_is_four_times_size_for_character_columns() {
         assert_eq!(
             char_octet_length(SqlDataType::EXT_W_VARCHAR, Some(50)),
-            ColumnValue::I32(50 * BYTES_PER_CHAR)
+            Some(50 * BYTES_PER_CHAR)
         );
     }
 
     #[test]
     fn char_octet_length_is_null_for_non_character_non_binary_columns() {
         // INTEGER is neither character nor binary data.
-        assert_eq!(
-            char_octet_length(SqlDataType::INTEGER, Some(10)),
-            ColumnValue::Null
-        );
+        assert_eq!(char_octet_length(SqlDataType::INTEGER, Some(10)), None);
     }
 
     #[test]
     fn char_octet_length_is_null_without_a_declared_length() {
-        assert_eq!(
-            char_octet_length(SqlDataType::EXT_W_VARCHAR, None),
-            ColumnValue::Null
-        );
+        assert_eq!(char_octet_length(SqlDataType::EXT_W_VARCHAR, None), None);
     }
 
     #[test]

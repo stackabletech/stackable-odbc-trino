@@ -179,6 +179,37 @@ when connected is not necessarily what `SQLGetInfo` returns before
 `get_info_every_named_info_type_has_the_declared_shape_pre_connect` covers the
 other side.
 
+### The catalog functions return rows, not statements
+
+`tables`, `columns`, `primary_keys`, `foreign_keys`, `statistics` and
+`special_columns` each return a `Vec` of core's typed row structs (`TableRow`,
+`ColumnRow`, …, in `stackable_odbc_core::types`). Core converts them to
+`ColumnValue`s in spec column order, sorts them, and serves the result set, so
+this crate never builds a `TrinoStatement` for a catalog call and never names a
+result-set descriptor. Three consequences, each of which is easy to undo by
+accident:
+
+- **No `ORDER BY` in `src/backend/metadata.rs`.** Core sorts every result set
+  into its spec order, using `Backend::null_collation` so the sort cannot
+  contradict what `SQLGetInfo` reports. A backend-side `ORDER BY` is redundant
+  server-side work.
+- **No `SQL_ATTR_METADATA_ID` handling.** Core normalises identifier arguments
+  before it calls this crate, from `identifier_case` and
+  `search_pattern_escape` — both of which this driver already declares. What
+  arrives here is always an ordinary pattern.
+- **No `SQL_ALL_*` special-casing in `tables`.** Core detects the three
+  enumerations on the raw arguments and answers them from `catalogs`,
+  `schemas` and `table_types` instead; `tables` is not called at all.
+
+`table_types` is required and returns `["TABLE", "VIEW"]` — the two
+`information_schema.tables.table_type` values `metadata::tables` maps, upper
+case per the spec. `catalogs` and `schemas` are *defaulted* in the trait but
+mandatory here: both `supports_catalogs` and `supports_schemas` answer `true`,
+and a backend that claims either and leaves the method defaulted answers
+`HYC00` to that enumeration. Both query `system.jdbc.*` rather than
+`information_schema`, which is what lets them work before a session catalog is
+set — exactly the state an application is in when it asks.
+
 ### Cancellation
 
 `Backend::cancel` receives a `TrinoCancelToken`, never a statement: `SQLCancel`
@@ -217,10 +248,11 @@ driver ("not applicable; the `Backend` trait is synchronous"); cross-thread
 application asked for is a finished result set, not the undefined cursor
 position `24000` describes.
 
-The six catalog functions take the token but record nothing in it, so
-`SQLCancel` cannot interrupt them. Four do no I/O at all; `tables` and `columns`
-go through `query_all_rows` → `Client::get_all`, which pages to exhaustion
-inside the client and never surfaces a query id.
+The six catalog functions, and the `catalogs` / `schemas` enumerations, take
+the token but record nothing in it, so `SQLCancel` cannot interrupt them. Four
+do no I/O at all; the other four go through `query_all_rows` →
+`Client::get_all`, which pages to exhaustion inside the client and never
+surfaces a query id.
 
 ### Type cast safety
 
@@ -329,7 +361,7 @@ transactions means revisiting all of those together; see
 | `src/backend.rs` | `TrinoBackend`, `TrinoConnection`, `TrinoStatement`; the `Backend` impl; `map_trino_error` |
 | `src/backend/execute.rs` | `exec_direct`, `execute`, paging, `StatementBackend` (fetch, `column_count`, `describe_col`, `close_cursor`) |
 | `src/backend/info.rs` | `SQLGetInfo` answers — the largest module. Typed `get_info` plus the raw `get_info_raw` path for info types with no `InfoType` variant |
-| `src/backend/metadata.rs` | Catalog functions: tables, columns, primary keys, foreign keys, statistics, type info |
+| `src/backend/metadata.rs` | Catalog functions: tables, columns, primary keys, foreign keys, statistics, special columns, and the catalog / schema / table-type enumerations. Each returns typed rows; core builds and sorts the result set |
 | `src/backend/params.rs` | Parameter interpolation. Trino has no wire-level parameter binding, so bound values are rendered into the SQL as literals — the escaping rules live here |
 | `src/backend/types/connect_params.rs` | Connection-string parsing, with `Redacted` secrets |
 | `src/escape_dialect.rs` | ODBC escape sequences (`{fn ...}`, `{d ...}`, `{oj ...}`) → Trino SQL |
