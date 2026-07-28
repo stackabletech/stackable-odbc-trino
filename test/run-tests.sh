@@ -67,6 +67,15 @@ uv run --with pyodbc python3 "$SCRIPT_DIR/test_integration.py" "DSN=trino_http"
 echo "=== Running Linux pyodbc integration tests (DSN, HTTPS) ==="
 uv run --with pyodbc python3 "$SCRIPT_DIR/test_integration.py" "DSN=trino_https_verify_false"
 
+# --- Linux: SQL surface pen test ---
+# The SQL a BI tool actually emits: every join shape, the GROUP BY extensions,
+# window functions, CTEs, set operations, parameters in each clause that takes
+# one, the catalog functions, and the statement forms whose result columns have
+# no declared length (DESCRIBE, SHOW, EXPLAIN).
+echo "=== Running SQL surface pen test ==="
+uv run --with pyodbc python3 "$SCRIPT_DIR/test_sql_surface.py" \
+    "Driver=$DRIVER_PATH;Host=localhost;Port=8080;User=admin;Password=admin;Protocol=http;Catalog=tpcds"
+
 # --- Linux: raw C ABI pen test (no Driver Manager) ---
 # Calls the driver's exported entry points directly with ctypes. unixODBC
 # answers a large part of the ODBC state machine itself, so the driver's own

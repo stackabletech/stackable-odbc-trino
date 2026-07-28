@@ -400,6 +400,40 @@ Do **not** run those alongside the FFI tests — two independent reqwest
 connection pools hitting the same coordinator cause intermittent TCP socket
 corruption.
 
+### Capturing suite output
+
+`uv run` in this environment fails when its stdout is a **regular file**: the
+process exits 120 and the file is left empty. Piping is unaffected, so capture
+output with `tee`, never with `>`:
+
+```bash
+uv run --with pyodbc python3 test/test_sql_surface.py "$CONN" 2>&1 | tee run.log   # good
+uv run --with pyodbc python3 test/test_sql_surface.py "$CONN" > run.log 2>&1       # loses everything
+```
+
+Reproduced with `uv run --with pyodbc python3 -c "print('x')"` alone, so it is
+neither the driver nor any suite (uv 0.11.21). `test/test_c_abi.py` needs no
+`uv` — standard library only — and redirects fine.
+
+This is worth knowing because the failure looks like a hang: the run completes,
+the output vanishes, and the only evidence left is a non-zero exit.
+
+### SQL surface pen test
+
+```bash
+uv run --with pyodbc python3 test/test_sql_surface.py "<connection-string>"
+```
+
+Walks the SQL a BI tool emits — join shapes, aggregates and the `GROUP BY`
+extensions, window functions, subqueries and CTEs, set operations, parameters
+in every clause that accepts one, the ODBC catalog functions, and the statement
+forms whose result columns carry no declared length.
+
+That last group is the one worth keeping: `DESCRIBE`, `SHOW` and `EXPLAIN`
+return unbounded `varchar` columns, so the driver has to describe a column
+whose size it cannot know, and an application sizes its buffers from what it
+says.
+
 ### Raw C ABI pen test
 
 ```bash
