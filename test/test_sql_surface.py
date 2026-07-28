@@ -232,6 +232,14 @@ def main():
         lambda: cur.primaryKeys(catalog="tpcds", schema="sf1", table="customer").fetchall())
     run("SQLStatistics (empty is correct)",
         lambda: cur.statistics(catalog="tpcds", schema="sf1", table="customer").fetchall())
+    # Trino has callable procedures (CALL system.runtime.kill_query(...))
+    # but publishes no metadata naming them, so an empty result set is the
+    # honest answer here too. pyodbc exposes no tablePrivileges() or
+    # columnPrivileges(), so those two are covered in test_c_abi.py instead.
+    run("SQLProcedures (empty is correct)",
+        lambda: cur.procedures(catalog="system", schema="runtime").fetchall())
+    run("SQLProcedureColumns (empty is correct)",
+        lambda: cur.procedureColumns(catalog="system", schema="runtime").fetchall())
 
     # ------------------------------------------------------------------
     print("\n--- ordering, distinct, and null handling ---")

@@ -113,6 +113,38 @@ unsafe fn alloc_stmt() -> (*mut c_void, *mut c_void, *mut c_void) {
     (env, conn, stmt)
 }
 
+/// The first diagnostic record on a statement, as `SQLSTATE: message`, or a
+/// placeholder when there is none.
+///
+/// For use in an assertion message: a catalog call that unexpectedly fails
+/// says nothing useful on its own, and the SQLSTATE plus the server's message
+/// is the difference between "the query was rejected" and a guess.
+unsafe fn diag_message(stmt: *mut c_void) -> String {
+    let mut state = [0u16; 6];
+    let mut msg = [0u16; 1024];
+    let mut msg_len: i16 = 0;
+    let mut native: i32 = 0;
+    let ret = unsafe {
+        ffi::diag::sql_get_diag_rec_w::<TrinoBackend>(
+            HandleType::Stmt as i16,
+            stmt,
+            1,
+            state.as_mut_ptr(),
+            &mut native,
+            msg.as_mut_ptr(),
+            msg.len() as i16,
+            &mut msg_len,
+        )
+    };
+    if ret != SqlReturn::SUCCESS {
+        return "<no diagnostic record>".to_string();
+    }
+    // The SQLSTATE buffer is a 5-character string plus its NUL terminator.
+    let state = String::from_utf16_lossy(&state[..5]);
+    let text = String::from_utf16_lossy(&msg[..msg_len as usize]);
+    format!("{state}: {text}")
+}
+
 /// Free just the statement handle. Drains any in-flight result first.
 /// The shared env + conn are left intact for the next test.
 unsafe fn cleanup_stmt(stmt: *mut c_void) {
@@ -2692,6 +2724,204 @@ fn statistics_returns_empty_result_set() {
             ffi::fetch::sql_fetch::<TrinoBackend>(stmt),
             SqlReturn::NO_DATA,
             "statistics should return empty result set"
+        );
+        cleanup_stmt(stmt);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SQLTablePrivilegesW / SQLColumnPrivilegesW / SQLProceduresW /
+// SQLProcedureColumnsW tests
+//
+// All four answer an empty result set against this test stack, but for two
+// different reasons, and the distinction is what these tests protect.
+//
+// `SQLTablePrivileges` runs a real query: Trino models table privileges in
+// `information_schema.table_privileges`, and it is empty here only because
+// neither test catalog implements permission management (`GRANT` on either
+// answers NOT_SUPPORTED, and a grant made directly in PostgreSQL is not
+// visible through the `postgresql` catalog — Trino synthesises its own
+// `information_schema`). So the assertion that matters is that the query is
+// accepted and its column list is the one the driver expects; a rename or
+// reordering in `information_schema.table_privileges` fails it. The row
+// conversion has unit coverage in `backend::metadata`.
+//
+// The other three read nothing. Trino publishes no column-privilege or
+// procedure metadata at all, so their empty result set is a fact about Trino,
+// not about this stack's configuration.
+// ---------------------------------------------------------------------------
+
+#[test]
+#[serial]
+#[ignore = "requires Trino at localhost:8080 -- run test/setup.sh first"]
+fn table_privileges_queries_trino_and_returns_the_spec_column_count() {
+    unsafe {
+        let (_env, _conn, stmt) = alloc_stmt();
+        let catalog: Vec<u16> = "tpcds".encode_utf16().collect();
+        let schema: Vec<u16> = "sf1".encode_utf16().collect();
+        let table: Vec<u16> = "call_center".encode_utf16().collect();
+        let ret = ffi::metadata::sql_table_privileges_w::<TrinoBackend>(
+            stmt,
+            catalog.as_ptr(),
+            catalog.len() as i16,
+            schema.as_ptr(),
+            schema.len() as i16,
+            table.as_ptr(),
+            table.len() as i16,
+        );
+        // A failure here is the interesting outcome: it means the query
+        // against information_schema.table_privileges was rejected.
+        assert_eq!(
+            ret,
+            SqlReturn::SUCCESS,
+            "sql_table_privileges_w should succeed: {}",
+            diag_message(stmt)
+        );
+
+        let mut col_count: i16 = 0;
+        let ret = ffi::cursor::sql_num_result_cols::<TrinoBackend>(stmt, &mut col_count);
+        assert_eq!(ret, SqlReturn::SUCCESS);
+        assert_eq!(
+            col_count, 7,
+            "table privileges result set should have 7 columns"
+        );
+
+        assert_eq!(
+            ffi::fetch::sql_fetch::<TrinoBackend>(stmt),
+            SqlReturn::NO_DATA,
+            "neither test catalog implements permission management, so no rows"
+        );
+        cleanup_stmt(stmt);
+    }
+}
+
+#[test]
+#[serial]
+#[ignore = "requires Trino at localhost:8080 -- run test/setup.sh first"]
+fn column_privileges_returns_empty_result_set() {
+    unsafe {
+        let (_env, _conn, stmt) = alloc_stmt();
+        let catalog: Vec<u16> = "tpcds".encode_utf16().collect();
+        let schema: Vec<u16> = "sf1".encode_utf16().collect();
+        let table: Vec<u16> = "call_center".encode_utf16().collect();
+        let column: Vec<u16> = "%".encode_utf16().collect();
+        let ret = ffi::metadata::sql_column_privileges_w::<TrinoBackend>(
+            stmt,
+            catalog.as_ptr(),
+            catalog.len() as i16,
+            schema.as_ptr(),
+            schema.len() as i16,
+            table.as_ptr(),
+            table.len() as i16,
+            column.as_ptr(),
+            column.len() as i16,
+        );
+        assert_eq!(
+            ret,
+            SqlReturn::SUCCESS,
+            "sql_column_privileges_w should succeed: {}",
+            diag_message(stmt)
+        );
+
+        let mut col_count: i16 = 0;
+        let ret = ffi::cursor::sql_num_result_cols::<TrinoBackend>(stmt, &mut col_count);
+        assert_eq!(ret, SqlReturn::SUCCESS);
+        assert_eq!(
+            col_count, 8,
+            "column privileges result set should have 8 columns"
+        );
+
+        assert_eq!(
+            ffi::fetch::sql_fetch::<TrinoBackend>(stmt),
+            SqlReturn::NO_DATA,
+            "Trino grants on tables, not columns, so there is nothing to report"
+        );
+        cleanup_stmt(stmt);
+    }
+}
+
+#[test]
+#[serial]
+#[ignore = "requires Trino at localhost:8080 -- run test/setup.sh first"]
+fn procedures_returns_empty_result_set() {
+    unsafe {
+        let (_env, _conn, stmt) = alloc_stmt();
+        let catalog: Vec<u16> = "system".encode_utf16().collect();
+        let schema: Vec<u16> = "runtime".encode_utf16().collect();
+        let proc_name: Vec<u16> = "%".encode_utf16().collect();
+        let ret = ffi::metadata::sql_procedures_w::<TrinoBackend>(
+            stmt,
+            catalog.as_ptr(),
+            catalog.len() as i16,
+            schema.as_ptr(),
+            schema.len() as i16,
+            proc_name.as_ptr(),
+            proc_name.len() as i16,
+        );
+        assert_eq!(
+            ret,
+            SqlReturn::SUCCESS,
+            "sql_procedures_w should succeed: {}",
+            diag_message(stmt)
+        );
+
+        let mut col_count: i16 = 0;
+        let ret = ffi::cursor::sql_num_result_cols::<TrinoBackend>(stmt, &mut col_count);
+        assert_eq!(ret, SqlReturn::SUCCESS);
+        assert_eq!(col_count, 8, "procedures result set should have 8 columns");
+
+        // `system.runtime` really does hold callable procedures
+        // (`kill_query`), so this asserts the documented gap: Trino publishes
+        // no metadata naming them.
+        assert_eq!(
+            ffi::fetch::sql_fetch::<TrinoBackend>(stmt),
+            SqlReturn::NO_DATA,
+            "Trino publishes no procedure metadata, even where procedures exist"
+        );
+        cleanup_stmt(stmt);
+    }
+}
+
+#[test]
+#[serial]
+#[ignore = "requires Trino at localhost:8080 -- run test/setup.sh first"]
+fn procedure_columns_returns_empty_result_set() {
+    unsafe {
+        let (_env, _conn, stmt) = alloc_stmt();
+        let catalog: Vec<u16> = "system".encode_utf16().collect();
+        let schema: Vec<u16> = "runtime".encode_utf16().collect();
+        let proc_name: Vec<u16> = "%".encode_utf16().collect();
+        let column: Vec<u16> = "%".encode_utf16().collect();
+        let ret = ffi::metadata::sql_procedure_columns_w::<TrinoBackend>(
+            stmt,
+            catalog.as_ptr(),
+            catalog.len() as i16,
+            schema.as_ptr(),
+            schema.len() as i16,
+            proc_name.as_ptr(),
+            proc_name.len() as i16,
+            column.as_ptr(),
+            column.len() as i16,
+        );
+        assert_eq!(
+            ret,
+            SqlReturn::SUCCESS,
+            "sql_procedure_columns_w should succeed: {}",
+            diag_message(stmt)
+        );
+
+        let mut col_count: i16 = 0;
+        let ret = ffi::cursor::sql_num_result_cols::<TrinoBackend>(stmt, &mut col_count);
+        assert_eq!(ret, SqlReturn::SUCCESS);
+        assert_eq!(
+            col_count, 19,
+            "procedure columns result set should have 19 columns"
+        );
+
+        assert_eq!(
+            ffi::fetch::sql_fetch::<TrinoBackend>(stmt),
+            SqlReturn::NO_DATA,
+            "Trino publishes no procedure metadata"
         );
         cleanup_stmt(stmt);
     }

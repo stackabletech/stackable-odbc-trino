@@ -181,13 +181,14 @@ other side.
 
 ### The catalog functions return rows, not statements
 
-`tables`, `columns`, `primary_keys`, `foreign_keys`, `statistics` and
-`special_columns` each return a `Vec` of core's typed row structs (`TableRow`,
-`ColumnRow`, …, in `stackable_odbc_core::types`). Core converts them to
-`ColumnValue`s in spec column order, sorts them, and serves the result set, so
-this crate never builds a `TrinoStatement` for a catalog call and never names a
-result-set descriptor. Three consequences, each of which is easy to undo by
-accident:
+The ten catalog methods — `tables`, `columns`, `primary_keys`, `foreign_keys`,
+`statistics`, `special_columns`, `table_privileges`, `column_privileges`,
+`procedures`, `procedure_columns` — each return a `Vec` of core's typed row
+structs (`TableRow`, `ColumnRow`, …, in `stackable_odbc_core::types`). Core
+converts them to `ColumnValue`s in spec column order, sorts them, and serves
+the result set, so this crate never builds a `TrinoStatement` for a catalog
+call and never names a result-set descriptor. Four consequences, each of which
+is easy to undo by accident:
 
 - **No `ORDER BY` in `src/backend/metadata.rs`.** Core sorts every result set
   into its spec order, using `Backend::null_collation` so the sort cannot
@@ -200,6 +201,9 @@ accident:
 - **No `SQL_ALL_*` special-casing in `tables`.** Core detects the three
   enumerations on the raw arguments and answers them from `catalogs`,
   `schemas` and `table_types` instead; `tables` is not called at all.
+- **No `TableType` value-list parsing.** Core splits and unquotes it;
+  `tables` receives `table_types: &[String]`, where an empty slice means no
+  filter.
 
 `table_types` is required and returns `["TABLE", "VIEW"]` — the two
 `information_schema.tables.table_type` values `metadata::tables` maps, upper
@@ -209,6 +213,56 @@ and a backend that claims either and leaves the method defaulted answers
 `HYC00` to that enumeration. Both query `system.jdbc.*` rather than
 `information_schema`, which is what lets them work before a session catalog is
 set — exactly the state an application is in when it asks.
+
+#### What Trino can and cannot answer
+
+Six of the ten return no rows, and the reason differs by group. Each is stated
+explicitly rather than left to the trait default, so the reason is recorded
+beside the answer and the call is logged like every other backend method.
+
+| Method | Source | Why |
+|--------|--------|-----|
+| `tables`, `columns` | `information_schema` | Real data. |
+| `catalogs`, `schemas` | `system.jdbc.*` | Real data, no session catalog needed. |
+| `table_privileges` | `information_schema.table_privileges` | Real query; see below. |
+| `primary_keys`, `foreign_keys` | — | Trino has no key metadata ([trino#22408]). |
+| `statistics`, `special_columns` | — | No cross-connector index metadata, no rowid. |
+| `column_privileges` | — | Trino grants on tables, never on columns. |
+| `procedures`, `procedure_columns` | — | See below. |
+
+**`table_privileges` queries, and gets nothing here.** Every catalog has an
+`information_schema.table_privileges` whose columns line up with ODBC's, and
+Trino's own JDBC driver reads the same table. It is populated from the
+connector's permission management, so only connectors that implement it — Hive
+and Iceberg under `sql-standard` security — return rows. A connector without it
+answers zero rows rather than an error, which is why the driver queries
+unconditionally instead of gating on the catalog.
+
+Both catalogs in the test stack are in that group: `GRANT` on either answers
+`NOT_SUPPORTED: Catalog does not support permission management`. **Adding
+`GRANT` statements to `test/postgres-init.sql` would not change this** — Trino
+synthesises its own `information_schema` rather than passing it through, and
+the base JDBC connector implements no permission management, so a grant made
+directly in PostgreSQL is visible in PostgreSQL's `information_schema.table_privileges`
+and not in the `postgresql` catalog's. Verified against the running stack; do
+not retry it. Getting a non-empty row would mean adding a Hive or Iceberg
+catalog with `sql-standard` security and a metastore, which the compose stack
+already cannot afford (see the TODO in `.github/workflows/build.yaml`).
+
+That leaves the row conversion untestable end to end, so it lives in
+`metadata::table_privilege_row` — a pure function with unit tests feeding it
+the rows such a coordinator would return. The integration tests assert what
+they can: that the query is accepted and the result set is described.
+
+**`procedures` publishes nothing to read.** Trino has callable procedures —
+`CALL system.runtime.kill_query(...)` is one, and an unregistered name answers
+`PROCEDURE_NOT_FOUND` — but no metadata names them. `system.jdbc.procedures`
+and `system.jdbc.procedure_columns` exist for JDBC compatibility and are
+hardwired empty, and `system.metadata` has no procedures table. This is
+consistent with the `SQL_ACCESSIBLE_PROCEDURES` = `"N"` already reported from
+`info`.
+
+[trino#22408]: https://github.com/trinodb/trino/issues/22408
 
 ### Cancellation
 
@@ -361,7 +415,7 @@ transactions means revisiting all of those together; see
 | `src/backend.rs` | `TrinoBackend`, `TrinoConnection`, `TrinoStatement`; the `Backend` impl; `map_trino_error` |
 | `src/backend/execute.rs` | `exec_direct`, `execute`, paging, `StatementBackend` (fetch, `column_count`, `describe_col`, `close_cursor`) |
 | `src/backend/info.rs` | `SQLGetInfo` answers — the largest module. Typed `get_info` plus the raw `get_info_raw` path for info types with no `InfoType` variant |
-| `src/backend/metadata.rs` | Catalog functions: tables, columns, primary keys, foreign keys, statistics, special columns, and the catalog / schema / table-type enumerations. Each returns typed rows; core builds and sorts the result set |
+| `src/backend/metadata.rs` | All ten catalog functions, plus the catalog / schema / table-type enumerations. Each returns typed rows; core builds and sorts the result set |
 | `src/backend/params.rs` | Parameter interpolation. Trino has no wire-level parameter binding, so bound values are rendered into the SQL as literals — the escaping rules live here |
 | `src/backend/types/connect_params.rs` | Connection-string parsing, with `Redacted` secrets |
 | `src/escape_dialect.rs` | ODBC escape sequences (`{fn ...}`, `{d ...}`, `{oj ...}`) → Trino SQL |
@@ -492,6 +546,19 @@ points **with no Driver Manager in the loop**. unixODBC answers a large part of
 the ODBC state machine itself, so the driver's own handling of out-of-order and
 malformed calls is invisible to the pyodbc and `isql` suites. This is the only
 place it is exercised.
+
+It is also the only suite that reaches `SQLTablePrivilegesW` and
+`SQLColumnPrivilegesW` at all: pyodbc exposes no `tablePrivileges()` or
+`columnPrivileges()` method, so neither the integration nor the SQL-surface
+suite can call them. `SQLColumnPrivileges`' `HY009` for a null `TableName` is
+probed here for the same reason, and only for that function — it is the one of
+the four privilege and procedure functions whose spec page states that
+sentence without a **(DM)** marker, so the other three must not report it.
+
+Every entry point called here needs its `argtypes` and `restype` declared in
+`load()`. `SQLRETURN` is a 16-bit `SQLSMALLINT`, and an undeclared function
+leaves ctypes reading the return register as a 32-bit `int`, where `SQL_ERROR`
+arrives as `65535` and every comparison against `-1` silently fails.
 
 That also means the spec's **(DM)** diagnostics must not be expected here:
 nothing produces them, so a probe demanding one would assert the absence of a

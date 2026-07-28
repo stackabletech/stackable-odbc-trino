@@ -1,19 +1,25 @@
-//! Catalog metadata for the Trino backend (`tables`, `columns`,
-//! `primary_keys`, `foreign_keys`, `statistics`, `special_columns`, plus the
-//! `catalogs` / `schemas` / `table_types` enumerations), built by querying
-//! Trino's `information_schema`, plus the private WHERE-clause and
-//! ODBC-wildcard helpers those queries share.
+//! Catalog metadata for the Trino backend: the ten catalog functions
+//! (`tables`, `columns`, `primary_keys`, `foreign_keys`, `statistics`,
+//! `special_columns`, `table_privileges`, `column_privileges`, `procedures`,
+//! `procedure_columns`) plus the `catalogs` / `schemas` / `table_types`
+//! enumerations, built by querying Trino's `information_schema` and
+//! `system.jdbc`, with the private WHERE-clause and ODBC-wildcard helpers
+//! those queries share.
 //!
 //! Every function here returns rows, never a statement: core converts them to
 //! `ColumnValue`s in spec column order, sorts them into the order each
 //! function's spec page defines, and serves the result set. That is why none
 //! of the queries below carries an `ORDER BY`.
+//!
+//! Six of the ten return no rows because Trino has nothing to answer them
+//! with. Each says which on its own doc comment; `AGENTS.md` has the table.
 
 use std::borrow::Cow;
 
 use stackable_odbc_core::types::{
-    ColumnRow, ForeignKeyRow, IdentifierType, Nullable, PrimaryKeyRow, Scope, SpecialColumnRow,
-    SqlDataType, StatisticsRow, TableRow,
+    ColumnPrivilegeRow, ColumnRow, ForeignKeyRow, IdentifierType, Nullable, PrimaryKeyRow,
+    ProcedureColumnRow, ProcedureRow, Scope, SpecialColumnRow, SqlDataType, StatisticsRow,
+    TablePrivilegeRow, TableRow,
 };
 
 use super::{TrinoConnection, TrinoError, info::trino_bare_type_name, query_all_rows};
@@ -230,9 +236,9 @@ pub(super) fn tables(
     catalog: Option<&str>,
     schema: Option<&str>,
     table: Option<&str>,
-    table_type: Option<&str>,
+    table_types: &[String],
 ) -> Result<Vec<TableRow>, TrinoError> {
-    tracing::debug!(catalog, schema, table, table_type, "TrinoBackend::tables");
+    tracing::debug!(catalog, schema, table, ?table_types, "TrinoBackend::tables");
 
     // No ORDER BY: core sorts the result set into the spec's order. The three
     // `SQL_ALL_*` enumerations never reach here either — core serves them from
@@ -245,12 +251,10 @@ pub(super) fn tables(
 
     let rows = query_all_rows(conn, sql)?;
 
-    // table_type filter: comma-separated list like "'TABLE','VIEW'"
-    let allowed_types: Option<Vec<String>> = table_type.filter(|s| !s.is_empty()).map(|tt| {
-        tt.split(',')
-            .map(|s| s.trim().trim_matches('\'').to_uppercase())
-            .collect()
-    });
+    // Core split and unquoted the value list; an empty slice is "no filter".
+    // The spec has applications supply table types in upper case, so folding
+    // here is tolerance for those that do not, not a requirement.
+    let allowed_types: Vec<String> = table_types.iter().map(|t| t.to_uppercase()).collect();
 
     Ok(rows
         .into_iter()
@@ -270,10 +274,7 @@ pub(super) fn tables(
                 }
             };
 
-            if allowed_types
-                .as_ref()
-                .is_some_and(|allowed| !allowed.iter().any(|a| a == odbc_type))
-            {
+            if !allowed_types.is_empty() && !allowed_types.iter().any(|a| a == odbc_type) {
                 return None;
             }
 
@@ -462,6 +463,181 @@ pub(super) fn columns(
         .collect())
 }
 
+/// 0-based positions in `table_privileges`' SELECT list. Must stay in sync
+/// with the query in [`table_privileges`].
+#[derive(Clone, Copy)]
+enum PrivilegeCol {
+    TableCatalog = 0,
+    TableSchema = 1,
+    TableName = 2,
+    Grantor = 3,
+    Grantee = 4,
+    PrivilegeType = 5,
+    IsGrantable = 6,
+}
+
+/// Convert one `information_schema.table_privileges` row to a
+/// [`TablePrivilegeRow`], or drop it if a column the spec marks not-NULL is
+/// missing or is not a string.
+///
+/// Split out from [`table_privileges`] because it is the only part of that
+/// function a live coordinator in this project's test stack cannot exercise:
+/// neither test catalog implements permission management, so the query is
+/// always empty there (`GRANT` on either answers `NOT_SUPPORTED`). The unit
+/// tests feed it the rows a coordinator with `sql-standard` security would
+/// return.
+fn table_privilege_row(vals: &[serde_json::Value]) -> Option<TablePrivilegeRow> {
+    let get = |col: PrivilegeCol| -> Option<String> {
+        vals.get(col as usize)?.as_str().map(str::to_string)
+    };
+
+    // TABLE_NAME, GRANTEE and PRIVILEGE are the three columns the spec marks
+    // "not NULL"; a row missing one is not a row an application can use.
+    let table_name = get(PrivilegeCol::TableName)?;
+    let grantee = get(PrivilegeCol::Grantee)?;
+    let privilege = get(PrivilegeCol::PrivilegeType)?;
+
+    Some(TablePrivilegeRow {
+        catalog: get(PrivilegeCol::TableCatalog),
+        schema: get(PrivilegeCol::TableSchema),
+        table_name,
+        // Nullable in both directions: Trino leaves `grantor` NULL for a
+        // privilege nobody explicitly granted, and ODBC's GRANTOR is nullable.
+        grantor: get(PrivilegeCol::Grantor),
+        grantee,
+        privilege,
+        // Trino spells this 'YES'/'NO', which is exactly ODBC's vocabulary for
+        // IS_GRANTABLE, so it passes through unmapped.
+        is_grantable: get(PrivilegeCol::IsGrantable),
+    })
+}
+
+/// Return the table-level privileges on the matching tables.
+///
+/// Trino models these: every catalog has an `information_schema.table_privileges`
+/// whose columns line up with ODBC's, and its own JDBC driver reads the same
+/// table for `DatabaseMetaData.getTablePrivileges()`.
+///
+/// It is populated from the connector's permission management, so it is
+/// non-empty only for connectors that implement it — Hive and Iceberg under
+/// `sql-standard` security, say. A connector without it answers with zero rows
+/// rather than an error, which is why this queries unconditionally instead of
+/// gating on the catalog. Both catalogs in this project's test stack are in
+/// that group, so the integration tests can assert the call's success and
+/// shape but never a row; [`table_privilege_row`] carries the unit tests that
+/// cover the conversion itself.
+///
+/// Note that Trino's `information_schema` is synthesised by Trino, not passed
+/// through to the underlying database: a `GRANT` issued directly in PostgreSQL
+/// is visible in PostgreSQL's own `information_schema.table_privileges` and
+/// **not** in the `postgresql` catalog's, because the base JDBC connector
+/// implements no permission management. Verified against the test stack.
+pub(super) fn table_privileges(
+    conn: &TrinoConnection,
+    catalog: Option<&str>,
+    schema: Option<&str>,
+    table: Option<&str>,
+) -> Result<Vec<TablePrivilegeRow>, TrinoError> {
+    tracing::debug!(catalog, schema, table, "TrinoBackend::table_privileges");
+
+    // No ORDER BY: core sorts by TABLE_CAT, TABLE_SCHEM, TABLE_NAME,
+    // PRIVILEGE, GRANTEE — note that PRIVILEGE outranks GRANTEE here.
+    let sql = format!(
+        "SELECT table_catalog, table_schema, table_name, grantor, grantee, \
+                privilege_type, is_grantable \
+         FROM information_schema.table_privileges{}",
+        build_tables_where_clause(catalog, schema, table)
+    );
+
+    let rows = query_all_rows(conn, sql)?;
+
+    Ok(rows
+        .into_iter()
+        .filter_map(|row| {
+            let vals: Vec<serde_json::Value> = row.into_json().into_iter().collect();
+            let converted = table_privilege_row(&vals);
+            if converted.is_none() {
+                tracing::warn!("table_privileges row missing a non-NULL column, skipping");
+            }
+            converted
+        })
+        .collect())
+}
+
+/// Return the column-level privileges on a single table.
+///
+/// Trino exposes no column-level privilege metadata at all: there is no
+/// `information_schema.column_privileges` in any catalog, and no `system.jdbc`
+/// equivalent. Privileges in Trino are granted on a table, never on a column,
+/// so there is nothing to narrow [`table_privileges`] down with either.
+///
+/// Core defaults this to no rows, but it is stated here so the reason is
+/// recorded and the call is logged like every other backend method.
+pub(super) fn column_privileges(
+    _conn: &TrinoConnection,
+    catalog: Option<&str>,
+    schema: Option<&str>,
+    table: Option<&str>,
+    column: Option<&str>,
+) -> Result<Vec<ColumnPrivilegeRow>, TrinoError> {
+    tracing::debug!(
+        catalog,
+        schema,
+        table,
+        column,
+        "TrinoBackend::column_privileges (empty — Trino grants on tables, not columns)"
+    );
+    Ok(Vec::new())
+}
+
+/// Return the stored procedures matching the given filters.
+///
+/// Trino has procedures — `CALL system.runtime.kill_query(...)` is one, and
+/// calling an unregistered name answers `PROCEDURE_NOT_FOUND` — but it
+/// publishes no metadata describing them. `system.jdbc.procedures` exists for
+/// JDBC compatibility and is hardwired empty (verified against a live
+/// coordinator: `system.runtime.kill_query` is callable while that table
+/// returns zero rows), and `system.metadata` has no procedures table.
+///
+/// This is consistent with the `SQL_ACCESSIBLE_PROCEDURES` = `"N"` this driver
+/// already reports from `info`.
+pub(super) fn procedures(
+    _conn: &TrinoConnection,
+    catalog: Option<&str>,
+    schema: Option<&str>,
+    proc_name: Option<&str>,
+) -> Result<Vec<ProcedureRow>, TrinoError> {
+    tracing::debug!(
+        catalog,
+        schema,
+        proc_name,
+        "TrinoBackend::procedures (empty — Trino publishes no procedure metadata)"
+    );
+    Ok(Vec::new())
+}
+
+/// Return the parameters and result-set columns of the matching procedures.
+///
+/// Empty for the same reason as [`procedures`]: `system.jdbc.procedure_columns`
+/// is the matching hardwired-empty JDBC compatibility view. A driver that
+/// cannot name a procedure cannot describe its parameters either.
+pub(super) fn procedure_columns(
+    _conn: &TrinoConnection,
+    catalog: Option<&str>,
+    schema: Option<&str>,
+    proc_name: Option<&str>,
+    column: Option<&str>,
+) -> Result<Vec<ProcedureColumnRow>, TrinoError> {
+    tracing::debug!(
+        catalog,
+        schema,
+        proc_name,
+        column,
+        "TrinoBackend::procedure_columns (empty — Trino publishes no procedure metadata)"
+    );
+    Ok(Vec::new())
+}
+
 /// Return primary key columns for the given table.
 ///
 /// Trino has no concept of primary keys at the engine level: no connector
@@ -611,6 +787,73 @@ mod tests {
     #[test]
     fn char_octet_length_is_null_without_a_declared_length() {
         assert_eq!(char_octet_length(SqlDataType::EXT_W_VARCHAR, None), None);
+    }
+
+    /// The row a coordinator with `sql-standard` security returns. Neither
+    /// catalog in this project's test stack implements permission management,
+    /// so this shape cannot be obtained from the live server the integration
+    /// tests run against — it is transcribed from
+    /// `information_schema.table_privileges`' column list, which was read off
+    /// the running coordinator.
+    fn privilege_json(grantor: serde_json::Value) -> Vec<serde_json::Value> {
+        use serde_json::json;
+        vec![
+            json!("tpcds"),       // table_catalog
+            json!("sf1"),         // table_schema
+            json!("call_center"), // table_name
+            grantor,              // grantor
+            json!("alice"),       // grantee
+            json!("SELECT"),      // privilege_type
+            json!("NO"),          // is_grantable
+        ]
+    }
+
+    #[test]
+    fn table_privilege_row_maps_every_column_to_its_spec_position() {
+        let row = table_privilege_row(&privilege_json(serde_json::json!("admin"))).unwrap();
+        assert_eq!(row.catalog.as_deref(), Some("tpcds"));
+        assert_eq!(row.schema.as_deref(), Some("sf1"));
+        assert_eq!(row.table_name, "call_center");
+        assert_eq!(row.grantor.as_deref(), Some("admin"));
+        assert_eq!(row.grantee, "alice");
+        assert_eq!(row.privilege, "SELECT");
+        assert_eq!(row.is_grantable.as_deref(), Some("NO"));
+    }
+
+    #[test]
+    fn table_privilege_row_keeps_a_null_grantor_null() {
+        // ODBC's GRANTOR is nullable and Trino leaves it NULL for a privilege
+        // nobody explicitly granted, so this must not become the string
+        // "null" or an empty string.
+        let row = table_privilege_row(&privilege_json(serde_json::Value::Null)).unwrap();
+        assert_eq!(row.grantor, None);
+    }
+
+    #[test]
+    fn table_privilege_row_drops_a_row_missing_a_non_null_column() {
+        // TABLE_NAME, GRANTEE and PRIVILEGE are the spec's not-NULL columns.
+        // A row without one cannot be described to an application, and
+        // core would serve it as an empty string rather than an error.
+        for missing in [
+            PrivilegeCol::TableName,
+            PrivilegeCol::Grantee,
+            PrivilegeCol::PrivilegeType,
+        ] {
+            let mut vals = privilege_json(serde_json::json!("admin"));
+            vals[missing as usize] = serde_json::Value::Null;
+            assert!(
+                table_privilege_row(&vals).is_none(),
+                "a NULL in column {} must drop the row",
+                missing as usize
+            );
+        }
+    }
+
+    #[test]
+    fn table_privilege_row_drops_a_short_row() {
+        // A truncated row must not panic on the index.
+        assert!(table_privilege_row(&[]).is_none());
+        assert!(table_privilege_row(&privilege_json(serde_json::Value::Null)[..3]).is_none());
     }
 
     #[test]

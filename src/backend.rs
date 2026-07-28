@@ -13,14 +13,15 @@ use stackable_odbc_core::{
     backend::Backend,
     errors::OdbcError,
     types::{
-        ColumnDescriptor, ColumnRow, ColumnValue, ConnectParams, ExecuteOutcome, ForeignKeyRow,
-        IdentifierType, InfoValue, Nullable, PrimaryKeyRow, SQL_CB_NULL, SQL_CN_ANY,
-        SQL_FN_CVT_CAST, SQL_FN_TSI_DAY, SQL_FN_TSI_HOUR, SQL_FN_TSI_MINUTE, SQL_FN_TSI_MONTH,
-        SQL_FN_TSI_QUARTER, SQL_FN_TSI_SECOND, SQL_FN_TSI_WEEK, SQL_FN_TSI_YEAR,
-        SQL_GB_GROUP_BY_CONTAINS_SELECT, SQL_IC_LOWER, SQL_NC_END, SQL_NNC_NON_NULL,
-        SQL_SQ_COMPARISON, SQL_SQ_CORRELATED_SUBQUERIES, SQL_SQ_EXISTS, SQL_SQ_IN,
-        SQL_SQ_QUANTIFIED, SQL_U_UNION, SQL_U_UNION_ALL, Scope, SpecialColumnRow, StatisticsRow,
-        TableRow, TypeInfoRow, format_odbc_version, parse_dotted_version,
+        ColumnDescriptor, ColumnPrivilegeRow, ColumnRow, ColumnValue, ConnectParams,
+        ExecuteOutcome, ForeignKeyRow, IdentifierType, InfoValue, Nullable, PrimaryKeyRow,
+        ProcedureColumnRow, ProcedureRow, SQL_CB_NULL, SQL_CN_ANY, SQL_FN_CVT_CAST, SQL_FN_TSI_DAY,
+        SQL_FN_TSI_HOUR, SQL_FN_TSI_MINUTE, SQL_FN_TSI_MONTH, SQL_FN_TSI_QUARTER,
+        SQL_FN_TSI_SECOND, SQL_FN_TSI_WEEK, SQL_FN_TSI_YEAR, SQL_GB_GROUP_BY_CONTAINS_SELECT,
+        SQL_IC_LOWER, SQL_NC_END, SQL_NNC_NON_NULL, SQL_SQ_COMPARISON,
+        SQL_SQ_CORRELATED_SUBQUERIES, SQL_SQ_EXISTS, SQL_SQ_IN, SQL_SQ_QUANTIFIED, SQL_U_UNION,
+        SQL_U_UNION_ALL, Scope, SpecialColumnRow, StatisticsRow, TablePrivilegeRow, TableRow,
+        TypeInfoRow, format_odbc_version, parse_dotted_version,
     },
 };
 use trino_rust_client::{Client, ClientBuilder, Trino, auth::Auth, ssl::Ssl};
@@ -1143,9 +1144,9 @@ impl Backend for TrinoBackend {
         catalog: Option<&str>,
         schema: Option<&str>,
         table: Option<&str>,
-        table_type: Option<&str>,
+        table_types: &[String],
     ) -> Result<Vec<TableRow>, TrinoError> {
-        metadata::tables(conn, catalog, schema, table, table_type)
+        metadata::tables(conn, catalog, schema, table, table_types)
     }
 
     /// The two `information_schema.tables.table_type` values `metadata::tables`
@@ -1242,6 +1243,54 @@ impl Backend for TrinoBackend {
             scope,
             nullable,
         )
+    }
+
+    // The four catalog functions core defaults to an empty result set. Only
+    // `table_privileges` has anything to read: Trino models table-level
+    // privileges in `information_schema.table_privileges` and nothing else in
+    // this group. All four are stated rather than left defaulted so the reason
+    // is recorded next to the answer and the call is logged like every other
+    // backend method; see `metadata` for what each one checked.
+    fn table_privileges(
+        conn: &TrinoConnection,
+        _cancel: &TrinoCancelToken,
+        catalog: Option<&str>,
+        schema: Option<&str>,
+        table: Option<&str>,
+    ) -> Result<Vec<TablePrivilegeRow>, TrinoError> {
+        metadata::table_privileges(conn, catalog, schema, table)
+    }
+
+    fn column_privileges(
+        conn: &TrinoConnection,
+        _cancel: &TrinoCancelToken,
+        catalog: Option<&str>,
+        schema: Option<&str>,
+        table: Option<&str>,
+        column: Option<&str>,
+    ) -> Result<Vec<ColumnPrivilegeRow>, TrinoError> {
+        metadata::column_privileges(conn, catalog, schema, table, column)
+    }
+
+    fn procedures(
+        conn: &TrinoConnection,
+        _cancel: &TrinoCancelToken,
+        catalog: Option<&str>,
+        schema: Option<&str>,
+        proc_name: Option<&str>,
+    ) -> Result<Vec<ProcedureRow>, TrinoError> {
+        metadata::procedures(conn, catalog, schema, proc_name)
+    }
+
+    fn procedure_columns(
+        conn: &TrinoConnection,
+        _cancel: &TrinoCancelToken,
+        catalog: Option<&str>,
+        schema: Option<&str>,
+        proc_name: Option<&str>,
+        column: Option<&str>,
+    ) -> Result<Vec<ProcedureColumnRow>, TrinoError> {
+        metadata::procedure_columns(conn, catalog, schema, proc_name, column)
     }
 
     /// Trino's `{fn}`/`{d}`/`{t}`/`{ts}` escape-translation dialect. See

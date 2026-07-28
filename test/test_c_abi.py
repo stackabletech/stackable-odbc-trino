@@ -121,6 +121,13 @@ def load(path):
         ),
         "SQLCancel": ([P], S),
         "SQLNumParams": ([P, ctypes.POINTER(S)], S),
+        # SQLRETURN is a 16-bit SQLSMALLINT. Every entry point called here
+        # needs its restype declared, or ctypes reads the return register as a
+        # 32-bit int and SQL_ERROR (-1) arrives as 65535.
+        "SQLTablePrivilegesW": ([P, W, S, W, S, W, S], S),
+        "SQLColumnPrivilegesW": ([P, W, S, W, S, W, S, W, S], S),
+        "SQLProceduresW": ([P, W, S, W, S, W, S], S),
+        "SQLProcedureColumnsW": ([P, W, S, W, S, W, S, W, S], S),
     }
     for name, (args, res) in sig.items():
         fn = getattr(lib, name)
@@ -533,6 +540,107 @@ def main():
             state="24000",
             got_state=second,
         )
+
+    # ---------------------------------------------------------------
+    print("\n--- privilege catalog functions ---")
+    # pyodbc exposes no tablePrivileges()/columnPrivileges(), so this is the
+    # only suite that reaches SQLTablePrivilegesW and SQLColumnPrivilegesW at
+    # all. Both answer an empty result set here, but for different reasons:
+    #
+    #  - SQLTablePrivileges runs a real query against
+    #    information_schema.table_privileges. It is empty because neither test
+    #    catalog implements permission management, not because the driver
+    #    declines to look. A SQL_ERROR here means the query was rejected.
+    #  - SQLColumnPrivileges reads nothing: Trino grants on tables, never on
+    #    columns, and publishes no column-privilege metadata.
+    #
+    # Both must still describe their result set, because an application sizes
+    # its buffers from SQLNumResultCols before it fetches anything.
+    cat, _kp1 = w("tpcds")
+    sch, _kp2 = w("sf1")
+    tbl, _kp3 = w("call_center")
+    pct, _kp4 = w("%")
+
+    r = lib.SQLTablePrivilegesW(stmt, cat, SQL_NTS, sch, SQL_NTS, tbl, SQL_NTS)
+    check(
+        "table privileges on a real table",
+        r,
+        SQL_SUCCESS,
+        got_state=sqlstate(lib, SQL_HANDLE_STMT, stmt),
+    )
+    ncols = ctypes.c_short(0)
+    lib.SQLNumResultCols(stmt, ctypes.byref(ncols))
+    check("table privileges describes 7 columns", ncols.value, 7)
+    check("table privileges is empty here", lib.SQLFetch(stmt), SQL_NO_DATA)
+    lib.SQLFreeStmt(stmt, SQL_CLOSE)
+
+    r = lib.SQLColumnPrivilegesW(
+        stmt, cat, SQL_NTS, sch, SQL_NTS, tbl, SQL_NTS, pct, SQL_NTS
+    )
+    check(
+        "column privileges on a real table",
+        r,
+        SQL_SUCCESS,
+        got_state=sqlstate(lib, SQL_HANDLE_STMT, stmt),
+    )
+    ncols = ctypes.c_short(0)
+    lib.SQLNumResultCols(stmt, ctypes.byref(ncols))
+    check("column privileges describes 8 columns", ncols.value, 8)
+    check("column privileges is empty", lib.SQLFetch(stmt), SQL_NO_DATA)
+    lib.SQLFreeStmt(stmt, SQL_CLOSE)
+
+    # SQLColumnPrivileges is the only one of the four privilege/procedure
+    # functions whose spec page states "The TableName argument was a null
+    # pointer" *without* a (DM) marker, so the driver owns that HY009. Its
+    # three neighbours must not report one, which is why only this is probed.
+    r = lib.SQLColumnPrivilegesW(
+        stmt, cat, SQL_NTS, sch, SQL_NTS, None, SQL_NTS, pct, SQL_NTS
+    )
+    check(
+        "column privileges with a null TableName",
+        r,
+        SQL_ERROR,
+        state="HY009",
+        got_state=sqlstate(lib, SQL_HANDLE_STMT, stmt),
+    )
+    lib.SQLFreeStmt(stmt, SQL_CLOSE)
+
+    # ---------------------------------------------------------------
+    print("\n--- procedure catalog functions ---")
+    # Trino has callable procedures -- CALL system.runtime.kill_query(...) is
+    # one -- but publishes no metadata naming them: system.jdbc.procedures is
+    # a JDBC-compatibility view that is hardwired empty. An empty result set
+    # is therefore the honest answer, and it must still be a described one.
+    sysc, _kp5 = w("system")
+    runt, _kp6 = w("runtime")
+
+    r = lib.SQLProceduresW(stmt, sysc, SQL_NTS, runt, SQL_NTS, pct, SQL_NTS)
+    check(
+        "procedures in system.runtime",
+        r,
+        SQL_SUCCESS,
+        got_state=sqlstate(lib, SQL_HANDLE_STMT, stmt),
+    )
+    ncols = ctypes.c_short(0)
+    lib.SQLNumResultCols(stmt, ctypes.byref(ncols))
+    check("procedures describes 8 columns", ncols.value, 8)
+    check("procedures is empty", lib.SQLFetch(stmt), SQL_NO_DATA)
+    lib.SQLFreeStmt(stmt, SQL_CLOSE)
+
+    r = lib.SQLProcedureColumnsW(
+        stmt, sysc, SQL_NTS, runt, SQL_NTS, pct, SQL_NTS, pct, SQL_NTS
+    )
+    check(
+        "procedure columns in system.runtime",
+        r,
+        SQL_SUCCESS,
+        got_state=sqlstate(lib, SQL_HANDLE_STMT, stmt),
+    )
+    ncols = ctypes.c_short(0)
+    lib.SQLNumResultCols(stmt, ctypes.byref(ncols))
+    check("procedure columns describes 19 columns", ncols.value, 19)
+    check("procedure columns is empty", lib.SQLFetch(stmt), SQL_NO_DATA)
+    lib.SQLFreeStmt(stmt, SQL_CLOSE)
 
     print("\n--- cancel with nothing running ---")
     r = lib.SQLCancel(stmt)

@@ -24,10 +24,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   this driver already declares, so nothing about which rows Trino is asked for
   changed except the interpretation the spec assigns them.
 
-  One new diagnostic comes with it: `SQLTables` and `SQLColumns` return `HY009`
-  when `SQL_ATTR_METADATA_ID` is `SQL_TRUE` and `CatalogName` is a null
-  pointer, which the spec requires of a driver whose data source supports
-  catalog names. Trino's do.
+  One new diagnostic comes with it: the catalog functions return `HY009` when
+  `SQL_ATTR_METADATA_ID` is `SQL_TRUE` and `CatalogName` is a null pointer,
+  which the spec requires of a driver whose data source supports catalog names.
+  Trino's do. `SQLColumnPrivileges` additionally returns `HY009` for a null
+  `TableName` unconditionally; it is the only one of the ten whose spec page
+  states that without a **(DM)** marker.
+- `SQLTablePrivileges` reports Trino's table-level privileges, read from the
+  connected catalog's `information_schema.table_privileges`. It previously
+  returned an empty result set for every data source.
+
+  Rows appear only for connectors that implement permission management — Hive
+  and Iceberg under `sql-standard` security, say. A connector without it, which
+  includes every JDBC-backed connector, has no privileges to report and still
+  answers with zero rows rather than an error.
+- `SQLColumnPrivileges`, `SQLProcedures` and `SQLProcedureColumns` describe
+  their result sets and return no rows, which is what they already did, now
+  stated by the driver rather than left to a default. Trino grants privileges
+  on tables and never on columns, and while it has callable procedures
+  (`CALL system.runtime.kill_query(...)`) it publishes no metadata naming them
+  — `system.jdbc.procedures` is a JDBC-compatibility view that is always empty.
+  This matches the `SQL_ACCESSIBLE_PROCEDURES` of `"N"` the driver reports.
 
 ### Changed
 
