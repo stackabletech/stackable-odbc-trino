@@ -19,6 +19,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- A server-side error's `SQLGetDiagRec` message no longer carries Trino's
+  `failure_info`. The coordinator's Java stack was reaching the application
+  through the diagnostic's causal chain, putting between 1,700 and 15,000
+  characters into every error message — `DIVISION_BY_ZERO` was the worst,
+  around 30 KB of UTF-16 across roughly 168 frames. The same errors now produce
+  62 to 124 characters.
+
+  Nothing an application can act on is lost. The message still names the Trino
+  error and what went wrong (`query error [COLUMN_NOT_FOUND]: line 1:8: Column
+  'nope' cannot be resolved`), and `SQLGetDiagRec` still reports Trino's own
+  error code verbatim through `NativeErrorPtr`. The full `failure_info` is
+  logged at `debug` instead, reachable through `ODBC_LOG_LEVEL` /
+  `ODBC_LOG_FILE`.
+
+  A transport failure's cause is unaffected and still carried whole; its
+  message is a single line.
 - `SQLCancel` can now interrupt a query from a thread other than the one
   executing it, which is the case the ODBC spec singles out and the one that
   matters to a BI tool with a cancel button. `stackable-odbc-core` replaced

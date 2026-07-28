@@ -69,6 +69,69 @@ const SQL_STATE_CANCELLED: &str = "HY008";
 /// range alongside `PERMISSION_DENIED` (4), which the arm below it names.
 const TRINO_ERROR_USER_CANCELED: i32 = 3;
 
+/// The cause attached to a [`TrinoError::Query`] or
+/// [`TrinoError::OperationCancelled`].
+///
+/// Two shapes, because the two kinds of failure carry very different amounts
+/// of text. A transport error's own `Display` is a single line and is kept
+/// whole. A server-side `QueryError` renders the coordinator's entire
+/// `failure_info` — its Java stack — and core walks the whole causal chain into
+/// the `SQLGetDiagRec` message, so keeping it whole put between 1,700 and
+/// 15,000 characters into every diagnostic (measured against a live
+/// coordinator; `DIVISION_BY_ZERO` was the worst at ~30 KB of UTF-16 across
+/// ~168 frames).
+///
+/// None of that is actionable through ODBC: the stack describes the
+/// coordinator's internals, the application already gets Trino's own error code
+/// verbatim through `NativeErrorPtr`, and the summary that names what actually
+/// went wrong is the first line. The stack is therefore logged at `debug`
+/// rather than marshalled — `ODBC_LOG_LEVEL` / `ODBC_LOG_FILE` are what a
+/// person debugging Trino itself reaches for.
+#[derive(Debug, Snafu)]
+pub enum QueryCause {
+    /// A transport failure, kept verbatim; its `Display` is already one line.
+    #[snafu(display("{source}"))]
+    Transport {
+        source: trino_rust_client::error::Error,
+    },
+    /// A server-side rejection, reduced to what an application can act on.
+    #[snafu(display("query error [{error_name}]: {message}"))]
+    Server { error_name: String, message: String },
+}
+
+/// Split a client error into the native error code and the cause to attach.
+///
+/// The single place `failure_info` is dropped, so the decision is made once for
+/// every arm that carries a cause.
+fn query_cause(e: trino_rust_client::error::Error) -> (QueryCause, i32) {
+    use trino_rust_client::error::Error;
+    match e {
+        Error::Query(query_error) => {
+            // Logged rather than discarded: this is the only copy, and it is
+            // what a person debugging the coordinator actually wants.
+            if let Some(ref failure) = query_error.failure_info {
+                tracing::debug!(
+                    error_name = %query_error.error_name,
+                    failure_info = ?failure,
+                    "Trino failure_info; omitted from the SQLGetDiagRec message, \
+                     which carries the summary and the native error code"
+                );
+            }
+            let native_error = query_error.error_code;
+            (
+                QueryCause::Server {
+                    error_name: query_error.error_name,
+                    message: query_error.message,
+                },
+                native_error,
+            )
+        }
+        // A transport failure has no Trino error code, and `0` is the spec's
+        // "no native code".
+        other => (QueryCause::Transport { source: other }, 0),
+    }
+}
+
 pub(crate) fn map_trino_error(e: trino_rust_client::error::Error) -> TrinoError {
     use trino_rust_client::error::Error;
     match e {
@@ -76,9 +139,9 @@ pub(crate) fn map_trino_error(e: trino_rust_client::error::Error) -> TrinoError 
         // would otherwise swallow this into `TrinoError::Query` and report
         // HY000 for a cancellation the spec gives its own SQLSTATE.
         Error::Query(ref query_error) if query_error.error_code == TRINO_ERROR_USER_CANCELED => {
-            let native_error = query_error.error_code;
+            let (source, native_error) = query_cause(e);
             TrinoError::OperationCancelled {
-                source: e,
+                source,
                 native_error,
             }
         }
@@ -114,12 +177,9 @@ pub(crate) fn map_trino_error(e: trino_rust_client::error::Error) -> TrinoError 
         // drops the code on the way, so that one maps to 28000 above with a
         // native code of 0.
         other => {
-            let native_error = match &other {
-                Error::Query(query_error) => query_error.error_code,
-                _ => 0,
-            };
+            let (source, native_error) = query_cause(other);
             TrinoError::Query {
-                source: other,
+                source,
                 native_error,
             }
         }
@@ -520,7 +580,7 @@ pub enum TrinoError {
     /// would print the client error twice.
     #[snafu(display("query failed"))]
     Query {
-        source: trino_rust_client::error::Error,
+        source: QueryCause,
         native_error: i32,
     },
     /// The query was cancelled while this request was in flight.
@@ -540,7 +600,7 @@ pub enum TrinoError {
     /// `CALL system.runtime.kill_query`.
     #[snafu(display("query was cancelled"))]
     OperationCancelled {
-        source: trino_rust_client::error::Error,
+        source: QueryCause,
         native_error: i32,
     },
     /// An error core itself produced.

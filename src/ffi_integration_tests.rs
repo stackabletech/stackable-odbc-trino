@@ -3283,6 +3283,86 @@ fn a_trailing_semicolon_does_not_fail_the_statement() {
     }
 }
 
+/// A server-side error's diagnostic must carry the summary and the native
+/// code, and must not carry Trino's `failure_info`.
+///
+/// `QueryError`'s own `Display` renders the coordinator's Java stack, and core
+/// walks the whole causal chain into the message, so before `QueryCause` split
+/// the two apart every diagnostic ran to thousands of characters — measured
+/// between 1,700 and 15,000 against a live coordinator, `DIVISION_BY_ZERO`
+/// being the worst at ~168 frames.
+///
+/// The bound below is deliberately loose. It is not asserting a particular
+/// length, it is asserting that no stack is in there, and it would fail by
+/// orders of magnitude if one came back.
+#[test]
+#[serial]
+#[ignore = "requires Trino at localhost:8080 -- run test/setup.sh first"]
+fn server_error_diagnostics_carry_the_summary_not_the_java_stack() {
+    // (SQL, Trino error name, native error code)
+    let cases: &[(&str, &str, i32)] = &[
+        (
+            "SELECT nope FROM tpcds.sf1.customer",
+            "COLUMN_NOT_FOUND",
+            47,
+        ),
+        ("SELECT 1/0", "DIVISION_BY_ZERO", 8),
+        ("SELECT CAST('abc' AS INTEGER)", "INVALID_CAST_ARGUMENT", 9),
+    ];
+    const MAX_DIAGNOSTIC_CHARS: usize = 500;
+
+    unsafe {
+        for (sql, error_name, want_native) in cases {
+            let (_env, _conn, stmt) = alloc_stmt();
+            // Some of these are rejected at planning and some only once a page
+            // is fetched, so drive both before reading the diagnostic.
+            if exec_direct(stmt, sql) == SqlReturn::SUCCESS {
+                let _ = ffi::fetch::sql_fetch::<TrinoBackend>(stmt);
+            }
+
+            let mut state = [0u16; 6];
+            let mut msg = [0u16; 4096];
+            let mut msg_len: i16 = 0;
+            let mut native: i32 = 0;
+            let ret = ffi::diag::sql_get_diag_rec_w::<TrinoBackend>(
+                HandleType::Stmt as i16,
+                stmt,
+                1,
+                state.as_mut_ptr(),
+                &mut native,
+                msg.as_mut_ptr(),
+                // In characters for SQLGetDiagRec, unlike SQLGetDiagField.
+                msg.len() as i16,
+                &mut msg_len,
+            );
+            assert_eq!(
+                ret,
+                SqlReturn::SUCCESS,
+                "{sql}: expected a diagnostic record"
+            );
+
+            let text = String::from_utf16_lossy(&msg[..msg_len as usize]);
+            assert!(
+                text.contains(error_name),
+                "{sql}: diagnostic does not name the error: {text}"
+            );
+            assert_eq!(native, *want_native, "{sql}: wrong native error code");
+            assert!(
+                !text.contains("io.trino") && !text.contains("java."),
+                "{sql}: Trino's failure_info reached the diagnostic: {text}"
+            );
+            assert!(
+                text.chars().count() <= MAX_DIAGNOSTIC_CHARS,
+                "{sql}: diagnostic is {} chars, over the {MAX_DIAGNOSTIC_CHARS} \
+                 bound that stands in for 'carries no stack': {text}",
+                text.chars().count()
+            );
+
+            cleanup_stmt(stmt);
+        }
+    }
+}
+
 /// A VARCHAR value holding digit text, read as `SQL_C_SBIGINT`, must succeed
 /// (the ODBC conversion matrix requires CHAR/VARCHAR to convert to every C
 /// type); the same shape holding non-numeric text must fail with the

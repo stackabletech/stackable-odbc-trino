@@ -239,11 +239,26 @@ codes to `HY000`. It yields `08S01` for link failures, `HYT00` for timeouts and
 `28000` for auth errors.
 
 It also decides what reaches `SQLGetDiagRec` beyond the SQLSTATE. Anything it
-does not classify becomes `TrinoError::Query`, which keeps the client error as
-its `source` and lifts `QueryError::error_code` into the native error — so a
+does not classify becomes `TrinoError::Query`, which keeps the failure as its
+`source` and lifts `QueryError::error_code` into the native error — so a
 server-side rejection reaches the application as its own Trino code rather than
-`0`. A variant that flattens the client error into a `String` throws both away,
+`0`. A variant that flattens the failure into a `String` throws both away,
 which is why the specific arms are the exception and not the pattern.
+
+The `source` is a [`QueryCause`], not the client error itself, and `query_cause`
+is the one place that decides which. A transport error is kept whole; its
+`Display` is a single line. A server-side `QueryError` is reduced to
+`[error_name]: message`, because its own `Display` renders `failure_info` — the
+coordinator's Java stack — and core walks the whole causal chain into the
+diagnostic. Measured against a live coordinator that put 1,700–15,000 characters
+into every message, `DIVISION_BY_ZERO` being the worst at roughly 30 KB of
+UTF-16 across ~168 frames.
+
+Nothing actionable is lost: the stack describes the coordinator's internals, the
+application already gets Trino's error code verbatim through `NativeErrorPtr`,
+and the summary naming the failure is what led the message anyway. The full
+`failure_info` is logged at `debug` instead, which is what `ODBC_LOG_LEVEL` /
+`ODBC_LOG_FILE` exist for.
 
 Two of those arms are load-bearing beyond diagnostics: `validate_connection`
 matches on `AuthFailure` and `QueryTimeout` to keep them at their own SQLSTATE
