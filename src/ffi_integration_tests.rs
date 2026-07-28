@@ -33,9 +33,9 @@ use stackable_odbc_core::odbc_sys;
 use stackable_odbc_core::test_support::{attach_connection, detach_connection};
 use stackable_odbc_core::types::{
     AttrOdbcVersion, CDataType, Desc, EnvironmentAttribute, HandleType, HeaderDiagnosticIdentifier,
-    InfoType, ParamType, SQL_ADD, SQL_DIAG_MESSAGE_TEXT, SQL_IC_SENSITIVE, SQL_INDEX_UNIQUE,
-    SQL_LOCK_NO_CHANGE, SQL_NTS, SQL_NULL_DATA, SQL_POSITION, SQL_QUICK, SqlDataType, SqlReturn,
-    StatementAttribute, expected_kind,
+    InfoType, ParamType, SQL_IC_SENSITIVE, SQL_INDEX_UNIQUE, SQL_LOCK_NO_CHANGE, SQL_NTS,
+    SQL_NULL_DATA, SQL_POSITION, SQL_QUICK, SqlDataType, SqlReturn, StatementAttribute,
+    expected_kind,
 };
 
 use crate::backend::info::{
@@ -1057,6 +1057,17 @@ fn string_parameter_with_quotes_is_not_injected() {
 
         let payload = "'; DROP TABLE users; --";
         let mut buf: Vec<u8> = payload.as_bytes().to_vec();
+        // The indicator is passed explicitly rather than left NULL. A NULL
+        // `StrLen_or_IndPtr` means "this buffer is null-terminated" per
+        // SQLBindParameter, so the driver scans for a NUL -- and `to_vec()`
+        // produces exactly `payload.len()` bytes with no terminator. That
+        // combination made the driver read past the allocation into whatever
+        // the heap held next, so this assertion failed with the payload plus
+        // trailing garbage whenever earlier tests had dirtied the allocator,
+        // and passed when the test ran alone. See
+        // `string_parameter_bound_as_nts_is_not_injected` for the
+        // null-terminated form of the same binding.
+        let mut ind_in: isize = buf.len() as isize;
         assert_eq!(
             ffi::params::sql_bind_parameter::<TrinoBackend>(
                 stmt,
@@ -1065,6 +1076,76 @@ fn string_parameter_with_quotes_is_not_injected() {
                 CDataType::Char as i16,
                 SqlDataType::VARCHAR.0,
                 buf.len(),
+                0,
+                buf.as_mut_ptr().cast(),
+                buf.len() as isize,
+                &mut ind_in,
+            ),
+            SqlReturn::SUCCESS
+        );
+        assert_eq!(
+            ffi::execute::sql_execute::<TrinoBackend>(stmt),
+            SqlReturn::SUCCESS
+        );
+
+        assert_eq!(
+            ffi::fetch::sql_fetch::<TrinoBackend>(stmt),
+            SqlReturn::SUCCESS
+        );
+        let mut out = [0u8; 64];
+        let mut ind: isize = 0;
+        assert_eq!(
+            ffi::fetch::sql_get_data::<TrinoBackend>(
+                stmt,
+                1,
+                CDataType::Char as i16,
+                out.as_mut_ptr().cast(),
+                out.len() as isize,
+                &mut ind,
+            ),
+            SqlReturn::SUCCESS
+        );
+        let got = std::str::from_utf8(&out[..ind as usize]).expect("utf8");
+        assert_eq!(got, payload, "payload was altered in transit");
+
+        cleanup_stmt(stmt);
+    }
+}
+
+/// The same payload bound the other legal way: a null-terminated buffer with a
+/// NULL `StrLen_or_IndPtr`.
+///
+/// `SQLBindParameter` defines a NULL indicator as "the data is
+/// null-terminated", so this is the path where the driver scans for the
+/// terminator rather than being told the length. It was untested, which is why
+/// the sibling test above could pass a buffer carrying no terminator down that
+/// path and have the resulting over-read read as an injection failure.
+#[test]
+#[serial]
+#[ignore = "requires Trino at localhost:8080 -- run test/setup.sh first"]
+fn string_parameter_bound_as_nts_is_not_injected() {
+    unsafe {
+        let (_env, _conn, stmt) = alloc_stmt();
+        let sql = "SELECT CAST(? AS VARCHAR) AS s";
+        let wide: Vec<u16> = sql.encode_utf16().collect();
+        assert_eq!(
+            ffi::execute::sql_prepare_w::<TrinoBackend>(stmt, wide.as_ptr(), wide.len() as i32),
+            SqlReturn::SUCCESS
+        );
+
+        let payload = "'; DROP TABLE users; --";
+        // The trailing NUL is the whole point: it is what makes a NULL
+        // indicator a legal binding.
+        let mut buf: Vec<u8> = payload.as_bytes().to_vec();
+        buf.push(0);
+        assert_eq!(
+            ffi::params::sql_bind_parameter::<TrinoBackend>(
+                stmt,
+                1,
+                ParamType::Input as i16,
+                CDataType::Char as i16,
+                SqlDataType::VARCHAR.0,
+                payload.len(),
                 0,
                 buf.as_mut_ptr().cast(),
                 buf.len() as isize,
@@ -2047,7 +2128,7 @@ fn get_diag_field_message_text_after_error() {
             HandleType::Stmt as i16,
             stmt,
             1, // first record
-            SQL_DIAG_MESSAGE_TEXT,
+            HeaderDiagnosticIdentifier::MessageText as i16,
             msg_buf.as_mut_ptr() as *mut c_void,
             buffer_length,
             &mut str_len,
@@ -2540,7 +2621,10 @@ fn bulk_operations_returns_hyc00() {
             ffi::fetch::sql_fetch::<TrinoBackend>(stmt),
             SqlReturn::SUCCESS
         );
-        let ret = ffi::cursor::sql_bulk_operations::<TrinoBackend>(stmt, SQL_ADD);
+        let ret = ffi::cursor::sql_bulk_operations::<TrinoBackend>(
+            stmt,
+            odbc_sys::BulkOperation::Add as i16,
+        );
         assert_eq!(
             ret,
             SqlReturn::ERROR,

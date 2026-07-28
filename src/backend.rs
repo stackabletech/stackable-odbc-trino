@@ -58,9 +58,30 @@ pub(crate) const TRINO_TIMESTAMP_INTERVALS: u32 = SQL_FN_TSI_SECOND
 ///
 /// Every error from the client library must be routed through here; hand-building
 /// a `TrinoError` at the call site silently degrades a specific SQLSTATE to `HY000`.
+/// SQLSTATE for "operation canceled", which core provides no named
+/// constructor for. See [`TrinoError::OperationCancelled`].
+const SQL_STATE_CANCELLED: &str = "HY008";
+
+/// Trino's `USER_CANCELED` error code, reported when a query is killed while a
+/// request against it is in flight.
+///
+/// From Trino's `StandardErrorCode` enum, where it sits in the `USER_ERROR`
+/// range alongside `PERMISSION_DENIED` (4), which the arm below it names.
+const TRINO_ERROR_USER_CANCELED: i32 = 3;
+
 pub(crate) fn map_trino_error(e: trino_rust_client::error::Error) -> TrinoError {
     use trino_rust_client::error::Error;
     match e {
+        // Checked before the catch-all `Error::Query` arm at the bottom, which
+        // would otherwise swallow this into `TrinoError::Query` and report
+        // HY000 for a cancellation the spec gives its own SQLSTATE.
+        Error::Query(ref query_error) if query_error.error_code == TRINO_ERROR_USER_CANCELED => {
+            let native_error = query_error.error_code;
+            TrinoError::OperationCancelled {
+                source: e,
+                native_error,
+            }
+        }
         Error::HttpError(ref req_err) if req_err.is_connect() => {
             TrinoError::CommunicationLinkFailure {
                 message: format!("unable to reach Trino server: {req_err}"),
@@ -502,6 +523,26 @@ pub enum TrinoError {
         source: trino_rust_client::error::Error,
         native_error: i32,
     },
+    /// The query was cancelled while this request was in flight.
+    ///
+    /// Maps to `HY008`, which the spec defines for exactly this case:
+    /// "the function was called, and before it completed execution,
+    /// `SQLCancel` ... was called on the StatementHandle from a different
+    /// thread in a multithreaded application". That clause carries no `(DM)`
+    /// annotation, so it is the driver's to report, not the Driver Manager's.
+    ///
+    /// Recognised from Trino's own `USER_CANCELED` error code rather than from
+    /// this driver's cancel flag, because the two race: the cancelling thread
+    /// sets its flag only after its `DELETE` returns, by which time the
+    /// coordinator may already have failed the in-flight page request. The
+    /// server's verdict needs no cross-thread ordering, and it also covers a
+    /// query killed by someone else entirely — another client, or
+    /// `CALL system.runtime.kill_query`.
+    #[snafu(display("query was cancelled"))]
+    OperationCancelled {
+        source: trino_rust_client::error::Error,
+        native_error: i32,
+    },
     /// An error core itself produced.
     ///
     /// `Backend::Error` is bounded by `From<OdbcError>` so that a defaulted
@@ -553,6 +594,16 @@ impl From<TrinoError> for OdbcError {
             TrinoError::AuthConfig { ref message } => {
                 OdbcError::general(message.clone(), SqlState::invalid_auth_spec())
             }
+            // `SqlState::new` rather than a named constructor: core has none
+            // for HY008, because it documents HY008 as never returned by a
+            // driver ("not applicable; the `Backend` trait is synchronous").
+            // Cross-thread `SQLCancel` made that false. See the CHANGELOG.
+            TrinoError::OperationCancelled {
+                source,
+                native_error,
+            } => OdbcError::general("query was cancelled", SqlState::new(SQL_STATE_CANCELLED))
+                .with_native_error(native_error)
+                .with_source(source),
             _ => OdbcError::general(e.to_string(), SqlState::general_error()),
         }
     }
@@ -1174,7 +1225,7 @@ mod tests {
         let types = TrinoBackend::get_type_info(&conn);
         assert!(!types.is_empty(), "should return at least one type");
 
-        let names: Vec<&str> = types.iter().map(|t| t.type_name.as_ref()).collect();
+        let names: Vec<&str> = types.iter().map(|t| t.type_name()).collect();
         for expected in &[
             "BOOLEAN",
             "TINYINT",
@@ -1197,22 +1248,22 @@ mod tests {
         }
 
         // Datetime types must have sql_data_type=9 (SQL_DATETIME) and a sub-type code
-        let date = types.iter().find(|t| t.type_name == "DATE").unwrap();
-        assert_eq!(date.sql_data_type, 9);
-        assert_eq!(date.sql_datetime_sub, Some(1));
+        let date = types.iter().find(|t| t.type_name() == "DATE").unwrap();
+        assert_eq!(date.sql_data_type(), 9);
+        assert_eq!(date.sql_datetime_sub(), Some(1));
 
-        let time = types.iter().find(|t| t.type_name == "TIME").unwrap();
-        assert_eq!(time.sql_data_type, 9);
-        assert_eq!(time.sql_datetime_sub, Some(2));
+        let time = types.iter().find(|t| t.type_name() == "TIME").unwrap();
+        assert_eq!(time.sql_data_type(), 9);
+        assert_eq!(time.sql_datetime_sub(), Some(2));
 
-        let ts = types.iter().find(|t| t.type_name == "TIMESTAMP").unwrap();
-        assert_eq!(ts.sql_data_type, 9);
-        assert_eq!(ts.sql_datetime_sub, Some(3));
+        let ts = types.iter().find(|t| t.type_name() == "TIMESTAMP").unwrap();
+        assert_eq!(ts.sql_data_type(), 9);
+        assert_eq!(ts.sql_datetime_sub(), Some(3));
 
         // Integer types must have num_prec_radix=10 and unsigned=false
-        let bigint = types.iter().find(|t| t.type_name == "BIGINT").unwrap();
-        assert_eq!(bigint.num_prec_radix, Some(10));
-        assert_eq!(bigint.unsigned, Some(false));
+        let bigint = types.iter().find(|t| t.type_name() == "BIGINT").unwrap();
+        assert_eq!(bigint.num_prec_radix(), Some(10));
+        assert_eq!(bigint.unsigned(), Some(false));
     }
 
     // -----------------------------------------------------------------------
@@ -1529,7 +1580,7 @@ mod tests {
             TrinoBackend::exec_direct(conn, &cancel, "SELECT 1 AS n").expect("exec_direct");
 
         assert_eq!(stmt.column_count(), 1);
-        assert_eq!(stmt.describe_col(1).expect("describe_col").name, "n");
+        assert_eq!(stmt.describe_col(1).expect("describe_col").name(), "n");
 
         assert_eq!(stmt.fetch().expect("fetch"), FetchResult::Row);
         let val = stmt.get_data(1, CDataType::SLong).expect("get_data");
@@ -1652,21 +1703,65 @@ mod tests {
         };
 
         // Keep fetching until the cancellation is observed. This must
-        // terminate: either the rows run out or the cancel flag stops the
+        // terminate: either the rows run out or the cancellation stops the
         // loop. A hang here is the deadlock this test is looking for.
         let mut rows = 0u64;
-        while let FetchResult::Row = stmt.fetch().expect("fetch during cancel") {
-            rows += 1;
-        }
+        let outcome = loop {
+            match stmt.fetch() {
+                Ok(FetchResult::Row) => rows += 1,
+                other => break other,
+            }
+        };
 
         let cancelled = canceller.join().expect("cancelling thread panicked");
         assert!(
             cancelled.is_ok(),
             "cross-thread cancel failed: {cancelled:?}"
         );
+
+        // Both endings are correct, and which one occurs depends on whether a
+        // page request happened to be in flight when the DELETE landed:
+        //
+        // - in flight: the coordinator fails that request with USER_CANCELED,
+        //   and the spec's HY008 is what must reach the application;
+        // - between requests: nothing was interrupted, so the statement simply
+        //   reports the result set as finished.
+        //
+        // Accepting either is not slack in the assertion — pinning one would
+        // make the test flaky on a timing detail neither the driver nor the
+        // application controls. What is asserted unconditionally is that the
+        // stream stopped early, below.
+        match outcome {
+            Err(e) => {
+                let odbc = OdbcError::from(e);
+                assert_eq!(
+                    odbc.sqlstate(),
+                    stackable_odbc_core::types::SqlState::new(SQL_STATE_CANCELLED),
+                    "a fetch interrupted by SQLCancel must report HY008, got {odbc:?}"
+                );
+            }
+            Ok(FetchResult::NoData) => {}
+            Ok(other) => panic!("unexpected fetch outcome after cancel: {other:?}"),
+        }
+
+        // The proof the cancel actually took effect. tpcds.sf1.customer holds
+        // 100,000 rows; had the cancel been a no-op the loop would have drained
+        // all of them and every assertion above would pass vacuously.
+        const CUSTOMER_ROWS: u64 = 100_000;
+        assert!(
+            rows < CUSTOMER_ROWS,
+            "the cancel did not stop the stream: fetched all {rows} rows"
+        );
         assert!(
             stmt.next_uri.is_none(),
             "the statement must not be left holding a next page URI, {rows} rows in"
+        );
+
+        // Not `fetch_failed`: a cancellation is not a failed fetch, so the
+        // statement reports a finished result set rather than 24000.
+        assert_eq!(
+            stmt.fetch().expect("fetch after a cancelled fetch"),
+            FetchResult::NoData
         );
     }
 

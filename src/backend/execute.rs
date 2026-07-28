@@ -358,6 +358,33 @@ impl TrinoStatement {
         self.fetch_failed = true;
         err
     }
+
+    /// Turn a failed page fetch into the right outcome, distinguishing a
+    /// cancellation from a genuine failure.
+    ///
+    /// Both discard the buffered rows, but they leave the statement in
+    /// different states. A failure marks it `fetch_failed`, so a further fetch
+    /// reports `24000` rather than a spurious `NoData` — the cursor position is
+    /// genuinely undefined. A cancellation is not a failure: the application
+    /// asked for it, the rows are simply over, and a subsequent fetch should
+    /// see the same clean `NoData` it would get had the cancel landed between
+    /// fetches rather than during one.
+    ///
+    /// Either way the drain is suppressed by `next_uri = None`: paging a
+    /// cancelled query fails and leaves the pooled socket dirty.
+    fn end_page_fetch(&mut self, err: TrinoError) -> TrinoError {
+        if matches!(err, TrinoError::OperationCancelled { .. }) {
+            tracing::debug!(
+                page = self.page_count,
+                "Trino reported the query as cancelled; ending the result set"
+            );
+            self.batch.clear();
+            self.batch_cursor = 0;
+            self.next_uri = None;
+            return err;
+        }
+        self.abandon_result_set(err)
+    }
 }
 
 impl StatementBackend for TrinoStatement {
@@ -433,11 +460,11 @@ impl StatementBackend for TrinoStatement {
             // remain readable through `get_data` after the error was reported.
             let mut page: trino_rust_client::QueryResult<Row> = match fetched {
                 Ok(page) => page,
-                Err(e) => return Err(self.abandon_result_set(map_trino_error(e))),
+                Err(e) => return Err(self.end_page_fetch(map_trino_error(e))),
             };
 
             if let Some(error) = page.error.take() {
-                return Err(self.abandon_result_set(map_trino_error(error.into())));
+                return Err(self.end_page_fetch(map_trino_error(error.into())));
             }
 
             log_page_stats(&page.stats, self.page_count);

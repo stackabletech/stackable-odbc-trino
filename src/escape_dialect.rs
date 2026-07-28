@@ -520,7 +520,7 @@ mod tests {
 
     #[test]
     fn dialect_uses_double_quote_identifiers() {
-        assert_eq!(dialect().identifier_quotes, &[('"', '"')]);
+        assert_eq!(dialect().identifier_quotes(), &[('"', '"')]);
     }
 
     #[test]

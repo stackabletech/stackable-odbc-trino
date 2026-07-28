@@ -199,6 +199,24 @@ failing. `fetch` and `close_cursor` read the flag and stop touching `next_uri`.
 Core never replaces a statement's token, including across a re-execute, so
 `begin_query` clears the flag as well as setting the id.
 
+That flag covers only the cancel that lands *between* requests. A cancel
+landing while a page request is in flight is recognised from Trino's own
+`USER_CANCELED` code instead, in `map_trino_error` — the flag races here,
+because the cancelling thread sets it only after its `DELETE` returns, by which
+time the coordinator may already have failed the in-flight request. The server's
+verdict needs no cross-thread ordering and also catches a query killed by
+something else, such as `CALL system.runtime.kill_query`.
+
+That path yields `TrinoError::OperationCancelled`, which is `HY008` — the
+SQLSTATE the spec gives a function interrupted by `SQLCancel` from another
+thread, with no `(DM)` annotation, so it is the driver's to report. Core has no
+named constructor for it, because core documents `HY008` as never returned by a
+driver ("not applicable; the `Backend` trait is synchronous"); cross-thread
+`SQLCancel` made that false, so this driver builds it with `SqlState::new`.
+`end_page_fetch` keeps that case off `abandon_result_set`: a cancellation the
+application asked for is a finished result set, not the undefined cursor
+position `24000` describes.
+
 The six catalog functions take the token but record nothing in it, so
 `SQLCancel` cannot interrupt them. Four do no I/O at all; `tables` and `columns`
 go through `query_all_rows` → `Client::get_all`, which pages to exhaustion

@@ -29,7 +29,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   publish as soon as the coordinator accepts the query, so a cancel arriving
   while the query is still queued or planning now reaches it.
 
-  A statement whose query was cancelled reports `SQL_NO_DATA` from the next
+  A `SQLFetch` interrupted by a concurrent `SQLCancel` now reports `HY008`
+  ("operation canceled"), which the spec defines for exactly this case — "the
+  function was called, and before it completed execution, `SQLCancel` … was
+  called on the StatementHandle from a different thread in a multithreaded
+  application". It previously reported `HY000`, because Trino fails the
+  in-flight page request with `USER_CANCELED` and nothing recognised that as a
+  cancellation. The statement is left reporting a finished result set rather
+  than `24000`: a cancellation the application asked for is not an abandoned
+  cursor.
+
+  The cancellation is recognised from Trino's own `USER_CANCELED` error code
+  rather than from the driver's cancel flag, because the two race — the
+  cancelling thread sets its flag only after its `DELETE` returns, by which
+  time the coordinator may already have failed the in-flight request. Reading
+  the server's verdict also covers a query killed by something else entirely,
+  such as `CALL system.runtime.kill_query`.
+
+  A statement cancelled between fetches reports `SQL_NO_DATA` from the next
   `SQLFetch`, as before. The six catalog functions remain uncancellable: four
   perform no I/O, and `SQLTables`/`SQLColumns` page inside the Trino client,
   which never surfaces the query id a cancel needs.
@@ -57,6 +74,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   value instead of Trino's.
 - `SQLGetTypeInfo` now requires an open connection, inherited from core: the
   type list belongs to the data source.
+- `SQLGetData` called repeatedly for one column now returns the value in parts,
+  inherited from core. Each call delivers the next chunk with `01004`, the last
+  returns `SQL_SUCCESS`, and a further call returns `SQL_NO_DATA`. Every call
+  previously restarted at the beginning of the value, so the spec's documented
+  read-in-a-loop pattern never terminated — an application reading a column
+  larger than its buffer hung.
 - `SQL_CURSOR_COMMIT_BEHAVIOR` now reports `SQL_CB_PRESERVE` instead of
   `SQL_CB_DELETE`. `stackable-odbc-core` derives it from
   `Backend::cursor_commit_behavior` rather than hard-coding it, and this driver

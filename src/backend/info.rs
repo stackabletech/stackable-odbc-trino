@@ -1157,17 +1157,21 @@ mod tests {
         ];
 
         for row in trino_type_info() {
-            if !BACKEND_INDEPENDENT.contains(&row.data_type) {
+            if !BACKEND_INDEPENDENT.contains(&row.data_type()) {
                 continue;
             }
-            let expected = catalog_column_size(row.data_type, IGNORED_PRECISION, IGNORED_SCALE);
+            let expected = catalog_column_size(row.data_type(), IGNORED_PRECISION, IGNORED_SCALE);
             assert_eq!(
-                row.column_size, expected,
+                row.column_size(),
+                expected,
                 "{} (DATA_TYPE {:?}): COLUMN_SIZE is {} but the \
                  backend-independent appendix formula for that DATA_TYPE \
                  gives {} — the row is built from a different SqlDataType \
                  than it reports",
-                row.type_name, row.data_type, row.column_size, expected
+                row.type_name(),
+                row.data_type(),
+                row.column_size(),
+                expected
             );
         }
     }
@@ -1352,7 +1356,7 @@ mod tests {
             assert!(
                 trino_type_info()
                     .iter()
-                    .any(|row| row.data_type == reported),
+                    .any(|row| row.data_type() == reported),
                 "TrinoTypeName::{ty:?} is reported as {reported:?}, which has no \
                  SQLGetTypeInfo row"
             );
@@ -1372,7 +1376,7 @@ mod tests {
             assert!(
                 trino_type_info()
                     .iter()
-                    .any(|row| row.data_type == reported),
+                    .any(|row| row.data_type() == reported),
                 "declared type {decl:?} is reported as {reported:?}, \
                  which has no SQLGetTypeInfo row"
             );
@@ -1447,7 +1451,7 @@ mod tests {
             assert!(
                 trino_type_info()
                     .iter()
-                    .any(|row| row.type_name == name && row.data_type == sql_type),
+                    .any(|row| row.type_name() == name && row.data_type() == sql_type),
                 "trino_bare_type_name({native:?}, {sql_type:?}) returned {name:?}, which is \
                  not a matching SQLGetTypeInfo row"
             );
@@ -1459,9 +1463,9 @@ mod tests {
         let mut seen = std::collections::HashSet::new();
         for row in trino_type_info() {
             assert!(
-                seen.insert(row.type_name.as_ref()),
+                seen.insert(row.type_name()),
                 "duplicate type_name in trino_type_info(): {}",
-                row.type_name
+                row.type_name()
             );
         }
     }
@@ -1484,7 +1488,7 @@ mod tests {
             "INTERVAL YEAR TO MONTH",
         ] {
             assert!(
-                trino_type_info().iter().any(|row| row.type_name == name),
+                trino_type_info().iter().any(|row| row.type_name() == name),
                 "missing SQLGetTypeInfo row for {name:?}"
             );
         }
@@ -1521,17 +1525,19 @@ mod tests {
         const DM_COMPAT_ONLY: &[&str] = &["SQL_CHAR", "SQL_VARCHAR"];
 
         for row in trino_type_info() {
-            if DM_COMPAT_ONLY.contains(&row.type_name.as_ref()) {
+            if DM_COMPAT_ONLY.contains(&row.type_name()) {
                 continue;
             }
-            let native = row.type_name.to_lowercase();
-            let produced = trino_bare_type_name(&native, row.data_type);
+            let native = row.type_name().to_lowercase();
+            let produced = trino_bare_type_name(&native, row.data_type());
             assert_eq!(
-                produced, row.type_name,
+                produced,
+                row.type_name(),
                 "trino_type_info() row {:?} (DATA_TYPE={:?}) is not reachable via \
                  trino_bare_type_name (got {produced:?} instead) — no real column can \
                  ever be reported under this TYPE_NAME",
-                row.type_name, row.data_type
+                row.type_name(),
+                row.data_type()
             );
         }
     }
@@ -1566,17 +1572,17 @@ mod tests {
         let timestamp = find_row(TrinoTypeName::Timestamp.name());
         let timestamp_tz = find_row(TrinoTypeName::TimestampWithTimeZone.name());
 
-        assert_eq!(time.column_size, 21); // 9 + 12
-        assert_eq!(time_tz.column_size, 27); // 9 + 12 + 6 ("+HH:MM")
-        assert_eq!(timestamp.column_size, 32); // 20 + 12
-        assert_eq!(timestamp_tz.column_size, 39); // 20 + 12 + 1 (space) + 6
+        assert_eq!(time.column_size(), 21); // 9 + 12
+        assert_eq!(time_tz.column_size(), 27); // 9 + 12 + 6 ("+HH:MM")
+        assert_eq!(timestamp.column_size(), 32); // 20 + 12
+        assert_eq!(timestamp_tz.column_size(), 39); // 20 + 12 + 1 (space) + 6
 
         for row in [time, time_tz, timestamp, timestamp_tz] {
             assert_eq!(
-                row.maximum_scale,
+                row.maximum_scale(),
                 Some(MAX_FRACTIONAL_SECONDS_PRECISION),
                 "{:?} MAXIMUM_SCALE must equal Trino's real maximum",
-                row.type_name
+                row.type_name()
             );
         }
     }
@@ -1584,7 +1590,7 @@ mod tests {
     fn find_row(type_name: &str) -> &'static TypeInfoRow {
         trino_type_info()
             .iter()
-            .find(|row| row.type_name == type_name)
+            .find(|row| row.type_name() == type_name)
             .unwrap_or_else(|| panic!("no SQLGetTypeInfo row for {type_name:?}"))
     }
 
@@ -1598,22 +1604,22 @@ mod tests {
         for pair in trino_type_info().windows(2) {
             let (prev, next) = (&pair[0], &pair[1]);
             assert!(
-                prev.data_type.0 <= next.data_type.0,
+                prev.data_type().0 <= next.data_type().0,
                 "trino_type_info() not sorted by DATA_TYPE: {:?} (DATA_TYPE={}) \
                  appears before {:?} (DATA_TYPE={})",
-                prev.type_name,
-                prev.data_type.0,
-                next.type_name,
-                next.data_type.0
+                prev.type_name(),
+                prev.data_type().0,
+                next.type_name(),
+                next.data_type().0
             );
-            if prev.data_type == next.data_type {
+            if prev.data_type() == next.data_type() {
                 assert!(
-                    prev.type_name <= next.type_name,
+                    prev.type_name() <= next.type_name(),
                     "rows sharing DATA_TYPE={} not sorted by TYPE_NAME: {:?} appears \
                      before {:?}",
-                    prev.data_type.0,
-                    prev.type_name,
-                    next.type_name
+                    prev.data_type().0,
+                    prev.type_name(),
+                    next.type_name()
                 );
             }
         }
