@@ -641,18 +641,20 @@ a statement can be allocated before connecting, because `SQLAllocHandle`'s
 A `NOTE` may also be marked `KNOWN`, for a gap diagnosed and recorded rather
 than asserted so the suite stays green until the owning crate changes. Tighten
 a `KNOWN` into a `check` as soon as its fix lands, or it becomes a permanent
-blind spot. Two are open, both `stackable-odbc-core` gaps reached through this
-driver:
+blind spot. There are none open: the two that named core's parameter handling
+were fixed in core and are now assertions, in the `bound parameter types`
+group. They are worth keeping in that shape because each pins a defect an
+application sees rather than a call's return code:
 
-- **`SQLBindParameter`'s declared SQL type is discarded.** Core's
-  `read_param_value` matches on the C type alone, so `SQL_C_CHAR` +
-  `SQL_NUMERIC` — what a client sends for a numeric delivered as text — becomes
-  a string. `WHERE decimal_col = ?` then fails with
-  `TYPE_MISMATCH: decimal(10,2) = varchar(5)`, which is an ordinary BI filter.
-- **An unbound parameter marker is padded with NULL.** The spec's answer is
-  `07002`; core's `collect_params` substitutes `NULL` and the application is
-  never told. This is why `SQLExecDirect("PREPARE p FROM ... ?")` registers a
-  statement with no parameters — see `backend/describe_param.rs`.
+- **The declared SQL type survives.** `SQL_C_CHAR` + `SQL_NUMERIC` — what a
+  client sends for a numeric delivered as text — reaches Trino as a `decimal`,
+  so `WHERE decimal_col = ?` works. It previously arrived as a string and
+  failed with `TYPE_MISMATCH: decimal(10,2) = varchar(5)`, an ordinary BI
+  filter.
+- **An unbound parameter marker is `07002`.** Core previously padded it with
+  `NULL` and told the application nothing, which is why
+  `SQLExecDirect("PREPARE p FROM ... ?")` registered a statement with no
+  parameters — see `backend/describe_param.rs`.
 
 ### Type-transform fuzz
 

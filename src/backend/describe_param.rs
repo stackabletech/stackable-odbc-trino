@@ -15,11 +15,12 @@
 //! ```
 //!
 //! The `PREPARE` must go through the client directly, **never** through the
-//! bound-parameter path: `params::interpolate` would replace the statement's
-//! own `?` markers with the (absent) parameter values, and Trino would
-//! register a statement with no parameters at all. That is not hypothetical —
-//! it is what `SQLExecDirect("PREPARE p FROM ... ?")` does today, and it is
-//! why `DESCRIBE INPUT` looks empty when driven that way.
+//! bound-parameter path. Its `?` markers belong to the statement being
+//! described, not to this call, and there are no values to substitute for
+//! them: `params::interpolate` would consume them, and core now rejects the
+//! shortfall with `07002` before it even gets that far. Either way the
+//! statement has to reach Trino verbatim, or `DESCRIBE INPUT` describes
+//! something with no parameters in it.
 //!
 //! `DEALLOCATE` is not optional housekeeping. A session's prepared statements
 //! ride on **every** subsequent request as an `X-Trino-Prepared-Statement`

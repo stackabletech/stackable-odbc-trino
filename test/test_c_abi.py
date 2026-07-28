@@ -677,14 +677,11 @@ def main():
         got_ind = ctypes.c_longlong(0)
         lib.SQLGetData(stmt, 1, SQL_C_CHAR, ctypes.cast(got, P), 64, ctypes.byref(got_ind))
         trino_type = got.value.decode(errors="replace")
-        if trino_type.startswith("decimal"):
-            check("NUMERIC parameter reaches Trino as a decimal", True, SQL_SUCCESS)
-        else:
-            note(
-                "NUMERIC parameter type",
-                f"KNOWN: arrives as {trino_type!r}, not a decimal; core's "
-                "read_param_value ignores ParameterBinding.sql_type",
-            )
+        check(
+            f"NUMERIC parameter reaches Trino as a decimal (got {trino_type!r})",
+            SQL_SUCCESS if trino_type.startswith("decimal") else SQL_ERROR,
+            SQL_SUCCESS,
+        )
     else:
         note("NUMERIC parameter type", "KNOWN: could not read the parameter's type back")
     lib.SQLFreeStmt(stmt, SQL_RESET_PARAMS)
