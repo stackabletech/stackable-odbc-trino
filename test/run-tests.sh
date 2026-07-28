@@ -67,6 +67,14 @@ uv run --with pyodbc python3 "$SCRIPT_DIR/test_integration.py" "DSN=trino_http"
 echo "=== Running Linux pyodbc integration tests (DSN, HTTPS) ==="
 uv run --with pyodbc python3 "$SCRIPT_DIR/test_integration.py" "DSN=trino_https_verify_false"
 
+# --- Linux: raw C ABI pen test (no Driver Manager) ---
+# Calls the driver's exported entry points directly with ctypes. unixODBC
+# answers a large part of the ODBC state machine itself, so the driver's own
+# handling of out-of-order and malformed calls is invisible to every suite
+# above this one. Standard library only -- no uv, no pyodbc.
+echo "=== Running raw C ABI pen test ==="
+python3 "$SCRIPT_DIR/test_c_abi.py" "$DRIVER_PATH"
+
 # --- Linux: Rust FFI integration tests ---
 # Only FFI tests are run here. The backend::tests integration tests use a
 # separate TrinoConnection (with its own reqwest pool), and running both

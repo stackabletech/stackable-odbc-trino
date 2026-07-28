@@ -400,6 +400,29 @@ Do **not** run those alongside the FFI tests — two independent reqwest
 connection pools hitting the same coordinator cause intermittent TCP socket
 corruption.
 
+### Raw C ABI pen test
+
+```bash
+python3 test/test_c_abi.py    # needs a running Trino; standard library only
+```
+
+`test/test_c_abi.py` loads the `.so` with `ctypes` and calls the exported entry
+points **with no Driver Manager in the loop**. unixODBC answers a large part of
+the ODBC state machine itself, so the driver's own handling of out-of-order and
+malformed calls is invisible to the pyodbc and `isql` suites. This is the only
+place it is exercised.
+
+That also means the spec's **(DM)** diagnostics must not be expected here:
+nothing produces them, so a probe demanding one would assert the absence of a
+component rather than the presence of a behaviour. `SQLExecDirect` answering
+`HY010` rather than `08003` on an unconnected connection is correct for this
+reason, not a defect.
+
+Output is `PASS` / `FAIL` / `NOTE`. A `NOTE` marked `KNOWN` is a gap that has
+been diagnosed and recorded rather than asserted, so the suite stays green
+until the owning crate changes; two currently name core's `SQLFreeStmt`
+diagnostic and `SQLFreeHandle` clearing behaviour.
+
 ### Integration tests
 
 Requires Docker and docker-compose. **This suite does not run in CI** — the
