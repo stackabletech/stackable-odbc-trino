@@ -240,13 +240,13 @@ def main():
         by_concise = {r[1]: (r[15], r[16]) for r in cur.getTypeInfo().fetchall()}
         # SQLColumns columns: DATA_TYPE 5, SQL_DATA_TYPE 14, SQL_DATETIME_SUB 15.
         #
-        # The connected catalog, not a named one: the driver resolves
-        # `information_schema` through the session catalog, so asking for a
-        # different catalog's columns returns nothing. tpcds carries DATE
-        # columns; TIME and TIMESTAMP are covered by the unit tests on
-        # `metadata::verbose_type`.
-        rows = cur.columns(schema="sf1", table="date_dim").fetchall()
-        assert rows, "no columns returned for the connected catalog"
+        # postgresql rather than the connected tpcds, because it is the catalog
+        # carrying date, time and timestamp columns together -- and because
+        # reaching another catalog at all is what the qualified
+        # `information_schema` reference makes possible.
+        rows = cur.columns(catalog="postgresql", schema="public",
+                           table="types_test").fetchall()
+        assert rows, "no columns returned for the postgresql catalog"
         seen = 0
         for r in rows:
             concise, verbose, sub = r[4], r[13], r[14]
@@ -258,10 +258,32 @@ def main():
             if verbose == SQL_DATETIME:
                 seen += 1
                 assert sub is not None, f"{r[3]}: SQL_DATETIME with no subcode"
-        assert seen >= 1, f"expected at least one datetime column, saw {seen}"
+        assert seen >= 3, f"expected date, time and timestamp columns, saw {seen}"
 
     run("SQLColumns datetime verbose type agrees with SQLGetTypeInfo",
         datetime_columns_report_the_verbose_type)
+
+    def catalog_functions_reach_an_unconnected_catalog():
+        """A named catalog other than the session one must still resolve.
+
+        Trino resolves a bare `information_schema` through the session catalog,
+        and each catalog's copy describes only itself, so filtering on
+        `table_catalog` could never reach another catalog. An application that
+        enumerates catalogs -- which is what Power Query's navigator does --
+        then found every catalog but its own empty.
+        """
+        assert cur.tables(catalog="postgresql", schema="public").fetchall(), \
+            "no tables for the postgresql catalog"
+        assert cur.columns(catalog="postgresql", schema="public",
+                           table="types_test").fetchall(), \
+            "no columns for the postgresql catalog"
+        # A catalog that does not exist is a filter matching nothing, not an
+        # error: Trino answers CATALOG_NOT_FOUND and the driver absorbs it.
+        assert cur.tables(catalog="no_such_catalog").fetchall() == [], \
+            "a missing catalog must be empty, not an error"
+
+    run("catalog functions reach an unconnected catalog",
+        catalog_functions_reach_an_unconnected_catalog)
     # Trino exposes no key or index metadata, so an empty result set is the
     # correct answer and the assertion is that the call succeeds and describes
     # its columns rather than erroring.

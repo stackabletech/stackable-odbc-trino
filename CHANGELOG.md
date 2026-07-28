@@ -237,6 +237,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `SQLTables`, `SQLColumns` and `SQLTablePrivileges` reached only the connected
+  catalog. Trino resolves a bare `information_schema` through the session
+  catalog, and each catalog's copy describes only itself, so naming any other
+  catalog matched nothing however the filter was written — an application that
+  enumerated catalogs and then asked each one for its tables found every
+  catalog but its own empty. The three now qualify the reference with the
+  requested catalog. A catalog that does not exist is an empty result set
+  rather than an error, which is what a filter naming something absent means.
 - `SQLColumns` reported the *concise* type in `SQL_DATA_TYPE` for datetime
   columns, contradicting `SQLGetTypeInfo`, which has always reported the
   verbose one. A `DATE` column came back as `SQL_DATA_TYPE` 91 with a NULL

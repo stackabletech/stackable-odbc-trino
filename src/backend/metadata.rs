@@ -80,6 +80,66 @@ fn push_filter(conditions: &mut Vec<String>, column: &str, value: &str) {
     }
 }
 
+/// Trino's error code for a catalog that does not exist.
+///
+/// The catalog functions turn it into an empty result set: the spec has them
+/// filter, and a filter naming something absent selects nothing. Failing
+/// instead would make an application browsing a stale catalog list error
+/// rather than simply find nothing there.
+const TRINO_CATALOG_NOT_FOUND: i32 = 44;
+
+/// The `information_schema.<table>` reference a catalog-scoped query runs
+/// against.
+///
+/// Trino resolves a bare `information_schema` through the **session** catalog,
+/// and each catalog's copy describes only itself. So filtering on
+/// `table_catalog` alone cannot reach another catalog — `SQLColumns` for a
+/// catalog other than the connected one matched nothing whatever the WHERE
+/// clause said, which left an application enumerating catalogs and finding
+/// every one but its own empty.
+///
+/// The catalog is a *identifier* here, not a literal, so it is delimited and
+/// its embedded quotes doubled. A pattern cannot appear in a FROM clause, so
+/// anything wildcarded — and the absent and `%` cases — keeps the session
+/// catalog, which is the previous behaviour.
+fn information_schema_ref(catalog: Option<&str>, table: &str) -> String {
+    match catalog.filter(|c| !c.is_empty() && *c != "%" && !has_odbc_wildcards(c)) {
+        Some(cat) => {
+            // Unescape the ODBC escapes first: `my\_cat` names the catalog
+            // `my_cat`, exactly as `push_filter` does for a literal.
+            let name = cat.replace("\\_", "_").replace("\\%", "%");
+            format!(
+                "\"{}\".information_schema.{table}",
+                name.replace('"', "\"\"")
+            )
+        }
+        None => format!("information_schema.{table}"),
+    }
+}
+
+/// Run a catalog-scoped `information_schema` query, treating a missing catalog
+/// as an empty result set rather than an error.
+fn query_information_schema(
+    conn: &TrinoConnection,
+    sql: String,
+) -> Result<Vec<trino_rust_client::Row>, TrinoError> {
+    match query_all_rows(conn, sql) {
+        Err(e) if trino_error_code(&e) == Some(TRINO_CATALOG_NOT_FOUND) => {
+            tracing::debug!("catalog not found; reporting an empty result set");
+            Ok(Vec::new())
+        }
+        other => other,
+    }
+}
+
+/// Trino's own error code for a failure, when it carried one.
+fn trino_error_code(error: &TrinoError) -> Option<i32> {
+    match error {
+        TrinoError::Query { native_error, .. } => Some(*native_error),
+        _ => None,
+    }
+}
+
 /// Build the SQL WHERE clause for an information_schema.tables query.
 /// Filters are only included if Some and non-empty/non-wildcard.
 fn build_tables_where_clause(
@@ -271,11 +331,12 @@ pub(super) fn tables(
     // `catalogs`, `schemas` and `table_types` above.
     let sql = format!(
         "SELECT table_catalog, table_schema, table_name, table_type \
-         FROM information_schema.tables{}",
+         FROM {}{}",
+        information_schema_ref(catalog, "tables"),
         build_tables_where_clause(catalog, schema, table)
     );
 
-    let rows = query_all_rows(conn, sql)?;
+    let rows = query_information_schema(conn, sql)?;
 
     // Core split and unquoted the value list; an empty slice is "no filter".
     // The spec has applications supply table types in upper case, so folding
@@ -353,11 +414,12 @@ pub(super) fn columns(
     let sql = format!(
         "SELECT table_catalog, table_schema, table_name, column_name, \
                 ordinal_position, column_default, is_nullable, data_type \
-         FROM information_schema.columns{}",
+         FROM {}{}",
+        information_schema_ref(catalog, "columns"),
         build_columns_where_clause(catalog, schema, table, column)
     );
 
-    let rows = query_all_rows(conn, sql)?;
+    let rows = query_information_schema(conn, sql)?;
 
     Ok(rows
         .into_iter()
@@ -572,11 +634,12 @@ pub(super) fn table_privileges(
     let sql = format!(
         "SELECT table_catalog, table_schema, table_name, grantor, grantee, \
                 privilege_type, is_grantable \
-         FROM information_schema.table_privileges{}",
+         FROM {}{}",
+        information_schema_ref(catalog, "table_privileges"),
         build_tables_where_clause(catalog, schema, table)
     );
 
-    let rows = query_all_rows(conn, sql)?;
+    let rows = query_information_schema(conn, sql)?;
 
     Ok(rows
         .into_iter()
@@ -914,6 +977,42 @@ mod tests {
             SqlDataType::DECIMAL,
         ] {
             assert_eq!(verbose_type(concise), (concise.0, None));
+        }
+    }
+
+    #[test]
+    fn an_exact_catalog_qualifies_the_information_schema_reference() {
+        // Trino resolves a bare `information_schema` through the *session*
+        // catalog, and each catalog's copy describes only itself. Asking for
+        // another catalog's tables therefore matched nothing at all, however
+        // the WHERE clause was written.
+        assert_eq!(
+            information_schema_ref(Some("postgresql"), "columns"),
+            "\"postgresql\".information_schema.columns"
+        );
+    }
+
+    #[test]
+    fn a_catalog_name_is_quoted_as_an_identifier() {
+        // It lands in the FROM clause, so it is an identifier, not a literal:
+        // delimited, with an embedded quote doubled.
+        assert_eq!(
+            information_schema_ref(Some("we\"ird"), "tables"),
+            "\"we\"\"ird\".information_schema.tables"
+        );
+    }
+
+    #[test]
+    fn an_absent_or_wildcard_catalog_leaves_the_reference_unqualified() {
+        // No catalog, or a pattern rather than a name, keeps the session
+        // catalog: there is no single catalog to qualify with, and a pattern
+        // cannot appear in a FROM clause.
+        for catalog in [None, Some(""), Some("%"), Some("pg%")] {
+            assert_eq!(
+                information_schema_ref(catalog, "tables"),
+                "information_schema.tables",
+                "{catalog:?} must not be qualified"
+            );
         }
     }
 
