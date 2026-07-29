@@ -9,6 +9,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`SQL_ATTR_QUERY_TIMEOUT` is now enforced.** Setting it previously returned
+  `01S02` and substituted `0`, so an application that asked for a deadline was
+  told, correctly but unhelpfully, that it had none. The driver now declares
+  `QueryTimeout::CoreCancels`, so `SQLGetStmtAttr` reads back the value that was
+  set, and `stackable-odbc-core` arms a timer that cancels the query — Trino's
+  `DELETE /v1/query/{id}`, so the coordinator stops the work — and reports
+  `HYT00`.
+
+  The deadline covers `SQLFetch`, which is what makes it useful here: Trino
+  answers with column metadata before it has computed a row, so `SQLExecDirect`
+  returns in milliseconds and a slow query spends its time paging. Verified
+  against a live coordinator under a 2-second deadline, both with and without a
+  Driver Manager: `SQLFetch` on `SELECT count(*) FROM tpcds.sf10.store_sales`
+  reports `HYT00` after 2.0s, where the query runs ~24s uncancelled. The
+  connection remains usable afterwards.
+
+  `SET SESSION query_max_run_time` was considered and rejected: it is a session
+  property, so it would give every statement on the connection the most
+  recently set value, and it would put a round trip inside `SQLSetStmtAttr`.
+
+- **`SQL_ATTR_CONNECTION_DEAD` now reports a lost connection.** It previously
+  always answered `SQL_CD_FALSE`, so a connection pool would hand out a
+  connection whose link had failed, and the next caller's first query failed for
+  no reason it could see. The driver now records a communication link failure
+  wherever it is observed — including a `SQLFetch` page request — and reports it
+  without a round trip. Only a link failure counts: a timeout, an auth rejection
+  and a server-side query error all leave the connection usable.
+- **`SQL_ATTR_LOGIN_TIMEOUT` and `SQL_ATTR_CONNECTION_TIMEOUT` now reach the
+  connection.** Both are set through `SQLSetConnectAttr` rather than the
+  connection string, and were previously discarded. `SQL_ATTR_CONNECTION_TIMEOUT`
+  becomes the per-request HTTP timeout, overriding the `QueryTimeout`
+  connection-string key when set; `SQL_ATTR_LOGIN_TIMEOUT` bounds the connect
+  round trip and reports `HYT00` on expiry. `0` means "no timeout" for both, per
+  the spec, and is not treated as unset.
+- **`SQLCancel` now reports `HY008` for a cancel that lands between page
+  requests.** The driver already reported it for one recognised from Trino's own
+  `USER_CANCELED` code, which covers a cancel arriving while a request is in
+  flight; `Backend::is_cancelled` covers the other half.
 - Initial extraction of `stackable-odbc-trino` into its own repository, from the
   `stackable-odbc-rs` workspace that held the core framework and the SQLite
   driver alongside it. Provides the ODBC driver for Trino: the `Backend` and
@@ -67,6 +105,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **The Linux installer now writes `Threading = 2`** into the driver's
+  `odbcinst.ini` section. unixODBC's default of `3` serialises at the
+  environment level and holds a cross-thread `SQLCancel` behind the call it was
+  meant to interrupt — measured on a query running ~24s and cancelled after 2s,
+  `SQLFetch` raised `HY010` after 23.9s at `Threading = 3` and `HY008` after
+  2.0s at `Threading = 2`. An existing installation must re-run the installer or
+  add the line by hand. This does not affect `SQL_ATTR_QUERY_TIMEOUT`, which
+  fires under either setting.
 - **`SQL_QUOTED_IDENTIFIER_CASE` reports `SQL_IC_LOWER`, not `SQL_IC_SENSITIVE`.**
   `stackable-odbc-core` used to hard-wire the latter on every driver's behalf;
   it is now `TrinoBackend::quoted_identifier_case`, and measurement against a

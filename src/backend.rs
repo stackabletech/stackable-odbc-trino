@@ -7,8 +7,10 @@
 use std::borrow::Cow;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use snafu::Snafu;
+use stackable_odbc_core::types::QueryTimeout;
 use stackable_odbc_core::{
     backend::Backend,
     errors::OdbcError,
@@ -28,6 +30,48 @@ use trino_rust_client::{Client, ClientBuilder, Trino, auth::Auth, ssl::Ssl};
 
 mod describe_param;
 mod execute;
+
+/// The request timeout used for `SQL_ATTR_CONNECTION_TIMEOUT = 0`, the spec's
+/// "there is no timeout".
+///
+/// `ClientBuilder::client_request_timeout` takes a `Duration` and reaches
+/// `reqwest::ClientBuilder::timeout`, neither of which can express "none", so
+/// the value has to stand in for it. `u32::MAX` seconds is roughly 136 years:
+/// long enough that no application can tell it from waiting forever, and small
+/// enough that adding it to an `Instant` cannot overflow.
+const NO_TIMEOUT: Duration = Duration::from_secs(u32::MAX as u64);
+
+/// The per-request timeout to build the HTTP client with.
+///
+/// `SQL_ATTR_CONNECTION_TIMEOUT` bounds "any request on the connection", which
+/// is exactly what the client's per-request timeout is, so it wins over the
+/// `QueryTimeout` connection-string key when the application set one: an
+/// attribute set through the API is the more specific instruction, and the key
+/// stays the default for everything that sets nothing.
+///
+/// `Some(0)` is the spec's "there is no timeout" and must not be read as unset
+/// -- doing so would reimpose a 30-second cap on an application that
+/// explicitly asked for none. See [`NO_TIMEOUT`] for why it is a duration
+/// rather than an absence.
+fn request_timeout(connection_timeout: Option<u32>, from_connection_string: Duration) -> Duration {
+    match connection_timeout {
+        Some(0) => NO_TIMEOUT,
+        Some(secs) => Duration::from_secs(u64::from(secs)),
+        None => from_connection_string,
+    }
+}
+
+/// The deadline to bound the login round trip with, if any.
+///
+/// `Some(0)` is the spec's "the timeout is disabled and a connection attempt
+/// will wait indefinitely", which is what no deadline already does, so it
+/// collapses onto the unset case.
+fn login_deadline(login_timeout: Option<u32>) -> Option<Duration> {
+    match login_timeout {
+        Some(0) | None => None,
+        Some(secs) => Some(Duration::from_secs(u64::from(secs))),
+    }
+}
 // `pub(crate)` only under `cfg(test)`: the FFI integration tests
 // (`ffi_integration_tests.rs`, a sibling of this module under `lib.rs`) need to
 // reach the `TRINO_*` capability bitmap constants declared in `info`. Non-test
@@ -135,6 +179,59 @@ fn query_cause(e: trino_rust_client::error::Error) -> (QueryCause, i32) {
     }
 }
 
+/// Whether this connection's link to the coordinator is still believed usable.
+///
+/// Backs [`Backend::connection_dead`], which a connection pool reads on every
+/// checkout. The spec's own note on that attribute is that "a driver can
+/// improve performance by minimizing the number of times that information is
+/// sent or requested from the server", so this is a flag the error path sets
+/// rather than a probe: no round trip happens when it is read.
+///
+/// Shared by `Arc` between the [`TrinoConnection`], every [`TrinoStatement`]
+/// it produced and its [`TrinoCancelToken`]s. Each of those issues its own HTTP
+/// requests, and a link failure observed on any of them is a fact about the
+/// connection they all share -- a `SQLFetch` that cannot reach the coordinator
+/// is the most likely place to learn it.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct Liveness(Arc<AtomicBool>);
+
+impl Liveness {
+    /// Mark the link dead if `error` is a connection-level failure.
+    ///
+    /// Only [`TrinoError::CommunicationLinkFailure`] counts, which
+    /// [`map_trino_error`] produces for a reqwest error whose `is_connect()` is
+    /// set. A timeout, an auth rejection and a server-side query failure all
+    /// leave the link intact, and `SQL_CD_TRUE` asserts the connection *has
+    /// been lost* rather than merely that something went wrong. The asymmetry
+    /// core documents applies: `false` means "not known to be dead", so
+    /// under-reporting here is the safe direction.
+    fn note(&self, error: &TrinoError) {
+        if matches!(error, TrinoError::CommunicationLinkFailure { .. }) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    fn is_dead(&self) -> bool {
+        self.0.load(Ordering::SeqCst)
+    }
+}
+
+/// [`map_trino_error`], recording a connection-level failure on the way past.
+///
+/// This is not a second place that decides the SQLSTATE -- it delegates the
+/// whole classification and only observes the result, so the rule that every
+/// client error is classified in exactly one place still holds. Use it wherever
+/// a [`Liveness`] handle is in scope; the bare [`map_trino_error`] remains
+/// correct where none is.
+pub(crate) fn map_trino_error_on(
+    liveness: &Liveness,
+    e: trino_rust_client::error::Error,
+) -> TrinoError {
+    let mapped = map_trino_error(e);
+    liveness.note(&mapped);
+    mapped
+}
+
 pub(crate) fn map_trino_error(e: trino_rust_client::error::Error) -> TrinoError {
     use trino_rust_client::error::Error;
     match e {
@@ -223,12 +320,43 @@ pub(crate) fn query_all_rows(
     conn: &TrinoConnection,
     sql: String,
 ) -> Result<Vec<trino_rust_client::Row>, TrinoError> {
+    query_all_rows_within(conn, sql, None)
+}
+
+/// [`query_all_rows`], optionally abandoned after `deadline`.
+///
+/// The deadline is imposed inside the runtime rather than on the HTTP client,
+/// because the client's own request timeout is a per-request bound configured
+/// once at connect and shared by every later query. This one bounds the whole
+/// call -- paging included -- which is what `SQL_ATTR_LOGIN_TIMEOUT` asks for
+/// and what a per-request timeout cannot express.
+///
+/// Expiry is `HYT00`, via [`TrinoError::QueryTimeout`]: the spec tells a driver
+/// to "return SQLSTATE HYT00 (Timeout expired) anytime that it is possible to
+/// time out in a situation not associated with query execution or login", and
+/// `SQLDriverConnect`'s own diagnostics table lists `HYT00` for the login case
+/// as well. `validate_connection` passes that variant through unreclassified
+/// for exactly this reason.
+fn query_all_rows_within(
+    conn: &TrinoConnection,
+    sql: String,
+    deadline: Option<Duration>,
+) -> Result<Vec<trino_rust_client::Row>, TrinoError> {
     let _span = tracing::info_span!("trino.query_all_rows").entered();
 
-    let rows = conn
-        .runtime
-        .block_on(conn.client.get_all::<trino_rust_client::Row>(sql))
-        .map_err(map_trino_error)?
+    let query = conn.client.get_all::<trino_rust_client::Row>(sql);
+    let result = match deadline {
+        Some(d) => conn
+            .runtime
+            .block_on(async { tokio::time::timeout(d, query).await })
+            .map_err(|_| TrinoError::QueryTimeout {
+                message: format!("timed out after {} seconds", d.as_secs()),
+            })?,
+        None => conn.runtime.block_on(query),
+    };
+
+    let rows = result
+        .map_err(|e| map_trino_error_on(&conn.liveness, e))?
         .into_vec();
 
     tracing::info!(total_rows = rows.len(), "query_all_rows complete");
@@ -271,10 +399,24 @@ fn validation_query(catalog: Option<&str>) -> String {
 /// [`map_trino_error`] produces for the same transport error mid-session. A
 /// connection whose catalog does not resolve cannot run anything, so that
 /// counts as a failure to establish a usable connection too.
-fn validate_connection(conn: &TrinoConnection, catalog: Option<&str>) -> Result<(), TrinoError> {
+///
+/// `login_timeout` is `SQL_ATTR_LOGIN_TIMEOUT`, which the spec defines as the
+/// seconds "to wait for a login request to complete before returning to the
+/// application" -- and this call is the login: it is the one round trip that
+/// decides whether `SQLDriverConnect` succeeds. It is applied here rather than
+/// on the HTTP client because the client's request timeout also bounds every
+/// later query, and the two attributes are separately settable. `Some(0)` never
+/// reaches this function: the spec makes it "the timeout is disabled and a
+/// connection attempt will wait indefinitely", which is the same behaviour as
+/// the unset case.
+fn validate_connection(
+    conn: &TrinoConnection,
+    catalog: Option<&str>,
+    login_timeout: Option<Duration>,
+) -> Result<(), TrinoError> {
     let _span = tracing::info_span!("trino.validate_connection").entered();
 
-    match query_all_rows(conn, validation_query(catalog)) {
+    match query_all_rows_within(conn, validation_query(catalog), login_timeout) {
         Ok(_) => {
             tracing::debug!("connection validated");
             Ok(())
@@ -395,6 +537,12 @@ pub struct TrinoConnection {
     /// Core walks a statement's parameters consecutively, so a single entry
     /// keyed on the SQL text collapses that to one.
     pub describe_param_cache: Mutex<Option<describe_param::CachedParams>>,
+    /// Whether the link to the coordinator has been observed to fail.
+    ///
+    /// Read by [`Backend::connection_dead`]; written by
+    /// [`map_trino_error_on`] from wherever the failure was seen, including a
+    /// statement this connection produced. See [`Liveness`].
+    pub(crate) liveness: Liveness,
 }
 
 /// The state a `SQLCancel` on one thread and the executing statement on
@@ -429,10 +577,18 @@ impl CancelState {
     /// Record the query the statement just submitted, and clear any earlier
     /// cancellation.
     ///
-    /// Called at the point a statement-producing call learns its query id. The
-    /// reset matters because core builds one token per *statement* and never
-    /// replaces it: a re-execute of the same prepared handle reuses the token
-    /// that a previous `SQLCancel` may already have marked.
+    /// Called at the point a statement-producing call learns its query id.
+    ///
+    /// The reset is belt-and-braces rather than load-bearing. Core mints a new
+    /// token at every statement-producing call, so a re-execute arrives with a
+    /// fresh [`CancelState`] whose flag is already clear, and [`cancel`] sets
+    /// the flag only after a `DELETE` that needed a query id this method had
+    /// already recorded. There is therefore no reachable path on which a
+    /// cancellation is pending here -- but the flag's whole purpose is to keep
+    /// a live query off a stale one's teardown, so it is cleared explicitly at
+    /// the one point that knows a new query has begun.
+    ///
+    /// [`cancel`]: crate::backend::execute::cancel
     pub(crate) fn begin_query(&self, query_id: String) {
         self.cancelled.store(false, Ordering::SeqCst);
         match self.query_id.lock() {
@@ -464,6 +620,9 @@ pub struct TrinoCancelToken {
     client: Arc<Client>,
     runtime: Arc<tokio::runtime::Runtime>,
     state: Arc<CancelState>,
+    /// The connection's liveness flag: `cancel` issues its own `DELETE`, so it
+    /// is one more place a lost link can first be observed.
+    liveness: Liveness,
 }
 
 /// Builds a `TrinoConnection` that performs no network I/O.
@@ -507,6 +666,9 @@ pub(crate) fn disconnected_trino_conn_with_catalog(catalog: Option<&str>) -> Tri
         // "not available" case, which both readers render as the empty string.
         catalog: catalog.map(str::to_string),
         describe_param_cache: Mutex::new(None),
+        // Nothing has been attempted, so nothing has been observed to fail --
+        // which is `SQL_CD_FALSE`, "not known to be dead".
+        liveness: Liveness::default(),
     }
 }
 
@@ -539,6 +701,10 @@ pub struct TrinoStatement {
     /// results and `tables_list_table_types` — which hold no `next_uri` and so
     /// have nothing for a cancellation to stop.
     pub(crate) cancel_state: Option<Arc<CancelState>>,
+    /// The connection's liveness flag, for the page fetches this statement
+    /// issues itself. `None` alongside `client` and `runtime`, for the
+    /// statements built entirely in memory, which reach no network.
+    pub(crate) liveness: Option<Liveness>,
 
     // --- Profiling counters (always present; ~48 bytes, negligible overhead) ---
     /// Total number of Trino REST API pages fetched for this query.
@@ -734,13 +900,17 @@ impl Backend for TrinoBackend {
     fn connect(params: &ConnectParams) -> Result<TrinoConnection, TrinoError> {
         let p = types::connect_params::TrinoConnectParams::try_from(params)?;
 
+        let request_timeout = request_timeout(params.connection_timeout(), p.query_timeout());
+        let login_timeout = login_deadline(params.login_timeout());
+
         tracing::debug!(
             host = p.host(),
             port = p.port(),
             user = p.user(),
             secure = p.secure(),
             tls_verify = p.tls_verify(),
-            query_timeout_secs = p.query_timeout().as_secs(),
+            request_timeout_secs = request_timeout.as_secs(),
+            login_timeout_secs = login_timeout.map(|d| d.as_secs()),
             "TrinoBackend::connect"
         );
 
@@ -755,7 +925,7 @@ impl Backend for TrinoBackend {
             .secure(p.secure())
             .source(p.source())
             .client_tags(p.client_tags().clone())
-            .client_request_timeout(p.query_timeout());
+            .client_request_timeout(request_timeout);
         match resolve_auth(p.secure(), p.user(), p.password(), p.access_token())? {
             Some(auth) => {
                 builder = builder.auth(auth).auth_http_insecure(false);
@@ -813,8 +983,9 @@ impl Backend for TrinoBackend {
             server_major: 0,
             catalog: p.catalog().map(str::to_owned),
             describe_param_cache: Mutex::new(None),
+            liveness: Liveness::default(),
         };
-        validate_connection(&conn, p.catalog())?;
+        validate_connection(&conn, p.catalog(), login_timeout)?;
         let version = fetch_server_version(&conn);
         conn.dbms_version = version.formatted;
         conn.server_major = version.major;
@@ -868,11 +1039,72 @@ impl Backend for TrinoBackend {
             client: Arc::clone(&conn.client),
             runtime: Arc::clone(&conn.runtime),
             state: Arc::new(CancelState::default()),
+            liveness: conn.liveness.clone(),
         }
     }
 
     fn cancel(token: &TrinoCancelToken) -> Result<(), TrinoError> {
         execute::cancel(token)
+    }
+
+    /// The other half of [`Backend::cancel`]: `cancel` signals the token, this
+    /// observes it, and core turns a `true` here into the `HY008` the spec
+    /// gives a function interrupted by `SQLCancel`.
+    ///
+    /// This covers the cancel that lands *between* page requests. One landing
+    /// while a request is in flight is caught by [`map_trino_error`] instead,
+    /// from Trino's own `USER_CANCELED` code: the flag is set only once the
+    /// cancelling thread's `DELETE` has returned, by which time the coordinator
+    /// may already have failed the in-flight request. The two are complementary
+    /// rather than redundant, and the server's verdict also catches a query
+    /// killed by something else, such as `CALL system.runtime.kill_query`.
+    fn is_cancelled(token: &TrinoCancelToken) -> bool {
+        token.state.is_cancelled()
+    }
+
+    /// Core enforces `SQL_ATTR_QUERY_TIMEOUT` by cancelling, because Trino
+    /// offers no per-statement server-side deadline this driver can set.
+    ///
+    /// The alternative would be `SET SESSION query_max_run_time`, which
+    /// `trino-rust-client` would carry (it tracks `X-Trino-Set-Session`), and
+    /// it is rejected on two counts. It is a *session* property, so it would
+    /// give every statement on the connection the most recently set value,
+    /// where core's timer is armed per statement and matches the attribute's
+    /// actual scope. And it would cost a round trip inside `SQLSetStmtAttr`,
+    /// which applications call freely and the spec does not expect to block.
+    ///
+    /// Returning [`QueryTimeout::CoreCancels`] asserts that
+    /// [`Backend::cancel`] really cancels, which it does: it issues Trino's
+    /// `DELETE /v1/query/{id}`, so the coordinator stops the work rather than
+    /// the client merely abandoning it -- the property that normally argues for
+    /// [`QueryTimeout::DataSource`]. [`Backend::is_cancelled`] is implemented
+    /// alongside, as that variant requires.
+    ///
+    /// The deadline covers `SQLFetch`, which is what makes it useful against
+    /// Trino: the coordinator answers with column metadata before it has
+    /// computed a row, so `exec_direct` returns in milliseconds and a slow
+    /// query spends its time paging.
+    ///
+    /// Unaffected by unixODBC's `Threading` level, unlike a cross-thread
+    /// `SQLCancel`: core's timer calls [`Backend::cancel`] directly from inside
+    /// this shared object, so it never crosses the Driver Manager.
+    fn set_query_timeout(
+        _conn: &TrinoConnection,
+        seconds: usize,
+    ) -> Result<QueryTimeout, TrinoError> {
+        tracing::debug!(seconds, "TrinoBackend::set_query_timeout");
+        Ok(QueryTimeout::CoreCancels)
+    }
+
+    /// Answered from the flag [`map_trino_error_on`] sets, never from a probe.
+    ///
+    /// A connection pool reads this on every checkout, and the spec asks a
+    /// driver to minimise what it sends to the server, so a round trip here
+    /// would be paid on a path that runs far more often than a query does.
+    fn connection_dead(conn: &TrinoConnection) -> bool {
+        let dead = conn.liveness.is_dead();
+        tracing::debug!(dead, "TrinoBackend::connection_dead");
+        dead
     }
 
     // --- Delegations ---
@@ -1560,6 +1792,162 @@ mod tests {
     };
 
     use super::*;
+
+    /// A reqwest error whose `is_connect()` is set, which is what
+    /// [`map_trino_error`] turns into `08S01`.
+    ///
+    /// Built by asking the client to reach a port nothing listens on rather
+    /// than by constructing a `reqwest::Error`, which has no public
+    /// constructor. Port 1 on the loopback interface is refused immediately, so
+    /// this costs no wall time and reaches no network.
+    fn connect_failure() -> trino_rust_client::error::Error {
+        let client = ClientBuilder::new("test", "127.0.0.1")
+            .port(1)
+            .build()
+            .expect("ClientBuilder::build performs no I/O");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("Runtime::build performs no I/O");
+        runtime
+            .block_on(client.get_all::<trino_rust_client::Row>("SELECT 1".to_string()))
+            .expect_err("nothing listens on 127.0.0.1:1")
+    }
+
+    /// `SQL_ATTR_CONNECTION_DEAD` asserts the connection *has been lost*, so a
+    /// connection that has observed nothing must answer `SQL_CD_FALSE`. The
+    /// asymmetry is the point: `false` means "not known to be dead", and a pool
+    /// that reads `true` here discards the connection.
+    #[test]
+    fn connection_dead_is_false_until_the_link_is_observed_to_fail() {
+        let conn = disconnected_trino_conn();
+        assert!(
+            !TrinoBackend::connection_dead(&conn),
+            "a connection that has attempted nothing has not been lost"
+        );
+    }
+
+    /// The flag is set from wherever the failure was seen -- including a
+    /// statement's page fetch -- because `SQL_ATTR_CONNECTION_DEAD` is a fact
+    /// about the connection, not about the handle that noticed.
+    #[test]
+    fn connection_dead_is_true_once_a_link_failure_is_mapped() {
+        let conn = disconnected_trino_conn();
+        let mapped = map_trino_error_on(&conn.liveness, connect_failure());
+
+        assert!(
+            matches!(mapped, TrinoError::CommunicationLinkFailure { .. }),
+            "an unreachable coordinator is a link failure, not {mapped:?}"
+        );
+        assert!(
+            TrinoBackend::connection_dead(&conn),
+            "a mapped link failure must be visible through SQL_ATTR_CONNECTION_DEAD"
+        );
+    }
+
+    /// Only a link failure counts. A server-side query rejection leaves the
+    /// connection perfectly usable, and reporting `SQL_CD_TRUE` for one would
+    /// make a pool discard a healthy connection on every application error.
+    #[test]
+    fn connection_dead_ignores_failures_that_leave_the_link_intact() {
+        let conn = disconnected_trino_conn();
+        conn.liveness.note(&TrinoError::Query {
+            source: QueryCause::Server {
+                error_name: "SYNTAX_ERROR".into(),
+                message: "line 1:1: mismatched input".into(),
+            },
+            native_error: 1,
+        });
+        conn.liveness.note(&TrinoError::AuthFailure {
+            message: "HTTP 401".into(),
+        });
+        conn.liveness.note(&TrinoError::QueryTimeout {
+            message: "request timed out".into(),
+        });
+
+        assert!(
+            !TrinoBackend::connection_dead(&conn),
+            "a query error, an auth rejection and a timeout all leave the link up"
+        );
+    }
+
+    /// `cancel` signals the token and `is_cancelled` observes it; core turns
+    /// the latter into `HY008`. A token that has not been cancelled must not
+    /// claim it was, or every unrelated failure on the statement would be
+    /// reported as an application-requested cancellation.
+    #[test]
+    fn is_cancelled_tracks_the_token_core_passes_back() {
+        let conn = disconnected_trino_conn();
+        let token = TrinoBackend::cancel_token(&conn);
+
+        assert!(
+            !TrinoBackend::is_cancelled(&token),
+            "a fresh token has not been cancelled"
+        );
+
+        token
+            .state
+            .begin_query("20260729_000000_00000_abcde".into());
+        assert!(
+            !TrinoBackend::is_cancelled(&token),
+            "submitting a query does not cancel it"
+        );
+
+        // What `execute::cancel` publishes once its DELETE has succeeded.
+        token.state.cancelled.store(true, Ordering::SeqCst);
+        assert!(
+            TrinoBackend::is_cancelled(&token),
+            "a server-side cancel must be observable through the token"
+        );
+    }
+
+    /// Core arms its timer only for `CoreCancels`, so this is what decides
+    /// whether `SQL_ATTR_QUERY_TIMEOUT` is honoured at all. Returning it
+    /// asserts that `cancel` really cancels — see the method's own doc.
+    #[test]
+    fn query_timeout_is_enforced_by_core_cancelling() {
+        let conn = disconnected_trino_conn();
+        assert_eq!(
+            TrinoBackend::set_query_timeout(&conn, 30)
+                .expect("this driver accepts a query timeout"),
+            QueryTimeout::CoreCancels,
+        );
+    }
+
+    /// `SQL_ATTR_CONNECTION_TIMEOUT` bounds every request on the connection, so
+    /// it overrides the `QueryTimeout` key; `Some(0)` is the spec's "there is
+    /// no timeout" and must not be confused with unset.
+    #[test]
+    fn connection_timeout_attribute_wins_over_the_connection_string_key() {
+        let from_key = Duration::from_secs(30);
+
+        assert_eq!(
+            request_timeout(None, from_key),
+            from_key,
+            "an application that set nothing keeps the connection-string default"
+        );
+        assert_eq!(
+            request_timeout(Some(5), from_key),
+            Duration::from_secs(5),
+            "an attribute the application set is the more specific instruction"
+        );
+        assert_eq!(
+            request_timeout(Some(0), from_key),
+            NO_TIMEOUT,
+            "0 is 'no timeout', not 'unset' -- reimposing the key's 30s would \
+             cap a connection that asked for none"
+        );
+    }
+
+    /// `SQL_ATTR_LOGIN_TIMEOUT` of `0` is "the timeout is disabled and a
+    /// connection attempt will wait indefinitely", which is the same behaviour
+    /// as setting none.
+    #[test]
+    fn login_timeout_of_zero_means_wait_indefinitely() {
+        assert_eq!(login_deadline(None), None);
+        assert_eq!(login_deadline(Some(0)), None);
+        assert_eq!(login_deadline(Some(15)), Some(Duration::from_secs(15)));
+    }
 
     #[test]
     fn get_type_info_returns_all_trino_types() {

@@ -29,6 +29,7 @@ needed -- ctypes, not pyodbc.
 import ctypes
 import os
 import sys
+import time
 
 # --- ODBC constants -------------------------------------------------------
 # Named rather than inlined, per the project's own rule about spec values.
@@ -541,9 +542,13 @@ def main():
     # actually use -- that is what makes the row's parenthesis true,
     # "(SQLGetStmtAttr can be called to determine the temporarily substituted
     # value.)". The read-back is asserted, not merely observed: a driver that
-    # kept the requested value would be claiming a timeout it does not enforce
-    # and a block cursor it does not implement, and an application reading its
-    # own number back has no way to tell.
+    # kept the requested value would be claiming a block cursor it does not
+    # implement, and an application reading its own number back has no way to
+    # tell.
+    #
+    # SQL_ATTR_QUERY_TIMEOUT is deliberately absent: the driver enforces it
+    # (Backend::set_query_timeout answers QueryTimeout::CoreCancels), so it is
+    # accepted rather than substituted. It is checked on its own below.
     #
     # SQLULEN is 64-bit here, so the read-back buffer is too. It is zeroed
     # before each read; see the KNOWN note on the write width below.
@@ -564,7 +569,6 @@ def main():
         ("SQL_ATTR_KEYSET_SIZE", SQL_ATTR_KEYSET_SIZE, 50, 0),
         ("SQL_ATTR_MAX_LENGTH", SQL_ATTR_MAX_LENGTH, 4096, 0),
         ("SQL_ATTR_MAX_ROWS", SQL_ATTR_MAX_ROWS, 100, 0),
-        ("SQL_ATTR_QUERY_TIMEOUT", SQL_ATTR_QUERY_TIMEOUT, 42, 0),
         ("SQL_ATTR_ROW_ARRAY_SIZE", SQL_ATTR_ROW_ARRAY_SIZE, 10, 1),
         ("SQL_ATTR_SIMULATE_CURSOR", SQL_ATTR_SIMULATE_CURSOR, 2, SQL_SC_NON_UNIQUE),
         # Two deviations from the spec's closed list, deliberate and documented
@@ -594,41 +598,107 @@ def main():
                 got_state=f"read {val.value}, expected {substituted}",
             )
 
-    print("\n--- statement attributes: refused values (HYC00) ---")
-    # SQL_ATTR_USE_BOOKMARKS is in this group but is also one of the four that
-    # may not be set after execution, so it stays on the fresh handle where
-    # HYC00 is the rule that applies rather than HY011.
-    # An attribute off the 01S02 list has no substitution to offer, so the value
-    # is refused outright. The distinction matters: 01S02 says "I did something
-    # else", HYC00 says "I did nothing", and reading a substituted value back is
-    # only meaningful for the first.
-    for label, attr, value in (
-        ("SQL_ATTR_USE_BOOKMARKS=SQL_UB_VARIABLE", SQL_ATTR_USE_BOOKMARKS, SQL_UB_VARIABLE),
-        ("SQL_ATTR_RETRIEVE_DATA=SQL_RD_OFF", SQL_ATTR_RETRIEVE_DATA, SQL_RD_OFF),
-        ("SQL_ATTR_CURSOR_SENSITIVITY=SQL_SENSITIVE", SQL_ATTR_CURSOR_SENSITIVITY, SQL_SENSITIVE),
-        ("SQL_ATTR_ENABLE_AUTO_IPD=SQL_TRUE", SQL_ATTR_ENABLE_AUTO_IPD, SQL_TRUE),
-        ("SQL_ATTR_ASYNC_ENABLE=SQL_ASYNC_ENABLE_ON", SQL_ATTR_ASYNC_ENABLE, SQL_ASYNC_ENABLE_ON),
-    ):
-        r = lib.SQLSetStmtAttrW(attr_stmt, attr, P(value), 0)
-        check(
-            f"set {label}",
-            r,
-            SQL_ERROR,
-            state="HYC00",
-            got_state=sqlstate(lib, SQL_HANDLE_STMT, attr_stmt),
-        )
+    # SQL_ATTR_QUERY_TIMEOUT is the one attribute on that list this driver
+    # enforces, so it must be accepted plainly and read back unchanged. Core
+    # arms its timer only when Backend::set_query_timeout answers Ok, and
+    # SQLGetStmtAttr reporting 42 rather than 0 is how an application learns the
+    # deadline is really in force.
+    #
+    # This needs Threading = 2 in odbcinst.ini to actually fire -- at unixODBC's
+    # default of 3 the timer thread is serialised against the executing call.
+    # Setting the attribute succeeds either way; only expiry is affected.
+    r = lib.SQLSetStmtAttrW(attr_stmt, SQL_ATTR_QUERY_TIMEOUT, P(42), 0)
+    check(
+        "set SQL_ATTR_QUERY_TIMEOUT=42 (enforced, not substituted)",
+        r,
+        SQL_SUCCESS,
+        got_state=sqlstate(lib, SQL_HANDLE_STMT, attr_stmt),
+    )
+    val.value = 0
+    r = lib.SQLGetStmtAttrW(
+        attr_stmt, SQL_ATTR_QUERY_TIMEOUT, ctypes.byref(val), 8, ctypes.byref(outlen32)
+    )
+    check("get SQL_ATTR_QUERY_TIMEOUT", r, SQL_SUCCESS)
+    check(
+        "SQL_ATTR_QUERY_TIMEOUT reads back the value that was set",
+        SQL_SUCCESS if val.value == 42 else SQL_ERROR,
+        SQL_SUCCESS,
+        got_state=f"read {val.value}, expected 42",
+    )
 
-    # The SQLULEN write width. Every non-pointer statement attribute on the
-    # SQLSetStmtAttr page is declared "An SQLULEN value" -- not one is
-    # SQLUINTEGER -- and SQLULEN is 64-bit here. BufferLength is ignored for a
-    # non-string value, so an application declaring `SQLULEN v;` and reading a
-    # short write would keep whatever was on its stack in the top half, and
-    # read an enormous row limit rather than the 0 the driver reported. The
-    # buffer is poisoned rather than zeroed for exactly that reason: a zeroed
-    # one cannot tell a correct write from a short one.
+    # The deadline reaches the call that actually waits. Trino returns column
+    # metadata before it has computed anything, so SQLExecDirect finishes in
+    # milliseconds and every second of a slow query is spent paging inside
+    # SQLFetch -- which is where SQL_ATTR_QUERY_TIMEOUT has to bite or it bounds
+    # nothing. SQLFetch's diagnostics table carries HYT00 ("the query timeout
+    # period expired before the data source returned the requested result set.
+    # The timeout period is set through SQLSetStmtAttr, SQL_ATTR_QUERY_TIMEOUT")
+    # with no (DM) marker, so it is the driver's to return.
+    #
+    # This was a KNOWN note until stackable-odbc-core armed the fetch site:
+    # before that, SQLExecDirect returned SQL_SUCCESS in 0.1s and the following
+    # SQLFetch returned SQL_SUCCESS after 24.6s under a 2-second deadline.
+    #
+    # A dedicated statement and a query that takes ~24s uncancelled, so a
+    # regression is a hard failure rather than a flake. Elapsed time is checked
+    # too: HYT00 arriving after the query finished on its own would be the
+    # timeout not working, reported as though it were.
+    timeout_stmt = ctypes.c_void_p()
+    r = lib.SQLAllocHandle(SQL_HANDLE_STMT, dbc, ctypes.byref(timeout_stmt))
+    check("allocate a statement for the query-timeout probe", r, SQL_SUCCESS)
+    r = lib.SQLSetStmtAttrW(timeout_stmt, SQL_ATTR_QUERY_TIMEOUT, P(2), 0)
+    check("set a 2-second deadline", r, SQL_SUCCESS)
+
+    slow, _keep_slow = w("SELECT count(*) FROM tpcds.sf10.store_sales")
+    r = lib.SQLExecDirectW(timeout_stmt, slow, SQL_NTS)
+    check(
+        "execute returns before the query has run (Trino sends metadata first)",
+        r,
+        SQL_SUCCESS,
+        got_state=sqlstate(lib, SQL_HANDLE_STMT, timeout_stmt),
+    )
+
+    t0 = time.monotonic()
+    r = lib.SQLFetch(timeout_stmt)
+    elapsed = time.monotonic() - t0
+    check(
+        "SQLFetch past the deadline reports HYT00",
+        r,
+        SQL_ERROR,
+        state="HYT00",
+        got_state=sqlstate(lib, SQL_HANDLE_STMT, timeout_stmt),
+    )
+    check(
+        "the deadline fired on time rather than after the query finished",
+        SQL_SUCCESS if elapsed < 15 else SQL_ERROR,
+        SQL_SUCCESS,
+        got_state=f"SQLFetch took {elapsed:.1f}s against a 2s deadline "
+        f"(the query runs ~24s uncancelled)",
+    )
+
+    # The cancelled query must not strand the connection. A server-side cancel
+    # leaves the pooled TCP socket carrying residual bytes if anything keeps
+    # paging it, which surfaces later as an unrelated query failing -- so the
+    # real assertion is that the next query on the same connection works.
+    r = lib.SQLFreeHandle(SQL_HANDLE_STMT, timeout_stmt)
+    check("free the timed-out statement", r, SQL_SUCCESS)
+
+    after_stmt = ctypes.c_void_p()
+    lib.SQLAllocHandle(SQL_HANDLE_STMT, dbc, ctypes.byref(after_stmt))
+    probe, _keep_probe = w("SELECT 1")
+    r = lib.SQLExecDirectW(after_stmt, probe, SQL_NTS)
+    check(
+        "the connection still works after a timed-out query",
+        r,
+        SQL_SUCCESS,
+        got_state=sqlstate(lib, SQL_HANDLE_STMT, after_stmt),
+    )
+    check("fetch the row after the timeout", lib.SQLFetch(after_stmt), SQL_SUCCESS)
+    lib.SQLFreeHandle(SQL_HANDLE_STMT, after_stmt)
+
     for label, attr, expected in (
         ("SQL_ATTR_MAX_ROWS", SQL_ATTR_MAX_ROWS, 0),
-        ("SQL_ATTR_QUERY_TIMEOUT", SQL_ATTR_QUERY_TIMEOUT, 0),
+        ("SQL_ATTR_QUERY_TIMEOUT", SQL_ATTR_QUERY_TIMEOUT, 42),
         ("SQL_ATTR_ROW_ARRAY_SIZE", SQL_ATTR_ROW_ARRAY_SIZE, 1),
         ("SQL_ATTR_CONCURRENCY", SQL_ATTR_CONCURRENCY, SQL_CONCUR_READ_ONLY),
         ("SQL_ATTR_NOSCAN", SQL_ATTR_NOSCAN, 0),

@@ -141,7 +141,7 @@ pub(super) fn describe_param(
 fn execute_statement(conn: &TrinoConnection, sql: String) -> Result<(), TrinoError> {
     conn.runtime
         .block_on(conn.client.execute(sql))
-        .map_err(super::map_trino_error)?;
+        .map_err(|e| super::map_trino_error_on(&conn.liveness, e))?;
     Ok(())
 }
 

@@ -16,6 +16,7 @@ use trino_rust_client::{Row, TrinoTy};
 use super::info::trino_bare_type_name;
 use super::{
     TrinoCancelToken, TrinoConnection, TrinoError, TrinoStatement, log_page_stats, map_trino_error,
+    map_trino_error_on,
 };
 use crate::type_conversion::{
     TrinoTypeName, json_to_column_value, trino_ty_precision, trino_ty_scale, trino_ty_to_sql_type,
@@ -95,7 +96,7 @@ pub(super) fn exec_direct(
         let _span = tracing::info_span!("trino.submit").entered();
         conn.runtime
             .block_on(conn.client.get::<Row>(sql.to_string()))
-            .map_err(map_trino_error)?
+            .map_err(|e| map_trino_error_on(&conn.liveness, e))?
     };
     let submit_elapsed = submit_start.elapsed();
 
@@ -117,7 +118,7 @@ pub(super) fn exec_direct(
         let _span = tracing::info_span!("trino.poll_metadata").entered();
         while page.columns.is_none() {
             if let Some(error) = page.error.take() {
-                return Err(map_trino_error(error.into()));
+                return Err(map_trino_error_on(&conn.liveness, error.into()));
             }
             let next_url = page.next_uri.as_ref().ok_or_else(|| TrinoError::General {
                 message: "query returned no columns and no next page".into(),
@@ -128,7 +129,7 @@ pub(super) fn exec_direct(
             page = conn
                 .runtime
                 .block_on(conn.client.get_next(next_url))
-                .map_err(map_trino_error)?;
+                .map_err(|e| map_trino_error_on(&conn.liveness, e))?;
             total_fetch_time += fetch_start.elapsed();
             page_count += 1;
 
@@ -138,7 +139,7 @@ pub(super) fn exec_direct(
     }
 
     if let Some(error) = page.error.take() {
-        return Err(map_trino_error(error.into()));
+        return Err(map_trino_error_on(&conn.liveness, error.into()));
     }
 
     // Extract column metadata.
@@ -239,6 +240,7 @@ pub(super) fn exec_direct(
         client: Some(Arc::clone(&conn.client)),
         runtime: Some(Arc::clone(&conn.runtime)),
         cancel_state: Some(Arc::clone(&cancel.state)),
+        liveness: Some(conn.liveness.clone()),
         page_count,
         empty_page_count,
         total_rows_fetched,
@@ -270,6 +272,7 @@ pub(super) fn prepare(
         client: None,
         runtime: None,
         cancel_state: None,
+        liveness: None,
         page_count: 0,
         empty_page_count: 0,
         total_rows_fetched: 0,
@@ -346,7 +349,7 @@ pub(super) fn cancel(token: &TrinoCancelToken) -> Result<(), TrinoError> {
     token
         .runtime
         .block_on(token.client.cancel(&query_id))
-        .map_err(map_trino_error)?;
+        .map_err(|e| map_trino_error_on(&token.liveness, e))?;
 
     // Publish the cancellation so `fetch`, `close_cursor` and `Drop` stay off
     // `next_uri`: after a server-side cancel, `get_next` fails and leaves the
@@ -375,6 +378,21 @@ impl TrinoStatement {
         self.cancel_state
             .as_ref()
             .is_some_and(|state| state.is_cancelled())
+    }
+
+    /// Classify a client error, recording a lost link on the connection this
+    /// statement came from.
+    ///
+    /// A page fetch is the most likely place a connection failure is first
+    /// seen, and `SQL_ATTR_CONNECTION_DEAD` is a fact about the connection
+    /// rather than about the statement — so the observation has to travel back.
+    /// Falls back to the bare mapper for a statement built without a liveness
+    /// handle, which is the in-memory catalog results that reach no network.
+    fn map_client_error(&self, e: trino_rust_client::error::Error) -> TrinoError {
+        match &self.liveness {
+            Some(liveness) => map_trino_error_on(liveness, e),
+            None => map_trino_error(e),
+        }
     }
 
     /// Discard the result set after a failed page fetch and return `err`.
@@ -496,11 +514,15 @@ impl StatementBackend for TrinoStatement {
             // remain readable through `get_data` after the error was reported.
             let mut page: trino_rust_client::QueryResult<Row> = match fetched {
                 Ok(page) => page,
-                Err(e) => return Err(self.end_page_fetch(map_trino_error(e))),
+                Err(e) => {
+                    let mapped = self.map_client_error(e);
+                    return Err(self.end_page_fetch(mapped));
+                }
             };
 
             if let Some(error) = page.error.take() {
-                return Err(self.end_page_fetch(map_trino_error(error.into())));
+                let mapped = self.map_client_error(error.into());
+                return Err(self.end_page_fetch(mapped));
             }
 
             log_page_stats(&page.stats, self.page_count);
@@ -635,7 +657,7 @@ impl StatementBackend for TrinoStatement {
                             "failed to drain remaining Trino pages; the pooled \
                              connection may carry residual bytes"
                         );
-                        drain_failure = Some(map_trino_error(e));
+                        drain_failure = Some(self.map_client_error(e));
                         break;
                     }
                 }

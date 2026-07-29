@@ -551,6 +551,127 @@ def main():
 
     run("Backend-declared SQLGetInfo values", test_backend_declared_info_values)
 
+    def test_query_timeout_fires_through_the_driver_manager():
+        # The only place the query timeout is exercised through a Driver
+        # Manager. test_c_abi.py loads the .so directly, so it proves the
+        # driver and core cooperate but says nothing about unixODBC.
+        #
+        # This is NOT gated on Threading. Core enforces the deadline from a
+        # timer thread that calls Backend::cancel directly, inside the .so, so
+        # it never crosses the Driver Manager and no threading policy can
+        # serialise it. Measured both ways against the live coordinator: HYT00
+        # at 2.0s under Threading = 2 and under Threading = 3 alike. The
+        # setting matters for application-initiated SQLCancel instead -- see
+        # the cross-thread cancel test below.
+        #
+        # pyodbc's Connection.timeout sets SQL_ATTR_QUERY_TIMEOUT on the
+        # statements it creates. The query runs ~24s uncancelled, so a
+        # regression fails outright rather than flaking, and the elapsed time is
+        # asserted as well: HYT00 arriving after the query finished on its own
+        # would be the timeout not working, reported as though it were.
+        import time
+
+        timed = pyodbc.connect(conn_str, autocommit=True)
+        try:
+            timed.timeout = 2
+            cur = timed.cursor()
+            # Trino answers with column metadata before it computes a row, so
+            # the execute returns promptly and the whole wait is in the fetch.
+            cur.execute("SELECT count(*) FROM tpcds.sf10.store_sales")
+            start = time.monotonic()
+            try:
+                cur.fetchall()
+            except pyodbc.Error as e:
+                elapsed = time.monotonic() - start
+                state = e.args[0]
+                assert state == "HYT00", f"expected HYT00, got {state}: {e}"
+                assert elapsed < 15, (
+                    f"HYT00 after {elapsed:.1f}s against a 2s deadline -- the "
+                    f"query runs ~24s uncancelled, so this fired on completion "
+                    f"rather than on the deadline"
+                )
+            else:
+                raise AssertionError(
+                    f"the query completed in {time.monotonic() - start:.1f}s "
+                    f"despite a 2-second deadline"
+                )
+
+            # A cancelled query must not strand the connection: a server-side
+            # cancel leaves the pooled socket carrying residual bytes if
+            # anything keeps paging it, which surfaces later as an unrelated
+            # query failing.
+            timed.timeout = 0
+            after = timed.cursor()
+            after.execute("SELECT 1")
+            assert after.fetchone()[0] == 1, "connection unusable after a timeout"
+        finally:
+            timed.close()
+
+    run(
+        "SQL_ATTR_QUERY_TIMEOUT fires during fetch",
+        test_query_timeout_fires_through_the_driver_manager,
+    )
+
+    def test_cross_thread_cancel_interrupts_a_running_fetch():
+        # This is what Threading = 2 in odbcinst.ini buys, and the only test
+        # that would notice it being lost. SQLCancel called from another thread
+        # goes *through* the Driver Manager, and at unixODBC's default
+        # Threading = 3 the DM serialises at the environment level and holds the
+        # cancelling thread behind the executing call. Measured against the live
+        # coordinator on a query that runs ~24s:
+        #
+        #   Threading = 3 -> SQLCancel blocked for the whole run; fetch raised
+        #                    HY010 after 23.9s, i.e. the query finished on its
+        #                    own and the cancel accomplished nothing.
+        #   Threading = 2 -> SQLCancel returned immediately; fetch raised HY008
+        #                    after 2.0s.
+        #
+        # HY008 is the spec's "operation canceled" for a function interrupted by
+        # SQLCancel from a different thread, which SQLFetch's diagnostics table
+        # lists without a (DM) marker.
+        import threading
+        import time
+
+        c = pyodbc.connect(conn_str, autocommit=True)
+        try:
+            cur = c.cursor()
+            cur.execute("SELECT count(*) FROM tpcds.sf10.store_sales")
+
+            def cancel_after_two_seconds():
+                time.sleep(2)
+                cur.cancel()
+
+            canceller = threading.Thread(target=cancel_after_two_seconds)
+            canceller.start()
+            start = time.monotonic()
+            try:
+                cur.fetchall()
+            except pyodbc.Error as e:
+                elapsed = time.monotonic() - start
+                state = e.args[0]
+                assert state == "HY008", (
+                    f"expected HY008, got {state}: {e}. HY010 after ~24s means "
+                    f"unixODBC serialised the cancelling thread -- check that "
+                    f"Threading = 2 is set in odbcinst.ini"
+                )
+                assert elapsed < 15, (
+                    f"HY008 after {elapsed:.1f}s: the query ran to completion "
+                    f"(~24s) before the cancel landed"
+                )
+            else:
+                raise AssertionError(
+                    "the fetch completed despite a cancel from another thread"
+                )
+            finally:
+                canceller.join()
+        finally:
+            c.close()
+
+    run(
+        "SQLCancel from another thread interrupts a fetch (needs Threading=2)",
+        test_cross_thread_cancel_interrupts_a_running_fetch,
+    )
+
     # === Cleanup ===
     conn.close()
 

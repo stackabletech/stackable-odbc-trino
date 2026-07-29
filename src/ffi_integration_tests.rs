@@ -4042,6 +4042,15 @@ unsafe fn sqlstate_of(handle_type: HandleType, handle: *mut c_void) -> String {
 /// alongside them although the spec's list does not name either; both are
 /// documented deviations at their arms in core, and pinning them here is what
 /// stops the deviation being undone by accident.
+///
+/// `SQL_ATTR_QUERY_TIMEOUT` is **not** in this list. This driver answers
+/// `Backend::set_query_timeout`, so a statement on a live connection accepts
+/// the value rather than substituting `0` — see
+/// `query_timeout_is_accepted_on_a_connected_statement`. It would still pass
+/// here, because these handles are never connected and core substitutes when it
+/// has no connection to offer the value to, and that is exactly why keeping it
+/// would be misleading: the assertion would hold for a reason unrelated to what
+/// it claims to check.
 #[test]
 fn set_stmt_attr_substitutes_and_reports_the_value_it_will_use() {
     // (attribute, requested value, the value core will report back)
@@ -4061,7 +4070,6 @@ fn set_stmt_attr_substitutes_and_reports_the_value_it_will_use() {
         (StatementAttribute::KeysetSize, 50, 0, "fully keyset-driven"),
         (StatementAttribute::MaxLength, 4096, 0, "all available data"),
         (StatementAttribute::MaxRows, 100, 0, "no row limit"),
-        (StatementAttribute::QueryTimeout, 30, 0, "no timeout"),
         (StatementAttribute::RowArraySize, 64, 1, "one-row rowset"),
         (
             StatementAttribute::SimulateCursor,
@@ -4126,7 +4134,6 @@ fn set_stmt_attr_accepts_the_value_it_already_uses_without_a_warning() {
         (StatementAttribute::KeysetSize, 0),
         (StatementAttribute::MaxLength, 0),
         (StatementAttribute::MaxRows, 0),
-        (StatementAttribute::QueryTimeout, 0),
         (StatementAttribute::RowArraySize, 1),
         (StatementAttribute::SimulateCursor, 0),
         (StatementAttribute::CursorScrollable, 0),
@@ -4152,6 +4159,55 @@ fn set_stmt_attr_accepts_the_value_it_already_uses_without_a_warning() {
             let _ = ffi::handle::sql_free_handle::<TrinoBackend>(HandleType::Dbc as i16, conn);
             let _ = ffi::handle::sql_free_handle::<TrinoBackend>(HandleType::Env as i16, env);
         }
+    }
+}
+
+/// `SQL_ATTR_QUERY_TIMEOUT` is accepted plainly on a connected statement, and
+/// reads back the value the application asked for.
+///
+/// This is the half that matters: core arms its timer only when
+/// `Backend::set_query_timeout` answers `Ok`, and `SQLGetStmtAttr` reporting
+/// the requested value rather than `0` is how an application learns its
+/// deadline is really in force. The driver answers `QueryTimeout::CoreCancels`,
+/// so both follow.
+///
+/// A *connected* handle is required, and that is the whole point of using
+/// `attach_connection` here: `offer_to_data_source` substitutes without
+/// consulting the backend when it has no connection, so the plain
+/// `alloc_handles` used by the neighbouring tests would exercise the fallback
+/// and never reach `TrinoBackend::set_query_timeout` at all.
+#[test]
+fn query_timeout_is_accepted_on_a_connected_statement() {
+    unsafe {
+        let (env, conn) = alloc_conn_with_injected_trino_connection();
+        let mut stmt: *mut c_void = std::ptr::null_mut();
+        assert_eq!(
+            ffi::handle::sql_alloc_handle::<TrinoBackend>(HandleType::Stmt as i16, conn, &mut stmt),
+            SqlReturn::SUCCESS
+        );
+
+        assert_eq!(
+            set_stmt_attr(stmt, StatementAttribute::QueryTimeout as i32, 30),
+            SqlReturn::SUCCESS,
+            "this driver enforces SQL_ATTR_QUERY_TIMEOUT, so it must not be substituted"
+        );
+        assert_eq!(
+            sqlstate_of(HandleType::Stmt, stmt),
+            "",
+            "an accepted attribute posts no diagnostic; 01S02 would tell the \
+             application its deadline had been capped"
+        );
+
+        let (ret, read_back) = get_stmt_attr(stmt, StatementAttribute::QueryTimeout as i32);
+        assert_eq!(ret, SqlReturn::SUCCESS);
+        assert_eq!(
+            read_back, 30,
+            "SQLGetStmtAttr must report the timeout that was set, not the 0 core \
+             substitutes for a backend that cannot enforce one"
+        );
+
+        let _ = ffi::handle::sql_free_handle::<TrinoBackend>(HandleType::Stmt as i16, stmt);
+        cleanup_injected_conn(env, conn);
     }
 }
 

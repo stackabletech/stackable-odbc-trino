@@ -383,8 +383,17 @@ query is exactly when an application reaches for `SQLCancel`.
 any further: `get_next` fails after a server-side cancel and leaves the pooled
 TCP socket carrying residual bytes, which surfaces later as an unrelated query
 failing. `fetch` and `close_cursor` read the flag and stop touching `next_uri`.
-Core never replaces a statement's token, including across a re-execute, so
-`begin_query` clears the flag as well as setting the id.
+`begin_query` clears the flag as well as setting the id. Core mints a **new
+token at every statement-producing call**, so a re-execute already arrives with
+a fresh `CancelState`, and `cancel` sets the flag only after a `DELETE` that
+needed an id `begin_query` had recorded — there is no reachable path on which a
+cancellation is pending there. The clear is kept because the flag's purpose is
+to keep a live query off a stale one's teardown, and the one point that knows a
+new query has begun is where that belongs.
+
+`Backend::is_cancelled` reads the same flag, and is what turns it into `HY008`:
+`cancel` signals, `is_cancelled` observes, and core discards the backend's own
+SQLSTATE when it answers `true`.
 
 That flag covers only the cancel that lands *between* requests. A cancel
 landing while a page request is in flight is recognised from Trino's own
@@ -392,7 +401,38 @@ landing while a page request is in flight is recognised from Trino's own
 because the cancelling thread sets it only after its `DELETE` returns, by which
 time the coordinator may already have failed the in-flight request. The server's
 verdict needs no cross-thread ordering and also catches a query killed by
-something else, such as `CALL system.runtime.kill_query`.
+something else, such as `CALL system.runtime.kill_query`. The two are
+complementary, which is why implementing `is_cancelled` did not replace the
+`OperationCancelled` arm.
+
+#### `Threading = 2` is required, not tuning
+
+`packaging/linux/install.sh` and `test/setup.sh` both write `Threading = 2`
+into the driver's `odbcinst.ini` section. unixODBC's default is `3`, which
+serialises at the environment level and holds a cross-thread `SQLCancel` behind
+the call it was meant to interrupt. Measured against a live coordinator on a
+query that runs ~24s, cancelling after 2s:
+
+| | `Threading = 3` | `Threading = 2` |
+|---|---|---|
+| `SQLCancel` returns | only after the fetch does | immediately |
+| `SQLFetch` raises | `HY010` after 23.9s | `HY008` after 2.0s |
+
+`HY010` after the query completed on its own is the cancel accomplishing
+nothing, reported to the application as a sequence error it did not commit.
+
+**`SQL_ATTR_QUERY_TIMEOUT` is not affected and fires either way.** Core enforces
+that deadline from a timer thread that calls `Backend::cancel` *directly*,
+inside the `.so`, so it never crosses the Driver Manager and no threading policy
+can serialise it — `HYT00` at 2.0s under both settings, measured. Do not cite
+the query timeout as the reason for this setting; the reason is `SQLCancel`.
+
+Neither the Rust FFI tests nor `test/test_c_abi.py` catch a regression here:
+both call the exported entry points directly, with no Driver Manager in the
+loop, so unixODBC's threading policy never applies to them. Only the pyodbc and
+`isql` paths go through it, which is why
+`test_cross_thread_cancel_interrupts_a_running_fetch` lives in
+`test/test_integration.py` and says so in its failure message.
 
 That path yields `TrinoError::OperationCancelled`, which is `HY008` — the
 SQLSTATE the spec gives a function interrupted by `SQLCancel` from another
@@ -409,6 +449,77 @@ the token but record nothing in it, so `SQLCancel` cannot interrupt them. Four
 do no I/O at all; the other four go through `query_all_rows` →
 `Client::get_all`, which pages to exhaustion inside the client and never
 surfaces a query id.
+
+### Timeouts, liveness, and the hooks left defaulted
+
+Core offers a defaulted hook for each attribute whose spec row makes it the
+data source's job. This driver takes up three and deliberately leaves three:
+
+| Hook | Answer | Why |
+|------|--------|-----|
+| `set_query_timeout` | `QueryTimeout::CoreCancels` | Trino has no per-statement server-side deadline this driver can set. See below. |
+| `connection_dead` | `TrinoConnection::liveness` | A flag the error path sets; never a probe. |
+| `is_cancelled` | `CancelState::cancelled` | The observing half of `cancel`; see [Cancellation](#cancellation). |
+| `set_access_mode` | defaulted `Ok(())` | Trino has no read-only session mode, and the spec makes the attribute a *hint*: "the driver is not required to prevent such statements from being submitted". Accepting and ignoring misleads nobody. |
+| `set_max_rows` | defaulted → `01S02` | Trino can cap a result set only through `LIMIT` in the SQL the application wrote. The spec forbids emulating: "a driver should not emulate SQL_ATTR_MAX_ROWS behavior". |
+| `set_max_length` | defaulted → `01S02` | Same. The attribute exists "to reduce network traffic", which truncating after the bytes arrive cannot achieve. |
+
+**Why `CoreCancels` and not `DataSource`.** `SET SESSION query_max_run_time`
+would work — `trino-rust-client` tracks `X-Trino-Set-Session`, so it would
+stick — and it is rejected on two counts. It is a *session* property, so every
+statement on the connection would get the most recently set value, where core's
+timer is armed per statement and matches the attribute's real scope. And it
+would put a round trip inside `SQLSetStmtAttr`, which applications call freely
+and the spec does not expect to block. Core's usual argument for `DataSource` —
+that the server stops the work rather than the client abandoning it — does not
+bite here, because `Backend::cancel` issues Trino's `DELETE /v1/query/{id}` and
+the coordinator does stop.
+
+**The deadline covers the fetch, which is where Trino's time goes.** Trino
+answers with column metadata before it has computed a row, so `exec_direct`
+returns in milliseconds and every second of a slow query is spent paging inside
+`fetch`. Core arms its timer at `SQLFetch` as well as at the
+statement-producing calls for exactly this reason — `SQLFetch`'s diagnostics
+table carries `HYT00` ("the query timeout period expired before the data source
+returned the requested result set") with no `(DM)` marker. `SQLGetData` is
+deliberately unarmed on core's side: its table carries `HYT01` and no `HYT00`
+row at all.
+
+Asserted end to end in two places, and both are needed. `test/test_c_abi.py`
+proves the driver and core cooperate with no Driver Manager in the loop;
+`test/test_integration.py` proves it survives unixODBC. Each also asserts the
+*elapsed time*, because `HYT00` arriving after the query finished on its own is
+the timeout not working, reported as though it were. Each then runs a further
+query on the same connection: a server-side cancel leaves the pooled socket
+carrying residual bytes if anything keeps paging it, and that surfaces later as
+an unrelated query failing.
+
+**`SQL_ATTR_CONNECTION_DEAD` is answered from a flag, never a probe.** A
+connection pool reads it on every checkout, so a round trip would be paid far
+more often than a query runs. `Liveness` is an `Arc<AtomicBool>` shared by the
+connection, every statement it produced and its cancel tokens — a `SQLFetch`
+that cannot reach the coordinator is the most likely place to learn the link is
+gone, and the fact belongs to the connection. Only
+`TrinoError::CommunicationLinkFailure` sets it: a timeout, an auth rejection and
+a server-side query error all leave the link up, and `SQL_CD_TRUE` asserts the
+connection *has been lost*, not that something went wrong.
+
+**`SQL_ATTR_LOGIN_TIMEOUT` and `SQL_ATTR_CONNECTION_TIMEOUT` arrive on
+`ConnectParams`**, as dedicated accessors rather than connection-string keys —
+they came from `SQLSetConnectAttr`, and `to_connection_string` is what
+`SQLDriverConnect` echoes back to the application. `connect` maps them with two
+pure functions, `request_timeout` and `login_deadline`, which is where their
+`Some(0)` cases are pinned by test:
+
+- `connection_timeout` becomes the HTTP client's per-request timeout,
+  overriding the `QueryTimeout` connection-string key when the application set
+  one. `Some(0)` is "there is no timeout" and must **not** be read as unset,
+  which would silently reimpose the key's 30-second cap.
+- `login_timeout` bounds `validate_connection` — the one round trip that
+  decides whether `SQLDriverConnect` succeeds — via `query_all_rows_within`.
+  It is applied there rather than on the client because the client's timeout
+  also bounds every later query, and the two attributes are set separately.
+  `Some(0)` is "wait indefinitely", the same as unset.
 
 ### Type cast safety
 
@@ -470,6 +581,15 @@ if let Some(error) = page.error.take() {
 Every `Backend` and `StatementBackend` method returns `Self::Error`, which is
 `TrinoError` for both, so there is no second error type to convert to at a call
 site: `.map_err(map_trino_error)?` is the whole idiom.
+
+**Prefer `map_trino_error_on(&liveness, e)` wherever a `Liveness` handle is in
+scope** — that is every path with a `TrinoConnection`, a `TrinoCancelToken`, or
+a `TrinoStatement` (through its `map_client_error` helper). It delegates the
+entire classification to `map_trino_error` and only observes the result, so the
+"one place decides the SQLSTATE" rule is intact; what it adds is the
+connection-level failure reaching `SQL_ATTR_CONNECTION_DEAD`. The bare
+`map_trino_error` stays correct where no handle exists, and is what the wrapper
+calls.
 
 Hand-built errors are correct only for *internal* invariant violations that never
 came from the client ("get_data called before fetch", a missing runtime handle, a
@@ -561,6 +681,12 @@ list — keep this table in sync with it. Keys are case-insensitive.
 | `Certificate` | No | Path to a PEM CA certificate for server verification |
 | `AccessToken` | No | JWT bearer token. Alias: `Token` |
 | `QueryTimeout` | No | Per-request HTTP timeout in seconds (default 30). Alias: `LoginTimeout` |
+
+`QueryTimeout` is the *default* for the per-request HTTP timeout, not the last
+word: an application that sets `SQL_ATTR_CONNECTION_TIMEOUT` overrides it, and
+`SQL_ATTR_LOGIN_TIMEOUT` separately bounds the login round trip. Neither is a
+connection-string key — they reach `connect` as `ConnectParams` accessors. See
+[Timeouts, liveness, and the hooks left defaulted](#timeouts-liveness-and-the-hooks-left-defaulted).
 
 ## Testing
 

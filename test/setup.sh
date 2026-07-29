@@ -103,9 +103,14 @@ cargo build
 DRIVER_PATH="$PROJECT_DIR/target/debug/libstackable_odbc_trino.so"
 
 echo "=== Writing ODBC install config ==="
+# Threading = 2 must match packaging/linux/install.sh -- see the comment there.
+# Without it the suites run against a Driver Manager that serialises a
+# cross-thread SQLCancel against the executing call, which is a configuration no
+# user has. test_integration.py's cross-thread cancel test is what notices.
 cat > "$SCRIPT_DIR/odbcinst.ini" << EOF
 [stackable_odbc_trino]
 Driver = $DRIVER_PATH
+Threading = 2
 EOF
 
 echo "=== Writing ODBC driver config ==="
