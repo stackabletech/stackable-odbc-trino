@@ -24,3 +24,37 @@ stackable_odbc_core::forward_ffi!(crate::backend::TrinoBackend);
 
 #[cfg(test)]
 mod ffi_integration_tests;
+
+#[cfg(test)]
+mod tests {
+    /// The Power Query connector's `[Version]` is the crate version.
+    ///
+    /// Power BI reads that attribute to decide whether an installed `.mez` is
+    /// newer than the one already present, and a release ships the `.mez` and
+    /// the driver binary together — so two different numbers describe one
+    /// release, and the one a bug report quotes is whichever artefact the
+    /// reporter happens to have. They had already drifted: the connector said
+    /// `1.0.0` against a crate at `0.0.1`.
+    ///
+    /// `release.toml` rewrites the connector as part of the version bump, in
+    /// the same commit. This asserts the result, so a hand-edit to either file
+    /// fails `cargo test` rather than surfacing in a release archive.
+    #[test]
+    fn connector_version_matches_the_crate() {
+        let source = include_str!("../connector/StackableTrinoODBC.pq");
+        let declared = source
+            .lines()
+            .find_map(|line| {
+                let rest = line.trim().strip_prefix("[Version = \"")?;
+                rest.strip_suffix("\"]")
+            })
+            .expect("connector/StackableTrinoODBC.pq must declare [Version = \"...\"]");
+
+        assert_eq!(
+            declared,
+            env!("CARGO_PKG_VERSION"),
+            "the connector's [Version] and the crate version name one release and must agree; \
+             release.toml's pre-release-replacement for the .pq is what keeps them together"
+        );
+    }
+}

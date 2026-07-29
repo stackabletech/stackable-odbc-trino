@@ -9,6 +9,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Eight connection-string keys covering the Trino client options the driver
+  never exposed**: `SessionProperties`, `ExtraCredentials`, `ResourceEstimates`,
+  `Path`, `ClientInfo`, `TraceToken`, `DisableCompression` and `MaxAttempts`.
+  Each maps to a `trino-rust-client` builder option that was simply never
+  called, so the settings were unreachable through this driver even though the
+  Trino JDBC driver exposes most of them.
+
+  `SessionProperties` is the one most often wanted — it is how a connection sets
+  `query_max_run_time`, `join_distribution_type` or any catalog property.
+  `ExtraCredentials` carries secrets and is declared in
+  `Backend::sensitive_connect_keywords`, so it is redacted from diagnostics and
+  from the connection string echoed back by `SQLDriverConnect`.
+
+  The three key-value keys take the Trino JDBC driver's format verbatim
+  (`name:value;name2:value2`), so a value copied from a JDBC URL transfers
+  unchanged. Because `;` also separates ODBC connection-string parameters, such
+  a value must be wrapped in braces —
+  `SessionProperties={query_max_run_time:10m;example.foo:bar}` — or everything
+  after the first pair is silently discarded by the connection-string parser. A
+  malformed pair fails the connection rather than being skipped.
 - **`SQL_ATTR_QUERY_TIMEOUT` is now enforced.** Setting it previously returned
   `01S02` and substituted `0`, so an application that asked for a deadline was
   told, correctly but unhelpfully, that it had none. The driver now declares

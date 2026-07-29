@@ -2,7 +2,7 @@
 //! password, protocol, catalog, schema, TLS and JWT options) parsed from the
 //! generic `stackable-odbc-core` connection-string key/value map.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 use stackable_odbc_core::types::{ConnectParams, Redacted};
@@ -35,6 +35,38 @@ pub(crate) const PARAM_CLIENT_TAGS: &str = "clienttags";
 pub(crate) const PARAM_ACCESS_TOKEN: &str = "accesstoken";
 /// Alias for [`PARAM_ACCESS_TOKEN`].
 pub(crate) const PARAM_TOKEN: &str = "token";
+/// Trino session properties, in JDBC's `name:value;name2:value2` form.
+pub(crate) const PARAM_SESSION_PROPERTIES: &str = "sessionproperties";
+/// Connector-level credentials passed through to the data source, in JDBC's
+/// `name:value;name2:value2` form. Carries secrets.
+pub(crate) const PARAM_EXTRA_CREDENTIALS: &str = "extracredentials";
+/// Scheduling hints, in the same `name:value;name2:value2` form.
+pub(crate) const PARAM_RESOURCE_ESTIMATES: &str = "resourceestimates";
+/// Default SQL path for resolving unqualified function names.
+pub(crate) const PARAM_PATH: &str = "path";
+/// Free-form client metadata Trino records against the query.
+pub(crate) const PARAM_CLIENT_INFO: &str = "clientinfo";
+/// Correlation token Trino records against the query.
+pub(crate) const PARAM_TRACE_TOKEN: &str = "tracetoken";
+/// Disable HTTP response compression: `"true"` or `"false"` (default).
+pub(crate) const PARAM_DISABLE_COMPRESSION: &str = "disablecompression";
+/// How many times a request is attempted before it fails.
+pub(crate) const PARAM_MAX_ATTEMPTS: &str = "maxattempts";
+
+/// Separator between the pairs of a key-value connection-string parameter.
+///
+/// `;` is JDBC's, and it is also the ODBC connection-string separator — so a
+/// value using it has to be `{}`-wrapped, which core's parser supports and
+/// [`parse_key_value_pairs`] documents. Matching JDBC is worth that: the value
+/// an operator already has in a JDBC URL transfers unchanged.
+const PAIR_SEPARATOR: char = ';';
+
+/// Separator between a key and its value, JDBC's again.
+///
+/// `:` rather than `=`, which means a value may contain `=` without escaping.
+/// Only the *first* occurrence splits, so a value may contain `:` too — which
+/// matters, because a session property value is routinely a URL or a duration.
+const KEY_VALUE_SEPARATOR: char = ':';
 
 /// Transport used when the connection string names none.
 ///
@@ -58,6 +90,72 @@ const DEFAULT_QUERY_TIMEOUT_SECS: u64 = 30;
 /// exactly when the question gets asked.
 pub(crate) const DEFAULT_SOURCE: &str = concat!("stackable-odbc-trino/", env!("CARGO_PKG_VERSION"));
 
+/// Parse a `name:value;name2:value2` parameter into a map.
+///
+/// The form is the Trino JDBC driver's for `sessionProperties` and
+/// `extraCredentials`, so a value copied from a JDBC URL works unchanged. It
+/// does need `{}` around it in an ODBC connection string, because `;` is what
+/// separates one connection-string parameter from the next:
+///
+/// ```text
+/// SessionProperties={query_max_run_time:10m;example.foo:bar}
+/// ```
+///
+/// Without the braces core's parser ends the value at the first `;` and treats
+/// the rest as another parameter, which it then discards as unrecognised —
+/// silently dropping every property but the first.
+///
+/// A malformed pair is an error rather than a skip. A dropped session property
+/// changes how the query runs, and an operator who mistyped one would otherwise
+/// see a plausible result computed under settings they did not ask for.
+fn parse_key_value_pairs(key: &str, raw: &str) -> Result<HashMap<String, String>, TrinoError> {
+    let mut map = HashMap::new();
+
+    for pair in raw.split(PAIR_SEPARATOR) {
+        // Trailing or doubled separators are the shape a hand-edited string
+        // takes; they carry no pair and no ambiguity, so they are skipped
+        // rather than rejected.
+        if pair.trim().is_empty() {
+            continue;
+        }
+        let (name, value) =
+            pair.split_once(KEY_VALUE_SEPARATOR)
+                .ok_or_else(|| TrinoError::General {
+                    message: format!(
+                        "invalid value for {key}: {pair:?} is not \
+                     \"name{KEY_VALUE_SEPARATOR}value\". Pairs are separated by \
+                     {PAIR_SEPARATOR:?}, so the whole value needs {{braces}} in a \
+                     connection string"
+                    ),
+                })?;
+
+        let name = name.trim();
+        if name.is_empty() {
+            return Err(TrinoError::General {
+                message: format!("invalid value for {key}: {pair:?} has an empty name"),
+            });
+        }
+        map.insert(name.to_string(), value.trim().to_string());
+    }
+
+    Ok(map)
+}
+
+/// Parse a `"true"` / `"false"` parameter, case-insensitively.
+///
+/// Rejects anything else rather than defaulting: every boolean here turns a
+/// protection or a behaviour off, and a typo silently reading as "leave it on"
+/// is the failure mode `TlsVerify` already guards against.
+fn parse_bool(key: &str, raw: &str) -> Result<bool, TrinoError> {
+    match raw {
+        v if v.eq_ignore_ascii_case("true") => Ok(true),
+        v if v.eq_ignore_ascii_case("false") => Ok(false),
+        v => Err(TrinoError::General {
+            message: format!("invalid value for {key}: {v:?}, expected \"true\" or \"false\""),
+        }),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Typed connection parameters
 // ---------------------------------------------------------------------------
@@ -78,6 +176,17 @@ pub(crate) struct TrinoConnectParams {
     schema: Option<String>,
     source: String,
     client_tags: HashSet<String>,
+    session_properties: HashMap<String, String>,
+    /// Redacted for the same reason as `password`: these are credentials the
+    /// connection forwards to a connector, and `Debug` on this struct reaches
+    /// the log.
+    extra_credentials: Redacted<HashMap<String, String>>,
+    resource_estimates: HashMap<String, String>,
+    path: Option<String>,
+    client_info: Option<String>,
+    trace_token: Option<String>,
+    compression_disabled: bool,
+    max_attempts: Option<usize>,
 }
 
 impl TrinoConnectParams {
@@ -127,6 +236,40 @@ impl TrinoConnectParams {
 
     pub fn catalog(&self) -> Option<&str> {
         self.catalog.as_deref()
+    }
+
+    pub fn session_properties(&self) -> &HashMap<String, String> {
+        &self.session_properties
+    }
+
+    pub fn extra_credentials(&self) -> &HashMap<String, String> {
+        &self.extra_credentials.0
+    }
+
+    pub fn resource_estimates(&self) -> &HashMap<String, String> {
+        &self.resource_estimates
+    }
+
+    pub fn path(&self) -> Option<&str> {
+        self.path.as_deref()
+    }
+
+    pub fn client_info(&self) -> Option<&str> {
+        self.client_info.as_deref()
+    }
+
+    pub fn trace_token(&self) -> Option<&str> {
+        self.trace_token.as_deref()
+    }
+
+    pub fn compression_disabled(&self) -> bool {
+        self.compression_disabled
+    }
+
+    /// `None` leaves `trino-rust-client`'s own retry budget in place, which is
+    /// the honest default: the driver has no better number than the client's.
+    pub fn max_attempts(&self) -> Option<usize> {
+        self.max_attempts
     }
 
     pub fn schema(&self) -> Option<&str> {
@@ -186,6 +329,41 @@ impl TryFrom<&ConnectParams> for TrinoConnectParams {
             }
         };
         let certificate = params.get(PARAM_CERTIFICATE).map(str::to_string);
+
+        let pairs = |key: &'static str| match params.get(key) {
+            None => Ok(HashMap::new()),
+            Some(raw) => parse_key_value_pairs(key, raw),
+        };
+        let session_properties = pairs(PARAM_SESSION_PROPERTIES)?;
+        let extra_credentials = pairs(PARAM_EXTRA_CREDENTIALS)?;
+        let resource_estimates = pairs(PARAM_RESOURCE_ESTIMATES)?;
+
+        let compression_disabled = match params.get(PARAM_DISABLE_COMPRESSION) {
+            None => false,
+            Some(v) => parse_bool(PARAM_DISABLE_COMPRESSION, v)?,
+        };
+
+        // Rejected rather than defaulted, unlike `QueryTimeout` above. That one
+        // predates this and warns for compatibility; a new key is better off
+        // telling the operator the value never took effect, since a retry
+        // budget silently reverting to the client's default is invisible until
+        // a flaky network makes it matter.
+        let max_attempts = match params.get(PARAM_MAX_ATTEMPTS) {
+            None => None,
+            Some(v) => match v.parse::<usize>() {
+                // Zero attempts would mean "never send the request", which is
+                // not a budget an application can have meant.
+                Ok(0) | Err(_) => {
+                    return Err(TrinoError::General {
+                        message: format!(
+                            "invalid value for {PARAM_MAX_ATTEMPTS}: {v:?}, \
+                             expected a positive integer"
+                        ),
+                    });
+                }
+                Ok(n) => Some(n),
+            },
+        };
         let query_timeout_secs: u64 = match params
             .get(PARAM_QUERY_TIMEOUT)
             .or_else(|| params.get(PARAM_LOGIN_TIMEOUT))
@@ -231,6 +409,14 @@ impl TryFrom<&ConnectParams> for TrinoConnectParams {
                         .collect()
                 })
                 .unwrap_or_default(),
+            session_properties,
+            extra_credentials: Redacted(extra_credentials),
+            resource_estimates,
+            path: params.get(PARAM_PATH).map(str::to_string),
+            client_info: params.get(PARAM_CLIENT_INFO).map(str::to_string),
+            trace_token: params.get(PARAM_TRACE_TOKEN).map(str::to_string),
+            compression_disabled,
+            max_attempts,
         })
     }
 }
@@ -283,6 +469,170 @@ mod tests {
     fn client_tags_are_empty_when_unset() {
         let p = parse("Host=localhost;Port=8080;User=admin");
         assert!(p.client_tags().is_empty());
+    }
+
+    /// The `{}` wrapping is not optional and not cosmetic: `;` separates one
+    /// connection-string parameter from the next, so an unbraced multi-pair
+    /// value is truncated at the first `;` by core's parser before this code
+    /// ever sees it. Both halves are asserted here so the requirement is
+    /// recorded as a behaviour rather than only in prose.
+    #[test]
+    fn session_properties_take_jdbcs_form_inside_braces() {
+        let p = parse(
+            "Host=localhost;Port=8080;User=admin;\
+             SessionProperties={query_max_run_time:10m;example.foo:bar}",
+        );
+        assert_eq!(
+            p.session_properties()
+                .get("query_max_run_time")
+                .map(String::as_str),
+            Some("10m")
+        );
+        assert_eq!(
+            p.session_properties()
+                .get("example.foo")
+                .map(String::as_str),
+            Some("bar")
+        );
+    }
+
+    #[test]
+    fn session_properties_unbraced_keep_only_the_first_pair() {
+        let p = parse(
+            "Host=localhost;Port=8080;User=admin;\
+             SessionProperties=query_max_run_time:10m;example.foo:bar",
+        );
+        assert_eq!(
+            p.session_properties().len(),
+            1,
+            "core's parser ends the value at the first ';', so the rest is a \
+             separate (unrecognised) parameter -- this is why braces are required"
+        );
+    }
+
+    /// Only the *first* separator splits, so a value may contain `:` — which
+    /// is not a corner case: `http://…` and `10:00` are ordinary property
+    /// values.
+    #[test]
+    fn a_property_value_may_contain_the_separator() {
+        let p = parse(
+            "Host=localhost;Port=8080;User=admin;\
+             SessionProperties={exchange.base-directories:s3://bucket/path}",
+        );
+        assert_eq!(
+            p.session_properties()
+                .get("exchange.base-directories")
+                .map(String::as_str),
+            Some("s3://bucket/path")
+        );
+    }
+
+    /// A dropped property changes how the query runs, so a typo has to fail
+    /// the connection rather than produce a plausible answer computed under
+    /// settings nobody asked for.
+    #[test]
+    fn a_malformed_pair_is_rejected() {
+        let err =
+            parse_err("Host=localhost;Port=8080;User=admin;SessionProperties={query_max_run_time}");
+        let message = err.to_string();
+        assert!(
+            message.contains("sessionproperties") && message.contains("query_max_run_time"),
+            "the error must name the key and the offending pair: {message}"
+        );
+    }
+
+    #[test]
+    fn an_empty_property_name_is_rejected() {
+        let err = parse_err("Host=localhost;Port=8080;User=admin;SessionProperties={:orphan}");
+        assert!(err.to_string().contains("empty name"), "{err}");
+    }
+
+    #[test]
+    fn key_value_parameters_are_empty_when_unset() {
+        let p = parse("Host=localhost;Port=8080;User=admin");
+        assert!(p.session_properties().is_empty());
+        assert!(p.extra_credentials().is_empty());
+        assert!(p.resource_estimates().is_empty());
+    }
+
+    #[test]
+    fn extra_credentials_and_resource_estimates_use_the_same_form() {
+        let p = parse(
+            "Host=localhost;Port=8080;User=admin;\
+             ExtraCredentials={s3.token:abc123;kerberos:xyz};\
+             ResourceEstimates={EXECUTION_TIME:1h}",
+        );
+        assert_eq!(p.extra_credentials().len(), 2);
+        assert_eq!(
+            p.extra_credentials().get("s3.token").map(String::as_str),
+            Some("abc123")
+        );
+        assert_eq!(
+            p.resource_estimates()
+                .get("EXECUTION_TIME")
+                .map(String::as_str),
+            Some("1h")
+        );
+    }
+
+    /// `Debug` on this struct reaches the log, and these are credentials being
+    /// forwarded to a connector.
+    #[test]
+    fn extra_credentials_are_redacted_in_debug() {
+        let p = parse("Host=localhost;Port=8080;User=admin;ExtraCredentials={s3.token:hunter2}");
+        let rendered = format!("{p:?}");
+        assert!(
+            !rendered.contains("hunter2"),
+            "the credential leaked into Debug output: {rendered}"
+        );
+    }
+
+    #[test]
+    fn the_plain_string_keys_round_trip() {
+        let p = parse(
+            "Host=localhost;Port=8080;User=admin;\
+             Path=system.builtin;ClientInfo=dashboard-7;TraceToken=abc-123",
+        );
+        assert_eq!(p.path(), Some("system.builtin"));
+        assert_eq!(p.client_info(), Some("dashboard-7"));
+        assert_eq!(p.trace_token(), Some("abc-123"));
+    }
+
+    #[test]
+    fn compression_is_enabled_unless_disabled() {
+        assert!(!parse("Host=localhost;Port=8080;User=admin").compression_disabled());
+        assert!(
+            parse("Host=localhost;Port=8080;User=admin;DisableCompression=TRUE")
+                .compression_disabled()
+        );
+        assert!(
+            parse_err("Host=localhost;Port=8080;User=admin;DisableCompression=yes")
+                .to_string()
+                .contains("disablecompression")
+        );
+    }
+
+    /// `None` leaves the client's own budget alone, which is different from
+    /// any number this driver could pick.
+    #[test]
+    fn max_attempts_is_unset_by_default_and_must_be_positive() {
+        assert_eq!(
+            parse("Host=localhost;Port=8080;User=admin").max_attempts(),
+            None
+        );
+        assert_eq!(
+            parse("Host=localhost;Port=8080;User=admin;MaxAttempts=5").max_attempts(),
+            Some(5)
+        );
+        for bad in ["0", "-1", "many"] {
+            let err = parse_err(&format!(
+                "Host=localhost;Port=8080;User=admin;MaxAttempts={bad}"
+            ));
+            assert!(
+                err.to_string().contains("maxattempts"),
+                "MaxAttempts={bad} must be rejected by name: {err}"
+            );
+        }
     }
 
     #[test]

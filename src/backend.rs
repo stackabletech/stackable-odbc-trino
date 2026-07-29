@@ -975,6 +975,36 @@ impl Backend for TrinoBackend {
             builder = builder.schema(sch);
         }
 
+        // Set unconditionally where the client's own default is what an unset
+        // key should mean, and conditionally where it is not: calling
+        // `properties` with an empty map is the same as not calling it, but
+        // `max_attempt(0)` is not the same as leaving the client's budget
+        // alone.
+        if !p.session_properties().is_empty() {
+            builder = builder.properties(p.session_properties().clone());
+        }
+        if !p.extra_credentials().is_empty() {
+            builder = builder.extra_credentials(p.extra_credentials().clone());
+        }
+        if !p.resource_estimates().is_empty() {
+            builder = builder.resource_estimates(p.resource_estimates().clone());
+        }
+        if let Some(path) = p.path() {
+            builder = builder.path(path);
+        }
+        if let Some(info) = p.client_info() {
+            builder = builder.client_info(info);
+        }
+        if let Some(token) = p.trace_token() {
+            builder = builder.trace_token(token);
+        }
+        if p.compression_disabled() {
+            builder = builder.compression_disabled(true);
+        }
+        if let Some(attempts) = p.max_attempts() {
+            builder = builder.max_attempt(attempts);
+        }
+
         if p.secure() {
             if !p.tls_verify() {
                 tracing::warn!(
@@ -1225,10 +1255,14 @@ impl Backend for TrinoBackend {
     ///
     /// `Password` is core's own spec-defined keyword, redacted there by name.
     fn sensitive_connect_keywords() -> Cow<'static, [Cow<'static, str>]> {
-        use types::connect_params::{PARAM_ACCESS_TOKEN, PARAM_TOKEN};
+        use types::connect_params::{PARAM_ACCESS_TOKEN, PARAM_EXTRA_CREDENTIALS, PARAM_TOKEN};
         Cow::Borrowed(&[
             Cow::Borrowed(PARAM_ACCESS_TOKEN),
             Cow::Borrowed(PARAM_TOKEN),
+            // Whole values are credentials the connection forwards to a
+            // connector -- an S3 key, a Kerberos ticket. Core has no way to
+            // know a `name:value` list holds secrets, so it has to be declared.
+            Cow::Borrowed(PARAM_EXTRA_CREDENTIALS),
         ])
     }
 
@@ -2179,10 +2213,10 @@ mod tests {
     /// keyword, redacted there by name rather than by this hook.
     #[test]
     fn every_trino_specific_secret_keyword_is_declared_sensitive() {
-        use types::connect_params::{PARAM_ACCESS_TOKEN, PARAM_TOKEN};
+        use types::connect_params::{PARAM_ACCESS_TOKEN, PARAM_EXTRA_CREDENTIALS, PARAM_TOKEN};
 
         let declared = TrinoBackend::sensitive_connect_keywords();
-        for key in [PARAM_ACCESS_TOKEN, PARAM_TOKEN] {
+        for key in [PARAM_ACCESS_TOKEN, PARAM_TOKEN, PARAM_EXTRA_CREDENTIALS] {
             assert!(
                 declared.iter().any(|d| d == key),
                 "{key} carries a bearer token but is not declared sensitive; declared: {declared:?}"

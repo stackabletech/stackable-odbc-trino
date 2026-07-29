@@ -694,6 +694,33 @@ list — keep this table in sync with it. Keys are case-insensitive.
 | `Certificate` | No | Path to a PEM CA certificate for server verification |
 | `AccessToken` | No | JWT bearer token. Alias: `Token` |
 | `QueryTimeout` | No | Per-request HTTP timeout in seconds (default 30). Alias: `LoginTimeout` |
+| `SessionProperties` | No | Trino session properties, `name:value;name2:value2`. Needs `{braces}` — see below |
+| `ExtraCredentials` | No | Connector-level credentials, same form. **Secret** — declared in `sensitive_connect_keywords` |
+| `ResourceEstimates` | No | Scheduling hints, same form |
+| `Path` | No | Default SQL path for resolving unqualified function names |
+| `ClientInfo` | No | Free-form client metadata Trino records against the query |
+| `TraceToken` | No | Correlation token Trino records against the query |
+| `DisableCompression` | No | `true` or `false` (default) |
+| `MaxAttempts` | No | Request retry budget. Unset leaves `trino-rust-client`'s own |
+
+The three `name:value;name2:value2` keys take **JDBC's format verbatim**, so a
+value copied out of a JDBC URL transfers unchanged. That format uses `;`, which
+is also what separates one ODBC connection-string parameter from the next, so
+the value must be wrapped in braces:
+
+```text
+SessionProperties={query_max_run_time:10m;example.foo:bar}
+```
+
+Unbraced, core's parser ends the value at the first `;` and discards the rest
+as an unrecognised parameter — every pair but the first vanishes silently.
+`session_properties_unbraced_keep_only_the_first_pair` pins that, so the
+requirement is recorded as behaviour and not only here. Only the *first* `:`
+splits a pair, so a value may contain one (`s3://bucket/path`, `10:00`).
+
+A malformed pair fails the connection rather than being skipped: a dropped
+session property changes how the query runs, and the result computed without it
+is plausible enough that nobody would look.
 
 `QueryTimeout` is the *default* for the per-request HTTP timeout, not the last
 word: an application that sets `SQL_ATTR_CONNECTION_TIMEOUT` overrides it, and
@@ -1006,9 +1033,18 @@ undefined-behaviour risk lives and where both are run.
 - `StackableTrinoODBC-<version>.mez` — standalone Power BI asset
 
 `connector/` holds the Power Query custom connector source; `connector/build.sh`
-zips it into the `.mez`. Note that `connector/StackableTrinoODBC.pq` carries its
-own `[Version = "..."]`, which Power BI reads — it is not the Cargo version and
-does not track it.
+zips it into the `.mez`.
+
+`connector/StackableTrinoODBC.pq` carries its own `[Version = "..."]`, which
+Power BI reads to decide whether an installed `.mez` supersedes the one already
+present. **It tracks the Cargo version**: `release.toml` rewrites it in the same
+commit as the bump, exactly as it does `packaging/README.md`, and
+`connector_version_matches_the_crate` in `src/lib.rs` fails `cargo test` if the
+two ever part. Do not edit it by hand.
+
+It was maintained separately until 2026-07-29 and had drifted to `1.0.0` against
+a crate at `0.0.1`, so one release shipped a `.mez` and a `.so` naming different
+versions — and a bug report quotes whichever the reporter installed.
 
 ### Cutting a release
 
