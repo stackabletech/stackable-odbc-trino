@@ -714,11 +714,12 @@ list — keep this table in sync with it. Keys are case-insensitive.
 | `ClientInfo` | No | Free-form client metadata Trino records against the query |
 | `TraceToken` | No | Correlation token Trino records against the query |
 | `SessionUser` | No | User statements run as, while `User` still authenticates. JDBC's `sessionUser` |
+| `Roles` | No | Authorisation role per catalog, `catalog:role;catalog2:ALL`. Needs `{braces}` |
 | `Locale` | No | Locale for locale-dependent formatting, sent as `X-Trino-Language` |
 | `DisableCompression` | No | `true` or `false` (default) |
 | `MaxAttempts` | No | Request retry budget. Unset leaves `trino-rust-client`'s own |
 
-The three `name:value;name2:value2` keys take **JDBC's format verbatim**, so a
+The four `name:value;name2:value2` keys take **JDBC's format verbatim**, so a
 value copied out of a JDBC URL transfers unchanged. That format uses `;`, which
 is also what separates one ODBC connection-string parameter from the next, so
 the value must be wrapped in braces:

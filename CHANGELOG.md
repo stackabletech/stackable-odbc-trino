@@ -133,6 +133,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   into another.
 - **`Locale` connection-string key**, sent as `X-Trino-Language` for
   locale-dependent formatting.
+- **`Roles` connection-string key**, an authorisation role per catalog in the
+  same `catalog:role;catalog2:ALL` form as the other key-value keys, so it needs
+  `{braces}` for the same reason. The value is a bare role name or the keyword
+  `ALL`/`NONE`, matching JDBC's `roles` property; Trino's own `X-Trino-Role`
+  spelling wraps a name as `ROLE{admin}`, and the driver renders that, because
+  those braces would otherwise have to survive the connection-string parser.
+
+  Roles are what Hive and Iceberg under `sql-standard` security check, and so
+  are what decides whether `SQLTablePrivileges` returns a row — until now the
+  client tracked `X-Trino-Set-Role` into a map that nothing could populate.
 - `SQLGetFunctions` reports `SQLGetDescField`, `SQLSetDescField`,
   `SQLGetDescRec` and `SQLSetDescRec` as supported, which
   `stackable-odbc-core` implements against the implicit descriptors an

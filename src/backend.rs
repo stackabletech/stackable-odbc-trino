@@ -1008,6 +1008,9 @@ impl Backend for TrinoBackend {
         if let Some(locale) = p.locale() {
             builder = builder.locale(locale);
         }
+        if !p.roles().is_empty() {
+            builder = builder.roles(p.roles().clone());
+        }
         if p.compression_disabled() {
             builder = builder.compression_disabled(true);
         }

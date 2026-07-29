@@ -6,6 +6,7 @@ use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 use stackable_odbc_core::types::{ConnectParams, Redacted};
+use trino_rust_client::selected_role::{RoleType, SelectedRole};
 
 use super::super::TrinoError;
 
@@ -48,6 +49,18 @@ pub(crate) const PARAM_PATH: &str = "path";
 pub(crate) const PARAM_CLIENT_INFO: &str = "clientinfo";
 /// Correlation token Trino records against the query.
 pub(crate) const PARAM_TRACE_TOKEN: &str = "tracetoken";
+/// Authorisation role per catalog, in the same `name:value;name2:value2` form
+/// as the other key-value keys — `Roles={hive:admin;iceberg:ALL}`.
+///
+/// The value is a role name, or the keyword `ALL` or `NONE`, which is the shape
+/// JDBC's `roles` property takes. Trino's own `X-Trino-Role` spelling wraps a
+/// name in braces (`ROLE{admin}`), and that would collide with the braces the
+/// connection string already needs around a `;`-separated value, so the name is
+/// written bare here and [`selected_role`] renders the wire form.
+///
+/// Roles are what Hive and Iceberg under `sql-standard` security check, and
+/// therefore what decides whether `SQLTablePrivileges` returns a row.
+pub(crate) const PARAM_ROLES: &str = "roles";
 /// User the statements run as, while authentication stays with [`PARAM_USER`].
 ///
 /// JDBC spells it `sessionUser`. Trino sends it as `X-Trino-User`, so the
@@ -118,6 +131,21 @@ pub(crate) const DEFAULT_SOURCE: &str = concat!("stackable-odbc-trino/", env!("C
 /// A malformed pair is an error rather than a skip. A dropped session property
 /// changes how the query runs, and an operator who mistyped one would otherwise
 /// see a plausible result computed under settings they did not ask for.
+/// A connection-string role value as `X-Trino-Role` spells it.
+///
+/// `ALL` and `NONE` are Trino's two keywords and are matched case-insensitively,
+/// the way every other connection-string value is. Anything else is a role
+/// name, which the wire format wraps as `ROLE{name}` — done here rather than
+/// asked of the operator, because the braces would have to be escaped past
+/// core's connection-string parser to survive.
+fn selected_role(value: &str) -> SelectedRole {
+    match value.to_ascii_uppercase().as_str() {
+        "ALL" => SelectedRole::new(RoleType::All, None),
+        "NONE" => SelectedRole::new(RoleType::None, None),
+        _ => SelectedRole::new(RoleType::Role, Some(value.to_string())),
+    }
+}
+
 fn parse_key_value_pairs(key: &str, raw: &str) -> Result<HashMap<String, String>, TrinoError> {
     let mut map = HashMap::new();
 
@@ -197,6 +225,7 @@ pub(crate) struct TrinoConnectParams {
     trace_token: Option<String>,
     session_user: Option<String>,
     locale: Option<String>,
+    roles: HashMap<String, SelectedRole>,
     compression_disabled: bool,
     max_attempts: Option<usize>,
 }
@@ -283,6 +312,12 @@ impl TrinoConnectParams {
         self.locale.as_deref()
     }
 
+    /// Authorisation role per catalog. Empty leaves the coordinator's default,
+    /// which for `sql-standard` security is no role at all.
+    pub fn roles(&self) -> &HashMap<String, SelectedRole> {
+        &self.roles
+    }
+
     pub fn compression_disabled(&self) -> bool {
         self.compression_disabled
     }
@@ -358,6 +393,10 @@ impl TryFrom<&ConnectParams> for TrinoConnectParams {
         let session_properties = pairs(PARAM_SESSION_PROPERTIES)?;
         let extra_credentials = pairs(PARAM_EXTRA_CREDENTIALS)?;
         let resource_estimates = pairs(PARAM_RESOURCE_ESTIMATES)?;
+        let roles = pairs(PARAM_ROLES)?
+            .into_iter()
+            .map(|(catalog, role)| (catalog, selected_role(&role)))
+            .collect();
 
         let compression_disabled = match params.get(PARAM_DISABLE_COMPRESSION) {
             None => false,
@@ -438,6 +477,7 @@ impl TryFrom<&ConnectParams> for TrinoConnectParams {
             trace_token: params.get(PARAM_TRACE_TOKEN).map(str::to_string),
             session_user: params.get(PARAM_SESSION_USER).map(str::to_string),
             locale: params.get(PARAM_LOCALE).map(str::to_string),
+            roles,
             compression_disabled,
             max_attempts,
         })
@@ -641,6 +681,39 @@ mod tests {
     fn locale_round_trips() {
         let p = parse("Host=localhost;Port=8080;User=admin;Locale=de-DE");
         assert_eq!(p.locale(), Some("de-DE"));
+    }
+
+    /// A bare name is a role name, and the two keywords are keywords. The
+    /// rendered form is what goes on the wire as `X-Trino-Role`, which is why
+    /// it is asserted rather than the enum: the braces are the part an operator
+    /// must not have to write.
+    #[test]
+    fn roles_render_the_wire_form_from_bare_names_and_keywords() {
+        let p = parse("Host=localhost;Port=8080;User=admin;Roles={hive:admin;iceberg:ALL;pg:none}");
+        assert_eq!(p.roles()["hive"].to_string(), "ROLE{admin}");
+        assert_eq!(p.roles()["iceberg"].to_string(), "ALL");
+        // Matched case-insensitively, like every other connection-string value.
+        assert_eq!(p.roles()["pg"].to_string(), "NONE");
+    }
+
+    #[test]
+    fn roles_are_empty_by_default() {
+        assert!(
+            parse("Host=localhost;Port=8080;User=admin")
+                .roles()
+                .is_empty()
+        );
+    }
+
+    /// The same malformed-pair rule as the other key-value keys: a dropped role
+    /// is a silently different permission set.
+    #[test]
+    fn a_role_without_a_catalog_is_rejected() {
+        let err = parse_err("Host=localhost;Port=8080;User=admin;Roles={hive:admin;bogus}");
+        assert!(
+            err.to_string().contains("roles"),
+            "the message must name the key: {err}"
+        );
     }
 
     #[test]
