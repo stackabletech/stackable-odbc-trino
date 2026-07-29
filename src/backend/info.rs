@@ -966,6 +966,18 @@ const TRINO_ADVERTISED_FUNCTIONS: &[FunctionId] = &[
     FunctionId::BrowseConnect,
     FunctionId::BulkOperations,
     FunctionId::SetPos,
+    // The descriptor-field functions, which core implements against the
+    // implicit descriptors an application reaches through
+    // `SQLGetStmtAttr(SQL_ATTR_APP_ROW_DESC)` and its three siblings. Reporting
+    // a working function unsupported is the mirror of reporting a missing one
+    // supported: the Driver Manager answers `IM001` and the application never
+    // calls it. `SQLCopyDesc` and `SQLAllocHandle(SQL_HANDLE_DESC)` are the
+    // explicit-descriptor half, which core does not implement, so `CopyDesc`
+    // stays out of this list and out of `CORE_EXPORTED_FUNCTIONS`.
+    FunctionId::GetDescField,
+    FunctionId::SetDescField,
+    FunctionId::GetDescRec,
+    FunctionId::SetDescRec,
 ];
 
 /// The functions core exports an entry point for that this driver deliberately
@@ -1034,22 +1046,6 @@ const TRINO_WITHHELD_FUNCTIONS: &[(FunctionId, &str)] = &[
         "ODBC 2.x, superseded by the SQL_ATTR_CURSOR_* statement attributes",
     ),
     (FunctionId::Transact, "ODBC 2.x, superseded by SQLEndTran"),
-    // The descriptor-field functions need a descriptor handle to work on.
-    // Core allocates one for SQLGetStmtAttr(SQL_ATTR_APP_ROW_DESC) and friends,
-    // but nothing accepts SQL_HANDLE_DESC, so there is no handle an application
-    // could pass to these.
-    (
-        FunctionId::GetDescField,
-        "requires a descriptor handle; SQL_HANDLE_DESC is not accepted",
-    ),
-    (
-        FunctionId::SetDescField,
-        "requires a descriptor handle; SQL_HANDLE_DESC is not accepted",
-    ),
-    (
-        FunctionId::SetDescRec,
-        "requires a descriptor handle; SQL_HANDLE_DESC is not accepted",
-    ),
 ];
 
 pub(super) fn get_functions() -> &'static [FunctionId] {

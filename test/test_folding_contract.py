@@ -49,7 +49,16 @@ SAMPLE = {
     "DATE": "'2020-01-01'",
     "TIMESTAMP": "'2020-01-01 12:00:00'",
     "TIME": "'12:00:00'",
+    "BOOLEAN": "true",
 }
+
+# TYPE_NAMEs that exist only so the Windows Driver Manager's
+# SQLGetTypeInfo(SQL_CHAR=1) / SQLGetTypeInfo(SQL_VARCHAR=12) lookups find a
+# row (`DM_COMPAT_ONLY` in src/backend/info.rs). `trino_bare_type_name` never
+# returns either for a real column, so Power Query can never look a visitor
+# entry up by one, an entry for them would be dead config, and listing them
+# as a folding gap misreports a gap that cannot exist.
+DM_COMPAT_ONLY = {"SQL_CHAR", "SQL_VARCHAR"}
 
 
 def check(label, ok, detail=""):
@@ -219,7 +228,7 @@ def main():
     # locally rather than fold it. It is still worth naming, because a missing
     # entry is invisible from the connector alone -- nothing there lists the
     # types it does not handle.
-    unhandled = sorted(type_names - set(visitor))
+    unhandled = sorted(type_names - set(visitor) - DM_COMPAT_ONLY)
     if unhandled:
         note(
             "constants that do not fold",

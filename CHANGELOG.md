@@ -122,6 +122,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`CALL system.runtime.kill_query(...)`) it publishes no metadata naming them
   — `system.jdbc.procedures` is a JDBC-compatibility view that is always empty.
   This matches the `SQL_ACCESSIBLE_PROCEDURES` of `"N"` the driver reports.
+- `SQLGetFunctions` reports `SQLGetDescField`, `SQLSetDescField`,
+  `SQLGetDescRec` and `SQLSetDescRec` as supported, which
+  `stackable-odbc-core` implements against the implicit descriptors an
+  application reaches through `SQLGetStmtAttr(SQL_ATTR_APP_ROW_DESC)` and its
+  three siblings. The Windows Driver Manager builds its dispatch table from
+  this bitmap, so a working function reported unsupported is one the
+  application never calls — it answers `IM001` instead. `SQLCopyDesc` and
+  `SQLAllocHandle(SQL_HANDLE_DESC)` are the explicit-descriptor half, which
+  core does not implement, so `SQLCopyDesc` stays unadvertised.
+- The Power Query connector folds `BIGINT`, `SMALLINT`, `TINYINT` and `BOOLEAN`
+  constants, which previously had no `Constant` visitor entry and so were
+  evaluated locally. `BIGINT` is the one that matters: it is what most Trino
+  connectors report an integer column as, so a filter comparing one to a
+  literal did not fold.
+
+  The remaining types the driver reports stay unfolded on purpose, and the
+  reasons are recorded beside the visitor. `CHAR` is the instructive one:
+  `CAST('abc' AS CHAR)` is `char(1)` in Trino, so an entry would truncate the
+  literal to `'a'` and fold an equality filter into one matching no rows.
+  Trino also cannot cast a `varchar` to either interval type, so no CAST target
+  exists to name for those.
 
 ### Changed
 

@@ -188,11 +188,52 @@ shared StackableTrinoODBC.Contents = (
                     Cast = (value, typeName) => [
                         Text = Text.Format("CAST(#{0} as #{1})", { value, typeName })
                     ],
+                    // An entry is added only where the cast is unambiguous.
+                    // A wrong one is worse than an absent one: absent, Power
+                    // Query evaluates the constant locally and the answer is
+                    // still right, only unfolded. The types deliberately left
+                    // out, each measured against a live coordinator:
+                    //
+                    //   CHAR      `CAST('abc' AS CHAR)` is char(1), not
+                    //             char(3) -- it truncates to 'a', and
+                    //             `CAST('abc' AS CHAR) = CAST('abc' AS
+                    //             CHAR(3))` is false. A CHAR entry would fold
+                    //             an equality filter into one matching no
+                    //             rows. Trino has no way to spell the width
+                    //             here, and `varchar = char(n)` already
+                    //             compares true, so there is nothing to gain.
+                    //   INTERVAL DAY TO SECOND, INTERVAL YEAR TO MONTH
+                    //             Trino cannot cast varchar to either:
+                    //             "Cannot cast varchar(10) to interval day to
+                    //             second". No CAST target exists to name.
+                    //   VARBINARY The constant is an M binary value, and
+                    //             rendering it as Trino's `X'..'` literal is
+                    //             not something this can be checked to get
+                    //             right without Power BI Desktop in the loop.
+                    //   UUID, JSON, TIME/TIMESTAMP WITH TIME ZONE
+                    //             Each has a valid Trino cast, but the
+                    //             rendering turns on whether Power Query
+                    //             hands a text-valued constant to the visitor
+                    //             already quoted -- unresolved, and the same
+                    //             question the VARCHAR entry below rests on.
+                    //             Settle that first, in Power BI Desktop, and
+                    //             all five can be added together.
+                    //
+                    // Microsoft documents this whole override as deprecated
+                    // ("Providing an override for the Constant value within
+                    // AstVisitor has been deprecated and may be removed in
+                    // future implementations"), so the list below is kept to
+                    // what pays for itself rather than grown to cover every
+                    // TYPE_NAME the driver reports.
                     Visitor = [
                         DECIMAL = each Cast(_, "DECIMAL"),
                         INTEGER = each Cast(_, "INTEGER"),
+                        BIGINT = each Cast(_, "BIGINT"),
+                        SMALLINT = each Cast(_, "SMALLINT"),
+                        TINYINT = each Cast(_, "TINYINT"),
                         REAL = each Cast(_, "REAL"),
                         DOUBLE = each Cast(_, "DOUBLE PRECISION"),
+                        BOOLEAN = each Cast(_, "BOOLEAN"),
                         DATE = each Cast(Quote(Date.ToText(_, "yyyy-MM-dd")), "DATE"),
                         VARCHAR = each Cast(_, "VARCHAR"),
                         TIMESTAMP = each Cast(Quote(DateTime.ToText(_, "yyyy-MM-dd HH:mm:ss.sssssss")), "TIMESTAMP"),

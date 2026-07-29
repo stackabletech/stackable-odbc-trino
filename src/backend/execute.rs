@@ -28,15 +28,23 @@ use crate::type_conversion::{
 /// Takes ownership of the page data to avoid cloning every `Row`. The caller
 /// must extract `next_uri`, `stats`, `error`, etc. from the page before
 /// passing `page.data` here.
+///
+/// A page the coordinator spooled cannot be decoded from the page alone — its
+/// segments may live in object storage — so `into_vec` reports
+/// `Error::Protocol` for one. This driver never advertises a spooling encoding,
+/// so the coordinator has no reason to send one; the error is returned rather
+/// than swallowed because an empty batch would reach the application as an
+/// empty result set.
 fn convert_rows(
     data: Option<trino_rust_client::models::QueryResultData<Row>>,
     types: &[(String, TrinoTy)],
-) -> Vec<Vec<ColumnValue>> {
+) -> Result<Vec<Vec<ColumnValue>>, trino_rust_client::error::Error> {
     let rows = match data {
-        Some(d) => d.into_vec(),
-        None => return Vec::new(),
+        Some(d) => d.into_vec()?,
+        None => return Ok(Vec::new()),
     };
-    rows.into_iter()
+    Ok(rows
+        .into_iter()
         .map(|row| {
             row.into_json()
                 .into_iter()
@@ -44,7 +52,7 @@ fn convert_rows(
                 .map(|(val, (_, ty))| json_to_column_value(val, ty))
                 .collect()
         })
-        .collect()
+        .collect())
 }
 
 /// Remove the statement terminator an application left on the end.
@@ -216,7 +224,7 @@ pub(super) fn exec_direct(
     let convert_start = Instant::now();
     let batch = {
         let _span = tracing::info_span!("trino.convert_batch", page = page_count).entered();
-        convert_rows(page.data, &trino_types)
+        convert_rows(page.data, &trino_types).map_err(|e| map_trino_error_on(&conn.liveness, e))?
     };
     let total_convert_time = convert_start.elapsed();
     let total_rows_fetched = batch.len() as u64;
@@ -542,10 +550,17 @@ impl StatementBackend for TrinoStatement {
 
             // Phase: row conversion
             let convert_start = Instant::now();
-            self.batch = {
+            let converted = {
                 let _span =
                     tracing::info_span!("trino.convert_batch", page = self.page_count).entered();
                 convert_rows(page.data, &self.trino_types)
+            };
+            self.batch = match converted {
+                Ok(batch) => batch,
+                Err(e) => {
+                    let mapped = self.map_client_error(e);
+                    return Err(self.end_page_fetch(mapped));
+                }
             };
 
             if self.batch.is_empty() {
