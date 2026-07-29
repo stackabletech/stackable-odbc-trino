@@ -30,7 +30,9 @@ tokio = { version = "1.51", features = ["rt", "macros", "time"] }
 tracing = "0.1"
 # TODO: switch back to a crates.io version dep once the fork's changes are
 # released upstream.
-trino-rust-client = { git = "https://github.com/stackabletech/trino-rust-client.git", branch = "stackable-main" }
+trino-rust-client = { git = "https://github.com/stackabletech/trino-rust-client.git", branch = "stackable-main", features = [
+  "spooling",
+] }
 
 [dev-dependencies]
 criterion = { version = "0.8", features = ["html_reports"] }

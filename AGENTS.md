@@ -212,11 +212,24 @@ other side.
 
 ### Why the catalog cannot be set
 
-`TrinoBackend::current_catalog` reports the `Catalog` connection-string value,
-and core feeds it to both readers the spec makes synonyms —
-`SQLGetConnectAttr(SQL_ATTR_CURRENT_CATALOG)` and
+`TrinoBackend::current_catalog` reports the catalog the **session** is on, read
+from `Client::session_snapshot`, and core feeds it to both readers the spec
+makes synonyms — `SQLGetConnectAttr(SQL_ATTR_CURRENT_CATALOG)` and
 `SQLGetInfo(SQL_DATABASE_NAME)`. That is the one place the value lives; neither
-has an arm in `info.rs`, and adding one would let the two disagree.
+has an arm in `info.rs`, and adding one would let the two disagree. The
+`Catalog` connection-string value is the fallback, for the window before any
+response has been seen.
+
+The session is the source because `USE postgresql.public` moves the
+coordinator's catalog and reports it back in `X-Trino-Set-Catalog`, which the
+client tracks. Measured against the live stack: `SQL_DATABASE_NAME` is `tpcds`
+before, `postgresql` after, and an unqualified `SELECT count(*) FROM customers`
+then resolves in `postgresql.public`. Reporting the connection-string value
+there would name a catalog the session had left, while the application's own
+unqualified names resolved somewhere else.
+`backend_current_catalog_follows_a_use_statement` pins it; the snapshot takes a
+read lock and performs no I/O, so a pool reading the attribute on every
+checkout pays nothing for it.
 
 `Backend::set_current_catalog` is deliberately **not** implemented, so
 `SQLSetConnectAttr(SQL_ATTR_CURRENT_CATALOG)` reports core's defaulted `HYC00`.

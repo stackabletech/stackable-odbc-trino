@@ -26,7 +26,7 @@ use stackable_odbc_core::{
         TableRow, TypeInfoRow, format_odbc_version, parse_dotted_version,
     },
 };
-use trino_rust_client::{Client, ClientBuilder, Trino, auth::Auth, ssl::Ssl};
+use trino_rust_client::{Client, ClientBuilder, TlsVerification, Trino, auth::Auth, ssl::Ssl};
 
 mod describe_param;
 mod execute;
@@ -1013,15 +1013,13 @@ impl Backend for TrinoBackend {
                      vulnerable to man-in-the-middle attacks. Use Certificate=<pem> \
                      to verify against a private CA instead."
                 );
-                builder = builder.no_verify(true);
+                builder = builder.tls_verification(TlsVerification::None);
             } else if let Some(cert_path) = p.certificate() {
                 let root_cert =
                     Ssl::read_pem(&cert_path.to_owned()).map_err(|e| TrinoError::General {
                         message: format!("failed to read certificate at {cert_path}: {e}"),
                     })?;
-                builder = builder.ssl(Ssl {
-                    root_cert: Some(root_cert),
-                });
+                builder = builder.ssl(Ssl::new().root_cert(root_cert));
             }
         }
 
@@ -1540,20 +1538,37 @@ impl Backend for TrinoBackend {
         Cow::Owned(conn.dbms_version.clone())
     }
 
-    /// The catalog this connection was opened against, from the `Catalog`
-    /// connection-string key.
+    /// The catalog the session is on **now**, which is not necessarily the one
+    /// the `Catalog` connection-string key named.
     ///
     /// This is the one place the value lives. Core feeds it to both readers the
     /// spec makes synonyms — `SQLGetConnectAttr(SQL_ATTR_CURRENT_CATALOG)` and
     /// `SQLGetInfo(SQL_DATABASE_NAME)` — so there is no arm for either in
-    /// `info.rs`. `None` when the connection string named no catalog, which
-    /// both readers render as the empty string, the spec's "not available".
+    /// `info.rs`. `None` when neither the session nor the connection string
+    /// names one, which both readers render as the empty string, the spec's
+    /// "not available".
+    ///
+    /// Read from the client's session rather than from `ConnectParams`, because
+    /// `USE postgresql.public` moves the coordinator's session catalog and says
+    /// so in `X-Trino-Set-Catalog`, which the client tracks. Reporting the
+    /// connection-string value after that names a catalog the session left, and
+    /// unqualified names in the application's own SQL resolve against the one
+    /// reported here.
+    ///
+    /// The snapshot takes a read lock and performs no I/O, so this stays cheap
+    /// enough for a connection pool that reads the attribute on every checkout.
+    /// `ConnectParams` remains the fallback for the window before the first
+    /// response has been seen.
     ///
     /// [`Backend::set_current_catalog`] is deliberately *not* implemented; see
-    /// below for why, and note the consequence the trait doc warns about: an
-    /// application can read this catalog and cannot change it.
+    /// below for why. An application can therefore read this catalog and cannot
+    /// change it through ODBC — only by executing `USE`.
     fn current_catalog(conn: &TrinoConnection) -> Option<Cow<'static, str>> {
-        conn.catalog.clone().map(Cow::Owned)
+        conn.runtime
+            .block_on(conn.client.session_snapshot())
+            .catalog
+            .or_else(|| conn.catalog.clone())
+            .map(Cow::Owned)
     }
 
     // `set_current_catalog` keeps core's default, which reports `HYC00`, so
@@ -2172,6 +2187,96 @@ mod tests {
             validation_query(Some(r#"we"ird"#)),
             r#"SHOW SCHEMAS FROM "we""ird" LIKE ''"#
         );
+    }
+
+    /// The session's catalog outranks the connection string's, which is what
+    /// makes `SQL_ATTR_CURRENT_CATALOG` follow a `USE`. Asserted offline: the
+    /// snapshot is client-side state, so a client built with a catalog reports
+    /// it with no coordinator in the loop, exactly as one that learnt it from
+    /// `X-Trino-Set-Catalog` would.
+    #[test]
+    fn current_catalog_prefers_the_session_over_the_connection_string() {
+        let client = ClientBuilder::new("test", "localhost")
+            .port(8080)
+            .catalog("moved_to")
+            .build()
+            .expect("ClientBuilder::build performs no I/O and cannot fail here");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("Runtime::build performs no I/O and cannot fail here");
+        let conn = TrinoConnection {
+            runtime: Arc::new(runtime),
+            client: Arc::new(client),
+            dbms_version: String::new(),
+            server_major: 0,
+            catalog: Some("connected_with".to_string()),
+            describe_param_cache: Mutex::new(None),
+            liveness: Liveness::default(),
+        };
+
+        assert_eq!(
+            TrinoBackend::current_catalog(&conn).as_deref(),
+            Some("moved_to")
+        );
+    }
+
+    /// `USE` moves the session catalog, and the reported one moves with it.
+    ///
+    /// Takes its own connection rather than [`shared_trino_conn`]: `USE`
+    /// changes session state for every later statement on that connection, so
+    /// running it on the shared one would leak a different catalog into
+    /// whichever test ran next.
+    ///
+    /// Measured against the live stack, this is the whole point of reading the
+    /// session: before the switch `SQL_DATABASE_NAME` is `tpcds`, after it
+    /// `postgresql`, and `SELECT count(*) FROM customers` — unqualified —
+    /// resolves in `postgresql.public`. Reporting `tpcds` there would name a
+    /// catalog the session had left, while the application's own unqualified
+    /// names resolved somewhere else.
+    #[test]
+    #[serial(backend)]
+    #[ignore = "requires Trino -- run in isolation: cargo test -- --ignored backend"]
+    fn backend_current_catalog_follows_a_use_statement() {
+        let params = ConnectParams::parse(
+            "Host=localhost;Port=8080;Protocol=http;User=admin;Password=admin;Catalog=tpcds",
+        )
+        .expect("parse params");
+        let conn = TrinoBackend::connect(&params).expect("connect");
+
+        assert_eq!(
+            TrinoBackend::current_catalog(&conn).as_deref(),
+            Some("tpcds"),
+            "the connection string's catalog is reported before any USE"
+        );
+
+        let cancel = TrinoBackend::cancel_token(&conn);
+        TrinoBackend::exec_direct(&conn, &cancel, "USE postgresql.public").expect("USE");
+
+        assert_eq!(
+            TrinoBackend::current_catalog(&conn).as_deref(),
+            Some("postgresql"),
+            "USE moved the session catalog, so the reported one has to move too"
+        );
+    }
+
+    /// The `Catalog` connection-string value is still reported while the
+    /// session names none, which is the window before the first response has
+    /// been seen.
+    #[test]
+    fn current_catalog_falls_back_to_the_connection_string() {
+        let conn = disconnected_trino_conn_with_catalog(Some("from_the_dsn"));
+        assert_eq!(
+            TrinoBackend::current_catalog(&conn).as_deref(),
+            Some("from_the_dsn")
+        );
+    }
+
+    /// Neither source names one, which both readers render as the empty string.
+    #[test]
+    fn current_catalog_is_none_when_nothing_names_one() {
+        let conn = disconnected_trino_conn();
+        assert_eq!(TrinoBackend::current_catalog(&conn), None);
     }
 
     #[test]

@@ -407,6 +407,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`SQL_ATTR_CURRENT_CATALOG` and `SQL_DATABASE_NAME` did not follow a
+  `USE`.** Both reported the `Catalog` connection-string value for the life of
+  the connection, so after `USE postgresql.public` a connection opened against
+  `tpcds` still answered `tpcds` — naming a catalog the session had left, while
+  the application's own unqualified table names resolved in the new one. They
+  are now read from the client's session, which tracks the
+  `X-Trino-Set-Catalog` the coordinator sends back, and the connection-string
+  value is the fallback for the window before any response has been seen. The
+  attribute is still not settable: `SQLSetConnectAttr` reports `HYC00`, because
+  Trino's `USE` grammar cannot move a catalog without also inventing a schema.
 - **`SQL_ATTR_CURRENT_CATALOG` was write-only, and disagreed with
   `SQL_DATABASE_NAME`.** The spec makes them one value under two names, but the
   attribute was a handle-local string nothing seeded from the connection: a
