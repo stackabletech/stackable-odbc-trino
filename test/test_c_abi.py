@@ -59,20 +59,60 @@ SQL_UNBIND = 2
 SQL_RESET_PARAMS = 3
 
 # Statement attributes
-SQL_ATTR_CURSOR_TYPE = 6
 SQL_ATTR_QUERY_TIMEOUT = 0
 SQL_ATTR_MAX_ROWS = 1
+SQL_ATTR_NOSCAN = 2
+SQL_ATTR_MAX_LENGTH = 3
+SQL_ATTR_ASYNC_ENABLE = 4
+SQL_ATTR_CURSOR_TYPE = 6
+SQL_ATTR_CONCURRENCY = 7
+SQL_ATTR_KEYSET_SIZE = 8
+SQL_ATTR_SIMULATE_CURSOR = 10
+SQL_ATTR_RETRIEVE_DATA = 11
+SQL_ATTR_USE_BOOKMARKS = 12
+SQL_ATTR_ENABLE_AUTO_IPD = 15
+SQL_ATTR_PARAM_STATUS_PTR = 20
+SQL_ATTR_PARAMS_PROCESSED_PTR = 21
+SQL_ATTR_PARAMSET_SIZE = 22
 SQL_ATTR_ROW_ARRAY_SIZE = 27
+SQL_ATTR_CURSOR_SCROLLABLE = -1
+SQL_ATTR_CURSOR_SENSITIVITY = -2
+SQL_ATTR_METADATA_ID = 10014
 SQL_CURSOR_FORWARD_ONLY = 0
 SQL_CURSOR_STATIC = 3
+
+# Values the driver substitutes to, and the values it refuses.
+SQL_CONCUR_READ_ONLY = 1
+SQL_SC_NON_UNIQUE = 0
+SQL_NONSCROLLABLE = 0
+SQL_UB_VARIABLE = 2
+SQL_RD_OFF = 0
+SQL_SENSITIVE = 2
+SQL_ASYNC_ENABLE_OFF = 0
+SQL_ASYNC_ENABLE_ON = 1
+
+# SQL_ATTR_PARAM_STATUS_PTR element values.
+SQL_PARAM_SUCCESS = 0
+SQL_PARAM_ERROR = 5
 
 # Connection attributes
 SQL_ATTR_AUTOCOMMIT = 102
 SQL_ATTR_TXN_ISOLATION = 108
+SQL_ATTR_CURRENT_CATALOG = 109
+SQL_ATTR_PACKET_SIZE = 112
+SQL_ATTR_ENLIST_IN_DTC = 1207
 SQL_AUTOCOMMIT_ON = 1
 SQL_TXN_SERIALIZABLE = 8
 
+# Info types read back beside the attributes that mirror them.
+SQL_DATABASE_NAME = 16
+
+SQL_TRUE = 1
+SQL_FALSE = 0
+
 SQL_C_CHAR = 1
+SQL_C_SBIGINT = -25
+SQL_BIGINT = -5
 
 # SQLBindParameter arguments used by the bound-parameter probes.
 SQL_PARAM_INPUT = 1
@@ -123,6 +163,7 @@ def load(path):
             [S, P, S, W, ctypes.POINTER(I), W, S, ctypes.POINTER(S)],
             S,
         ),
+        "SQLGetInfoW": ([P, ctypes.c_uint16, P, S, ctypes.POINTER(S)], S),
         "SQLCancel": ([P], S),
         "SQLNumParams": ([P, ctypes.POINTER(S)], S),
         "SQLBindParameter": (
@@ -163,6 +204,22 @@ def sqlstate(lib, htype, handle):
     if ret not in (SQL_SUCCESS, SQL_SUCCESS_WITH_INFO):
         return ""
     return "".join(chr(c) for c in state if c).strip()
+
+
+def read_wide_info(lib, dbc, info_type):
+    """A character-shaped SQLGetInfoW answer, as a str."""
+    buf = (ctypes.c_uint16 * 256)()
+    length = ctypes.c_int16(0)
+    ret = lib.SQLGetInfoW(
+        dbc,
+        info_type,
+        ctypes.cast(buf, ctypes.c_void_p),
+        512,
+        ctypes.byref(length),
+    )
+    if ret not in (SQL_SUCCESS, SQL_SUCCESS_WITH_INFO):
+        return None
+    return "".join(chr(c) for c in buf[: max(length.value, 0) // 2])
 
 
 RET_NAMES = {
@@ -478,38 +535,141 @@ def main():
     )
 
     # ---------------------------------------------------------------
-    print("\n--- attribute round-trips ---")
-    # Both of these are unsupported values the driver substitutes rather than
-    # refuses. That is the spec's own prescription -- accept, substitute, report
-    # 01S02, and let SQLGetStmtAttr tell the application what it actually got --
-    # so the substituted value is asserted, not merely observed. A driver that
-    # silently kept the requested value would be claiming a timeout it does not
-    # enforce and a block cursor it does not implement.
+    print("\n--- statement attributes: substituted values (01S02) ---")
+    # The spec's 01S02 row closes the set of statement attributes a driver may
+    # substitute for, and for each the driver must store the value it will
+    # actually use -- that is what makes the row's parenthesis true,
+    # "(SQLGetStmtAttr can be called to determine the temporarily substituted
+    # value.)". The read-back is asserted, not merely observed: a driver that
+    # kept the requested value would be claiming a timeout it does not enforce
+    # and a block cursor it does not implement, and an application reading its
+    # own number back has no way to tell.
     #
-    # SQLULEN is 64-bit here, so the read-back buffer is too.
+    # SQLULEN is 64-bit here, so the read-back buffer is too. It is zeroed
+    # before each read; see the KNOWN note on the write width below.
+    #
+    # A *fresh* statement, not the shared one: SQL_ATTR_CONCURRENCY,
+    # SQL_ATTR_CURSOR_TYPE, SQL_ATTR_SIMULATE_CURSOR and SQL_ATTR_USE_BOOKMARKS
+    # "must be set before the statement is executed", and the shared handle has
+    # been prepared and executed by now. Setting one of those on it answers
+    # HY011 -- correctly, which is what the group below this one asserts.
     val = ctypes.c_uint64(0)
     outlen32 = ctypes.c_int32(0)
+    attr_stmt = ctypes.c_void_p()
+    r = lib.SQLAllocHandle(SQL_HANDLE_STMT, dbc, ctypes.byref(attr_stmt))
+    check("allocate a fresh statement for the attribute probes", r, SQL_SUCCESS)
     for label, attr, asked, substituted in (
+        ("SQL_ATTR_CONCURRENCY", SQL_ATTR_CONCURRENCY, 2, SQL_CONCUR_READ_ONLY),
+        ("SQL_ATTR_CURSOR_TYPE", SQL_ATTR_CURSOR_TYPE, SQL_CURSOR_STATIC, SQL_CURSOR_FORWARD_ONLY),
+        ("SQL_ATTR_KEYSET_SIZE", SQL_ATTR_KEYSET_SIZE, 50, 0),
+        ("SQL_ATTR_MAX_LENGTH", SQL_ATTR_MAX_LENGTH, 4096, 0),
+        ("SQL_ATTR_MAX_ROWS", SQL_ATTR_MAX_ROWS, 100, 0),
         ("SQL_ATTR_QUERY_TIMEOUT", SQL_ATTR_QUERY_TIMEOUT, 42, 0),
         ("SQL_ATTR_ROW_ARRAY_SIZE", SQL_ATTR_ROW_ARRAY_SIZE, 10, 1),
+        ("SQL_ATTR_SIMULATE_CURSOR", SQL_ATTR_SIMULATE_CURSOR, 2, SQL_SC_NON_UNIQUE),
+        # Two deviations from the spec's closed list, deliberate and documented
+        # in core: substituting keeps SQL_ATTR_CURSOR_SCROLLABLE consistent with
+        # SQL_ATTR_CURSOR_TYPE, and refusing SQL_ATTR_PARAMSET_SIZE would fail a
+        # call every parameter-array-capable tool makes while accepting it
+        # verbatim would silently drop every set past the first.
+        ("SQL_ATTR_CURSOR_SCROLLABLE", SQL_ATTR_CURSOR_SCROLLABLE, 1, SQL_NONSCROLLABLE),
+        ("SQL_ATTR_PARAMSET_SIZE", SQL_ATTR_PARAMSET_SIZE, 500, 1),
     ):
-        r = lib.SQLSetStmtAttrW(stmt, attr, P(asked), 0)
+        r = lib.SQLSetStmtAttrW(attr_stmt, attr, P(asked), 0)
         check(
             f"set {label}={asked} (unsupported)",
             r,
             SQL_SUCCESS_WITH_INFO,
             state="01S02",
-            got_state=sqlstate(lib, SQL_HANDLE_STMT, stmt),
+            got_state=sqlstate(lib, SQL_HANDLE_STMT, attr_stmt),
         )
         val.value = 0
-        r = lib.SQLGetStmtAttrW(stmt, attr, ctypes.byref(val), 8, ctypes.byref(outlen32))
+        r = lib.SQLGetStmtAttrW(attr_stmt, attr, ctypes.byref(val), 8, ctypes.byref(outlen32))
         check(f"get {label}", r, SQL_SUCCESS)
-        if r == SQL_SUCCESS and val.value != substituted:
-            note(
-                f"{label} substitution",
-                f"asked {asked}, expected the driver to substitute "
-                f"{substituted}, read back {val.value}",
+        if r == SQL_SUCCESS:
+            check(
+                f"{label} reads back the substituted value",
+                SQL_SUCCESS if val.value == substituted else SQL_ERROR,
+                SQL_SUCCESS,
+                got_state=f"read {val.value}, expected {substituted}",
             )
+
+    print("\n--- statement attributes: refused values (HYC00) ---")
+    # SQL_ATTR_USE_BOOKMARKS is in this group but is also one of the four that
+    # may not be set after execution, so it stays on the fresh handle where
+    # HYC00 is the rule that applies rather than HY011.
+    # An attribute off the 01S02 list has no substitution to offer, so the value
+    # is refused outright. The distinction matters: 01S02 says "I did something
+    # else", HYC00 says "I did nothing", and reading a substituted value back is
+    # only meaningful for the first.
+    for label, attr, value in (
+        ("SQL_ATTR_USE_BOOKMARKS=SQL_UB_VARIABLE", SQL_ATTR_USE_BOOKMARKS, SQL_UB_VARIABLE),
+        ("SQL_ATTR_RETRIEVE_DATA=SQL_RD_OFF", SQL_ATTR_RETRIEVE_DATA, SQL_RD_OFF),
+        ("SQL_ATTR_CURSOR_SENSITIVITY=SQL_SENSITIVE", SQL_ATTR_CURSOR_SENSITIVITY, SQL_SENSITIVE),
+        ("SQL_ATTR_ENABLE_AUTO_IPD=SQL_TRUE", SQL_ATTR_ENABLE_AUTO_IPD, SQL_TRUE),
+        ("SQL_ATTR_ASYNC_ENABLE=SQL_ASYNC_ENABLE_ON", SQL_ATTR_ASYNC_ENABLE, SQL_ASYNC_ENABLE_ON),
+    ):
+        r = lib.SQLSetStmtAttrW(attr_stmt, attr, P(value), 0)
+        check(
+            f"set {label}",
+            r,
+            SQL_ERROR,
+            state="HYC00",
+            got_state=sqlstate(lib, SQL_HANDLE_STMT, attr_stmt),
+        )
+
+    # The SQLULEN write width. Every non-pointer statement attribute on the
+    # SQLSetStmtAttr page is declared "An SQLULEN value" -- not one is
+    # SQLUINTEGER -- and SQLULEN is 64-bit here. BufferLength is ignored for a
+    # non-string value, so an application declaring `SQLULEN v;` and reading a
+    # short write would keep whatever was on its stack in the top half, and
+    # read an enormous row limit rather than the 0 the driver reported. The
+    # buffer is poisoned rather than zeroed for exactly that reason: a zeroed
+    # one cannot tell a correct write from a short one.
+    for label, attr, expected in (
+        ("SQL_ATTR_MAX_ROWS", SQL_ATTR_MAX_ROWS, 0),
+        ("SQL_ATTR_QUERY_TIMEOUT", SQL_ATTR_QUERY_TIMEOUT, 0),
+        ("SQL_ATTR_ROW_ARRAY_SIZE", SQL_ATTR_ROW_ARRAY_SIZE, 1),
+        ("SQL_ATTR_CONCURRENCY", SQL_ATTR_CONCURRENCY, SQL_CONCUR_READ_ONLY),
+        ("SQL_ATTR_NOSCAN", SQL_ATTR_NOSCAN, 0),
+        ("SQL_ATTR_METADATA_ID", SQL_ATTR_METADATA_ID, SQL_FALSE),
+    ):
+        val.value = 0xFFFFFFFFFFFFFFFF
+        outlen32.value = 0
+        r = lib.SQLGetStmtAttrW(
+            attr_stmt, attr, ctypes.byref(val), 8, ctypes.byref(outlen32)
+        )
+        check(f"get {label} into a poisoned SQLULEN", r, SQL_SUCCESS)
+        check(
+            f"{label} is written at the full SQLULEN width",
+            SQL_SUCCESS if (val.value == expected and outlen32.value == 8) else SQL_ERROR,
+            SQL_SUCCESS,
+            got_state=f"read 0x{val.value:016x} with StringLength {outlen32.value}",
+        )
+
+    lib.SQLFreeHandle(SQL_HANDLE_STMT, attr_stmt)
+
+    print("\n--- statement attributes: too late to set (HY011) ---")
+    # The four the spec's Comments say "must be set before the statement is
+    # executed". The shared `stmt` has been prepared and executed by this
+    # point, so each is refused -- and refused *before* the substitution and
+    # HYC00 rules above are consulted, which is why they had to run on a fresh
+    # handle. An application that sets one of these mid-cursor is asking for a
+    # different cursor over a result set that already exists.
+    for label, attr, value in (
+        ("SQL_ATTR_CONCURRENCY", SQL_ATTR_CONCURRENCY, 2),
+        ("SQL_ATTR_CURSOR_TYPE", SQL_ATTR_CURSOR_TYPE, SQL_CURSOR_STATIC),
+        ("SQL_ATTR_SIMULATE_CURSOR", SQL_ATTR_SIMULATE_CURSOR, 2),
+        ("SQL_ATTR_USE_BOOKMARKS", SQL_ATTR_USE_BOOKMARKS, SQL_UB_VARIABLE),
+    ):
+        r = lib.SQLSetStmtAttrW(stmt, attr, P(value), 0)
+        check(
+            f"set {label} after the statement was executed",
+            r,
+            SQL_ERROR,
+            state="HY011",
+            got_state=sqlstate(lib, SQL_HANDLE_STMT, stmt),
+        )
 
     # Accepted silently, by decision rather than by omission: core relaxes the
     # spec's HY092 here for Driver Manager and tool compatibility, and says so
@@ -521,6 +681,206 @@ def main():
         dbc, SQL_ATTR_AUTOCOMMIT, ctypes.byref(val), 4, ctypes.byref(outlen32)
     )
     check("get SQL_ATTR_AUTOCOMMIT", r, SQL_SUCCESS)
+
+    print("\n--- connection attributes the driver owns ---")
+    # SQL_ATTR_PACKET_SIZE: the spec states this one directly -- "if the
+    # application sets packet size after a connection has already been made,
+    # the driver will return SQLSTATE HY011 (Attribute cannot be set now)".
+    r = lib.SQLSetConnectAttrW(dbc, SQL_ATTR_PACKET_SIZE, P(8192), 0)
+    check(
+        "set SQL_ATTR_PACKET_SIZE after connecting",
+        r,
+        SQL_ERROR,
+        state="HY011",
+        got_state=sqlstate(lib, SQL_HANDLE_DBC, dbc),
+    )
+    # Neither is implemented and neither has a substitution to offer: this
+    # driver reports SQL_AM_NONE for SQL_ASYNC_MODE and enlists in no
+    # distributed transaction, so accepting either would leave an application
+    # believing in behaviour it does not get.
+    r = lib.SQLSetConnectAttrW(dbc, SQL_ATTR_ENLIST_IN_DTC, P(1), 0)
+    check(
+        "set SQL_ATTR_ENLIST_IN_DTC",
+        r,
+        SQL_ERROR,
+        state="HYC00",
+        got_state=sqlstate(lib, SQL_HANDLE_DBC, dbc),
+    )
+    r = lib.SQLSetConnectAttrW(dbc, SQL_ATTR_ASYNC_ENABLE, P(SQL_ASYNC_ENABLE_ON), 0)
+    check(
+        "set SQL_ATTR_ASYNC_ENABLE=SQL_ASYNC_ENABLE_ON",
+        r,
+        SQL_ERROR,
+        state="HYC00",
+        got_state=sqlstate(lib, SQL_HANDLE_DBC, dbc),
+    )
+    r = lib.SQLSetConnectAttrW(dbc, SQL_ATTR_ASYNC_ENABLE, P(SQL_ASYNC_ENABLE_OFF), 0)
+    check("set SQL_ATTR_ASYNC_ENABLE=SQL_ASYNC_ENABLE_OFF", r, SQL_SUCCESS)
+
+    print("\n--- SQL_ATTR_METADATA_ID inherits from the connection ---")
+    # SQLSetStmtAttr's Comments make this one of exactly two attributes an
+    # application may set at the connection level. It is not a cosmetic
+    # read-back: it decides whether the catalog functions treat their arguments
+    # as identifiers or as search patterns, and the connection-level route
+    # previously reached no statement at all -- SQL_SUCCESS, the value echoed
+    # back by SQLGetConnectAttr, and then pattern semantics with no diagnostic.
+    # Per the ODBC 2.x rule it inherits, this is the default for statements
+    # allocated afterwards only, so the pre-existing one is checked too.
+    r = lib.SQLSetConnectAttrW(dbc, SQL_ATTR_METADATA_ID, P(SQL_TRUE), 0)
+    check("set SQL_ATTR_METADATA_ID on the connection", r, SQL_SUCCESS)
+    inherit_stmt = ctypes.c_void_p()
+    r = lib.SQLAllocHandle(SQL_HANDLE_STMT, dbc, ctypes.byref(inherit_stmt))
+    check("allocate a statement after setting it", r, SQL_SUCCESS)
+    val.value = 0
+    r = lib.SQLGetStmtAttrW(
+        inherit_stmt, SQL_ATTR_METADATA_ID, ctypes.byref(val), 8, ctypes.byref(outlen32)
+    )
+    check("get SQL_ATTR_METADATA_ID on the new statement", r, SQL_SUCCESS)
+    check(
+        "the new statement inherited SQL_TRUE",
+        SQL_SUCCESS if val.value == SQL_TRUE else SQL_ERROR,
+        SQL_SUCCESS,
+        got_state=f"read {val.value}",
+    )
+    val.value = 0
+    lib.SQLGetStmtAttrW(
+        stmt, SQL_ATTR_METADATA_ID, ctypes.byref(val), 8, ctypes.byref(outlen32)
+    )
+    check(
+        "a statement that already existed is untouched",
+        SQL_SUCCESS if val.value == SQL_FALSE else SQL_ERROR,
+        SQL_SUCCESS,
+        got_state=f"read {val.value}",
+    )
+    lib.SQLFreeHandle(SQL_HANDLE_STMT, inherit_stmt)
+    lib.SQLSetConnectAttrW(dbc, SQL_ATTR_METADATA_ID, P(SQL_FALSE), 0)
+
+    print("\n--- an execution reports its parameter set ---")
+    # The parameter-side counterpart of what SQLFetch writes through
+    # SQL_ATTR_ROWS_FETCHED_PTR. An application binding a status array to detect
+    # per-set errors previously read back its own initial buffer contents, which
+    # is indistinguishable from every set having succeeded.
+    param_stmt = ctypes.c_void_p()
+    lib.SQLAllocHandle(SQL_HANDLE_STMT, dbc, ctypes.byref(param_stmt))
+    processed = ctypes.c_uint64(0xFFFFFFFFFFFFFFFF)
+    status = (ctypes.c_uint16 * 4)(*([0xBEEF] * 4))
+    r = lib.SQLSetStmtAttrW(
+        param_stmt, SQL_ATTR_PARAMS_PROCESSED_PTR, ctypes.cast(ctypes.byref(processed), P), 0
+    )
+    check("set SQL_ATTR_PARAMS_PROCESSED_PTR", r, SQL_SUCCESS)
+    r = lib.SQLSetStmtAttrW(
+        param_stmt, SQL_ATTR_PARAM_STATUS_PTR, ctypes.cast(status, P), 0
+    )
+    check("set SQL_ATTR_PARAM_STATUS_PTR", r, SQL_SUCCESS)
+
+    pval = ctypes.c_int64(42)
+    plen = ctypes.c_int64(8)
+    r = lib.SQLBindParameter(
+        param_stmt,
+        1,
+        SQL_PARAM_INPUT,
+        SQL_C_SBIGINT,
+        SQL_BIGINT,
+        19,
+        0,
+        ctypes.cast(ctypes.byref(pval), P),
+        8,
+        ctypes.byref(plen),
+    )
+    check("bind the parameter", r, SQL_SUCCESS)
+    sql, _kp = w("SELECT CAST(? AS bigint)")
+    r = lib.SQLExecDirectW(param_stmt, sql, SQL_NTS)
+    check("execute with one parameter set", r, SQL_SUCCESS)
+    check(
+        "the processed count is 1",
+        SQL_SUCCESS if processed.value == 1 else SQL_ERROR,
+        SQL_SUCCESS,
+        got_state=f"read {processed.value}",
+    )
+    check(
+        "the status element is SQL_PARAM_SUCCESS",
+        SQL_SUCCESS if status[0] == SQL_PARAM_SUCCESS else SQL_ERROR,
+        SQL_SUCCESS,
+        got_state=f"read {status[0]}",
+    )
+    check(
+        "the sets past the first are untouched",
+        SQL_SUCCESS if status[1] == 0xBEEF else SQL_ERROR,
+        SQL_SUCCESS,
+        got_state=f"read {status[1]:#x}",
+    )
+    lib.SQLCloseCursor(param_stmt)
+
+    # The failing half. The rejection comes from the coordinator rather than
+    # from parameter handling, which is the case an application binds a status
+    # array for.
+    processed.value = 0xFFFFFFFFFFFFFFFF
+    status[0] = 0xBEEF
+    sql, _kq = w("SELECT ? FROM does_not_exist_zzz")
+    r = lib.SQLExecDirectW(param_stmt, sql, SQL_NTS)
+    check("execute a statement the coordinator rejects", r, SQL_ERROR)
+    check(
+        "the processed count includes the error set",
+        SQL_SUCCESS if processed.value == 1 else SQL_ERROR,
+        SQL_SUCCESS,
+        got_state=f"read {processed.value}",
+    )
+    check(
+        "the status element is SQL_PARAM_ERROR",
+        SQL_SUCCESS if status[0] == SQL_PARAM_ERROR else SQL_ERROR,
+        SQL_SUCCESS,
+        got_state=f"read {status[0]}",
+    )
+    lib.SQLFreeHandle(SQL_HANDLE_STMT, param_stmt)
+
+    print("\n--- SQL_DATABASE_NAME and SQL_ATTR_CURRENT_CATALOG ---")
+    # The spec makes these one value under two names: "in ODBC 3.x, the value
+    # returned for this InfoType can also be returned by calling
+    # SQLGetConnectAttr with an Attribute argument of SQL_ATTR_CURRENT_CATALOG".
+    dbname = read_wide_info(lib, dbc, SQL_DATABASE_NAME)
+    check(
+        "SQLGetInfo(SQL_DATABASE_NAME) is the connected catalog",
+        SQL_SUCCESS if dbname == "tpcds" else SQL_ERROR,
+        SQL_SUCCESS,
+        got_state=f"read {dbname!r}",
+    )
+    catbuf = (ctypes.c_uint16 * 256)()
+    outlen32.value = 0
+    r = lib.SQLGetConnectAttrW(
+        dbc, SQL_ATTR_CURRENT_CATALOG, ctypes.cast(catbuf, P), 512, ctypes.byref(outlen32)
+    )
+    check("get SQL_ATTR_CURRENT_CATALOG", r, SQL_SUCCESS)
+    current = "".join(chr(c) for c in catbuf[: max(outlen32.value, 0) // 2])
+    check(
+        "SQL_ATTR_CURRENT_CATALOG agrees with SQL_DATABASE_NAME",
+        SQL_SUCCESS if current == dbname else SQL_ERROR,
+        SQL_SUCCESS,
+        got_state=f"attribute {current!r}, info type {dbname!r}",
+    )
+
+    # Setting it is refused rather than silently accepted. Trino's only
+    # catalog-switching statement is `USE`, whose grammar requires a schema, so
+    # honouring this would mean inventing one and moving where the session's
+    # unqualified names resolve. Storing the value and returning SQL_SUCCESS --
+    # what the driver did before -- told an application its names had moved
+    # when nothing had.
+    newcat, _kc = w("postgresql")
+    r = lib.SQLSetConnectAttrW(
+        dbc, SQL_ATTR_CURRENT_CATALOG, ctypes.cast(newcat, P), SQL_NTS
+    )
+    check(
+        "set SQL_ATTR_CURRENT_CATALOG",
+        r,
+        SQL_ERROR,
+        state="HYC00",
+        got_state=sqlstate(lib, SQL_HANDLE_DBC, dbc),
+    )
+    check(
+        "a refused catalog switch leaves both readers where they were",
+        SQL_SUCCESS if read_wide_info(lib, dbc, SQL_DATABASE_NAME) == dbname else SQL_ERROR,
+        SQL_SUCCESS,
+        got_state=f"SQL_DATABASE_NAME is now {read_wide_info(lib, dbc, SQL_DATABASE_NAME)!r}",
+    )
 
     # ---------------------------------------------------------------
     print("\n--- diagnostics are cleared at function entry ---")

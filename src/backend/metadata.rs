@@ -365,13 +365,17 @@ pub(super) fn tables(
                 return None;
             }
 
-            Some(TableRow {
-                catalog: cat_val.as_str().map(str::to_string),
-                schema: sch_val.as_str().map(str::to_string),
-                name: Some(name),
-                table_type: Some(odbc_type.to_string()),
-                remarks: None,
-            })
+            // `remarks` is left at its default `None`: Trino's
+            // `information_schema.tables` has no comment column. Every setter
+            // takes `impl Into<T>`, so an `Option<String>` column accepts the
+            // `Option` directly as well as a bare `String`.
+            Some(
+                TableRow::default()
+                    .catalog(cat_val.as_str().map(str::to_string))
+                    .schema(sch_val.as_str().map(str::to_string))
+                    .name(name)
+                    .table_type(odbc_type.to_string()),
+            )
         })
         .collect())
 }
@@ -528,26 +532,28 @@ pub(super) fn columns(
             let char_octet = char_octet_length(sql_type, ty_precision);
             let (verbose, datetime_sub) = verbose_type(sql_type);
 
-            Some(ColumnRow {
-                catalog: table_cat,
-                schema: table_sch,
-                table_name,
-                column_name: col_name,
-                data_type: sql_type.0,
-                type_name: data_type,
-                column_size: col_size,
-                buffer_length: None,
-                decimal_digits,
-                num_prec_radix,
-                nullable: nullable.into(),
-                remarks: None,
-                column_def: col_def,
-                sql_data_type: verbose,
-                sql_datetime_sub: datetime_sub,
-                char_octet_length: char_octet,
-                ordinal_position: ordinal,
-                is_nullable: Some(nullable.as_is_nullable_str().to_string()),
-            })
+            // `buffer_length` and `remarks` keep their default `None`: the
+            // spec lets a driver omit BUFFER_LENGTH, and Trino's
+            // `information_schema.columns` has no comment column.
+            Some(
+                ColumnRow::default()
+                    .catalog(table_cat)
+                    .schema(table_sch)
+                    .table_name(table_name)
+                    .column_name(col_name)
+                    .data_type(sql_type.0)
+                    .type_name(data_type)
+                    .column_size(col_size)
+                    .decimal_digits(decimal_digits)
+                    .num_prec_radix(num_prec_radix)
+                    .nullable(i16::from(nullable))
+                    .column_def(col_def)
+                    .sql_data_type(verbose)
+                    .sql_datetime_sub(datetime_sub)
+                    .char_octet_length(char_octet)
+                    .ordinal_position(ordinal)
+                    .is_nullable(nullable.as_is_nullable_str().to_string()),
+            )
         })
         .collect())
 }
@@ -586,19 +592,21 @@ fn table_privilege_row(vals: &[serde_json::Value]) -> Option<TablePrivilegeRow> 
     let grantee = get(PrivilegeCol::Grantee)?;
     let privilege = get(PrivilegeCol::PrivilegeType)?;
 
-    Some(TablePrivilegeRow {
-        catalog: get(PrivilegeCol::TableCatalog),
-        schema: get(PrivilegeCol::TableSchema),
-        table_name,
-        // Nullable in both directions: Trino leaves `grantor` NULL for a
-        // privilege nobody explicitly granted, and ODBC's GRANTOR is nullable.
-        grantor: get(PrivilegeCol::Grantor),
-        grantee,
-        privilege,
-        // Trino spells this 'YES'/'NO', which is exactly ODBC's vocabulary for
-        // IS_GRANTABLE, so it passes through unmapped.
-        is_grantable: get(PrivilegeCol::IsGrantable),
-    })
+    Some(
+        TablePrivilegeRow::default()
+            .catalog(get(PrivilegeCol::TableCatalog))
+            .schema(get(PrivilegeCol::TableSchema))
+            .table_name(table_name)
+            // Nullable in both directions: Trino leaves `grantor` NULL for a
+            // privilege nobody explicitly granted, and ODBC's GRANTOR is
+            // nullable.
+            .grantor(get(PrivilegeCol::Grantor))
+            .grantee(grantee)
+            .privilege(privilege)
+            // Trino spells this 'YES'/'NO', which is exactly ODBC's vocabulary
+            // for IS_GRANTABLE, so it passes through unmapped.
+            .is_grantable(get(PrivilegeCol::IsGrantable)),
+    )
 }
 
 /// Return the table-level privileges on the matching tables.

@@ -33,16 +33,16 @@ use stackable_odbc_core::odbc_sys;
 use stackable_odbc_core::test_support::{attach_connection, detach_connection};
 use stackable_odbc_core::types::{
     AttrOdbcVersion, CDataType, Desc, EnvironmentAttribute, HandleType, HeaderDiagnosticIdentifier,
-    InfoType, ParamType, SQL_IC_SENSITIVE, SQL_INDEX_UNIQUE, SQL_LOCK_NO_CHANGE, SQL_NTS,
-    SQL_NULL_DATA, SQL_POSITION, SQL_QUICK, SqlDataType, SqlReturn, StatementAttribute,
-    expected_kind,
+    InfoType, ParamType, SQL_IC_LOWER, SQL_INDEX_UNIQUE, SQL_LOCK_NO_CHANGE, SQL_NTS,
+    SQL_NULL_DATA, SQL_PARAM_ERROR, SQL_PARAM_SUCCESS, SQL_POSITION, SQL_QUICK, SqlDataType,
+    SqlReturn, StatementAttribute, expected_kind,
 };
 
 use crate::backend::info::{
     TRINO_AGGREGATE_FUNCTIONS, TRINO_NUMERIC_FUNCTIONS, TRINO_SQL92_VALUE_EXPRESSIONS,
     TRINO_STRING_FUNCTIONS, TRINO_SYSTEM_FUNCTIONS, TRINO_TIMEDATE_FUNCTIONS,
 };
-use crate::backend::{TrinoBackend, disconnected_trino_conn};
+use crate::backend::{TrinoBackend, disconnected_trino_conn, disconnected_trino_conn_with_catalog};
 
 const CONN_STR: &str =
     "Host=localhost;Port=8080;Protocol=http;User=admin;Password=admin;Catalog=tpcds";
@@ -441,7 +441,12 @@ fn get_info_named_but_unhandled_types_fall_back_to_get_info_raw() {
         // common_get_info_raw after TrinoBackend::get_info_raw's own match
         // misses, so Trino depends on that fallback ordering for them too.
         assert_get_info_u16(conn, InfoType::SqlFileUsage, 0);
-        assert_get_info_u16(conn, InfoType::SqlQuotedIdentifierCase, SQL_IC_SENSITIVE);
+        // `SQL_IC_LOWER`, not the `SQL_IC_SENSITIVE` core used to hard-wire
+        // here: `common_get_info_raw` now reads
+        // `TrinoBackend::quoted_identifier_case`, and a quoted identifier is
+        // case-insensitive in Trino and reported lower case by the system
+        // catalog. See that hook for the coordinator probes.
+        assert_get_info_u16(conn, InfoType::SqlQuotedIdentifierCase, SQL_IC_LOWER);
 
         cleanup_injected_conn(env, conn);
     }
@@ -532,6 +537,40 @@ fn get_info_every_named_info_type_has_the_declared_shape_pre_connect() {
         let _ = ffi::handle::sql_free_handle::<TrinoBackend>(HandleType::Stmt as i16, stmt);
         let _ = ffi::handle::sql_free_handle::<TrinoBackend>(HandleType::Dbc as i16, conn);
         let _ = ffi::handle::sql_free_handle::<TrinoBackend>(HandleType::Env as i16, env);
+    }
+}
+
+/// Property 1c: the `SQLGetInfo` groups whose members constrain each other
+/// agree, for this backend's real answers.
+///
+/// The shape checks above police one info type at a time; this polices the
+/// pairs. Core cannot check these at runtime — `TrinoBackend::get_info` runs
+/// first and is entitled to answer anything — so the invariants live in
+/// `conformance` and each driver runs them against its own backend.
+///
+/// Two of the groups are ones this driver overrides part of and could easily
+/// desynchronise: `SQL_CATALOG_TERM` / `SQL_CATALOG_NAME_SEPARATOR` against
+/// `SQL_CATALOG_NAME` (which core derives from
+/// [`crate::backend::TrinoBackend::supports_catalogs`], answering `true`), and
+/// `SQL_TXN_CAPABLE` against `SQL_TXN_ISOLATION_OPTION` and
+/// `SQL_DEFAULT_TXN_ISOLATION` — the three that
+/// [`crate::backend::TrinoBackend::end_tran`] names as moving together when
+/// transactions land. If `txn_capable` stops saying `SQL_TC_NONE` and the two
+/// isolation declarations stay at `0`, this fails.
+#[test]
+fn get_info_groups_that_constrain_each_other_agree() {
+    unsafe {
+        let (env, conn) = alloc_conn_with_injected_trino_connection();
+
+        let violations =
+            stackable_odbc_core::conformance::info_group_inconsistencies::<TrinoBackend>(conn);
+        assert!(
+            violations.is_empty(),
+            "SQLGetInfo answers contradict each other:\n  {}",
+            violations.join("\n  ")
+        );
+
+        cleanup_injected_conn(env, conn);
     }
 }
 
@@ -3907,5 +3946,815 @@ fn timestamp_shaped_text_column_read_as_type_timestamp() {
         assert_eq!(ret2, SqlReturn::ERROR);
         assert_eq!(last_sqlstate(stmt), "22018");
         cleanup_stmt(stmt);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Statement and connection attributes
+// ---------------------------------------------------------------------------
+//
+// Core owns every one of these paths, but they are only observable through a
+// driver: `sql_set_stmt_attr_w::<TrinoBackend>` is what an application calls,
+// and what it returns is what an application plans around. The tests here
+// drive the real entry points with `TrinoBackend` as the type parameter, so a
+// core change that alters the contract fails this crate's suite rather than
+// being noticed by a BI tool.
+//
+// None of them need a live coordinator: `SQLSetStmtAttr` and `SQLGetStmtAttr`
+// touch the handle's attribute map and nothing else, and the connection-level
+// tests use the injected network-free `TrinoConnection`.
+
+/// `SQL_ATTR_ENLIST_IN_DTC` (1207), which `odbc_sys::ConnectionAttribute` does
+/// not model.
+const SQL_ATTR_ENLIST_IN_DTC: i32 = 1207;
+
+/// Reads one statement attribute back through `SQLGetStmtAttr`.
+///
+/// The buffer is zeroed rather than poisoned, because core currently writes
+/// only four bytes for the integer-valued attributes — see
+/// [`statement_attribute_read_back_width_is_narrower_than_the_spec_declares`],
+/// which owns that question. Every value these tests compare fits in 32 bits,
+/// so this reads correctly both before and after that is fixed.
+unsafe fn get_stmt_attr(stmt: *mut c_void, attribute: i32) -> (SqlReturn, usize) {
+    let mut value: usize = 0;
+    let mut string_length: i32 = 0;
+    let ret = unsafe {
+        ffi::stmt_attr::sql_get_stmt_attr_w::<TrinoBackend>(
+            stmt,
+            attribute,
+            &mut value as *mut usize as *mut c_void,
+            0,
+            &mut string_length,
+        )
+    };
+    (ret, value)
+}
+
+/// Sets one integer-valued statement attribute through `SQLSetStmtAttr`.
+unsafe fn set_stmt_attr(stmt: *mut c_void, attribute: i32, value: usize) -> SqlReturn {
+    unsafe {
+        ffi::stmt_attr::sql_set_stmt_attr_w::<TrinoBackend>(
+            stmt,
+            attribute,
+            std::ptr::without_provenance_mut(value),
+            0,
+        )
+    }
+}
+
+/// The first diagnostic record's SQLSTATE on any handle, or `""` when there is
+/// none. Unlike [`last_sqlstate`] this does not assert one exists — the
+/// attribute tests below check *both* that a warning is posted and that a
+/// plain success posts nothing.
+unsafe fn sqlstate_of(handle_type: HandleType, handle: *mut c_void) -> String {
+    let mut state = [0u16; 6];
+    let mut native: i32 = 0;
+    let mut msg = [0u16; 256];
+    let mut msg_len: i16 = 0;
+    let ret = unsafe {
+        ffi::diag::sql_get_diag_rec_w::<TrinoBackend>(
+            handle_type as i16,
+            handle,
+            1,
+            state.as_mut_ptr(),
+            &mut native,
+            msg.as_mut_ptr(),
+            msg.len() as i16,
+            &mut msg_len,
+        )
+    };
+    if ret == SqlReturn::SUCCESS {
+        String::from_utf16_lossy(&state[..5])
+    } else {
+        String::new()
+    }
+}
+
+/// The spec's `01S02` row closes the set of statement attributes a driver may
+/// substitute for, and for each of them core stores the value it will actually
+/// use rather than the one asked for. That is what makes the row's parenthesis
+/// true — "(`SQLGetStmtAttr` can be called to determine the temporarily
+/// substituted value.)" — and it is the half an application acts on: a tool
+/// that sets `SQL_ATTR_MAX_ROWS = 100` and reads back `100` believes it will
+/// receive at most a hundred rows, while this driver returns every one.
+///
+/// `SQL_ATTR_CURSOR_SCROLLABLE` and `SQL_ATTR_PARAMSET_SIZE` are checked
+/// alongside them although the spec's list does not name either; both are
+/// documented deviations at their arms in core, and pinning them here is what
+/// stops the deviation being undone by accident.
+#[test]
+fn set_stmt_attr_substitutes_and_reports_the_value_it_will_use() {
+    // (attribute, requested value, the value core will report back)
+    let cases: &[(StatementAttribute, usize, usize, &str)] = &[
+        (
+            StatementAttribute::Concurrency,
+            2,
+            1,
+            "SQL_CONCUR_READ_ONLY",
+        ),
+        (
+            StatementAttribute::CursorType,
+            2,
+            0,
+            "SQL_CURSOR_FORWARD_ONLY",
+        ),
+        (StatementAttribute::KeysetSize, 50, 0, "fully keyset-driven"),
+        (StatementAttribute::MaxLength, 4096, 0, "all available data"),
+        (StatementAttribute::MaxRows, 100, 0, "no row limit"),
+        (StatementAttribute::QueryTimeout, 30, 0, "no timeout"),
+        (StatementAttribute::RowArraySize, 64, 1, "one-row rowset"),
+        (
+            StatementAttribute::SimulateCursor,
+            2,
+            0,
+            "SQL_SC_NON_UNIQUE",
+        ),
+        // The two deviations from the spec's closed list.
+        (
+            StatementAttribute::CursorScrollable,
+            1,
+            0,
+            "SQL_NONSCROLLABLE",
+        ),
+        (
+            StatementAttribute::ParamsetSize,
+            500,
+            1,
+            "one parameter set",
+        ),
+    ];
+
+    unsafe {
+        for &(attr, requested, substituted, why) in cases {
+            let (env, conn, stmt) = alloc_handles();
+
+            assert_eq!(
+                set_stmt_attr(stmt, attr as i32, requested),
+                SqlReturn::SUCCESS_WITH_INFO,
+                "{attr:?} = {requested} must be reported as substituted ({why})"
+            );
+            assert_eq!(
+                sqlstate_of(HandleType::Stmt, stmt),
+                "01S02",
+                "{attr:?}: the spec's SQLSTATE for a substituted attribute value"
+            );
+
+            let (ret, read_back) = get_stmt_attr(stmt, attr as i32);
+            assert_eq!(ret, SqlReturn::SUCCESS, "{attr:?} must be readable");
+            assert_eq!(
+                read_back, substituted,
+                "{attr:?}: SQLGetStmtAttr must report the substituted value \
+                 ({substituted}, {why}), not the {requested} that was asked for"
+            );
+
+            let _ = ffi::handle::sql_free_handle::<TrinoBackend>(HandleType::Stmt as i16, stmt);
+            let _ = ffi::handle::sql_free_handle::<TrinoBackend>(HandleType::Dbc as i16, conn);
+            let _ = ffi::handle::sql_free_handle::<TrinoBackend>(HandleType::Env as i16, env);
+        }
+    }
+}
+
+/// The value each of those attributes already holds is accepted plainly —
+/// `SQL_SUCCESS`, no diagnostic. Without this the test above would still pass
+/// if core substituted unconditionally, which would post a warning on every
+/// tool that sets an attribute to the value the driver already uses.
+#[test]
+fn set_stmt_attr_accepts_the_value_it_already_uses_without_a_warning() {
+    let cases: &[(StatementAttribute, usize)] = &[
+        (StatementAttribute::Concurrency, 1),
+        (StatementAttribute::CursorType, 0),
+        (StatementAttribute::KeysetSize, 0),
+        (StatementAttribute::MaxLength, 0),
+        (StatementAttribute::MaxRows, 0),
+        (StatementAttribute::QueryTimeout, 0),
+        (StatementAttribute::RowArraySize, 1),
+        (StatementAttribute::SimulateCursor, 0),
+        (StatementAttribute::CursorScrollable, 0),
+        (StatementAttribute::ParamsetSize, 1),
+    ];
+
+    unsafe {
+        for &(attr, value) in cases {
+            let (env, conn, stmt) = alloc_handles();
+
+            assert_eq!(
+                set_stmt_attr(stmt, attr as i32, value),
+                SqlReturn::SUCCESS,
+                "{attr:?} = {value} is what the driver already does"
+            );
+            assert_eq!(
+                sqlstate_of(HandleType::Stmt, stmt),
+                "",
+                "{attr:?} = {value} must post no diagnostic"
+            );
+
+            let _ = ffi::handle::sql_free_handle::<TrinoBackend>(HandleType::Stmt as i16, stmt);
+            let _ = ffi::handle::sql_free_handle::<TrinoBackend>(HandleType::Dbc as i16, conn);
+            let _ = ffi::handle::sql_free_handle::<TrinoBackend>(HandleType::Env as i16, env);
+        }
+    }
+}
+
+/// An attribute off the `01S02` list has no substitution to offer, so the
+/// value is refused outright with `HYC00` — "optional feature not
+/// implemented". The distinction matters to an application: `01S02` says
+/// "I did something else", `HYC00` says "I did nothing", and reading a
+/// substituted value back is only meaningful for the first.
+#[test]
+fn set_stmt_attr_reports_hyc00_for_a_value_it_cannot_substitute_for() {
+    // (attribute, an unhonourable value, what it would mean)
+    let cases: &[(StatementAttribute, usize, &str)] = &[
+        (StatementAttribute::UseBookmarks, 2, "SQL_UB_VARIABLE"),
+        (StatementAttribute::RetrieveData, 0, "SQL_RD_OFF"),
+        (StatementAttribute::CursorSensitivity, 2, "SQL_SENSITIVE"),
+        (StatementAttribute::EnableAutoIpd, 1, "SQL_TRUE"),
+        (StatementAttribute::AsyncEnable, 1, "SQL_ASYNC_ENABLE_ON"),
+    ];
+
+    unsafe {
+        for &(attr, value, meaning) in cases {
+            let (env, conn, stmt) = alloc_handles();
+
+            assert_eq!(
+                set_stmt_attr(stmt, attr as i32, value),
+                SqlReturn::ERROR,
+                "{attr:?} = {meaning} is not implemented and must be refused"
+            );
+            assert_eq!(
+                sqlstate_of(HandleType::Stmt, stmt),
+                "HYC00",
+                "{attr:?} = {meaning}: the spec's SQLSTATE for a valid attribute \
+                 whose value the driver does not support"
+            );
+
+            let _ = ffi::handle::sql_free_handle::<TrinoBackend>(HandleType::Stmt as i16, stmt);
+            let _ = ffi::handle::sql_free_handle::<TrinoBackend>(HandleType::Dbc as i16, conn);
+            let _ = ffi::handle::sql_free_handle::<TrinoBackend>(HandleType::Env as i16, env);
+        }
+    }
+}
+
+/// Every statement attribute `SQLSetStmtAttr` accepts can be read back.
+///
+/// A value stored but not readable is worse than one refused: the application
+/// sets it, gets `SQL_SUCCESS`, and then gets `HYC00` asking what it is. The
+/// pointer-valued attributes are the ones this covers that nothing else does —
+/// a tool binding a row-status array reads the pointer back to confirm the
+/// driver took it.
+#[test]
+fn every_statement_attribute_the_driver_accepts_is_readable() {
+    let mut sink: usize = 0;
+    let ptr = &mut sink as *mut usize as usize;
+
+    // (attribute, a value the driver honours as-is)
+    let cases: &[(StatementAttribute, usize)] = &[
+        (StatementAttribute::NoScan, 0),
+        (StatementAttribute::RowBindType, 0),
+        (StatementAttribute::ParamBindType, 0),
+        (StatementAttribute::MetadataId, 1),
+        (StatementAttribute::RowsFetchedPtr, ptr),
+        (StatementAttribute::RowStatusPtr, ptr),
+        (StatementAttribute::RowBindOffsetPtr, ptr),
+        (StatementAttribute::RowOperationPtr, ptr),
+        (StatementAttribute::ParamsProcessedPtr, ptr),
+        (StatementAttribute::ParamStatusPtr, ptr),
+        (StatementAttribute::ParamBindOffsetPtr, ptr),
+        (StatementAttribute::ParamOpterationPtr, ptr),
+        (StatementAttribute::FetchBookmarkPtr, 0),
+    ];
+
+    unsafe {
+        let (env, conn, stmt) = alloc_handles();
+
+        for &(attr, value) in cases {
+            assert_eq!(
+                set_stmt_attr(stmt, attr as i32, value),
+                SqlReturn::SUCCESS,
+                "{attr:?} = {value:#x} must be accepted"
+            );
+            let (ret, read_back) = get_stmt_attr(stmt, attr as i32);
+            assert_eq!(
+                ret,
+                SqlReturn::SUCCESS,
+                "{attr:?} was accepted, so SQLGetStmtAttr must answer it"
+            );
+            assert_eq!(read_back, value, "{attr:?} must read back as what was set");
+        }
+
+        let _ = ffi::handle::sql_free_handle::<TrinoBackend>(HandleType::Stmt as i16, stmt);
+        let _ = ffi::handle::sql_free_handle::<TrinoBackend>(HandleType::Dbc as i16, conn);
+        let _ = ffi::handle::sql_free_handle::<TrinoBackend>(HandleType::Env as i16, env);
+    }
+}
+
+/// `SQL_ATTR_METADATA_ID` is one of exactly two attributes `SQLSetStmtAttr`'s
+/// Comments allow an application to set at the connection level, and a
+/// statement allocated afterwards must start from the connection's value.
+///
+/// This is not a cosmetic read-back: `metadata_id_enabled` consults the
+/// *statement's* map, and it is what decides whether the catalog functions
+/// treat their arguments as identifiers (case-folded, wildcards escaped) or as
+/// search patterns. An application taking the connection-level route
+/// previously got `SQL_SUCCESS`, saw its value echoed by `SQLGetConnectAttr`,
+/// and then got pattern semantics with no diagnostic saying so — which for
+/// this driver means `SQLColumns(table_name = "my_table")` matching
+/// `my7table` as well, because `_` is a wildcard.
+///
+/// The ODBC 2.x rule the connection-level route inherits makes this the
+/// default for statements allocated *afterwards* only, so the statement that
+/// already existed is asserted to be untouched in the same test.
+#[test]
+fn metadata_id_set_on_the_connection_reaches_statements_allocated_after_it() {
+    unsafe {
+        let (env, conn, before) = alloc_handles();
+
+        // A statement that predates the connection-level setting.
+        assert_eq!(
+            get_stmt_attr(before, StatementAttribute::MetadataId as i32).1,
+            0
+        );
+
+        assert_eq!(
+            ffi::connect_attr::sql_set_connect_attr_w::<TrinoBackend>(
+                conn,
+                odbc_sys::ConnectionAttribute::METADATA_ID.0,
+                std::ptr::without_provenance_mut(1usize), // SQL_TRUE
+                0,
+            ),
+            SqlReturn::SUCCESS
+        );
+
+        let mut after: *mut c_void = std::ptr::null_mut();
+        assert_eq!(
+            ffi::handle::sql_alloc_handle::<TrinoBackend>(
+                HandleType::Stmt as i16,
+                conn,
+                &mut after
+            ),
+            SqlReturn::SUCCESS
+        );
+        assert_eq!(
+            get_stmt_attr(after, StatementAttribute::MetadataId as i32),
+            (SqlReturn::SUCCESS, 1),
+            "a statement allocated after SQLSetConnectAttr(SQL_ATTR_METADATA_ID, \
+             SQL_TRUE) must inherit it"
+        );
+
+        assert_eq!(
+            get_stmt_attr(before, StatementAttribute::MetadataId as i32).1,
+            0,
+            "a statement that already existed is untouched, per the ODBC 2.x \
+             rule the connection-level route inherits"
+        );
+
+        // A later SQLSetStmtAttr still overrides the inherited value.
+        assert_eq!(
+            set_stmt_attr(after, StatementAttribute::MetadataId as i32, 0),
+            SqlReturn::SUCCESS
+        );
+        assert_eq!(
+            get_stmt_attr(after, StatementAttribute::MetadataId as i32).1,
+            0
+        );
+
+        let _ = ffi::handle::sql_free_handle::<TrinoBackend>(HandleType::Stmt as i16, after);
+        let _ = ffi::handle::sql_free_handle::<TrinoBackend>(HandleType::Stmt as i16, before);
+        let _ = ffi::handle::sql_free_handle::<TrinoBackend>(HandleType::Dbc as i16, conn);
+        let _ = ffi::handle::sql_free_handle::<TrinoBackend>(HandleType::Env as i16, env);
+    }
+}
+
+/// The two connection attributes whose state and support rules the
+/// `SQLSetConnectAttr` page assigns to the driver rather than to the Driver
+/// Manager.
+///
+/// `SQL_ATTR_PACKET_SIZE` is stated directly — "if the application sets packet
+/// size after a connection has already been made, the driver will return
+/// SQLSTATE HY011" — and needs a connection to be open, which is what the
+/// injected `TrinoConnection` supplies without a coordinator. It is accepted
+/// before one, since a driver that refused it there would have no legal moment
+/// to accept it at all.
+///
+/// `SQL_ATTR_ENLIST_IN_DTC` and `SQL_ATTR_ASYNC_ENABLE = SQL_ASYNC_ENABLE_ON`
+/// are `HYC00` at any time: this driver reports `SQL_AM_NONE` for
+/// `SQL_ASYNC_MODE` and enlists in no distributed transaction, so accepting
+/// either would leave an application believing in behaviour it does not get.
+#[test]
+fn set_connect_attr_enforces_the_rules_the_spec_assigns_to_the_driver() {
+    unsafe {
+        let (env, conn) = alloc_conn_with_injected_trino_connection();
+
+        assert_eq!(
+            ffi::connect_attr::sql_set_connect_attr_w::<TrinoBackend>(
+                conn,
+                odbc_sys::ConnectionAttribute::PACKET_SIZE.0,
+                std::ptr::without_provenance_mut(8192usize),
+                0,
+            ),
+            SqlReturn::ERROR,
+            "SQL_ATTR_PACKET_SIZE after the connection is open"
+        );
+        assert_eq!(sqlstate_of(HandleType::Dbc, conn), "HY011");
+
+        assert_eq!(
+            ffi::connect_attr::sql_set_connect_attr_w::<TrinoBackend>(
+                conn,
+                SQL_ATTR_ENLIST_IN_DTC,
+                std::ptr::without_provenance_mut(1usize),
+                0,
+            ),
+            SqlReturn::ERROR,
+            "SQL_ATTR_ENLIST_IN_DTC"
+        );
+        assert_eq!(sqlstate_of(HandleType::Dbc, conn), "HYC00");
+
+        assert_eq!(
+            ffi::connect_attr::sql_set_connect_attr_w::<TrinoBackend>(
+                conn,
+                odbc_sys::ConnectionAttribute::ASYNC_ENABLE.0,
+                std::ptr::without_provenance_mut(1usize), // SQL_ASYNC_ENABLE_ON
+                0,
+            ),
+            SqlReturn::ERROR,
+            "SQL_ATTR_ASYNC_ENABLE = SQL_ASYNC_ENABLE_ON, with SQL_ASYNC_MODE = SQL_AM_NONE"
+        );
+        assert_eq!(sqlstate_of(HandleType::Dbc, conn), "HYC00");
+
+        // SQL_ASYNC_ENABLE_OFF is the value the driver already uses.
+        assert_eq!(
+            ffi::connect_attr::sql_set_connect_attr_w::<TrinoBackend>(
+                conn,
+                odbc_sys::ConnectionAttribute::ASYNC_ENABLE.0,
+                std::ptr::without_provenance_mut(0usize),
+                0,
+            ),
+            SqlReturn::SUCCESS
+        );
+
+        cleanup_injected_conn(env, conn);
+    }
+}
+
+/// `SQL_ATTR_PACKET_SIZE` before a connection exists is accepted, which is the
+/// other half of the `HY011` rule above: the spec's restriction is on setting
+/// it *after* connecting, so refusing it always would leave the attribute with
+/// no legal moment.
+#[test]
+fn set_connect_attr_accepts_packet_size_before_connecting() {
+    unsafe {
+        let (env, conn, stmt) = alloc_handles();
+
+        assert_eq!(
+            ffi::connect_attr::sql_set_connect_attr_w::<TrinoBackend>(
+                conn,
+                odbc_sys::ConnectionAttribute::PACKET_SIZE.0,
+                std::ptr::without_provenance_mut(8192usize),
+                0,
+            ),
+            SqlReturn::SUCCESS
+        );
+        assert_eq!(sqlstate_of(HandleType::Dbc, conn), "");
+
+        let _ = ffi::handle::sql_free_handle::<TrinoBackend>(HandleType::Stmt as i16, stmt);
+        let _ = ffi::handle::sql_free_handle::<TrinoBackend>(HandleType::Dbc as i16, conn);
+        let _ = ffi::handle::sql_free_handle::<TrinoBackend>(HandleType::Env as i16, env);
+    }
+}
+
+/// Every statement attribute is written at the width the spec declares.
+///
+/// `SQLSetStmtAttr`'s page declares every non-pointer statement attribute it
+/// lists as "An SQLULEN value" — `SQL_ATTR_CONCURRENCY`,
+/// `SQL_ATTR_CURSOR_TYPE`, `SQL_ATTR_NOSCAN`, `SQL_ATTR_METADATA_ID`,
+/// `SQL_ATTR_QUERY_TIMEOUT`, `SQL_ATTR_MAX_ROWS`, `SQL_ATTR_ROW_ARRAY_SIZE`
+/// and the rest. Not one is `SQLUINTEGER`, and `SQLULEN` is 64 bits on a
+/// 64-bit platform.
+///
+/// A short write is the same class of defect as a wrongly-shaped `SQLGetInfo`
+/// answer, in the other direction: `SQLGetStmtAttr`'s `BufferLength` is
+/// ignored for a non-string value, so an application writing
+/// `SQLULEN v; SQLGetStmtAttr(stmt, SQL_ATTR_MAX_ROWS, &v, 0, NULL);` would
+/// keep whatever was on its stack in the top four bytes of `v` and read a row
+/// limit of some enormous number rather than the `0` core reported. Core did
+/// exactly that until this driver's suite found it, which is why the buffer
+/// below is poisoned rather than zeroed: a zeroed one cannot tell a correct
+/// write from a short one.
+#[test]
+fn statement_attributes_are_written_at_the_full_sqlulen_width() {
+    // The integer-valued attributes, each at a value whose top half is zero,
+    // so a short write leaves the poison visible.
+    let cases: &[(StatementAttribute, usize)] = &[
+        (StatementAttribute::QueryTimeout, 0),
+        (StatementAttribute::MaxRows, 0),
+        (StatementAttribute::MaxLength, 0),
+        (StatementAttribute::KeysetSize, 0),
+        (StatementAttribute::RowArraySize, 1),
+        (StatementAttribute::ParamsetSize, 1),
+        (StatementAttribute::Concurrency, 1),
+        (StatementAttribute::CursorType, 0),
+        (StatementAttribute::NoScan, 0),
+        (StatementAttribute::RowBindType, 0),
+        (StatementAttribute::ParamBindType, 0),
+        (StatementAttribute::MetadataId, 0),
+        (StatementAttribute::CursorScrollable, 0),
+        (StatementAttribute::CursorSensitivity, 0),
+        (StatementAttribute::SimulateCursor, 0),
+        (StatementAttribute::RetrieveData, 1),
+        (StatementAttribute::UseBookmarks, 0),
+        (StatementAttribute::EnableAutoIpd, 0),
+        (StatementAttribute::AsyncEnable, 0),
+    ];
+
+    unsafe {
+        let (env, conn, stmt) = alloc_handles();
+
+        for &(attr, expected) in cases {
+            let mut value: usize = usize::MAX;
+            let mut string_length: i32 = 0;
+            assert_eq!(
+                ffi::stmt_attr::sql_get_stmt_attr_w::<TrinoBackend>(
+                    stmt,
+                    attr as i32,
+                    &mut value as *mut usize as *mut c_void,
+                    0,
+                    &mut string_length,
+                ),
+                SqlReturn::SUCCESS,
+                "{attr:?} must be readable"
+            );
+            assert_eq!(
+                value, expected,
+                "{attr:?}: the poisoned top half survived, so the write was \
+                 narrower than the SQLULEN the spec declares"
+            );
+            assert_eq!(
+                string_length,
+                std::mem::size_of::<usize>() as i32,
+                "{attr:?}: StringLength must be size_of::<SQLULEN>()"
+            );
+        }
+
+        // The pointer-valued attributes were always full width; asserted
+        // alongside so the two groups cannot drift apart.
+        let mut sink: usize = 0;
+        let ptr = &mut sink as *mut usize as usize;
+        assert_eq!(
+            set_stmt_attr(stmt, StatementAttribute::RowsFetchedPtr as i32, ptr),
+            SqlReturn::SUCCESS
+        );
+        let mut back: usize = usize::MAX;
+        let mut ptr_len: i32 = 0;
+        assert_eq!(
+            ffi::stmt_attr::sql_get_stmt_attr_w::<TrinoBackend>(
+                stmt,
+                StatementAttribute::RowsFetchedPtr as i32,
+                &mut back as *mut usize as *mut c_void,
+                0,
+                &mut ptr_len,
+            ),
+            SqlReturn::SUCCESS
+        );
+        assert_eq!(back, ptr, "SQL_ATTR_ROWS_FETCHED_PTR round-trips whole");
+        assert_eq!(ptr_len, std::mem::size_of::<usize>() as i32);
+
+        let _ = ffi::handle::sql_free_handle::<TrinoBackend>(HandleType::Stmt as i16, stmt);
+        let _ = ffi::handle::sql_free_handle::<TrinoBackend>(HandleType::Dbc as i16, conn);
+        let _ = ffi::handle::sql_free_handle::<TrinoBackend>(HandleType::Env as i16, env);
+    }
+}
+
+/// An execution reports its parameter set through
+/// `SQL_ATTR_PARAMS_PROCESSED_PTR` and `SQL_ATTR_PARAM_STATUS_PTR`.
+///
+/// The parameter-side counterpart of what `SQLFetch` already writes through
+/// `SQL_ATTR_ROWS_FETCHED_PTR`. An application that binds a status array to
+/// detect per-set errors previously read back its own initial buffer contents,
+/// which is indistinguishable from every set having succeeded.
+///
+/// Driven against a live coordinator rather than a mock because the value of
+/// the status element is decided by whether the *execution* succeeded, and a
+/// real rejection by Trino is the only way to reach `SQL_PARAM_ERROR` through
+/// the same path an application does.
+#[test]
+#[serial]
+#[ignore = "requires Trino at localhost:8080 -- run test/setup.sh first"]
+fn execution_writes_the_processed_count_and_the_parameter_status() {
+    unsafe {
+        // --- A successful execution ---
+        let (_env, _conn, stmt) = alloc_stmt();
+
+        let mut processed: usize = usize::MAX;
+        let mut status: [u16; 4] = [0xBEEF; 4];
+        assert_eq!(
+            set_stmt_attr(
+                stmt,
+                StatementAttribute::ParamsProcessedPtr as i32,
+                &mut processed as *mut usize as usize,
+            ),
+            SqlReturn::SUCCESS
+        );
+        assert_eq!(
+            set_stmt_attr(
+                stmt,
+                StatementAttribute::ParamStatusPtr as i32,
+                status.as_mut_ptr() as usize,
+            ),
+            SqlReturn::SUCCESS
+        );
+
+        let mut value: i64 = 42;
+        assert_eq!(bind_i64(stmt, 1, &mut value), SqlReturn::SUCCESS);
+        assert_eq!(
+            exec_direct(stmt, "SELECT CAST(? AS bigint)"),
+            SqlReturn::SUCCESS,
+            "{}",
+            diag_message(stmt)
+        );
+
+        assert_eq!(
+            processed, 1,
+            "SQL_ATTR_PARAMSET_SIZE is pinned at 1, so exactly one set is processed"
+        );
+        assert_eq!(
+            status[0], SQL_PARAM_SUCCESS,
+            "the first status element after a successful execution"
+        );
+        assert_eq!(
+            status[1], 0xBEEF,
+            "only the sets actually processed are written; element 2 is untouched"
+        );
+        assert_eq!(fetch_one_i64(stmt), 42);
+        cleanup_stmt(stmt);
+
+        // --- A rejected execution ---
+        let (_env, _conn, stmt) = alloc_stmt();
+
+        let mut processed: usize = usize::MAX;
+        let mut status: [u16; 4] = [0xBEEF; 4];
+        assert_eq!(
+            set_stmt_attr(
+                stmt,
+                StatementAttribute::ParamsProcessedPtr as i32,
+                &mut processed as *mut usize as usize,
+            ),
+            SqlReturn::SUCCESS
+        );
+        assert_eq!(
+            set_stmt_attr(
+                stmt,
+                StatementAttribute::ParamStatusPtr as i32,
+                status.as_mut_ptr() as usize,
+            ),
+            SqlReturn::SUCCESS
+        );
+
+        let mut value: i64 = 1;
+        assert_eq!(bind_i64(stmt, 1, &mut value), SqlReturn::SUCCESS);
+        // Trino rejects the reference to a table that does not exist, so the
+        // failure comes from the coordinator rather than from parameter
+        // handling — which is the case an application binds a status array for.
+        assert_eq!(
+            exec_direct(stmt, "SELECT ? FROM does_not_exist_zzz"),
+            SqlReturn::ERROR
+        );
+        assert_eq!(
+            processed, 1,
+            "the processed count includes error sets, per the spec's \
+             \"including error sets\""
+        );
+        assert_eq!(
+            status[0], SQL_PARAM_ERROR,
+            "the status element for a set whose execution failed"
+        );
+        cleanup_stmt(stmt);
+    }
+}
+
+/// `SQL_ATTR_CURRENT_CATALOG` and `SQL_DATABASE_NAME` are one value under two
+/// names, so they must agree.
+///
+/// The spec says so directly: "in ODBC 3.x, the value returned for this
+/// InfoType can also be returned by calling `SQLGetConnectAttr` with an
+/// Attribute argument of `SQL_ATTR_CURRENT_CATALOG`". Until core grew
+/// [`TrinoBackend::current_catalog`] they did not: this driver answered the
+/// info type from its own `get_info_raw` while the attribute was a handle-local
+/// string nothing ever seeded, so a connection opened against `tpcds` reported
+/// `"tpcds"` under one name and `""` under the other.
+///
+/// One source now feeds both, which is why `info.rs` has no arm for either.
+#[test]
+fn the_current_catalog_reads_the_same_under_both_of_its_names() {
+    unsafe {
+        for catalog in [Some("tpcds"), None] {
+            let expected = catalog.unwrap_or("");
+
+            let mut env: *mut c_void = std::ptr::null_mut();
+            assert_eq!(
+                ffi::handle::sql_alloc_handle::<TrinoBackend>(
+                    HandleType::Env as i16,
+                    std::ptr::null_mut(),
+                    &mut env,
+                ),
+                SqlReturn::SUCCESS
+            );
+            let mut conn: *mut c_void = std::ptr::null_mut();
+            assert_eq!(
+                ffi::handle::sql_alloc_handle::<TrinoBackend>(
+                    HandleType::Dbc as i16,
+                    env,
+                    &mut conn
+                ),
+                SqlReturn::SUCCESS
+            );
+            attach_connection::<TrinoBackend>(conn, disconnected_trino_conn_with_catalog(catalog))
+                .expect("valid conn handle");
+
+            let mut buf = [0u16; 128];
+            let mut len: i32 = 0;
+            assert_eq!(
+                ffi::connect_attr::sql_get_connect_attr_w::<TrinoBackend>(
+                    conn,
+                    odbc_sys::ConnectionAttribute::CURRENT_CATALOG.0,
+                    buf.as_mut_ptr().cast(),
+                    (buf.len() * 2) as i32,
+                    &mut len,
+                ),
+                SqlReturn::SUCCESS
+            );
+            let attr = String::from_utf16_lossy(&buf[..(len / 2).max(0) as usize]);
+            assert_eq!(
+                attr, expected,
+                "SQLGetConnectAttr(SQL_ATTR_CURRENT_CATALOG) for catalog {catalog:?}"
+            );
+
+            let (ret, info) = stackable_odbc_core::conformance::observe_string_value::<TrinoBackend>(
+                conn,
+                stackable_odbc_core::types::SQL_DATABASE_NAME,
+            );
+            assert_eq!(ret, SqlReturn::SUCCESS);
+            assert_eq!(
+                info, attr,
+                "SQL_DATABASE_NAME and SQL_ATTR_CURRENT_CATALOG are the same \
+                 value under two names and must not disagree"
+            );
+
+            cleanup_injected_conn(env, conn);
+        }
+    }
+}
+
+/// `SQLSetConnectAttr(SQL_ATTR_CURRENT_CATALOG)` reports `HYC00`, because this
+/// driver cannot switch catalogs.
+///
+/// Core's `set_current_catalog` default, deliberately left in place. Trino's
+/// only catalog-switching statement is `USE`, whose grammar requires a schema
+/// — `USE postgresql` is `NOT_FOUND`, parsed as a schema name — so honouring
+/// the call would mean inventing a schema and silently moving the session's
+/// unqualified name resolution into it. See the comment beside
+/// `TrinoBackend::current_catalog` for the coordinator probes.
+///
+/// This is a visible change from the previous store-and-succeed: an
+/// application that sets the attribute now gets `SQL_ERROR`. It is the honest
+/// answer, and the failing call is the one that was doing nothing.
+#[test]
+fn setting_the_current_catalog_is_refused_rather_than_silently_ignored() {
+    unsafe {
+        let (env, conn) = alloc_conn_with_injected_trino_connection();
+
+        let wide: Vec<u16> = "postgresql".encode_utf16().collect();
+        assert_eq!(
+            ffi::connect_attr::sql_set_connect_attr_w::<TrinoBackend>(
+                conn,
+                odbc_sys::ConnectionAttribute::CURRENT_CATALOG.0,
+                wide.as_ptr() as *mut c_void,
+                (wide.len() * 2) as i32,
+            ),
+            SqlReturn::ERROR
+        );
+        assert_eq!(sqlstate_of(HandleType::Dbc, conn), "HYC00");
+
+        // And nothing was stored: a refused switch must not move what the
+        // readers report, or the attribute would claim a catalog the session
+        // is not using.
+        let mut buf = [0u16; 128];
+        let mut len: i32 = 0;
+        assert_eq!(
+            ffi::connect_attr::sql_get_connect_attr_w::<TrinoBackend>(
+                conn,
+                odbc_sys::ConnectionAttribute::CURRENT_CATALOG.0,
+                buf.as_mut_ptr().cast(),
+                (buf.len() * 2) as i32,
+                &mut len,
+            ),
+            SqlReturn::SUCCESS
+        );
+        assert_eq!(
+            String::from_utf16_lossy(&buf[..(len / 2).max(0) as usize]),
+            "",
+            "the injected connection names no catalog, and the refused set \
+             must not have changed that"
+        );
+
+        cleanup_injected_conn(env, conn);
     }
 }

@@ -133,10 +133,11 @@ layouts, for a struct read out of a buffer core wrote.
 
 ### Non-exhaustive types from core
 
-`ColumnDescriptor`, `TypeInfoRow`, `EscapeDialect` and
-`CatalogResultColumnWidths` are `#[non_exhaustive]`, so struct-literal syntax
-does not compile here and `..Default::default()` is not an escape hatch either.
-Build them with the constructor plus `with_*` builders:
+`ColumnDescriptor`, `TypeInfoRow`, `EscapeDialect`,
+`CatalogResultColumnWidths` and the ten catalog row types (`TableRow`,
+`ColumnRow`, `TablePrivilegeRow`, …) are `#[non_exhaustive]`, so struct-literal
+syntax does not compile here and `..Default::default()` is not an escape hatch
+either. Build them with the constructor plus `with_*` builders:
 
 ```rust
 ColumnDescriptor::new(name, sql_type)
@@ -158,19 +159,49 @@ claiming the least-committal value, which is why all 22 rows leave `nullable`
 and `searchable` alone. `nullable` is a `Nullable`, not a raw `i16`, matching
 `ColumnDescriptor::nullable`.
 
+The catalog row types are the exception to the `with_*` naming: their setters
+are named after their fields, because core generates them from the field list
+with a `macro_rules!` that cannot build an identifier from parts. Each takes
+`impl Into<T>`, so an `Option<String>` column accepts a bare `String` *or* the
+`Option`, and a `String` column accepts a `&str`:
+
+```rust
+TableRow::default()
+    .catalog(cat_val.as_str().map(str::to_string))   // Option<String>
+    .name(name)                                       // String
+    .table_type(odbc_type.to_string())
+```
+
+Adding a column to a spec result set is a core-only change that generates one
+more setter, so leave the columns the data source cannot answer unset rather
+than spelling out a `None` for each.
+
 ### Capability declarations take a connection
 
-The 25 required capability methods, plus `get_type_info` and `escape_dialect`,
+The 33 required capability methods, plus `get_type_info` and `escape_dialect`,
 take `&Self::Connection`: `SQLGetInfo` is a per-connection call, so what the
 data source can do belongs to the connection rather than to the driver binary.
-This driver answers all of them without reading it — every value is a fact about
-Trino-the-engine or about this driver's own SQL generation — but
+This driver answers all but one of them without reading it — every value is a
+fact about Trino-the-engine or about this driver's own SQL generation — and
 `TrinoConnection::server_major` is there for the ones that should eventually
-gate on the coordinator's version.
+gate on the coordinator's version. `dbms_version` is the exception, and reads
+`TrinoConnection::dbms_version`.
 
-`cursor_commit_behavior`, `cursor_rollback_behavior` and
-`catalog_result_column_widths` deliberately keep no connection, because they are
-consumed on paths that have none.
+`cursor_commit_behavior`, `cursor_rollback_behavior`,
+`catalog_result_column_widths`, `driver_name` and `driver_version` deliberately
+keep no connection. The first three are consumed on paths that have none; the
+last two describe the driver rather than the data source, and the Windows
+Driver Manager asks for them before `SQLDriverConnectW`. Declaring those two is
+what lets core answer the whole pre-connect identity group itself, so this
+driver's `get_info_pre_connect` no longer overrides anything for the DM's
+benefit.
+
+**Nothing that a capability method declares may also have an arm in
+`backend/info.rs`.** An arm there wins for `SQLGetInfo` while the method keeps
+driving `SQLGetConnectAttr` and the `HY024` validation in
+`sql_set_connect_attr`, so the two can disagree for one connection. The list of
+info types this applies to is in the `_ => {}` comment at the end of
+`trino_get_info`'s match; ten joined it when core made them required.
 
 Pre-connect, core passes `None` and skips every declaration that needs a
 connection, substituting its own benign default — so a value this driver reports
@@ -178,6 +209,46 @@ when connected is not necessarily what `SQLGetInfo` returns before
 `SQLDriverConnectW`. `info::get_info_snapshot` asserts the connected answers;
 `get_info_every_named_info_type_has_the_declared_shape_pre_connect` covers the
 other side.
+
+### Why the catalog cannot be set
+
+`TrinoBackend::current_catalog` reports the `Catalog` connection-string value,
+and core feeds it to both readers the spec makes synonyms —
+`SQLGetConnectAttr(SQL_ATTR_CURRENT_CATALOG)` and
+`SQLGetInfo(SQL_DATABASE_NAME)`. That is the one place the value lives; neither
+has an arm in `info.rs`, and adding one would let the two disagree.
+
+`Backend::set_current_catalog` is deliberately **not** implemented, so
+`SQLSetConnectAttr(SQL_ATTR_CURRENT_CATALOG)` reports core's defaulted `HYC00`.
+Trino cannot switch a catalog without also switching the schema, and it is the
+second half that makes accepting the call a lie. Measured against a live
+coordinator:
+
+| Statement | Result |
+|---|---|
+| `USE postgresql.public` | `X-Trino-Set-Catalog: postgresql`, `X-Trino-Set-Schema: public` |
+| `USE postgresql` | `NOT_FOUND` — parsed as a *schema* named `postgresql` |
+
+`USE` is the only statement that moves the session catalog and its grammar
+requires a schema, so honouring "set the catalog to X" means inventing one.
+Every catalog has an `information_schema`, so the invention would succeed and
+then leave an unqualified `SELECT ... FROM orders` resolving inside it — the
+application's names pointing somewhere it never asked for, which is the failure
+`HYC00` exists to avoid, displaced from the catalog to the schema. Reconnecting
+under a new catalog is worse: it drops the session's prepared statements and
+its connection pool under a call the application thinks is an attribute write.
+
+`trino-rust-client` is not the constraint and would need no change — it already
+tracks `X-Trino-Set-Catalog` into its session and carries the new value on later
+requests. Trino's grammar is. Revisit if `SET SESSION CATALOG`, or any
+catalog-only form of `USE`, ever lands.
+
+This is a behaviour change from the driver's previous store-and-succeed, so if
+a tool turns out to set the attribute during connection setup it will now see
+`SQL_ERROR`. Neither unixODBC nor the Power Query connector does — the connector
+passes `Catalog` in the connection string — and all four
+`test/run-tests.sh` configurations (DSN and DSN-less, HTTP and HTTPS) plus the
+Windows Driver Manager suite connect unaffected.
 
 ### The catalog functions return rows, not statements
 
@@ -512,11 +583,22 @@ self-contained.
 Core's `conformance` and `test_support` modules are behind its default-off
 `test-support` feature, enabled by the `[dev-dependencies]` entry on
 `stackable-odbc-core` so it never reaches the shipped `cdylib`. `conformance`
-supplies the `SQLGetInfo` return-shape checks; `test_support` supplies
+supplies the `SQLGetInfo` return-shape checks and
+`info_group_inconsistencies`; `test_support` supplies
 `attach_connection` / `detach_connection`, which put a network-free
 `TrinoConnection` into a connection handle so the *connected* `SQLGetInfo` path
 can be tested offline. Core's `handles` module is `pub(crate)`, so these are the
 supported way to do that — do not look for a way to reach the handle directly.
+
+`info_group_inconsistencies` checks the `SQLGetInfo` groups whose members
+constrain each other — vendor terminology against `SQL_CATALOG_NAME`,
+`SQL_TXN_CAPABLE` against the two isolation declarations — and returns one
+message per violation. Core cannot police these at runtime, because
+`TrinoBackend::get_info` runs first and is entitled to answer anything, so the
+invariants live in the shared harness and each driver runs them against its own
+backend. `get_info_groups_that_constrain_each_other_agree` is the call site
+here; it is what would catch `txn_capable` moving off `SQL_TC_NONE` while
+`default_txn_isolation` and `txn_isolation_options` stayed at `0`.
 
 `SQLFreeHandle` refuses a connection handle that still holds a connection
 (`HY010`), so such a test must `detach_connection` before freeing, which is what
@@ -641,10 +723,38 @@ a statement can be allocated before connecting, because `SQLAllocHandle`'s
 A `NOTE` may also be marked `KNOWN`, for a gap diagnosed and recorded rather
 than asserted so the suite stays green until the owning crate changes. Tighten
 a `KNOWN` into a `check` as soon as its fix lands, or it becomes a permanent
-blind spot. There are none open: the two that named core's parameter handling
-were fixed in core and are now assertions, in the `bound parameter types`
-group. They are worth keeping in that shape because each pins a defect an
-application sees rather than a call's return code:
+blind spot.
+
+None are open. Four have been raised from this suite and all four were fixed
+in the crate that owned them, so each is now an assertion rather than a note:
+
+- **Integer statement attributes were written four bytes wide.** Every
+  non-pointer attribute on the `SQLSetStmtAttr` page is declared "An SQLULEN
+  value" — not one is `SQLUINTEGER` — and `SQLULEN` is 64-bit on a 64-bit
+  platform. `BufferLength` is ignored for a non-string value, so an application
+  writing `SQLULEN v; SQLGetStmtAttr(s, SQL_ATTR_MAX_ROWS, &v, 0, NULL);` kept
+  whatever was on its stack in the top half of `v` and read an enormous row
+  limit rather than the `0` core reported. Now checked for six attributes here
+  and all nineteen in
+  `statement_attributes_are_written_at_the_full_sqlulen_width`.
+
+  **Do not carry the rule across to connection attributes.** Only
+  `SQL_ATTR_ASYNC_ENABLE` and `SQL_ATTR_ODBC_CURSORS` are `SQLULEN` there; the
+  rest genuinely are `SQLUINTEGER`, and widening those would introduce the
+  opposite bug — an eight-byte write into the four an application allocated.
+
+- **`SQL_ATTR_CURRENT_CATALOG` was a write-only handle-local string.** It and
+  `SQL_DATABASE_NAME` are one value under two names, but the attribute answered
+  `""` where the info type answered the connected catalog, and setting it
+  returned `SQL_SUCCESS` while switching nothing. Core grew
+  `Backend::current_catalog` and `Backend::set_current_catalog`; this driver
+  implements the first and deliberately leaves the second defaulted. See
+  [Why the catalog cannot be set](#why-the-catalog-cannot-be-set).
+
+The two that named core's parameter handling were fixed in core and are now
+assertions, in the `bound parameter types` group. They are worth keeping in
+that shape because each pins a defect an application sees rather than a call's
+return code:
 
 - **The declared SQL type survives.** `SQL_C_CHAR` + `SQL_NUMERIC` — what a
   client sends for a numeric delivered as text — reaches Trino as a `decimal`,

@@ -67,6 +67,79 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **`SQL_QUOTED_IDENTIFIER_CASE` reports `SQL_IC_LOWER`, not `SQL_IC_SENSITIVE`.**
+  `stackable-odbc-core` used to hard-wire the latter on every driver's behalf;
+  it is now `TrinoBackend::quoted_identifier_case`, and measurement against a
+  live coordinator says Trino does not agree with the old answer. A column
+  created in PostgreSQL as `"MixedCol"` and reached through the `postgresql`
+  catalog resolves as `"MixedCol"`, `"mixedcol"` *and* `"MIXEDCOL"`, so quoted
+  identifiers are case-insensitive, and `information_schema` reports the name
+  as `mixedcol`, so the system catalog stores it folded. That is `SQL_IC_LOWER`
+  by definition, and it matches what `SQL_IDENTIFIER_CASE` already said.
+
+  An application generating SQL from `SQLColumns` or `SQLTables` output reads
+  this to decide how to quote. Under `SQL_IC_SENSITIVE` it believes a quoted
+  name must match the catalog's spelling exactly, a restriction Trino does not
+  impose.
+
+- **`SQL_CURSOR_SENSITIVITY` reports `SQL_UNSPECIFIED`, not `SQL_INSENSITIVE`.**
+  Core owns this value and corrected it: insensitivity is a promise that no
+  other cursor's changes become visible, and core's fetch streams rows from this
+  backend as the application asks for them, so it can make no such promise about
+  rows it has not read yet.
+
+- **`SQL_DBMS_NAME`, `SQL_DBMS_VER`, `SQL_DRIVER_NAME`, `SQL_DRIVER_VER`,
+  `SQL_TXN_CAPABLE`, `SQL_INTEGRITY`, `SQL_MULTIPLE_ACTIVE_TXN`,
+  `SQL_SPECIAL_CHARACTERS` and `SQL_ACCESSIBLE_PROCEDURES` are now declarations
+  rather than answers.** Each moved from an arm in `backend/info.rs`, or from a
+  value core supplied on this driver's behalf, to a required `Backend` method.
+  Every reported value is unchanged except `SQL_QUOTED_IDENTIFIER_CASE` above —
+  what changed is that there is now one place each of them lives, and the
+  compiler asks for it.
+
+  `SQL_SPECIAL_CHARACTERS` stays `""` and is now a measurement rather than an
+  understatement: `SELECT 1 AS a@b`, and the same with `:`, `$`, `#`, `-` and a
+  space, each fail with `SYNTAX_ERROR` against a live coordinator, while `a_b`
+  succeeds. Trino's identifier production admits nothing beyond the
+  alphanumerics and underscore, which is exactly what this info type excludes.
+
+- **An unsupported statement-attribute value is now answered rather than
+  accepted silently.** `SQLSetStmtAttr` reports `01S02` and stores the value the
+  driver will actually use for the eight attributes the spec's substitution row
+  names, plus `SQL_ATTR_CURSOR_SCROLLABLE` and `SQL_ATTR_PARAMSET_SIZE`; and
+  `HYC00` for a value with no substitution to offer —
+  `SQL_ATTR_USE_BOOKMARKS` above `SQL_UB_OFF`, `SQL_ATTR_RETRIEVE_DATA =
+  SQL_RD_OFF`, `SQL_ATTR_CURSOR_SENSITIVITY = SQL_SENSITIVE`,
+  `SQL_ATTR_ENABLE_AUTO_IPD = SQL_TRUE` and `SQL_ATTR_ASYNC_ENABLE =
+  SQL_ASYNC_ENABLE_ON`. An application that asks for a 30-second query timeout
+  no longer reads `30` back from a driver that applies none. Owned by
+  `stackable-odbc-core`; recorded here because it is what an application using
+  this driver observes.
+
+- **`SQLSetConnectAttr` enforces its driver-side rules.**
+  `SQL_ATTR_PACKET_SIZE` reports `HY011` once the connection is open, which the
+  spec states outright; `SQL_ATTR_ENLIST_IN_DTC` and `SQL_ATTR_ASYNC_ENABLE =
+  SQL_ASYNC_ENABLE_ON` report `HYC00`, since this driver reports `SQL_AM_NONE`
+  for `SQL_ASYNC_MODE` and enlists in no distributed transaction.
+
+- **`SQLSetConnectAttr(SQL_ATTR_CURRENT_CATALOG)` reports `HYC00` where it
+  previously returned `SQL_SUCCESS`.** The old success was empty: the value was
+  stored on the handle and nothing switched, so an application was told its
+  unqualified names now resolved in a catalog the session was not using.
+
+  Trino cannot switch a catalog without also switching the schema. `USE` is the
+  only statement that moves the session catalog and its grammar requires one —
+  `USE postgresql.public` works, `USE postgresql` is `NOT_FOUND`, parsed as a
+  schema name — so honouring the call would mean inventing a schema and moving
+  where unqualified names resolve, which is the same lie one level down. See
+  `TrinoBackend::current_catalog` for the coordinator probes.
+
+  This is a visible change for anything that sets the attribute during
+  connection setup. Nothing in the tested paths does: all four
+  `test/run-tests.sh` configurations, `isql`, and the Windows Driver Manager
+  suite are unaffected, and the Power Query connector passes `Catalog` in the
+  connection string rather than as an attribute.
+
 - The Power Query connector binds parameters instead of inlining literals
   (`Config_UseParameterBindings`). It was off while the driver's parameter
   binding was incomplete, and turning it off also declared
@@ -237,6 +310,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`SQL_ATTR_CURRENT_CATALOG` was write-only, and disagreed with
+  `SQL_DATABASE_NAME`.** The spec makes them one value under two names, but the
+  attribute was a handle-local string nothing seeded from the connection: a
+  connection opened against `tpcds` reported `"tpcds"` from
+  `SQLGetInfo(SQL_DATABASE_NAME)` and `""` from
+  `SQLGetConnectAttr(SQL_ATTR_CURRENT_CATALOG)`. The driver now declares
+  `Backend::current_catalog`, which core feeds to both readers, so there is one
+  source and they cannot diverge.
+- **Integer statement attributes were read back four bytes wide.** Every
+  non-pointer attribute on the `SQLSetStmtAttr` page is declared an `SQLULEN`,
+  which is 64-bit on a 64-bit platform, and `SQLGetStmtAttr` ignores
+  `BufferLength` for a non-string value. An application writing
+  `SQLULEN v; SQLGetStmtAttr(stmt, SQL_ATTR_MAX_ROWS, &v, 0, NULL);` therefore
+  kept whatever was on its stack in the top half of `v` — reading an enormous
+  row limit rather than the `0` the driver reported. Fixed in
+  `stackable-odbc-core` for all nineteen; found from this driver's suite.
+- **`SQL_ATTR_METADATA_ID` set on the *connection* never reached its
+  statements.** It is one of exactly two attributes the spec allows an
+  application to set at the connection level, and the value was stored and read
+  back correctly while nothing acted on it: every catalog call on every
+  statement of that connection kept pattern semantics. An application taking
+  that route got `SQL_SUCCESS`, saw its value echoed, and then had
+  `SQLColumns(TableName = "my_table")` match `my7table` as well, with no
+  diagnostic to explain it. A statement now starts from its connection's value;
+  per the ODBC 2.x rule the connection-level route inherits, that applies to
+  statements allocated afterwards, and a later `SQLSetStmtAttr` still overrides
+  it. Fixed in `stackable-odbc-core`; recorded here because the wrong result
+  sets were this driver's.
+- **`SQL_ATTR_PARAMS_PROCESSED_PTR` and `SQL_ATTR_PARAM_STATUS_PTR` were stored
+  and never written.** `SQLExecDirect`, `SQLExecute` and the `SQLParamData`
+  completion now report the processed count (`1`, since `SQL_ATTR_PARAMSET_SIZE`
+  is pinned there) and set the first status element to `SQL_PARAM_SUCCESS` or
+  `SQL_PARAM_ERROR`. An application that binds a status array to detect per-set
+  errors previously read back its own initial buffer contents, which is
+  indistinguishable from every set having succeeded.
+- **Nine statement attributes `SQLSetStmtAttr` accepted could not be read
+  back.** `SQL_ATTR_KEYSET_SIZE`, `SQL_ATTR_PARAM_BIND_TYPE`,
+  `SQL_ATTR_PARAMS_PROCESSED_PTR`, `SQL_ATTR_PARAM_STATUS_PTR`,
+  `SQL_ATTR_PARAM_BIND_OFFSET_PTR`, `SQL_ATTR_PARAM_OPERATION_PTR`,
+  `SQL_ATTR_ROW_OPERATION_PTR`, `SQL_ATTR_FETCH_BOOKMARK_PTR` and
+  `SQL_ATTR_ASYNC_STMT_EVENT` answered `HYC00` from `SQLGetStmtAttr` after
+  being accepted by the setter.
 - `SQLTables`, `SQLColumns` and `SQLTablePrivileges` reached only the connected
   catalog. Trino resolves a bare `information_schema` through the session
   catalog, and each catalog's copy describes only itself, so naming any other

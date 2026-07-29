@@ -32,6 +32,15 @@ def run(label, fn):
         failed += 1
 
 
+def conn_str_catalog(conn_str):
+    """The `Catalog` value of a connection string, or None for a DSN."""
+    for part in conn_str.split(";"):
+        key, _, value = part.partition("=")
+        if key.strip().lower() == "catalog":
+            return value.strip()
+    return None
+
+
 def main():
     if len(sys.argv) != 2:
         print(f"Usage: {sys.argv[0]} <connection-string>")
@@ -369,6 +378,178 @@ def main():
         assert val.minute == 0, f"minute: expected 0, got {val.minute}"
 
     run("TIMESTAMP WITH UTC TZ", test_timestamp_with_utc_tz)
+
+    # ------------------------------------------------------------------
+    # Connection attributes, through the Driver Manager
+    # ------------------------------------------------------------------
+    # test/test_c_abi.py drives these with no DM in the loop; the point here is
+    # that unixODBC forwards them rather than answering them itself, so what an
+    # ordinary application sees is what the driver decided.
+
+    def test_connection_attribute_rules():
+        SQL_ATTR_PACKET_SIZE = 112
+        SQL_ATTR_ENLIST_IN_DTC = 1207
+        SQL_ATTR_ASYNC_ENABLE = 4
+        SQL_ASYNC_ENABLE_OFF = 0
+        SQL_ASYNC_ENABLE_ON = 1
+
+        for label, attr, value, state in (
+            # The spec states this one outright: "if the application sets
+            # packet size after a connection has already been made, the driver
+            # will return SQLSTATE HY011".
+            ("SQL_ATTR_PACKET_SIZE", SQL_ATTR_PACKET_SIZE, 8192, "HY011"),
+            # Neither is implemented, and neither is on any substitution list.
+            ("SQL_ATTR_ENLIST_IN_DTC", SQL_ATTR_ENLIST_IN_DTC, 1, "HYC00"),
+            ("SQL_ATTR_ASYNC_ENABLE", SQL_ATTR_ASYNC_ENABLE, SQL_ASYNC_ENABLE_ON, "HYC00"),
+        ):
+            try:
+                conn.set_attr(attr, value)
+                raise AssertionError(f"{label} was accepted; expected {state}")
+            except pyodbc.Error as e:
+                assert e.args[0] == state, f"{label}: expected {state}, got {e.args[0]}"
+
+        # The value the driver already uses is accepted.
+        conn.set_attr(SQL_ATTR_ASYNC_ENABLE, SQL_ASYNC_ENABLE_OFF)
+
+    run("connection attribute state and support rules", test_connection_attribute_rules)
+
+    # ------------------------------------------------------------------
+    # SQL_DATABASE_NAME names the connected catalog
+    # ------------------------------------------------------------------
+    # The spec makes this and SQL_ATTR_CURRENT_CATALOG one value under two
+    # names, and both now read the driver's `current_catalog` declaration. Only
+    # the info-type half is asserted here: pyodbc's `set_attr` takes an integer
+    # value and it exposes no string `SQLGetConnectAttr`, so the attribute half
+    # -- including that setting it reports HYC00 -- lives in test/test_c_abi.py,
+    # which calls both entry points directly.
+    #
+    # Still worth having on this path: what the connection string asked for has
+    # to survive the Driver Manager and come back under the name an application
+    # reads, and a DSN connection reaches this through a different route than a
+    # DSN-less one.
+
+    def test_database_name_is_the_connected_catalog():
+        got = conn.getinfo(pyodbc.SQL_DATABASE_NAME)
+        wanted = conn_str_catalog(conn_str)
+        if wanted is None:
+            # A DSN connection string; the DSN's own Catalog key decided it, so
+            # assert only that something was reported.
+            assert got, f"SQL_DATABASE_NAME should name a catalog, got {got!r}"
+        else:
+            assert got == wanted, (
+                f"SQL_DATABASE_NAME is {got!r}, but the connection string named {wanted!r}"
+            )
+
+    run("SQL_DATABASE_NAME is the connected catalog", test_database_name_is_the_connected_catalog)
+
+    # ------------------------------------------------------------------
+    # SQL_ATTR_METADATA_ID changes what the catalog functions match
+    # ------------------------------------------------------------------
+    # The attribute is one of exactly two an application may set at the
+    # connection level, and it decides whether a catalog function's string
+    # arguments are identifiers or search patterns. Asserted end to end rather
+    # than by reading the attribute back: the read-back was always correct, and
+    # what was broken was that nothing acted on it.
+    #
+    # A separate connection, because the setting outlives the statement and
+    # would change every later catalog call on the shared one.
+
+    def test_metadata_id_changes_catalog_argument_semantics():
+        SQL_ATTR_METADATA_ID = 10014
+        SQL_FALSE, SQL_TRUE = 0, 1
+        target = "types_test"
+
+        def names(c, probe):
+            rows = c.cursor().tables(
+                table=probe, catalog="postgresql", schema="public"
+            ).fetchall()
+            return sorted({r.table_name for r in rows})
+
+        probe_conn = pyodbc.connect(conn_str, autocommit=True)
+        try:
+            # As a pattern: case matters, and `%` and `_` are wildcards.
+            probe_conn.set_attr(SQL_ATTR_METADATA_ID, SQL_FALSE)
+            assert names(probe_conn, target) == [target], "the exact name matches"
+            assert names(probe_conn, target.upper()) == [], (
+                "a pattern is case-sensitive, and Trino stores the name lower case"
+            )
+            assert names(probe_conn, "types%test") == [target], "`%` is a wildcard"
+            assert names(probe_conn, "types_tes_") == [target], "`_` is a wildcard"
+
+            # As an identifier: case-folded per SQL_IDENTIFIER_CASE, and the
+            # wildcards escaped per SQL_SEARCH_PATTERN_ESCAPE, so both become
+            # literal characters that no table here has.
+            probe_conn.set_attr(SQL_ATTR_METADATA_ID, SQL_TRUE)
+            assert names(probe_conn, target) == [target], "the exact name still matches"
+            assert names(probe_conn, target.upper()) == [target], (
+                "an identifier is case-folded, so the upper-case spelling resolves"
+            )
+            assert names(probe_conn, "types%test") == [], "`%` is escaped to a literal"
+            assert names(probe_conn, "types_tes_") == [], "`_` is escaped to a literal"
+        finally:
+            probe_conn.close()
+
+    run(
+        "SQL_ATTR_METADATA_ID changes catalog argument semantics",
+        test_metadata_id_changes_catalog_argument_semantics,
+    )
+
+    # ------------------------------------------------------------------
+    # The SQLGetInfo values backed by a required Backend declaration
+    # ------------------------------------------------------------------
+    # Each of these was previously answered by a hard-wired value in
+    # stackable-odbc-core, on this driver's behalf. They are now declarations
+    # the compiler requires, so what an application reads is what the driver
+    # states about Trino. Asserted through the DM because that is the path that
+    # decides the value's shape as well as its content.
+
+    def test_backend_declared_info_values():
+        SQL_IC_LOWER = 2
+        SQL_TC_NONE = 0
+
+        expected = {
+            "SQL_DRIVER_NAME": (pyodbc.SQL_DRIVER_NAME, "stackable-odbc-trino"),
+            "SQL_DBMS_NAME": (pyodbc.SQL_DBMS_NAME, "Trino"),
+            # Quoted identifiers are case-insensitive in Trino and reported
+            # lower case by the system catalog, so this matches
+            # SQL_IDENTIFIER_CASE rather than being SQL_IC_SENSITIVE.
+            "SQL_QUOTED_IDENTIFIER_CASE": (pyodbc.SQL_QUOTED_IDENTIFIER_CASE, SQL_IC_LOWER),
+            "SQL_IDENTIFIER_CASE": (pyodbc.SQL_IDENTIFIER_CASE, SQL_IC_LOWER),
+            # This driver implements no SQLEndTran; see TrinoBackend::end_tran.
+            "SQL_TXN_CAPABLE": (pyodbc.SQL_TXN_CAPABLE, SQL_TC_NONE),
+            # Trino's grammar rejects every referential-integrity constraint.
+            "SQL_INTEGRITY": (pyodbc.SQL_INTEGRITY, False),
+            # No transaction can be active, so certainly not two.
+            "SQL_MULTIPLE_ACTIVE_TXN": (pyodbc.SQL_MULTIPLE_ACTIVE_TXN, False),
+            # Trino publishes no metadata naming its procedures.
+            "SQL_ACCESSIBLE_PROCEDURES": (pyodbc.SQL_ACCESSIBLE_PROCEDURES, False),
+            # Trino's identifier production is (LETTER | '_') (LETTER | DIGIT |
+            # '_')*, which is exactly the set ODBC excludes from this info type.
+            "SQL_SPECIAL_CHARACTERS": (pyodbc.SQL_SPECIAL_CHARACTERS, ""),
+        }
+        for label, (info_type, want) in expected.items():
+            got = conn.getinfo(info_type)
+            assert got == want, f"{label}: expected {want!r}, got {got!r}"
+
+        # Version strings are not fixed values, so assert their shape instead.
+        # The spec's form is "##.##.####" -- major, minor, release -- optionally
+        # followed by the data source's own version text, which is why
+        # SQL_DBMS_VER's trailing "(467)" is allowed here and SQL_DRIVER_VER's
+        # absence of one is too. The major group is not held to two digits:
+        # Trino's is 467.
+        import re
+
+        version_shape = re.compile(r"^\d+\.\d{2}\.\d{4}( .*)?$")
+        for label, info_type in (
+            ("SQL_DRIVER_VER", pyodbc.SQL_DRIVER_VER),
+            ("SQL_DBMS_VER", pyodbc.SQL_DBMS_VER),
+        ):
+            got = conn.getinfo(info_type)
+            assert version_shape.match(got), (
+                f"{label} is not ##.##.#### with an optional suffix: {got!r}"
+            )
+
+    run("Backend-declared SQLGetInfo values", test_backend_declared_info_values)
 
     # === Cleanup ===
     conn.close()

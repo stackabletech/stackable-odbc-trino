@@ -15,12 +15,12 @@ use stackable_odbc_core::types::{
     SQL_AT_ADD_COLUMN_SINGLE, SQL_AT_ADD_CONSTRAINT, SQL_AT_DROP_COLUMN, SQL_CL_START,
     SQL_CODE_DATE, SQL_CODE_TIME, SQL_CODE_TIMESTAMP, SQL_CU_DML_STATEMENTS,
     SQL_CU_PRIVILEGE_DEFINITION, SQL_CU_PROCEDURE_INVOCATION, SQL_CU_TABLE_DEFINITION,
-    SQL_DATABASE_NAME, SQL_FN_NUM_ABS, SQL_FN_NUM_ACOS, SQL_FN_NUM_ASIN, SQL_FN_NUM_ATAN,
-    SQL_FN_NUM_ATAN2, SQL_FN_NUM_CEILING, SQL_FN_NUM_COS, SQL_FN_NUM_DEGREES, SQL_FN_NUM_EXP,
-    SQL_FN_NUM_FLOOR, SQL_FN_NUM_LOG, SQL_FN_NUM_LOG10, SQL_FN_NUM_MOD, SQL_FN_NUM_PI,
-    SQL_FN_NUM_POWER, SQL_FN_NUM_RADIANS, SQL_FN_NUM_RAND, SQL_FN_NUM_ROUND, SQL_FN_NUM_SIGN,
-    SQL_FN_NUM_SIN, SQL_FN_NUM_SQRT, SQL_FN_NUM_TAN, SQL_FN_NUM_TRUNCATE, SQL_FN_STR_CHAR,
-    SQL_FN_STR_CONCAT, SQL_FN_STR_LCASE, SQL_FN_STR_LENGTH, SQL_FN_STR_LOCATE_2, SQL_FN_STR_LTRIM,
+    SQL_FN_NUM_ABS, SQL_FN_NUM_ACOS, SQL_FN_NUM_ASIN, SQL_FN_NUM_ATAN, SQL_FN_NUM_ATAN2,
+    SQL_FN_NUM_CEILING, SQL_FN_NUM_COS, SQL_FN_NUM_DEGREES, SQL_FN_NUM_EXP, SQL_FN_NUM_FLOOR,
+    SQL_FN_NUM_LOG, SQL_FN_NUM_LOG10, SQL_FN_NUM_MOD, SQL_FN_NUM_PI, SQL_FN_NUM_POWER,
+    SQL_FN_NUM_RADIANS, SQL_FN_NUM_RAND, SQL_FN_NUM_ROUND, SQL_FN_NUM_SIGN, SQL_FN_NUM_SIN,
+    SQL_FN_NUM_SQRT, SQL_FN_NUM_TAN, SQL_FN_NUM_TRUNCATE, SQL_FN_STR_CHAR, SQL_FN_STR_CONCAT,
+    SQL_FN_STR_LCASE, SQL_FN_STR_LENGTH, SQL_FN_STR_LOCATE_2, SQL_FN_STR_LTRIM,
     SQL_FN_STR_POSITION, SQL_FN_STR_REPLACE, SQL_FN_STR_RTRIM, SQL_FN_STR_SOUNDEX,
     SQL_FN_STR_SUBSTRING, SQL_FN_STR_UCASE, SQL_FN_SYS_DBNAME, SQL_FN_SYS_IFNULL,
     SQL_FN_SYS_USERNAME, SQL_FN_TD_CURDATE, SQL_FN_TD_CURRENT_DATE, SQL_FN_TD_CURRENT_TIME,
@@ -39,8 +39,7 @@ use stackable_odbc_core::types::{
     SQL_SRJO_LEFT_OUTER_JOIN, SQL_SRJO_RIGHT_OUTER_JOIN, SQL_STRING_FUNCTIONS,
     SQL_SU_DML_STATEMENTS, SQL_SU_PRIVILEGE_DEFINITION, SQL_SU_PROCEDURE_INVOCATION,
     SQL_SU_TABLE_DEFINITION, SQL_SVE_CASE, SQL_SVE_CAST, SQL_SVE_COALESCE, SQL_SVE_NULLIF,
-    SQL_SYSTEM_FUNCTIONS, SQL_TC_NONE, SQL_TIMEDATE_FUNCTIONS, SqlDataType, TypeInfoRow,
-    catalog_column_size,
+    SQL_SYSTEM_FUNCTIONS, SQL_TIMEDATE_FUNCTIONS, SqlDataType, TypeInfoRow, catalog_column_size,
 };
 
 use super::TrinoBackend;
@@ -367,11 +366,6 @@ fn trino_get_info(
     info_type: InfoType,
 ) -> Result<InfoValue, TrinoError> {
     match info_type {
-        InfoType::DriverName => return Ok(InfoValue::String("stackable-odbc-trino".into())),
-        InfoType::DriverVer => {
-            return Ok(InfoValue::String(stackable_odbc_core::driver_version!()));
-        }
-        InfoType::DbmsName => return Ok(InfoValue::String("Trino".into())),
         // A schema-qualified name (`schema.table`) is usable in DML, in a
         // `CALL schema.procedure()` invocation, in `CREATE`/`ALTER`/`DROP
         // TABLE`, and in `GRANT`/`REVOKE` -- all confirmed against the Trino
@@ -404,13 +398,6 @@ fn trino_get_info(
         }
         // Trino's qualified names read catalog.schema.table -- catalog first.
         InfoType::CatalogLocation => return Ok(InfoValue::U16(SQL_CL_START)),
-        // SQL_TXN_CAPABLE is `An SQLUSMALLINT value` per the SQLGetInfo
-        // spec, not SQLUINTEGER -- found by the info-type conformance test
-        // (`stackable_odbc_core::conformance`). SQL_TC_NONE: this driver does not
-        // implement SQLEndTran/manual-commit. Trino does support transactions,
-        // so this reports a driver limitation rather than a platform one:
-        // see TrinoBackend::end_tran.
-        InfoType::TransactionCapable => return Ok(InfoValue::U16(SQL_TC_NONE as u16)),
         // SQL_GD_BLOCK is deliberately not claimed: it means SQLGetData can
         // be called for a row in a block cursor after a bulk fetch, but no
         // driver in this workspace has block cursors -- `SQLSetStmtAttrW`
@@ -455,6 +442,15 @@ fn trino_get_info(
         // `HY024` validation in `sql_set_connect_attr` -- the two answers
         // could then disagree for the same connection. See the hook
         // implementations in `crate::backend`.
+        //
+        // Ten more joined that list when core made them required declarations:
+        // SQL_DRIVER_NAME, SQL_DRIVER_VER, SQL_DBMS_NAME, SQL_DBMS_VER,
+        // SQL_TXN_CAPABLE, SQL_QUOTED_IDENTIFIER_CASE, SQL_INTEGRITY,
+        // SQL_MULTIPLE_ACTIVE_TXN, SQL_SPECIAL_CHARACTERS and
+        // SQL_ACCESSIBLE_PROCEDURES. Each had an arm here or a hard-wired
+        // answer in core; each is now a `TrinoBackend` method, which is the
+        // one place its value lives. Re-adding an arm for any of them would
+        // reintroduce exactly the two-sources problem above.
         _ => {}
     }
 
@@ -471,10 +467,9 @@ pub(super) fn get_info(
     conn: &TrinoConnection,
     info_type: InfoType,
 ) -> Result<InfoValue, TrinoError> {
-    // Connection-dependent: captured from the coordinator at connect time.
-    if info_type == InfoType::DbmsVer {
-        return Ok(InfoValue::String(conn.dbms_version.clone()));
-    }
+    // SQL_DBMS_VER is connection-dependent but needs no arm here: core's
+    // `default_get_info` reads it from `TrinoBackend::dbms_version`, which is
+    // handed the same connection.
     trino_get_info(Some(conn), info_type)
 }
 
@@ -889,14 +884,14 @@ pub(super) fn get_info_raw(
         // Trino supports LIKE ... ESCAPE and full outer joins.
         SQL_LIKE_ESCAPE_CLAUSE => Some(Ok(InfoValue::String("Y".into()))),
         SQL_OUTER_JOINS => Some(Ok(InfoValue::String("Y".into()))),
-        // The catalog this connection was opened against. Answered here
-        // rather than left to `common_get_info_raw`, whose shared answer is
-        // the empty string -- correct only for a backend that cannot name its
-        // current database. The empty string still stands for a connection
-        // that named no catalog, which is the spec's "not available".
-        SQL_DATABASE_NAME => Some(Ok(InfoValue::String(
-            conn.catalog.clone().unwrap_or_default(),
-        ))),
+        // SQL_DATABASE_NAME is deliberately absent. The spec makes it and
+        // `SQLGetConnectAttr(SQL_ATTR_CURRENT_CATALOG)` one value under two
+        // names, and core reads both from `TrinoBackend::current_catalog` --
+        // what the application set, else what the session is using, in that
+        // order for both. An arm here would answer only the info type and let
+        // the two disagree, which is the state this driver was in until core
+        // grew the hook: `SQLGetInfo` said `tpcds` while `SQLGetConnectAttr`
+        // said `""`.
         _ => common_get_info_raw::<TrinoBackend>(Some(conn), info_type).map(Ok),
     }
 }
@@ -1183,9 +1178,9 @@ mod tests {
         SQL_FN_TD_CURRENT_TIME, SQL_FN_TD_CURRENT_TIMESTAMP, SQL_FN_TD_CURTIME,
         SQL_FN_TD_DAYOFWEEK, SQL_FN_TD_TIMESTAMPADD, SQL_FN_TD_TIMESTAMPDIFF,
         SQL_GB_GROUP_BY_CONTAINS_SELECT, SQL_GD_ANY_COLUMN, SQL_GD_ANY_ORDER, SQL_GD_BOUND,
-        SQL_IC_LOWER, SQL_INSENSITIVE, SQL_MAX_CURSOR_NAME_LEN, SQL_NC_END, SQL_OIC_CORE,
-        SQL_SO_FORWARD_ONLY, SQL_SQ_COMPARISON, SQL_SQ_CORRELATED_SUBQUERIES, SQL_SQ_EXISTS,
-        SQL_SQ_IN, SQL_SQ_QUANTIFIED, SQL_U_UNION, SQL_U_UNION_ALL,
+        SQL_IC_LOWER, SQL_MAX_CURSOR_NAME_LEN, SQL_NC_END, SQL_OIC_CORE, SQL_SO_FORWARD_ONLY,
+        SQL_SQ_COMPARISON, SQL_SQ_CORRELATED_SUBQUERIES, SQL_SQ_EXISTS, SQL_SQ_IN,
+        SQL_SQ_QUANTIFIED, SQL_U_UNION, SQL_U_UNION_ALL, SQL_UNSPECIFIED,
     };
 
     enum Expected {
@@ -1248,13 +1243,17 @@ mod tests {
         (InfoType::ActiveEnvironments,            Expected::U16(0)),
         (InfoType::MaxIdentifierLen,              Expected::U16(DEFAULT_IDENTIFIER_LEN)),
         (InfoType::CatalogLocation,               Expected::U16(SQL_CL_START)),
-        // TransactionCapable is SQLUSMALLINT per spec, not SQLUINTEGER -- see
-        // the matching comment on its arm in trino_get_info.
+        // TransactionCapable is SQLUSMALLINT per spec, not SQLUINTEGER, and is
+        // declared by `TrinoBackend::txn_capable`.
         (InfoType::TransactionCapable,            Expected::U16(SQL_TC_NONE as u16)),
         // --- U32 values ---
         // CursorSensitivity is SQLUINTEGER per spec, not SQLUSMALLINT -- see
         // the matching comment in stackable-odbc-core's default_get_info.
-        (InfoType::CursorSensitivity,             Expected::U32(SQL_INSENSITIVE as u32)),
+        // `SQL_UNSPECIFIED`, not `SQL_INSENSITIVE`: core's fetch streams rows
+        // from this backend as the application asks for them, so it makes no
+        // promise about rows it has not read. Core owns this value; there is no
+        // `Backend` hook and no arm here.
+        (InfoType::CursorSensitivity,             Expected::U32(SQL_UNSPECIFIED as u32)),
         (InfoType::Subqueries,                    Expected::U32(SQL_SQ_COMPARISON | SQL_SQ_EXISTS | SQL_SQ_IN | SQL_SQ_QUANTIFIED | SQL_SQ_CORRELATED_SUBQUERIES)),
         (InfoType::UnionStatement,                Expected::U32(SQL_U_UNION | SQL_U_UNION_ALL)),
         (InfoType::DefaultTxnIsolation,           Expected::U32(0)),

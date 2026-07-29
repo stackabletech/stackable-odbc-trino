@@ -19,9 +19,9 @@ use stackable_odbc_core::{
         SQL_FN_TSI_DAY, SQL_FN_TSI_HOUR, SQL_FN_TSI_MINUTE, SQL_FN_TSI_MONTH, SQL_FN_TSI_QUARTER,
         SQL_FN_TSI_SECOND, SQL_FN_TSI_WEEK, SQL_FN_TSI_YEAR, SQL_GB_GROUP_BY_CONTAINS_SELECT,
         SQL_IC_LOWER, SQL_NC_END, SQL_NNC_NON_NULL, SQL_SQ_COMPARISON,
-        SQL_SQ_CORRELATED_SUBQUERIES, SQL_SQ_EXISTS, SQL_SQ_IN, SQL_SQ_QUANTIFIED, SQL_U_UNION,
-        SQL_U_UNION_ALL, Scope, SpecialColumnRow, StatisticsRow, TablePrivilegeRow, TableRow,
-        TypeInfoRow, format_odbc_version, parse_dotted_version,
+        SQL_SQ_CORRELATED_SUBQUERIES, SQL_SQ_EXISTS, SQL_SQ_IN, SQL_SQ_QUANTIFIED, SQL_TC_NONE,
+        SQL_U_UNION, SQL_U_UNION_ALL, Scope, SpecialColumnRow, StatisticsRow, TablePrivilegeRow,
+        TableRow, TypeInfoRow, format_odbc_version, parse_dotted_version,
     },
 };
 use trino_rust_client::{Client, ClientBuilder, Trino, auth::Auth, ssl::Ssl};
@@ -478,6 +478,15 @@ pub struct TrinoCancelToken {
 /// do not depend on the coordinator, which is exactly what this stands in for.
 #[cfg(test)]
 pub(crate) fn disconnected_trino_conn() -> TrinoConnection {
+    disconnected_trino_conn_with_catalog(None)
+}
+
+/// [`disconnected_trino_conn`] with a `Catalog` connection-string value, for
+/// the tests that assert what [`TrinoBackend::current_catalog`] feeds to
+/// `SQL_ATTR_CURRENT_CATALOG` and `SQL_DATABASE_NAME`. Those two are only
+/// interesting when there is a catalog to report.
+#[cfg(test)]
+pub(crate) fn disconnected_trino_conn_with_catalog(catalog: Option<&str>) -> TrinoConnection {
     let client = ClientBuilder::new("test", "localhost")
         .port(8080)
         .build()
@@ -494,9 +503,9 @@ pub(crate) fn disconnected_trino_conn() -> TrinoConnection {
         // leave behind if `fetch_server_version` could not reach a coordinator.
         dbms_version: String::new(),
         server_major: 0,
-        // No `Catalog` key was supplied, which is the SQL_DATABASE_NAME
-        // "not available" case.
-        catalog: None,
+        // `None` is the `SQL_DATABASE_NAME` / `SQL_ATTR_CURRENT_CATALOG`
+        // "not available" case, which both readers render as the empty string.
+        catalog: catalog.map(str::to_string),
         describe_param_cache: Mutex::new(None),
     }
 }
@@ -972,12 +981,38 @@ impl Backend for TrinoBackend {
     /// every one of the four `SQL_IC_*` values is a different claim about how
     /// the data source folds identifiers, and no default can be legal.
     ///
-    /// `SQL_QUOTED_IDENTIFIER_CASE` is separately `SQL_IC_SENSITIVE` — a
-    /// double-quoted identifier keeps its case — and is answered by core's
-    /// `common_get_info_raw`.
-    ///
     /// <https://trino.io/docs/current/language/reserved.html>
     fn identifier_case(_conn: &TrinoConnection) -> u16 {
+        SQL_IC_LOWER
+    }
+
+    /// `SQL_IC_LOWER` as well: a *quoted* identifier is case-insensitive too,
+    /// and the system catalog stores it lower case.
+    ///
+    /// Not the `SQL_IC_SENSITIVE` a reader of the SQL standard would expect,
+    /// and measured against a live coordinator rather than assumed. A column
+    /// created in PostgreSQL as `"MixedCol"`, reached through the `postgresql`
+    /// catalog:
+    ///
+    /// | Probe | Result |
+    /// |---|---|
+    /// | `information_schema.columns.column_name` | `mixedcol` |
+    /// | `SELECT "MixedCol" FROM ...` | 1 row |
+    /// | `SELECT "mixedcol" FROM ...` | 1 row |
+    /// | `SELECT "MIXEDCOL" FROM ...` | 1 row |
+    ///
+    /// All three spellings resolve, so quoted identifiers are case-*in*sensitive
+    /// — which rules out `SQL_IC_SENSITIVE` — and the catalog reports the name
+    /// folded down, which rules out `SQL_IC_MIXED`. That is `SQL_IC_LOWER`'s
+    /// definition exactly. The same holds one level up: `CREATE TABLE
+    /// postgresql.s."MixedCase"` lands in PostgreSQL as `mixedcase`.
+    ///
+    /// This matters to an application generating SQL from
+    /// `SQLColumns`/`SQLTables` output: under `SQL_IC_SENSITIVE` it would
+    /// believe a quoted name must match the catalog's spelling exactly, which
+    /// Trino does not require and which core's previous hard-wired answer
+    /// asserted on this driver's behalf.
+    fn quoted_identifier_case(_conn: &TrinoConnection) -> u16 {
         SQL_IC_LOWER
     }
 
@@ -1081,6 +1116,38 @@ impl Backend for TrinoBackend {
         false
     }
 
+    /// `false`. The guarantee is that the connected user can execute every
+    /// procedure `SQLProcedures` returns; this driver's
+    /// [`Backend::procedures`] returns none, because Trino publishes no
+    /// metadata naming them (see AGENTS.md). Answering `"Y"` about an empty
+    /// set would be vacuously true and read as a claim about a set that does
+    /// not exist, so it stays `"N"` — the value this driver has always
+    /// reported for `SQL_ACCESSIBLE_PROCEDURES`.
+    fn accessible_procedures(_conn: &TrinoConnection) -> bool {
+        false
+    }
+
+    /// `false`. The Integrity Enhancement Facility is referential-integrity
+    /// DDL, and Trino's grammar rejects all four constraint forms outright —
+    /// `PRIMARY KEY`, `UNIQUE`, `CHECK` and `REFERENCES` each fail with
+    /// `SYNTAX_ERROR` against a live coordinator. That is the same measurement
+    /// [`TrinoBackend::sql_conformance`] cites for refusing SQL-92 entry level.
+    fn integrity(_conn: &TrinoConnection) -> bool {
+        false
+    }
+
+    /// The characters legal in an unquoted identifier beyond `a`–`z`, `A`–`Z`,
+    /// `0`–`9` and `_` — none, so the empty string.
+    ///
+    /// A measurement rather than an understatement: `SELECT 1 AS a@b` and the
+    /// same with `:`, `$`, `#`, `-` and a space each fail with `SYNTAX_ERROR`
+    /// against a live coordinator, while `a_b` and `ab` succeed. Trino's
+    /// `IDENTIFIER` production is `(LETTER | '_') (LETTER | DIGIT | '_')*`, and
+    /// that is exactly the set ODBC excludes from this info type.
+    fn special_characters(_conn: &TrinoConnection) -> Cow<'static, str> {
+        Cow::Borrowed("")
+    }
+
     /// `false`: writes reach whichever connector backs the catalog —
     /// `CREATE TABLE`, `INSERT` and `DROP TABLE` all run against the
     /// PostgreSQL catalog in the test stack.
@@ -1101,6 +1168,32 @@ impl Backend for TrinoBackend {
         Cow::Borrowed(info::reserved_keywords())
     }
 
+    /// `SQL_TC_NONE`: this driver implements no `SQLEndTran`/manual-commit, so
+    /// nothing may be run inside a transaction.
+    ///
+    /// Trino itself *does* support transactions, so this reports a driver
+    /// limitation rather than a platform one — see [`TrinoBackend::end_tran`]
+    /// for the full list of declarations that move together when that changes.
+    /// Core pins the invariant this is one half of: `SQL_TC_NONE` if and only
+    /// if [`Backend::txn_isolation_options`] is `0`, which is why the three
+    /// sit together here.
+    ///
+    /// `u16`, not `u32`: `SQL_TXN_CAPABLE` is an `SQLUSMALLINT` per the
+    /// `SQLGetInfo` page, while the `SQL_TC_*` constants are typed `u32` for
+    /// use in bitmask expressions.
+    fn txn_capable(_conn: &TrinoConnection) -> u16 {
+        SQL_TC_NONE as u16
+    }
+
+    /// `false`. With [`TrinoBackend::txn_capable`] reporting `SQL_TC_NONE` this
+    /// driver can never have even one transaction active, so it certainly
+    /// cannot have two. Revisit alongside `end_tran`: Trino gives each session
+    /// its own `X-Trino-Transaction-Id`, and connections are independent, so
+    /// the answer becomes `true` the moment transactions are implemented.
+    fn multiple_active_txn(_conn: &TrinoConnection) -> bool {
+        false
+    }
+
     /// `0`, the spec's value for a data source that does not support
     /// transactions, matching the `SQL_TC_NONE` this driver reports. See
     /// [`TrinoBackend::end_tran`] for why that is a driver limitation rather
@@ -1115,6 +1208,88 @@ impl Backend for TrinoBackend {
     fn txn_isolation_options(_conn: &TrinoConnection) -> u32 {
         0
     }
+
+    // --- Identity ---
+    //
+    // The two driver-level answers take no connection, because the Windows
+    // Driver Manager asks for them before `SQLDriverConnectW`. With both
+    // declared, core answers the whole pre-connect group the DM wants —
+    // `SQL_DRIVER_NAME`, `SQL_DRIVER_VER`, `SQL_DRIVER_ODBC_VER`,
+    // `SQL_ASYNC_DBC_FUNCTIONS` and `SQL_MAX_CONCURRENT_ACTIVITIES` — so
+    // `get_info_pre_connect` no longer has to.
+
+    /// The name the driver is registered under in `odbcinst.ini` and in the
+    /// Windows registry; `packaging/` writes exactly this string.
+    fn driver_name() -> Cow<'static, str> {
+        Cow::Borrowed("stackable-odbc-trino")
+    }
+
+    /// This crate's `Cargo.toml` version, in the spec's `##.##.####` form.
+    fn driver_version() -> Cow<'static, str> {
+        Cow::Owned(stackable_odbc_core::driver_version!())
+    }
+
+    /// The DBMS is Trino whatever the connection reached — this driver speaks
+    /// only Trino's REST protocol, so there is no other answer.
+    fn dbms_name(_conn: &TrinoConnection) -> Cow<'static, str> {
+        Cow::Borrowed("Trino")
+    }
+
+    /// The coordinator's own version, captured from the `X-Trino-Server`-style
+    /// probe `connect` runs, already normalised to `##.##.####`.
+    ///
+    /// Connection-dependent, which is why the pre-connect path in
+    /// [`info::get_info_pre_connect`] answers the empty string instead: before
+    /// a connection exists there is no server to report a version for, and the
+    /// empty string is the spec's "not available".
+    fn dbms_version(conn: &TrinoConnection) -> Cow<'static, str> {
+        Cow::Owned(conn.dbms_version.clone())
+    }
+
+    /// The catalog this connection was opened against, from the `Catalog`
+    /// connection-string key.
+    ///
+    /// This is the one place the value lives. Core feeds it to both readers the
+    /// spec makes synonyms — `SQLGetConnectAttr(SQL_ATTR_CURRENT_CATALOG)` and
+    /// `SQLGetInfo(SQL_DATABASE_NAME)` — so there is no arm for either in
+    /// `info.rs`. `None` when the connection string named no catalog, which
+    /// both readers render as the empty string, the spec's "not available".
+    ///
+    /// [`Backend::set_current_catalog`] is deliberately *not* implemented; see
+    /// below for why, and note the consequence the trait doc warns about: an
+    /// application can read this catalog and cannot change it.
+    fn current_catalog(conn: &TrinoConnection) -> Option<Cow<'static, str>> {
+        conn.catalog.clone().map(Cow::Owned)
+    }
+
+    // `set_current_catalog` keeps core's default, which reports `HYC00`, so
+    // `SQLSetConnectAttr(SQL_ATTR_CURRENT_CATALOG)` fails rather than
+    // pretending. Trino cannot switch a catalog without also switching the
+    // schema, and it is the second half that makes accepting the call a lie.
+    //
+    // The only statement that moves the session catalog is `USE`, and its
+    // grammar requires a schema. Measured against a live coordinator:
+    //
+    // | Statement | Result |
+    // |---|---|
+    // | `USE postgresql.public` | `X-Trino-Set-Catalog: postgresql`, `X-Trino-Set-Schema: public` |
+    // | `USE "postgresql"."public"` | the same |
+    // | `USE postgresql` | `NOT_FOUND` — parsed as a *schema* named `postgresql` |
+    //
+    // So there is no way to honour "set the catalog to X" without inventing a
+    // schema to go with it. Every catalog has an `information_schema`, so that
+    // invention would succeed and then leave an unqualified `SELECT ... FROM
+    // orders` resolving inside `information_schema` — the application's names
+    // pointing somewhere it never asked for, which is exactly the failure
+    // `HYC00` exists to avoid, displaced from the catalog to the schema.
+    // Reconnecting under a new catalog is the other option and is worse: it
+    // drops the session's prepared statements and its connection pool under a
+    // call the application thinks is an attribute write.
+    //
+    // `trino-rust-client` is not the constraint here and would not need to
+    // change: it already tracks `X-Trino-Set-Catalog` into its session and
+    // carries the new value on later requests. Trino's grammar is. Revisit if
+    // `SET SESSION CATALOG`, or any catalog-only form of `USE`, ever lands.
 
     fn get_info(
         conn: &TrinoConnection,
@@ -1727,10 +1902,20 @@ mod tests {
     // run them in isolation. The FFI integration tests provide equivalent
     // coverage via the ODBC call stack.
 
+    /// The `Backend` trait's own `exec_direct` path.
+    ///
+    /// Named so that no filter can select it and
+    /// `ffi_integration_tests::exec_direct_select_and_fetch` — the same query
+    /// through the C ABI — at the same time. `cargo test` filters by substring,
+    /// and the two suites must never share a process: each opens its own
+    /// reqwest connection pool, and two pools against one coordinator corrupt
+    /// each other's TCP sockets (see the note above). Neither name is a
+    /// substring of the other, which is what keeps `cargo test <either name>`
+    /// selecting one suite.
     #[test]
     #[serial(backend)]
     #[ignore = "requires Trino -- run in isolation: cargo test -- --ignored backend"]
-    fn exec_direct_select_and_fetch() {
+    fn backend_exec_direct_selects_and_fetches() {
         use stackable_odbc_core::types::CDataType;
         let conn = shared_trino_conn();
         let cancel = TrinoBackend::cancel_token(conn);
