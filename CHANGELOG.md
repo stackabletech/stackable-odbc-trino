@@ -133,6 +133,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   into another.
 - **`Locale` connection-string key**, sent as `X-Trino-Language` for
   locale-dependent formatting.
+- **`ExtraHeaders` connection-string key**, arbitrary HTTP headers on every
+  request in the same `name:value;name2:value2` form as the other key-value
+  keys, for gateways and reverse proxies that require one. A name the client
+  manages is rejected when the connection is built rather than sent alongside
+  the client's own value, because `reqwest` appends and the request would
+  otherwise carry two — verified against a live coordinator, where
+  `ExtraHeaders={X-Trino-User:evil}` fails with `reserved header:
+  X-Trino-User is managed by the client`.
+
+  Declared in `Backend::sensitive_connect_keywords`. Unlike `AccessToken` and
+  `ExtraCredentials` it is not a credential by definition, but a header a
+  gateway demands is routinely an API key and nothing in the name says so.
+- **`ClientCapabilities` connection-string key**, a comma-separated list added
+  to the `PARAMETRIC_DATETIME` and `PATH` the client always sends. Those two
+  cannot be dropped: its type decoder depends on both.
 - **`TimeZone` connection-string key**, an IANA zone name sent as
   `X-Trino-Time-Zone`. Trino resolves `current_timestamp`, `TIMESTAMP WITH TIME
   ZONE` literals and every `AT TIME ZONE` against the session zone, so leaving

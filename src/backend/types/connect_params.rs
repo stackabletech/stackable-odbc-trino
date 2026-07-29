@@ -50,6 +50,23 @@ pub(crate) const PARAM_PATH: &str = "path";
 pub(crate) const PARAM_CLIENT_INFO: &str = "clientinfo";
 /// Correlation token Trino records against the query.
 pub(crate) const PARAM_TRACE_TOKEN: &str = "tracetoken";
+/// Extra HTTP headers on every request, in the same `name:value;name2:value2`
+/// form as the other key-value keys.
+///
+/// For gateways and reverse proxies that require one. A name the client already
+/// manages is rejected when the client is built, because `reqwest` appends
+/// rather than replaces and the request would carry two values for it.
+///
+/// **Secret.** A gateway header routinely carries an API key, and nothing in
+/// the name tells the driver whether this one does, so the whole value is
+/// declared in `Backend::sensitive_connect_keywords`.
+pub(crate) const PARAM_EXTRA_HEADERS: &str = "extraheaders";
+/// Comma-separated Trino client capabilities, on top of the two the client
+/// always sends.
+///
+/// `PARAMETRIC_DATETIME` and `PATH` are sent unconditionally and cannot be
+/// dropped — the client's own type decoder depends on both.
+pub(crate) const PARAM_CLIENT_CAPABILITIES: &str = "clientcapabilities";
 /// IANA time zone the session runs in, sent as `X-Trino-Time-Zone`.
 ///
 /// Trino resolves `current_timestamp`, `TIMESTAMP WITH TIME ZONE` literals and
@@ -235,6 +252,10 @@ pub(crate) struct TrinoConnectParams {
     locale: Option<String>,
     roles: HashMap<String, SelectedRole>,
     time_zone: Option<Tz>,
+    /// Redacted for the same reason as `extra_credentials`: a gateway header
+    /// is a plausible place for an API key, and `Debug` reaches the log.
+    extra_headers: Redacted<HashMap<String, String>>,
+    client_capabilities: HashSet<String>,
     compression_disabled: bool,
     max_attempts: Option<usize>,
 }
@@ -332,6 +353,15 @@ impl TrinoConnectParams {
         self.time_zone
     }
 
+    pub fn extra_headers(&self) -> &HashMap<String, String> {
+        &self.extra_headers.0
+    }
+
+    /// Capabilities on top of the two the client always sends.
+    pub fn client_capabilities(&self) -> &HashSet<String> {
+        &self.client_capabilities
+    }
+
     pub fn compression_disabled(&self) -> bool {
         self.compression_disabled
     }
@@ -406,6 +436,7 @@ impl TryFrom<&ConnectParams> for TrinoConnectParams {
         };
         let session_properties = pairs(PARAM_SESSION_PROPERTIES)?;
         let extra_credentials = pairs(PARAM_EXTRA_CREDENTIALS)?;
+        let extra_headers = pairs(PARAM_EXTRA_HEADERS)?;
         let resource_estimates = pairs(PARAM_RESOURCE_ESTIMATES)?;
         let roles = pairs(PARAM_ROLES)?
             .into_iter()
@@ -507,6 +538,20 @@ impl TryFrom<&ConnectParams> for TrinoConnectParams {
             locale: params.get(PARAM_LOCALE).map(str::to_string),
             roles,
             time_zone,
+            extra_headers: Redacted(extra_headers),
+            // Split like `client_tags`, and for the same reasons: trimmed so a
+            // written-out list does not send " FOO", and empty elements dropped
+            // rather than sent as an empty capability.
+            client_capabilities: params
+                .get(PARAM_CLIENT_CAPABILITIES)
+                .map(|raw| {
+                    raw.split(',')
+                        .map(str::trim)
+                        .filter(|cap| !cap.is_empty())
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_default(),
             compression_disabled,
             max_attempts,
         })
@@ -723,6 +768,49 @@ mod tests {
         assert_eq!(p.roles()["iceberg"].to_string(), "ALL");
         // Matched case-insensitively, like every other connection-string value.
         assert_eq!(p.roles()["pg"].to_string(), "NONE");
+    }
+
+    #[test]
+    fn extra_headers_take_the_key_value_form() {
+        let p = parse(
+            "Host=localhost;Port=8080;User=admin;\
+             ExtraHeaders={X-Gateway-Key:abc123;X-Tenant:eu-west}",
+        );
+        assert_eq!(
+            p.extra_headers().get("X-Gateway-Key").map(String::as_str),
+            Some("abc123")
+        );
+        assert_eq!(
+            p.extra_headers().get("X-Tenant").map(String::as_str),
+            Some("eu-west")
+        );
+    }
+
+    /// A gateway header is a plausible place for an API key, and `Debug` on
+    /// this struct reaches the log.
+    #[test]
+    fn extra_headers_are_redacted_in_debug() {
+        let p = parse("Host=localhost;Port=8080;User=admin;ExtraHeaders={X-Key:hunter2}");
+        let rendered = format!("{p:?}");
+        assert!(
+            !rendered.contains("hunter2"),
+            "the header value leaked into Debug output: {rendered}"
+        );
+    }
+
+    #[test]
+    fn client_capabilities_split_on_commas_and_trim() {
+        let p =
+            parse("Host=localhost;Port=8080;User=admin;ClientCapabilities=SESSION_AUTHORIZATION, ");
+        assert_eq!(p.client_capabilities().len(), 1);
+        assert!(p.client_capabilities().contains("SESSION_AUTHORIZATION"));
+    }
+
+    #[test]
+    fn extra_headers_and_capabilities_are_empty_by_default() {
+        let p = parse("Host=localhost;Port=8080;User=admin");
+        assert!(p.extra_headers().is_empty());
+        assert!(p.client_capabilities().is_empty());
     }
 
     #[test]

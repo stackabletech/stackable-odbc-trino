@@ -1014,6 +1014,15 @@ impl Backend for TrinoBackend {
         if let Some(tz) = p.time_zone() {
             builder = builder.timezone(tz);
         }
+        // A name the client manages is rejected by `build` below, rather than
+        // sent alongside the client's own value -- `reqwest` appends, so the
+        // request would carry both.
+        if !p.extra_headers().is_empty() {
+            builder = builder.extra_headers(p.extra_headers().clone());
+        }
+        if !p.client_capabilities().is_empty() {
+            builder = builder.client_capabilities(p.client_capabilities().clone());
+        }
         if p.compression_disabled() {
             builder = builder.compression_disabled(true);
         }
@@ -1269,7 +1278,9 @@ impl Backend for TrinoBackend {
     ///
     /// `Password` is core's own spec-defined keyword, redacted there by name.
     fn sensitive_connect_keywords() -> Cow<'static, [Cow<'static, str>]> {
-        use types::connect_params::{PARAM_ACCESS_TOKEN, PARAM_EXTRA_CREDENTIALS, PARAM_TOKEN};
+        use types::connect_params::{
+            PARAM_ACCESS_TOKEN, PARAM_EXTRA_CREDENTIALS, PARAM_EXTRA_HEADERS, PARAM_TOKEN,
+        };
         Cow::Borrowed(&[
             Cow::Borrowed(PARAM_ACCESS_TOKEN),
             Cow::Borrowed(PARAM_TOKEN),
@@ -1277,6 +1288,12 @@ impl Backend for TrinoBackend {
             // connector -- an S3 key, a Kerberos ticket. Core has no way to
             // know a `name:value` list holds secrets, so it has to be declared.
             Cow::Borrowed(PARAM_EXTRA_CREDENTIALS),
+            // Not credentials by definition, unlike the three above, but a
+            // header a gateway demands is routinely an API key and the name
+            // alone does not say. Declared because the cost of redacting a
+            // header that turns out to be innocuous is nothing, and the cost of
+            // echoing one that was not is a key in a log.
+            Cow::Borrowed(PARAM_EXTRA_HEADERS),
         ])
     }
 
@@ -2334,13 +2351,20 @@ mod tests {
     /// keyword, redacted there by name rather than by this hook.
     #[test]
     fn every_trino_specific_secret_keyword_is_declared_sensitive() {
-        use types::connect_params::{PARAM_ACCESS_TOKEN, PARAM_EXTRA_CREDENTIALS, PARAM_TOKEN};
+        use types::connect_params::{
+            PARAM_ACCESS_TOKEN, PARAM_EXTRA_CREDENTIALS, PARAM_EXTRA_HEADERS, PARAM_TOKEN,
+        };
 
         let declared = TrinoBackend::sensitive_connect_keywords();
-        for key in [PARAM_ACCESS_TOKEN, PARAM_TOKEN, PARAM_EXTRA_CREDENTIALS] {
+        for key in [
+            PARAM_ACCESS_TOKEN,
+            PARAM_TOKEN,
+            PARAM_EXTRA_CREDENTIALS,
+            PARAM_EXTRA_HEADERS,
+        ] {
             assert!(
                 declared.iter().any(|d| d == key),
-                "{key} carries a bearer token but is not declared sensitive; declared: {declared:?}"
+                "{key} can carry a credential but is not declared sensitive; declared: {declared:?}"
             );
         }
     }

@@ -716,11 +716,13 @@ list — keep this table in sync with it. Keys are case-insensitive.
 | `SessionUser` | No | User statements run as, while `User` still authenticates. JDBC's `sessionUser` |
 | `Roles` | No | Authorisation role per catalog, `catalog:role;catalog2:ALL`. Needs `{braces}` |
 | `TimeZone` | No | IANA session time zone (`Europe/Berlin`). Unset leaves the coordinator's |
+| `ExtraHeaders` | No | Extra HTTP headers, same form. **Secret** — declared in `sensitive_connect_keywords` |
+| `ClientCapabilities` | No | Comma-separated extra capabilities, on top of `PARAMETRIC_DATETIME` and `PATH` |
 | `Locale` | No | Locale for locale-dependent formatting, sent as `X-Trino-Language` |
 | `DisableCompression` | No | `true` or `false` (default) |
 | `MaxAttempts` | No | Request retry budget. Unset leaves `trino-rust-client`'s own |
 
-The four `name:value;name2:value2` keys take **JDBC's format verbatim**, so a
+The five `name:value;name2:value2` keys take **JDBC's format verbatim**, so a
 value copied out of a JDBC URL transfers unchanged. That format uses `;`, which
 is also what separates one ODBC connection-string parameter from the next, so
 the value must be wrapped in braces:
