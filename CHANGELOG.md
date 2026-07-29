@@ -105,6 +105,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **A fetch stopped by a cancellation now reports `HY008` instead of an empty
+  result set.** `SQLFetch` returned `SQL_NO_DATA` when it found the statement
+  already cancelled, which says "your result set ended" for rows that were in
+  fact discarded. It also silently defeated `SQL_ATTR_QUERY_TIMEOUT`:
+  `stackable-odbc-core` relabels a fetch *error* to `HYT00` when its timer
+  fired and has nothing to relabel when the fetch succeeds, so a timeout whose
+  cancel landed between page requests — rather than during one — surfaced as an
+  empty result set with no diagnostic, indistinguishable from an empty table.
+  Both paths now report `HY008`, and `HYT00` when a timeout caused it, so what
+  the application is told no longer depends on the timing of the cancel.
 - **The Linux installer now writes `Threading = 2`** into the driver's
   `odbcinst.ini` section. unixODBC's default of `3` serialises at the
   environment level and holds a cross-thread `SQLCancel` behind the call it was

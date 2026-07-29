@@ -383,6 +383,19 @@ query is exactly when an application reaches for `SQLCancel`.
 any further: `get_next` fails after a server-side cancel and leaves the pooled
 TCP socket carrying residual bytes, which surfaces later as an unrelated query
 failing. `fetch` and `close_cursor` read the flag and stop touching `next_uri`.
+
+**A cancelled `fetch` reports `HY008`, never `NoData`.** `NoData` says "your
+result set ended", which is false when rows were discarded, and it is not a
+cosmetic difference: core relabels a fetch *error* to `HYT00` when its query
+timer fired, and has nothing to relabel when the fetch succeeds. While `fetch`
+returned `NoData` here, a query timeout whose cancel happened to land between
+page requests reached the application as an empty result set with no diagnostic
+at all — indistinguishable from an empty table. Rare, because the cancel
+usually lands while a request is in flight, which is the other path; caught by
+`test_query_timeout_fires_through_the_driver_manager` on roughly one run in
+twenty. `cancelled_between_requests` builds that error, and
+`cancel_from_another_thread_while_fetching` now requires `HY008` from both
+paths rather than accepting either ending.
 `begin_query` clears the flag as well as setting the id. Core mints a **new
 token at every statement-producing call**, so a re-execute already arrives with
 a fresh `CancelState`, and `cancel` sets the flag only after a `DELETE` that

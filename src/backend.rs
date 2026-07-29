@@ -232,6 +232,34 @@ pub(crate) fn map_trino_error_on(
     mapped
 }
 
+/// The error a statement reports for a cancellation it learned about from the
+/// token rather than from a failed request.
+///
+/// [`map_trino_error`] covers the cancel that lands while a page request is in
+/// flight, recognising Trino's `USER_CANCELED` on the response. A cancel that
+/// completes *between* requests leaves no failed response to classify, and the
+/// next `fetch` finds only [`CancelState::is_cancelled`] — so the error has to
+/// be built here.
+///
+/// Reporting the same `USER_CANCELED` name and native code is accurate rather
+/// than invented: the flag is set only once `cancel`'s `DELETE` has succeeded,
+/// so the coordinator really did cancel the query, and code 3 is what it calls
+/// that.
+///
+/// Both arms therefore reach the application as `HY008`, and core relabels
+/// either to `HYT00` when the failure follows a query timeout it armed. The
+/// alternative — reporting `NoData` — told an application its result set had
+/// ended normally when its rows had in fact been discarded.
+pub(crate) fn cancelled_between_requests() -> TrinoError {
+    TrinoError::OperationCancelled {
+        source: QueryCause::Server {
+            error_name: "USER_CANCELED".to_owned(),
+            message: "the query was cancelled".to_owned(),
+        },
+        native_error: TRINO_ERROR_USER_CANCELED,
+    }
+}
+
 pub(crate) fn map_trino_error(e: trino_rust_client::error::Error) -> TrinoError {
     use trino_rust_client::error::Error;
     match e {
@@ -2385,10 +2413,17 @@ mod tests {
         // cancellation through the token instead of clearing `next_uri`
         // directly. The statement must observe that on its next fetch and stop
         // polling: draining a cancelled query is what corrupts the pool.
-        assert_eq!(
-            stmt.fetch().expect("fetch after cancel"),
-            FetchResult::NoData,
-            "a cancelled statement must report NoData rather than resume paging"
+        //
+        // The observation is reported as `HY008`, not `NoData`. `NoData` says
+        // "your result set ended", which is false when rows were discarded --
+        // and it is what let a query timeout enforced by cancelling arrive as
+        // an empty result set with no diagnostic at all.
+        let err = stmt
+            .fetch()
+            .expect_err("a cancelled statement must report the cancellation, not NoData");
+        assert!(
+            matches!(err, TrinoError::OperationCancelled { .. }),
+            "expected OperationCancelled (HY008), got {err:?}"
         );
         assert!(
             stmt.next_uri.is_none(),
@@ -2450,30 +2485,29 @@ mod tests {
             "cross-thread cancel failed: {cancelled:?}"
         );
 
-        // Both endings are correct, and which one occurs depends on whether a
-        // page request happened to be in flight when the DELETE landed:
+        // `HY008` whichever way the race fell. Two paths reach it, depending on
+        // whether a page request happened to be in flight when the `DELETE`
+        // landed:
         //
-        // - in flight: the coordinator fails that request with USER_CANCELED,
-        //   and the spec's HY008 is what must reach the application;
-        // - between requests: nothing was interrupted, so the statement simply
-        //   reports the result set as finished.
+        // - in flight: the coordinator fails that request with `USER_CANCELED`,
+        //   which `map_trino_error` classifies;
+        // - between requests: nothing was interrupted, so the next `fetch`
+        //   finds only the token's flag and builds the same error from
+        //   `cancelled_between_requests`.
         //
-        // Accepting either is not slack in the assertion — pinning one would
-        // make the test flaky on a timing detail neither the driver nor the
-        // application controls. What is asserted unconditionally is that the
-        // stream stopped early, below.
-        match outcome {
-            Err(e) => {
-                let odbc = OdbcError::from(e);
-                assert_eq!(
-                    odbc.sqlstate(),
-                    stackable_odbc_core::types::SqlState::new(SQL_STATE_CANCELLED),
-                    "a fetch interrupted by SQLCancel must report HY008, got {odbc:?}"
-                );
-            }
-            Ok(FetchResult::NoData) => {}
-            Ok(other) => panic!("unexpected fetch outcome after cancel: {other:?}"),
-        }
+        // This assertion was previously "either `HY008` or `NoData`", on the
+        // grounds that the timing was outside anyone's control. The timing
+        // still is — but what the application is *told* must not depend on it,
+        // and while `NoData` was permitted a query timeout enforced by
+        // cancelling could surface as an empty result set with no diagnostic.
+        let odbc = OdbcError::from(
+            outcome.expect_err("a fetch stopped by SQLCancel must report the cancellation"),
+        );
+        assert_eq!(
+            odbc.sqlstate(),
+            stackable_odbc_core::types::SqlState::new(SQL_STATE_CANCELLED),
+            "a fetch interrupted by SQLCancel must report HY008, got {odbc:?}"
+        );
 
         // The proof the cancel actually took effect. tpcds.sf1.customer holds
         // 100,000 rows; had the cancel been a no-op the loop would have drained
@@ -2488,11 +2522,19 @@ mod tests {
             "the statement must not be left holding a next page URI, {rows} rows in"
         );
 
-        // Not `fetch_failed`: a cancellation is not a failed fetch, so the
-        // statement reports a finished result set rather than 24000.
+        // Not `fetch_failed`: a cancellation is not a failed fetch, so a
+        // further fetch reports the cancellation again rather than the `24000`
+        // an abandoned result set would give. The distinction is what keeps the
+        // handle re-executable — and a re-execute arrives with a fresh token,
+        // so the flag does not follow it.
+        let again = OdbcError::from(
+            stmt.fetch()
+                .expect_err("a cancelled statement stays cancelled until it is re-executed"),
+        );
         assert_eq!(
-            stmt.fetch().expect("fetch after a cancelled fetch"),
-            FetchResult::NoData
+            again.sqlstate(),
+            stackable_odbc_core::types::SqlState::new(SQL_STATE_CANCELLED),
+            "expected HY008 again, got {again:?}"
         );
     }
 

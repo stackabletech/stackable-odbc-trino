@@ -462,15 +462,25 @@ impl StatementBackend for TrinoStatement {
         // empty page exhausts the stack, and a stack overflow aborts the host
         // process rather than unwinding into panic_safe.
         loop {
-            // A concurrent SQLCancel has already stopped this query
-            // server-side. Discard what is left rather than serving rows from a
-            // result set the application asked to abandon, and above all do not
-            // poll `next_uri` -- see `cancel` for why that dirties the socket.
+            // A concurrent SQLCancel, or a query timeout core enforced by
+            // cancelling, has already stopped this query server-side. Discard
+            // what is left rather than serving rows from a result set the
+            // application asked to abandon, and above all do not poll
+            // `next_uri` -- see `cancel` for why that dirties the socket.
+            //
+            // Reported as an error, not `NoData`. `NoData` is "your result set
+            // ended", which is false here: rows were discarded, and an
+            // application that asked for a 30-second deadline and got an empty
+            // answer at 30 seconds cannot tell a timeout from an empty table.
+            // `end_page_fetch` recognises the cancelled variant and keeps it
+            // off `abandon_result_set`, so the cursor is finished rather than
+            // left in the undefined position `24000` describes.
+            //
+            // This is the half of the cancel that `map_trino_error` cannot see:
+            // a cancel landing between page requests leaves no failed response
+            // to classify. Core relabels it `HYT00` when its own timer fired.
             if self.is_cancelled() {
-                self.batch.clear();
-                self.batch_cursor = 0;
-                self.next_uri = None;
-                return Ok(FetchResult::NoData);
+                return Err(self.end_page_fetch(super::cancelled_between_requests()));
             }
 
             // Try to advance within the current batch.
