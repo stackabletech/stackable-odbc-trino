@@ -1011,6 +1011,9 @@ impl Backend for TrinoBackend {
         if !p.roles().is_empty() {
             builder = builder.roles(p.roles().clone());
         }
+        if let Some(tz) = p.time_zone() {
+            builder = builder.timezone(tz);
+        }
         if p.compression_disabled() {
             builder = builder.compression_disabled(true);
         }

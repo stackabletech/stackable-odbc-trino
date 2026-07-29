@@ -715,6 +715,7 @@ list — keep this table in sync with it. Keys are case-insensitive.
 | `TraceToken` | No | Correlation token Trino records against the query |
 | `SessionUser` | No | User statements run as, while `User` still authenticates. JDBC's `sessionUser` |
 | `Roles` | No | Authorisation role per catalog, `catalog:role;catalog2:ALL`. Needs `{braces}` |
+| `TimeZone` | No | IANA session time zone (`Europe/Berlin`). Unset leaves the coordinator's |
 | `Locale` | No | Locale for locale-dependent formatting, sent as `X-Trino-Language` |
 | `DisableCompression` | No | `true` or `false` (default) |
 | `MaxAttempts` | No | Request retry budget. Unset leaves `trino-rust-client`'s own |

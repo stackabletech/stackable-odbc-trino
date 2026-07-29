@@ -6,6 +6,7 @@ use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 use stackable_odbc_core::types::{ConnectParams, Redacted};
+use trino_rust_client::Tz;
 use trino_rust_client::selected_role::{RoleType, SelectedRole};
 
 use super::super::TrinoError;
@@ -49,6 +50,13 @@ pub(crate) const PARAM_PATH: &str = "path";
 pub(crate) const PARAM_CLIENT_INFO: &str = "clientinfo";
 /// Correlation token Trino records against the query.
 pub(crate) const PARAM_TRACE_TOKEN: &str = "tracetoken";
+/// IANA time zone the session runs in, sent as `X-Trino-Time-Zone`.
+///
+/// Trino resolves `current_timestamp`, `TIMESTAMP WITH TIME ZONE` literals and
+/// every `AT TIME ZONE` against the session zone, so leaving it unset means
+/// those follow whatever zone the coordinator's JVM happens to be in — which is
+/// a property of the server, not of the query.
+pub(crate) const PARAM_TIME_ZONE: &str = "timezone";
 /// Authorisation role per catalog, in the same `name:value;name2:value2` form
 /// as the other key-value keys — `Roles={hive:admin;iceberg:ALL}`.
 ///
@@ -131,21 +139,6 @@ pub(crate) const DEFAULT_SOURCE: &str = concat!("stackable-odbc-trino/", env!("C
 /// A malformed pair is an error rather than a skip. A dropped session property
 /// changes how the query runs, and an operator who mistyped one would otherwise
 /// see a plausible result computed under settings they did not ask for.
-/// A connection-string role value as `X-Trino-Role` spells it.
-///
-/// `ALL` and `NONE` are Trino's two keywords and are matched case-insensitively,
-/// the way every other connection-string value is. Anything else is a role
-/// name, which the wire format wraps as `ROLE{name}` — done here rather than
-/// asked of the operator, because the braces would have to be escaped past
-/// core's connection-string parser to survive.
-fn selected_role(value: &str) -> SelectedRole {
-    match value.to_ascii_uppercase().as_str() {
-        "ALL" => SelectedRole::new(RoleType::All, None),
-        "NONE" => SelectedRole::new(RoleType::None, None),
-        _ => SelectedRole::new(RoleType::Role, Some(value.to_string())),
-    }
-}
-
 fn parse_key_value_pairs(key: &str, raw: &str) -> Result<HashMap<String, String>, TrinoError> {
     let mut map = HashMap::new();
 
@@ -177,6 +170,21 @@ fn parse_key_value_pairs(key: &str, raw: &str) -> Result<HashMap<String, String>
     }
 
     Ok(map)
+}
+
+/// A connection-string role value as `X-Trino-Role` spells it.
+///
+/// `ALL` and `NONE` are Trino's two keywords and are matched case-insensitively,
+/// the way every other connection-string value is. Anything else is a role
+/// name, which the wire format wraps as `ROLE{name}` — done here rather than
+/// asked of the operator, because the braces would have to be escaped past
+/// core's connection-string parser to survive.
+fn selected_role(value: &str) -> SelectedRole {
+    match value.to_ascii_uppercase().as_str() {
+        "ALL" => SelectedRole::new(RoleType::All, None),
+        "NONE" => SelectedRole::new(RoleType::None, None),
+        _ => SelectedRole::new(RoleType::Role, Some(value.to_string())),
+    }
 }
 
 /// Parse a `"true"` / `"false"` parameter, case-insensitively.
@@ -226,6 +234,7 @@ pub(crate) struct TrinoConnectParams {
     session_user: Option<String>,
     locale: Option<String>,
     roles: HashMap<String, SelectedRole>,
+    time_zone: Option<Tz>,
     compression_disabled: bool,
     max_attempts: Option<usize>,
 }
@@ -318,6 +327,11 @@ impl TrinoConnectParams {
         &self.roles
     }
 
+    /// `None` leaves the coordinator's own zone in force.
+    pub fn time_zone(&self) -> Option<Tz> {
+        self.time_zone
+    }
+
     pub fn compression_disabled(&self) -> bool {
         self.compression_disabled
     }
@@ -397,6 +411,20 @@ impl TryFrom<&ConnectParams> for TrinoConnectParams {
             .into_iter()
             .map(|(catalog, role)| (catalog, selected_role(&role)))
             .collect();
+
+        // Rejected rather than ignored. A zone the operator mistyped would
+        // otherwise leave every `current_timestamp` and `AT TIME ZONE` on the
+        // coordinator's own zone, which is a plausible-looking answer that is
+        // silently hours out.
+        let time_zone = match params.get(PARAM_TIME_ZONE) {
+            None => None,
+            Some(raw) => Some(raw.parse::<Tz>().map_err(|_| TrinoError::General {
+                message: format!(
+                    "invalid value for {PARAM_TIME_ZONE}: {raw:?} is not an IANA \
+                     time zone name, such as \"Europe/Berlin\" or \"UTC\""
+                ),
+            })?),
+        };
 
         let compression_disabled = match params.get(PARAM_DISABLE_COMPRESSION) {
             None => false,
@@ -478,6 +506,7 @@ impl TryFrom<&ConnectParams> for TrinoConnectParams {
             session_user: params.get(PARAM_SESSION_USER).map(str::to_string),
             locale: params.get(PARAM_LOCALE).map(str::to_string),
             roles,
+            time_zone,
             compression_disabled,
             max_attempts,
         })
@@ -694,6 +723,30 @@ mod tests {
         assert_eq!(p.roles()["iceberg"].to_string(), "ALL");
         // Matched case-insensitively, like every other connection-string value.
         assert_eq!(p.roles()["pg"].to_string(), "NONE");
+    }
+
+    #[test]
+    fn time_zone_takes_an_iana_name() {
+        let p = parse("Host=localhost;Port=8080;User=admin;TimeZone=Europe/Berlin");
+        assert_eq!(
+            p.time_zone().map(|tz| tz.to_string()),
+            Some("Europe/Berlin".to_string())
+        );
+        assert_eq!(
+            parse("Host=localhost;Port=8080;User=admin").time_zone(),
+            None
+        );
+    }
+
+    /// A mistyped zone leaves every `current_timestamp` on the coordinator's
+    /// own, which is a wrong answer that looks right.
+    #[test]
+    fn an_unknown_time_zone_is_rejected() {
+        let err = parse_err("Host=localhost;Port=8080;User=admin;TimeZone=Europe/Berlim");
+        assert!(
+            err.to_string().contains("IANA"),
+            "the message must say what a valid value looks like: {err}"
+        );
     }
 
     #[test]

@@ -133,6 +133,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   into another.
 - **`Locale` connection-string key**, sent as `X-Trino-Language` for
   locale-dependent formatting.
+- **`TimeZone` connection-string key**, an IANA zone name sent as
+  `X-Trino-Time-Zone`. Trino resolves `current_timestamp`, `TIMESTAMP WITH TIME
+  ZONE` literals and every `AT TIME ZONE` against the session zone, so leaving
+  it unset means those follow the coordinator's JVM — a property of the server
+  rather than of the query. An unknown zone fails the connection instead of
+  being ignored, because the alternative is timestamps that are silently hours
+  out. Verified against a live coordinator: `current_timezone()` answers `UTC`
+  unset, and `Europe/Berlin` or `Pacific/Auckland` when set.
 - **`Roles` connection-string key**, an authorisation role per catalog in the
   same `catalog:role;catalog2:ALL` form as the other key-value keys, so it needs
   `{braces}` for the same reason. The value is a bare role name or the keyword
