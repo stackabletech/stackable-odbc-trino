@@ -998,6 +998,16 @@ impl Backend for TrinoBackend {
         if let Some(token) = p.trace_token() {
             builder = builder.trace_token(token);
         }
+        // Impersonation: `X-Trino-User` becomes this, while the credentials
+        // stay those of `User`. Session state accumulates per client, so one
+        // ODBC connection per impersonated user is what keeps a `SET SESSION`
+        // made for one from reaching another.
+        if let Some(session_user) = p.session_user() {
+            builder = builder.session_user(session_user);
+        }
+        if let Some(locale) = p.locale() {
+            builder = builder.locale(locale);
+        }
         if p.compression_disabled() {
             builder = builder.compression_disabled(true);
         }

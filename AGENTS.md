@@ -713,6 +713,8 @@ list — keep this table in sync with it. Keys are case-insensitive.
 | `Path` | No | Default SQL path for resolving unqualified function names |
 | `ClientInfo` | No | Free-form client metadata Trino records against the query |
 | `TraceToken` | No | Correlation token Trino records against the query |
+| `SessionUser` | No | User statements run as, while `User` still authenticates. JDBC's `sessionUser` |
+| `Locale` | No | Locale for locale-dependent formatting, sent as `X-Trino-Language` |
 | `DisableCompression` | No | `true` or `false` (default) |
 | `MaxAttempts` | No | Request retry budget. Unset leaves `trino-rust-client`'s own |
 

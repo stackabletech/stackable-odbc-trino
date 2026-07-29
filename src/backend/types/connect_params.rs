@@ -48,6 +48,16 @@ pub(crate) const PARAM_PATH: &str = "path";
 pub(crate) const PARAM_CLIENT_INFO: &str = "clientinfo";
 /// Correlation token Trino records against the query.
 pub(crate) const PARAM_TRACE_TOKEN: &str = "tracetoken";
+/// User the statements run as, while authentication stays with [`PARAM_USER`].
+///
+/// JDBC spells it `sessionUser`. Trino sends it as `X-Trino-User`, so the
+/// coordinator applies the impersonated user's permissions and records it
+/// against the query, while the connection still authenticates as the
+/// principal in `User`.
+pub(crate) const PARAM_SESSION_USER: &str = "sessionuser";
+/// Locale Trino formats locale-dependent values in, sent as
+/// `X-Trino-Language`.
+pub(crate) const PARAM_LOCALE: &str = "locale";
 /// Disable HTTP response compression: `"true"` or `"false"` (default).
 pub(crate) const PARAM_DISABLE_COMPRESSION: &str = "disablecompression";
 /// How many times a request is attempted before it fails.
@@ -185,6 +195,8 @@ pub(crate) struct TrinoConnectParams {
     path: Option<String>,
     client_info: Option<String>,
     trace_token: Option<String>,
+    session_user: Option<String>,
+    locale: Option<String>,
     compression_disabled: bool,
     max_attempts: Option<usize>,
 }
@@ -260,6 +272,15 @@ impl TrinoConnectParams {
 
     pub fn trace_token(&self) -> Option<&str> {
         self.trace_token.as_deref()
+    }
+
+    /// The user statements run as, when it differs from the authenticating one.
+    pub fn session_user(&self) -> Option<&str> {
+        self.session_user.as_deref()
+    }
+
+    pub fn locale(&self) -> Option<&str> {
+        self.locale.as_deref()
     }
 
     pub fn compression_disabled(&self) -> bool {
@@ -415,6 +436,8 @@ impl TryFrom<&ConnectParams> for TrinoConnectParams {
             path: params.get(PARAM_PATH).map(str::to_string),
             client_info: params.get(PARAM_CLIENT_INFO).map(str::to_string),
             trace_token: params.get(PARAM_TRACE_TOKEN).map(str::to_string),
+            session_user: params.get(PARAM_SESSION_USER).map(str::to_string),
+            locale: params.get(PARAM_LOCALE).map(str::to_string),
             compression_disabled,
             max_attempts,
         })
@@ -596,6 +619,28 @@ mod tests {
         assert_eq!(p.path(), Some("system.builtin"));
         assert_eq!(p.client_info(), Some("dashboard-7"));
         assert_eq!(p.trace_token(), Some("abc-123"));
+    }
+
+    /// Impersonation is a second user alongside the authenticating one, not a
+    /// replacement for it: `User` still carries the credentials.
+    #[test]
+    fn session_user_is_separate_from_the_authenticating_user() {
+        let p = parse("Host=localhost;Port=8080;User=svc_bi;SessionUser=alice");
+        assert_eq!(p.user(), "svc_bi");
+        assert_eq!(p.session_user(), Some("alice"));
+    }
+
+    #[test]
+    fn session_user_and_locale_are_unset_by_default() {
+        let p = parse("Host=localhost;Port=8080;User=admin");
+        assert_eq!(p.session_user(), None);
+        assert_eq!(p.locale(), None);
+    }
+
+    #[test]
+    fn locale_round_trips() {
+        let p = parse("Host=localhost;Port=8080;User=admin;Locale=de-DE");
+        assert_eq!(p.locale(), Some("de-DE"));
     }
 
     #[test]

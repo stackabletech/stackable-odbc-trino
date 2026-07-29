@@ -122,6 +122,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`CALL system.runtime.kill_query(...)`) it publishes no metadata naming them
   — `system.jdbc.procedures` is a JDBC-compatibility view that is always empty.
   This matches the `SQL_ACCESSIBLE_PROCEDURES` of `"N"` the driver reports.
+- **`SessionUser` connection-string key**, for running statements as another
+  user while the connection authenticates as the principal in `User` — JDBC
+  spells it `sessionUser`. Trino sends it as `X-Trino-User`, so the coordinator
+  applies the impersonated user's permissions and records it against the query.
+  Verified against a live coordinator: `SELECT current_user` answers `alice`
+  with `SessionUser=alice` and `admin` without. One ODBC connection per
+  impersonated user is the intended use, because session state accumulates per
+  connection and would otherwise carry a `SET SESSION` made for one identity
+  into another.
+- **`Locale` connection-string key**, sent as `X-Trino-Language` for
+  locale-dependent formatting.
 - `SQLGetFunctions` reports `SQLGetDescField`, `SQLSetDescField`,
   `SQLGetDescRec` and `SQLSetDescRec` as supported, which
   `stackable-odbc-core` implements against the implicit descriptors an
