@@ -1,7 +1,7 @@
 //! FFI-level integration tests for the Trino backend.
 //!
-//! All tests require Trino running at localhost:8080.
-//! Start with: `./test/setup.sh`
+//! All tests require Trino running at localhost:8443.
+//! Start with: `./integration-tests/setup.sh`
 //!
 //! Run with: `cargo test -- --ignored ffi_integration_tests`
 //!
@@ -44,8 +44,15 @@ use crate::backend::info::{
 };
 use crate::backend::{TrinoBackend, disconnected_trino_conn, disconnected_trino_conn_with_catalog};
 
-const CONN_STR: &str =
-    "Host=localhost;Port=8080;Protocol=http;User=admin;Password=admin;Catalog=tpcds";
+/// The coordinator serves HTTPS only, so these tests verify against the test
+/// CA. The path is resolved from `CARGO_MANIFEST_DIR` at compile time rather
+/// than hardcoded: `generated/` is produced per checkout, and a literal path
+/// would only work in one of them.
+const CONN_STR: &str = concat!(
+    "Host=localhost;Port=8443;Protocol=https;User=admin;Password=admin;Catalog=tpcds;Certificate=",
+    env!("CARGO_MANIFEST_DIR"),
+    "/integration-tests/generated/certs/ca.crt"
+);
 
 // ---------------------------------------------------------------------------
 // Shared connection infrastructure
@@ -177,7 +184,7 @@ unsafe fn alloc_handles() -> (*mut c_void, *mut c_void, *mut c_void) {
     }
 }
 
-/// Helper: connect to Trino at localhost:8080.
+/// Helper: connect to Trino at localhost:8443.
 unsafe fn connect_trino(conn: *mut c_void) -> SqlReturn {
     let wide: Vec<u16> = CONN_STR.encode_utf16().collect();
     unsafe {
@@ -674,7 +681,7 @@ unsafe fn get_i64_col(stmt: *mut c_void, col: u16) -> i64 {
 
 #[test]
 #[serial]
-#[ignore = "requires Trino at localhost:8080 -- run test/setup.sh first"]
+#[ignore = "requires Trino at localhost:8443 -- run ./integration-tests/setup.sh first"]
 fn connect_and_disconnect_lifecycle() {
     unsafe {
         let (env, conn, stmt) = alloc_handles();
@@ -696,7 +703,7 @@ fn connect_and_disconnect_lifecycle() {
 
 #[test]
 #[serial]
-#[ignore = "requires Trino at localhost:8080 -- run test/setup.sh first"]
+#[ignore = "requires Trino at localhost:8443 -- run ./integration-tests/setup.sh first"]
 fn tables_returns_tpcds_tables() {
     unsafe {
         let (_env, _conn, stmt) = alloc_stmt();
@@ -728,7 +735,7 @@ fn tables_returns_tpcds_tables() {
 /// payload, not the ASCII bytes of the base64 string ("3q2+7w==").
 #[test]
 #[serial]
-#[ignore = "requires Trino at localhost:8080 -- run test/setup.sh first"]
+#[ignore = "requires Trino at localhost:8443 -- run ./integration-tests/setup.sh first"]
 fn varbinary_get_data_returns_raw_bytes() {
     unsafe {
         let (_env, _conn, stmt) = alloc_stmt();
@@ -765,7 +772,7 @@ fn varbinary_get_data_returns_raw_bytes() {
 /// `crate::escape_dialect`).
 #[test]
 #[serial]
-#[ignore = "requires Trino at localhost:8080 -- run test/setup.sh first"]
+#[ignore = "requires Trino at localhost:8443 -- run ./integration-tests/setup.sh first"]
 fn escape_fn_and_date_literal_translate_for_trino() {
     unsafe {
         let (_env, _conn, stmt) = alloc_stmt();
@@ -810,7 +817,7 @@ fn escape_fn_and_date_literal_translate_for_trino() {
 /// in Trino's ISO one.
 #[test]
 #[serial]
-#[ignore = "requires Trino at localhost:8080 -- run test/setup.sh first"]
+#[ignore = "requires Trino at localhost:8443 -- run ./integration-tests/setup.sh first"]
 fn every_advertised_scalar_function_escape_runs_on_trino() {
     // (escape, expected value as text, or None for "must merely run")
     let cases: &[(&str, Option<&str>)] = &[
@@ -915,7 +922,7 @@ fn every_advertised_scalar_function_escape_runs_on_trino() {
 /// the `CAST` this produces is one Trino accepts.
 #[test]
 #[serial]
-#[ignore = "requires Trino at localhost:8080 -- run test/setup.sh first"]
+#[ignore = "requires Trino at localhost:8443 -- run ./integration-tests/setup.sh first"]
 fn every_convert_escape_target_runs_on_trino() {
     // (value expression, ODBC type keyword, expected text, or None for "must
     // merely run")
@@ -993,7 +1000,7 @@ fn every_convert_escape_target_runs_on_trino() {
 
 #[test]
 #[serial]
-#[ignore = "requires Trino at localhost:8080 -- run test/setup.sh first"]
+#[ignore = "requires Trino at localhost:8443 -- run ./integration-tests/setup.sh first"]
 fn date_columns_return_column_date_not_string() {
     unsafe {
         let (_env, _conn, stmt) = alloc_stmt();
@@ -1035,7 +1042,7 @@ fn date_columns_return_column_date_not_string() {
 /// seed data (`test/postgres-init.sql`) only has whole-second values.
 #[test]
 #[serial]
-#[ignore = "requires Trino at localhost:8080 -- run test/setup.sh first"]
+#[ignore = "requires Trino at localhost:8443 -- run ./integration-tests/setup.sh first"]
 fn time_with_fraction_keeps_milliseconds_via_get_data_string() {
     unsafe {
         let (_env, _conn, stmt) = alloc_stmt();
@@ -1070,7 +1077,7 @@ fn time_with_fraction_keeps_milliseconds_via_get_data_string() {
 
 #[test]
 #[serial]
-#[ignore = "requires Trino at localhost:8080 -- run test/setup.sh first"]
+#[ignore = "requires Trino at localhost:8443 -- run ./integration-tests/setup.sh first"]
 fn exec_direct_select_and_fetch() {
     unsafe {
         let (_env, _conn, stmt) = alloc_stmt();
@@ -1144,7 +1151,7 @@ unsafe fn fetch_one_i64(stmt: *mut c_void) -> i64 {
 
 #[test]
 #[serial]
-#[ignore = "requires Trino at localhost:8080 -- run test/setup.sh first"]
+#[ignore = "requires Trino at localhost:8443 -- run ./integration-tests/setup.sh first"]
 fn prepared_statement_binds_parameter() {
     unsafe {
         let (_env, _conn, stmt) = alloc_stmt();
@@ -1169,7 +1176,7 @@ fn prepared_statement_binds_parameter() {
 
 #[test]
 #[serial]
-#[ignore = "requires Trino at localhost:8080 -- run test/setup.sh first"]
+#[ignore = "requires Trino at localhost:8443 -- run ./integration-tests/setup.sh first"]
 fn prepared_statement_re_executes_with_new_parameter() {
     // The point of preparing is running the same statement with different
     // values; the second execute must not fail or reuse the first value.
@@ -1203,7 +1210,7 @@ fn prepared_statement_re_executes_with_new_parameter() {
 
 #[test]
 #[serial]
-#[ignore = "requires Trino at localhost:8080 -- run test/setup.sh first"]
+#[ignore = "requires Trino at localhost:8443 -- run ./integration-tests/setup.sh first"]
 fn string_parameter_with_quotes_is_not_injected() {
     // A payload that would break out of the literal must come back verbatim as
     // data. If escaping were wrong this would be a syntax error or return the
@@ -1284,7 +1291,7 @@ fn string_parameter_with_quotes_is_not_injected() {
 /// path and have the resulting over-read read as an injection failure.
 #[test]
 #[serial]
-#[ignore = "requires Trino at localhost:8080 -- run test/setup.sh first"]
+#[ignore = "requires Trino at localhost:8443 -- run ./integration-tests/setup.sh first"]
 fn string_parameter_bound_as_nts_is_not_injected() {
     unsafe {
         let (_env, _conn, stmt) = alloc_stmt();
@@ -1346,7 +1353,7 @@ fn string_parameter_bound_as_nts_is_not_injected() {
 
 #[test]
 #[serial]
-#[ignore = "requires Trino at localhost:8080 -- run test/setup.sh first"]
+#[ignore = "requires Trino at localhost:8443 -- run ./integration-tests/setup.sh first"]
 fn columns_returns_tpcds_sf1_columns() {
     unsafe {
         let (_env, _conn, stmt) = alloc_stmt();
@@ -1395,7 +1402,7 @@ fn columns_returns_tpcds_sf1_columns() {
 
 #[test]
 #[serial]
-#[ignore = "requires Trino at localhost:8080 -- run test/setup.sh first"]
+#[ignore = "requires Trino at localhost:8443 -- run ./integration-tests/setup.sh first"]
 fn tables_catalog_enumeration_mode() {
     unsafe {
         let (_env, _conn, stmt) = alloc_stmt();
@@ -1426,7 +1433,7 @@ fn tables_catalog_enumeration_mode() {
 
 #[test]
 #[serial]
-#[ignore = "requires Trino at localhost:8080 -- run test/setup.sh first"]
+#[ignore = "requires Trino at localhost:8443 -- run ./integration-tests/setup.sh first"]
 fn tables_schema_enumeration_mode() {
     unsafe {
         let (_env, _conn, stmt) = alloc_stmt();
@@ -1457,7 +1464,7 @@ fn tables_schema_enumeration_mode() {
 
 #[test]
 #[serial]
-#[ignore = "requires Trino at localhost:8080 -- run test/setup.sh first"]
+#[ignore = "requires Trino at localhost:8443 -- run ./integration-tests/setup.sh first"]
 fn tables_table_type_enumeration_mode() {
     unsafe {
         let (_env, _conn, stmt) = alloc_stmt();
@@ -1506,7 +1513,7 @@ fn tables_table_type_enumeration_mode() {
 
 #[test]
 #[serial]
-#[ignore = "requires Trino at localhost:8080 -- run test/setup.sh first"]
+#[ignore = "requires Trino at localhost:8443 -- run ./integration-tests/setup.sh first"]
 fn decimal_literal_returns_wchar_string() {
     unsafe {
         let (_env, _conn, stmt) = alloc_stmt();
@@ -1526,7 +1533,7 @@ fn decimal_literal_returns_wchar_string() {
 
 #[test]
 #[serial]
-#[ignore = "requires Trino at localhost:8080 -- run test/setup.sh first"]
+#[ignore = "requires Trino at localhost:8443 -- run ./integration-tests/setup.sh first"]
 fn json_literal_returns_wchar_string() {
     unsafe {
         let (_env, _conn, stmt) = alloc_stmt();
@@ -1547,7 +1554,7 @@ fn json_literal_returns_wchar_string() {
 
 #[test]
 #[serial]
-#[ignore = "requires Trino at localhost:8080 -- run test/setup.sh first"]
+#[ignore = "requires Trino at localhost:8443 -- run ./integration-tests/setup.sh first"]
 fn interval_year_month_returns_wchar() {
     unsafe {
         let (_env, _conn, stmt) = alloc_stmt();
@@ -1568,7 +1575,7 @@ fn interval_year_month_returns_wchar() {
 
 #[test]
 #[serial]
-#[ignore = "requires Trino at localhost:8080 -- run test/setup.sh first"]
+#[ignore = "requires Trino at localhost:8443 -- run ./integration-tests/setup.sh first"]
 fn interval_day_time_returns_wchar() {
     unsafe {
         let (_env, _conn, stmt) = alloc_stmt();
@@ -1588,7 +1595,7 @@ fn interval_day_time_returns_wchar() {
 
 #[test]
 #[serial]
-#[ignore = "requires Trino at localhost:8080 -- run test/setup.sh first"]
+#[ignore = "requires Trino at localhost:8443 -- run ./integration-tests/setup.sh first"]
 fn timestamp_with_tz_returns_wchar() {
     unsafe {
         let (_env, _conn, stmt) = alloc_stmt();
@@ -1608,7 +1615,7 @@ fn timestamp_with_tz_returns_wchar() {
 
 #[test]
 #[serial]
-#[ignore = "requires Trino at localhost:8080 -- run test/setup.sh first"]
+#[ignore = "requires Trino at localhost:8443 -- run ./integration-tests/setup.sh first"]
 fn timestamp_with_named_tz_returns_utc_via_get_data() {
     unsafe {
         let (_env, _conn, stmt) = alloc_stmt();
@@ -1657,7 +1664,7 @@ fn timestamp_with_named_tz_returns_utc_via_get_data() {
 
 #[test]
 #[serial]
-#[ignore = "requires Trino at localhost:8080 -- run test/setup.sh first"]
+#[ignore = "requires Trino at localhost:8443 -- run ./integration-tests/setup.sh first"]
 fn timestamp_with_utc_tz_returns_utc_via_get_data() {
     unsafe {
         let (_env, _conn, stmt) = alloc_stmt();
@@ -1701,7 +1708,7 @@ fn timestamp_with_utc_tz_returns_utc_via_get_data() {
 
 #[test]
 #[serial]
-#[ignore = "requires Trino at localhost:8080 -- run test/setup.sh first"]
+#[ignore = "requires Trino at localhost:8443 -- run ./integration-tests/setup.sh first"]
 fn array_literal_returns_wchar() {
     unsafe {
         let (_env, _conn, stmt) = alloc_stmt();
@@ -1723,7 +1730,7 @@ fn array_literal_returns_wchar() {
 
 #[test]
 #[serial]
-#[ignore = "requires Trino at localhost:8080 -- run test/setup.sh first"]
+#[ignore = "requires Trino at localhost:8443 -- run ./integration-tests/setup.sh first"]
 fn map_literal_returns_wchar() {
     unsafe {
         let (_env, _conn, stmt) = alloc_stmt();
@@ -1744,7 +1751,7 @@ fn map_literal_returns_wchar() {
 
 #[test]
 #[serial]
-#[ignore = "requires Trino at localhost:8080 -- run test/setup.sh first"]
+#[ignore = "requires Trino at localhost:8443 -- run ./integration-tests/setup.sh first"]
 fn row_literal_returns_wchar() {
     unsafe {
         let (_env, _conn, stmt) = alloc_stmt();
@@ -1769,7 +1776,7 @@ fn row_literal_returns_wchar() {
 
 #[test]
 #[serial]
-#[ignore = "requires Trino at localhost:8080 -- run test/setup.sh first"]
+#[ignore = "requires Trino at localhost:8443 -- run ./integration-tests/setup.sh first"]
 fn get_data_truncates_string_returns_success_with_info() {
     // Verifies that reading a string column into a buffer that is too small
     // returns SUCCESS_WITH_INFO (SQLSTATE 01004) and writes the truncated value.
@@ -1815,7 +1822,7 @@ fn get_data_truncates_string_returns_success_with_info() {
 
 #[test]
 #[serial]
-#[ignore = "requires Trino at localhost:8080 -- run test/setup.sh first"]
+#[ignore = "requires Trino at localhost:8443 -- run ./integration-tests/setup.sh first"]
 fn fetch_after_no_data_returns_no_data_again() {
     // After a result set is exhausted (SQLFetch returns NO_DATA), subsequent
     // SQLFetch calls must also return NO_DATA, not ERROR or panic.
@@ -1850,7 +1857,7 @@ fn fetch_after_no_data_returns_no_data_again() {
 
 #[test]
 #[serial]
-#[ignore = "requires Trino at localhost:8080 -- run test/setup.sh first"]
+#[ignore = "requires Trino at localhost:8443 -- run ./integration-tests/setup.sh first"]
 fn exec_direct_reuse_after_error() {
     // After a failed exec_direct (invalid SQL → SQL_ERROR), the same statement
     // handle must accept a valid query and succeed.
@@ -1891,7 +1898,7 @@ fn exec_direct_reuse_after_error() {
 
 #[test]
 #[serial]
-#[ignore = "requires Trino at localhost:8080 -- run test/setup.sh first"]
+#[ignore = "requires Trino at localhost:8443 -- run ./integration-tests/setup.sh first"]
 fn sql_col_attribute_w_returns_nullable() {
     // SQL_DESC_NULLABLE (1008): verify the field is readable and returns a
     // valid ODBC nullable value (0 = not nullable, 1 = nullable, 2 = unknown).
@@ -1930,7 +1937,7 @@ fn sql_col_attribute_w_returns_nullable() {
 
 #[test]
 #[serial]
-#[ignore = "requires Trino at localhost:8080 -- run test/setup.sh first"]
+#[ignore = "requires Trino at localhost:8443 -- run ./integration-tests/setup.sh first"]
 fn sql_col_attribute_w_returns_precision_for_integer() {
     // SQL_DESC_PRECISION (1005): integer columns must return a positive precision.
     unsafe {
@@ -1963,7 +1970,7 @@ fn sql_col_attribute_w_returns_precision_for_integer() {
 
 #[test]
 #[serial]
-#[ignore = "requires Trino at localhost:8080 -- run test/setup.sh first"]
+#[ignore = "requires Trino at localhost:8443 -- run ./integration-tests/setup.sh first"]
 fn sql_col_attribute_w_returns_octet_length_for_integer() {
     // SQL_DESC_OCTET_LENGTH (1013): integer columns must return a positive length.
     unsafe {
@@ -2016,7 +2023,7 @@ fn sql_col_attribute_w_returns_octet_length_for_integer() {
 /// independently so neither mistake can pass silently.
 #[test]
 #[serial]
-#[ignore = "requires Trino at localhost:8080 -- run test/setup.sh first"]
+#[ignore = "requires Trino at localhost:8443 -- run ./integration-tests/setup.sh first"]
 fn timestamp_6_reports_correct_length_and_precision_via_sql_col_attribute() {
     unsafe {
         let (_env, _conn, stmt) = alloc_stmt();
@@ -2070,7 +2077,7 @@ fn timestamp_6_reports_correct_length_and_precision_via_sql_col_attribute() {
 /// `SQL_DESC_LENGTH` = `9 + 6` = 15 and `SQL_DESC_PRECISION` = 6.
 #[test]
 #[serial]
-#[ignore = "requires Trino at localhost:8080 -- run test/setup.sh first"]
+#[ignore = "requires Trino at localhost:8443 -- run ./integration-tests/setup.sh first"]
 fn time_6_reports_correct_length_and_precision_via_sql_col_attribute() {
     unsafe {
         let (_env, _conn, stmt) = alloc_stmt();
@@ -2123,7 +2130,7 @@ fn time_6_reports_correct_length_and_precision_via_sql_col_attribute() {
 
 #[test]
 #[serial]
-#[ignore = "requires Trino at localhost:8080 -- run test/setup.sh first"]
+#[ignore = "requires Trino at localhost:8443 -- run ./integration-tests/setup.sh first"]
 fn close_cursor_twice_returns_error() {
     // The second SQLCloseCursor call must return ERROR (SQLSTATE 24000, invalid
     // cursor state) because there is no open cursor after the first close.
@@ -2153,7 +2160,7 @@ fn close_cursor_twice_returns_error() {
 
 #[test]
 #[serial]
-#[ignore = "requires Trino at localhost:8080 -- run test/setup.sh first"]
+#[ignore = "requires Trino at localhost:8443 -- run ./integration-tests/setup.sh first"]
 fn num_result_cols_after_prepare_before_execute() {
     // After SQLPrepare (but before SQLExecute), SQLNumResultCols must return
     // SUCCESS. The Trino backend returns count=0 because column metadata is
@@ -2183,7 +2190,7 @@ fn num_result_cols_after_prepare_before_execute() {
 
 #[test]
 #[serial]
-#[ignore = "requires Trino at localhost:8080 -- run test/setup.sh first"]
+#[ignore = "requires Trino at localhost:8443 -- run ./integration-tests/setup.sh first"]
 fn get_diag_field_number_after_error() {
     // SQL_DIAG_NUMBER (2) on the header record (rec_number=0) reports the count
     // of diagnostic records. After one error it must be 1.
@@ -2211,7 +2218,7 @@ fn get_diag_field_number_after_error() {
 
 #[test]
 #[serial]
-#[ignore = "requires Trino at localhost:8080 -- run test/setup.sh first"]
+#[ignore = "requires Trino at localhost:8443 -- run ./integration-tests/setup.sh first"]
 fn get_diag_field_sqlstate_after_error() {
     // SQL_DIAG_SQLSTATE (4) on rec_number=1 returns the 5-character SQLSTATE.
     unsafe {
@@ -2244,7 +2251,7 @@ fn get_diag_field_sqlstate_after_error() {
 
 #[test]
 #[serial]
-#[ignore = "requires Trino at localhost:8080 -- run test/setup.sh first"]
+#[ignore = "requires Trino at localhost:8443 -- run ./integration-tests/setup.sh first"]
 fn get_diag_field_native_error_after_error() {
     // SQL_DIAG_NATIVE (5) returns the driver-specific native error code (i32).
     unsafe {
@@ -2273,7 +2280,7 @@ fn get_diag_field_native_error_after_error() {
 
 #[test]
 #[serial]
-#[ignore = "requires Trino at localhost:8080 -- run test/setup.sh first"]
+#[ignore = "requires Trino at localhost:8443 -- run ./integration-tests/setup.sh first"]
 fn get_diag_field_message_text_after_error() {
     // SQL_DIAG_MESSAGE_TEXT (6) returns the diagnostic message string.
     // After an invalid-SQL error the message must be non-empty.
@@ -2319,7 +2326,7 @@ fn get_diag_field_message_text_after_error() {
 
 #[test]
 #[serial]
-#[ignore = "requires Trino at localhost:8080 -- run test/setup.sh first"]
+#[ignore = "requires Trino at localhost:8443 -- run ./integration-tests/setup.sh first"]
 fn empty_result_set_where_false() {
     // A query that returns no rows (WHERE 1=0) must:
     //   - exec_direct → SUCCESS (not ERROR)
@@ -2420,7 +2427,7 @@ fn get_env_attr_odbc_version_roundtrip() {
 
 #[test]
 #[serial]
-#[ignore = "requires Trino at localhost:8080 -- run test/setup.sh first"]
+#[ignore = "requires Trino at localhost:8443 -- run ./integration-tests/setup.sh first"]
 fn bind_col_and_fetch_reads_bound_column_values() {
     // Exercises SQL_ATTR_ROW_ARRAY_SIZE (27) and SQL_ATTR_ROWS_FETCHED_PTR (26)
     // attribute setting (accepted without error) plus the full SQLBindCol →
@@ -2624,7 +2631,7 @@ fn primary_keys_postgresql_returns_success() {
 
 #[test]
 #[serial]
-#[ignore = "requires Trino at localhost:8080 -- run test/setup.sh first"]
+#[ignore = "requires Trino at localhost:8443 -- run ./integration-tests/setup.sh first"]
 fn primary_keys_no_constraints_returns_empty() {
     unsafe {
         let (_env, _conn, stmt) = alloc_stmt();
@@ -2692,7 +2699,7 @@ fn foreign_keys_postgresql_returns_success() {
 
 #[test]
 #[serial]
-#[ignore = "requires Trino at localhost:8080 -- run test/setup.sh first"]
+#[ignore = "requires Trino at localhost:8443 -- run ./integration-tests/setup.sh first"]
 fn foreign_keys_no_constraints_returns_empty() {
     unsafe {
         let (_env, _conn, stmt) = alloc_stmt();
@@ -2729,7 +2736,7 @@ fn foreign_keys_no_constraints_returns_empty() {
 
 #[test]
 #[serial]
-#[ignore = "requires Trino at localhost:8080 -- run test/setup.sh first"]
+#[ignore = "requires Trino at localhost:8443 -- run ./integration-tests/setup.sh first"]
 fn statistics_returns_empty_result_set() {
     unsafe {
         let (_env, _conn, stmt) = alloc_stmt();
@@ -2779,7 +2786,7 @@ fn statistics_returns_empty_result_set() {
 
 #[test]
 #[serial]
-#[ignore = "requires Trino at localhost:8080 -- run test/setup.sh first"]
+#[ignore = "requires Trino at localhost:8443 -- run ./integration-tests/setup.sh first"]
 fn queries_reach_trino_tagged_with_the_drivers_source() {
     unsafe {
         let (_env, _conn, stmt) = alloc_stmt();
@@ -2847,7 +2854,7 @@ fn queries_reach_trino_tagged_with_the_drivers_source() {
 
 #[test]
 #[serial]
-#[ignore = "requires Trino at localhost:8080 -- run test/setup.sh first"]
+#[ignore = "requires Trino at localhost:8443 -- run ./integration-tests/setup.sh first"]
 fn describe_param_reports_the_type_trino_infers_for_each_parameter() {
     unsafe {
         let (_env, _conn, stmt) = alloc_stmt();
@@ -2905,7 +2912,7 @@ fn describe_param_reports_the_type_trino_infers_for_each_parameter() {
 
 #[test]
 #[serial]
-#[ignore = "requires Trino at localhost:8080 -- run test/setup.sh first"]
+#[ignore = "requires Trino at localhost:8443 -- run ./integration-tests/setup.sh first"]
 fn describe_param_re_describes_when_the_statement_changes() {
     // The descriptors are cached on the connection, keyed by SQL text, because
     // `Backend::describe_param` is called once per parameter and gets no
@@ -2976,7 +2983,7 @@ fn describe_param_re_describes_when_the_statement_changes() {
 
 #[test]
 #[serial]
-#[ignore = "requires Trino at localhost:8080 -- run test/setup.sh first"]
+#[ignore = "requires Trino at localhost:8443 -- run ./integration-tests/setup.sh first"]
 fn table_privileges_queries_trino_and_returns_the_spec_column_count() {
     unsafe {
         let (_env, _conn, stmt) = alloc_stmt();
@@ -3020,7 +3027,7 @@ fn table_privileges_queries_trino_and_returns_the_spec_column_count() {
 
 #[test]
 #[serial]
-#[ignore = "requires Trino at localhost:8080 -- run test/setup.sh first"]
+#[ignore = "requires Trino at localhost:8443 -- run ./integration-tests/setup.sh first"]
 fn column_privileges_returns_empty_result_set() {
     unsafe {
         let (_env, _conn, stmt) = alloc_stmt();
@@ -3065,7 +3072,7 @@ fn column_privileges_returns_empty_result_set() {
 
 #[test]
 #[serial]
-#[ignore = "requires Trino at localhost:8080 -- run test/setup.sh first"]
+#[ignore = "requires Trino at localhost:8443 -- run ./integration-tests/setup.sh first"]
 fn procedures_returns_empty_result_set() {
     unsafe {
         let (_env, _conn, stmt) = alloc_stmt();
@@ -3107,7 +3114,7 @@ fn procedures_returns_empty_result_set() {
 
 #[test]
 #[serial]
-#[ignore = "requires Trino at localhost:8080 -- run test/setup.sh first"]
+#[ignore = "requires Trino at localhost:8443 -- run ./integration-tests/setup.sh first"]
 fn procedure_columns_returns_empty_result_set() {
     unsafe {
         let (_env, _conn, stmt) = alloc_stmt();
@@ -3156,7 +3163,7 @@ fn procedure_columns_returns_empty_result_set() {
 
 #[test]
 #[serial]
-#[ignore = "requires Trino at localhost:8080 -- run test/setup.sh first"]
+#[ignore = "requires Trino at localhost:8443 -- run ./integration-tests/setup.sh first"]
 fn bulk_operations_returns_hyc00() {
     unsafe {
         let (_env, _conn, stmt) = alloc_stmt();
@@ -3252,7 +3259,7 @@ unsafe fn collect_describe_col(stmt: *mut c_void) -> Vec<(String, i16, usize, i1
 /// session), so it runs before the catalog is switched.
 #[test]
 #[serial]
-#[ignore = "requires Trino at localhost:8080 -- run test/setup.sh first"]
+#[ignore = "requires Trino at localhost:8443 -- run ./integration-tests/setup.sh first"]
 fn describe_col_and_columns_agree_on_type_metadata() {
     const CATALOG: &str = "postgresql";
     const SCHEMA: &str = "public";
@@ -3350,7 +3357,7 @@ fn describe_col_and_columns_agree_on_type_metadata() {
 
 #[test]
 #[serial]
-#[ignore = "requires Trino at localhost:8080 -- run test/setup.sh first"]
+#[ignore = "requires Trino at localhost:8443 -- run ./integration-tests/setup.sh first"]
 fn set_pos_returns_hyc00() {
     unsafe {
         let (_env, _conn, stmt) = alloc_stmt();
@@ -3482,7 +3489,7 @@ unsafe fn last_sqlstate(stmt: *mut c_void) -> String {
 
 #[test]
 #[serial]
-#[ignore = "requires Trino at localhost:8080 -- run test/setup.sh first"]
+#[ignore = "requires Trino at localhost:8443 -- run ./integration-tests/setup.sh first"]
 fn metadata_sized_wchar_round_trip_covers_representative_types() {
     unsafe {
         let (_env, _conn, stmt) = alloc_stmt();
@@ -3563,7 +3570,7 @@ fn metadata_sized_wchar_round_trip_covers_representative_types() {
 /// representation.
 #[test]
 #[serial]
-#[ignore = "requires Trino at localhost:8080 -- run test/setup.sh first"]
+#[ignore = "requires Trino at localhost:8443 -- run ./integration-tests/setup.sh first"]
 fn decimal_column_read_as_double() {
     unsafe {
         let (_env, _conn, stmt) = alloc_stmt();
@@ -3603,7 +3610,7 @@ fn decimal_column_read_as_double() {
 /// on, which is why this is not left to the unit tests over `json_to_column_value`.
 #[test]
 #[serial]
-#[ignore = "requires Trino at localhost:8080 -- run test/setup.sh first"]
+#[ignore = "requires Trino at localhost:8443 -- run ./integration-tests/setup.sh first"]
 fn ieee_special_floats_are_readable_as_c_double() {
     /// Predicate on the `f64` read back, since the specials do not compare
     /// equal to themselves and cannot be asserted with `assert_eq!`.
@@ -3673,7 +3680,7 @@ fn ieee_special_floats_are_readable_as_c_double() {
 /// the terminator survives parameter interpolation.
 #[test]
 #[serial]
-#[ignore = "requires Trino at localhost:8080 -- run test/setup.sh first"]
+#[ignore = "requires Trino at localhost:8443 -- run ./integration-tests/setup.sh first"]
 fn a_trailing_semicolon_does_not_fail_the_statement() {
     unsafe {
         for sql in ["SELECT 1 AS n;", "SELECT 1 AS n ;  ", "SELECT 1 AS n;;"] {
@@ -3750,7 +3757,7 @@ fn a_trailing_semicolon_does_not_fail_the_statement() {
 /// orders of magnitude if one came back.
 #[test]
 #[serial]
-#[ignore = "requires Trino at localhost:8080 -- run test/setup.sh first"]
+#[ignore = "requires Trino at localhost:8443 -- run ./integration-tests/setup.sh first"]
 fn server_error_diagnostics_carry_the_summary_not_the_java_stack() {
     // (SQL, Trino error name, native error code)
     let cases: &[(&str, &str, i32)] = &[
@@ -3822,7 +3829,7 @@ fn server_error_diagnostics_carry_the_summary_not_the_java_stack() {
 /// specific SQLSTATE the spec defines (22018), not merely "some error".
 #[test]
 #[serial]
-#[ignore = "requires Trino at localhost:8080 -- run test/setup.sh first"]
+#[ignore = "requires Trino at localhost:8443 -- run ./integration-tests/setup.sh first"]
 fn numeric_looking_text_column_read_as_sbigint() {
     unsafe {
         let (_env, _conn, stmt) = alloc_stmt();
@@ -3885,7 +3892,7 @@ fn numeric_looking_text_column_read_as_sbigint() {
 /// arm end-to-end is a VARCHAR-typed source, not a native TIMESTAMP column.
 #[test]
 #[serial]
-#[ignore = "requires Trino at localhost:8080 -- run test/setup.sh first"]
+#[ignore = "requires Trino at localhost:8443 -- run ./integration-tests/setup.sh first"]
 fn timestamp_shaped_text_column_read_as_type_timestamp() {
     unsafe {
         let (_env, _conn, stmt) = alloc_stmt();
@@ -4593,7 +4600,7 @@ fn statement_attributes_are_written_at_the_full_sqlulen_width() {
 /// the same path an application does.
 #[test]
 #[serial]
-#[ignore = "requires Trino at localhost:8080 -- run test/setup.sh first"]
+#[ignore = "requires Trino at localhost:8443 -- run ./integration-tests/setup.sh first"]
 fn execution_writes_the_processed_count_and_the_parameter_status() {
     unsafe {
         // --- A successful execution ---

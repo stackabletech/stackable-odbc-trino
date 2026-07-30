@@ -10,7 +10,7 @@
 #   ./integration-tests/setup.sh --profile oauth,hive
 #   PROFILES=all ./integration-tests/setup.sh
 set -euo pipefail
-# shellcheck source=lib.sh
+# shellcheck source-path=SCRIPTDIR source=lib.sh
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib.sh"
 
 PROFILES_ARG="${PROFILES:-}"
@@ -58,12 +58,16 @@ trino_ready() {
     # can schedule work. HTTP 200 alone is not enough: /v1/info answers while
     # the node is still initialising, which surfaces later as
     # NO_NODES_AVAILABLE on a data query.
-    curl -sf "http://$TRINO_HOST:$TRINO_HTTP_PORT/v1/info" | grep -q '"starting":false'
+    curl -sf --cacert "$CERT_DIR/ca.crt" \
+        "https://$TRINO_HOST:$TRINO_HTTPS_PORT/v1/info" | grep -q '"starting":false'
 }
 
 postgresql_catalog_ready() {
-    curl -sf -X POST "http://$TRINO_HOST:$TRINO_HTTP_PORT/v1/statement" \
-        -H "X-Trino-User: $TRINO_USER" \
+    # -u rather than X-Trino-User: PASSWORD authentication is mandatory now
+    # that there is no allow-insecure-over-http path to slip through, and the
+    # authenticated identity supplies the user.
+    curl -sf --cacert "$CERT_DIR/ca.crt" -u "$TRINO_USER:$TRINO_PASSWORD" \
+        -X POST "https://$TRINO_HOST:$TRINO_HTTPS_PORT/v1/statement" \
         -H "X-Trino-Catalog: postgresql" \
         -H "X-Trino-Schema: public" \
         -d "SELECT 1 FROM postgresql.public.customers LIMIT 1" | grep -q '"stats"'

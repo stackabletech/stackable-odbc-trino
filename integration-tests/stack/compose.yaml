@@ -18,7 +18,6 @@ services:
     # spooling profile needs did not exist before it.
     image: trinodb/trino:483
     ports:
-      - "8080:8080"
       - "8443:8443"
     volumes:
       - ./trino/base:/etc/trino
@@ -32,7 +31,10 @@ services:
       postgres:
         condition: service_healthy
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8080/v1/info"]
+      # -k because curl inside the container has no reason to hold this CA, and
+      # this is a liveness probe, not a TLS test. test_tls.py verifies the
+      # certificate.
+      test: ["CMD", "curl", "-fsk", "https://localhost:8443/v1/info"]
       interval: 5s
       timeout: 5s
       retries: 20

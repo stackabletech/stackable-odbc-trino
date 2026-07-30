@@ -8,7 +8,7 @@
 # under `full` and succeeds under `ca`, which verifies the chain but not the
 # name. Do not add 127.0.0.1 -- test_tls.py asserts its absence.
 set -euo pipefail
-# shellcheck source=lib.sh
+# shellcheck source-path=SCRIPTDIR source=lib.sh
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib.sh"
 
 # The host-only network gateway, for the Windows VM. Override for a non-default

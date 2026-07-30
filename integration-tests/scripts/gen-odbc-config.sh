@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Writes odbcinst.ini, odbc.ini and stack.env into generated/.
 set -euo pipefail
-# shellcheck source=lib.sh
+# shellcheck source-path=SCRIPTDIR source=lib.sh
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib.sh"
 
 # The certificate the coordinator is verified against: the test CA, which
@@ -39,22 +39,15 @@ Protocol = https
 Catalog = $TRINO_CATALOG
 TlsVerify = false
 
-[trino_http]
-Driver = stackable_odbc_trino
-Host = $TRINO_HOST
-Port = $TRINO_HTTP_PORT
-User = $TRINO_USER
-Password = $TRINO_PASSWORD
-Protocol = http
-Catalog = $TRINO_CATALOG
-
 [trino_postgresql]
 Driver = stackable_odbc_trino
 Host = $TRINO_HOST
-Port = $TRINO_HTTP_PORT
+Port = $TRINO_HTTPS_PORT
 User = $TRINO_USER
-Protocol = http
+Password = $TRINO_PASSWORD
+Protocol = https
 Catalog = postgresql
+Certificate = $SERVER_CERT
 EOF
 
 # One description of the running stack. Bash sources it; harness.Stack parses
@@ -65,7 +58,6 @@ cat > "$STACK_ENV" << EOF
 DRIVER_PATH=$DRIVER_PATH
 TRINO_HOST=$TRINO_HOST
 TRINO_HTTPS_PORT=$TRINO_HTTPS_PORT
-TRINO_HTTP_PORT=$TRINO_HTTP_PORT
 TRINO_USER=$TRINO_USER
 TRINO_PASSWORD=$TRINO_PASSWORD
 TRINO_CATALOG=$TRINO_CATALOG

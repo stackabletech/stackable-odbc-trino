@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Generates the secrets the stack needs. Idempotent.
 set -euo pipefail
-# shellcheck source=lib.sh
+# shellcheck source-path=SCRIPTDIR source=lib.sh
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib.sh"
 
 PASSFILE="$GENERATED/password.db"

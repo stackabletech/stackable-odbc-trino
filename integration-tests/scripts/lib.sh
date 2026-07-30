@@ -1,5 +1,9 @@
 #!/usr/bin/env bash
 # Shared paths, profile handling and helpers. Sourced, never executed.
+#
+# SC2034: every variable below is consumed by a script that sources this file,
+# which shellcheck cannot see from here.
+# shellcheck disable=SC2034
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TEST_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -13,14 +17,12 @@ STACK_ENV="$GENERATED/stack.env"
 
 DRIVER_PATH="$PROJECT_DIR/target/debug/libstackable_odbc_trino.so"
 
-TRINO_HOST=localhost
+TRINO_HOST="localhost"
 TRINO_HTTPS_PORT=8443
-# The plaintext listener, removed when the coordinator moves to HTTPS only.
-TRINO_HTTP_PORT=8080
-TRINO_USER=admin
-TRINO_PASSWORD=admin
-TRINO_CATALOG=tpcds
-KEYSTORE_PASSWORD=changeit
+TRINO_USER="admin"
+TRINO_PASSWORD="admin"
+TRINO_CATALOG="tpcds"
+KEYSTORE_PASSWORD="changeit"
 
 # Every profile this stack knows about. `--profile all` expands to this.
 ALL_PROFILES="oauth spooling hive"

@@ -9,7 +9,7 @@
 #   ./integration-tests/run-tests.sh --skip-build   # skip the cargo build (also passed to windows_test.py)
 #   ./integration-tests/run-tests.sh --skip-delete  # keep the stack running afterwards
 set -euo pipefail
-# shellcheck source=lib.sh
+# shellcheck source-path=SCRIPTDIR source=lib.sh
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib.sh"
 
 RUN_WINDOWS=false
@@ -56,20 +56,37 @@ if [[ "$SKIP_BUILD" == false ]]; then
 fi
 
 # --- Linux: pyodbc integration tests (4 configs, matching Windows) ---
-CONN_HTTP="Driver=$DRIVER_PATH;Host=localhost;Port=8080;User=admin;Password=admin;Protocol=http;Catalog=tpcds"
+# Built from stack.env rather than written out here, so a port, a credential
+# or a certificate path is stated in exactly one place. The four configurations
+# are DSN and DSN-less crossed with verified and unverified TLS -- the
+# HTTP/HTTPS axis went with the plaintext listener.
+stack_conn() {
+    python3 - "$@" <<'PYEOF'
+import os, sys
+sys.path.insert(0, os.path.join(os.environ["TEST_DIR"], "suites"))
+from harness import Stack
+overrides = dict(a.split("=", 1) for a in sys.argv[1:])
+for k, v in overrides.items():
+    if v == "":
+        overrides[k] = None
+print(Stack.load(os.environ["STACK_ENV"]).conn_str(**overrides))
+PYEOF
+}
+export TEST_DIR STACK_ENV
 
-echo "=== Running Linux pyodbc integration tests (DSN-less, HTTP) ==="
-uv run --with pyodbc python3 "$TEST_DIR/suites/test_integration.py" \
-    "Driver=$DRIVER_PATH;Host=localhost;Port=8080;User=admin;Password=admin;Protocol=http;Catalog=tpcds"
+CONN_HTTPS="$(stack_conn)"
+CONN_HTTPS_NOVERIFY="$(stack_conn TlsVerify=false Certificate=)"
 
-echo "=== Running Linux pyodbc integration tests (DSN-less, HTTPS) ==="
-uv run --with pyodbc python3 "$TEST_DIR/suites/test_integration.py" \
-    "Driver=$DRIVER_PATH;Host=localhost;Port=8443;User=admin;Password=admin;Protocol=https;TlsVerify=false;Catalog=tpcds"
+echo "=== Running Linux pyodbc integration tests (DSN-less, verified TLS) ==="
+uv run --with pyodbc python3 "$TEST_DIR/suites/test_integration.py" "$CONN_HTTPS"
 
-echo "=== Running Linux pyodbc integration tests (DSN, HTTP) ==="
-uv run --with pyodbc python3 "$TEST_DIR/suites/test_integration.py" "DSN=trino_http"
+echo "=== Running Linux pyodbc integration tests (DSN-less, TlsVerify=false) ==="
+uv run --with pyodbc python3 "$TEST_DIR/suites/test_integration.py" "$CONN_HTTPS_NOVERIFY"
 
-echo "=== Running Linux pyodbc integration tests (DSN, HTTPS) ==="
+echo "=== Running Linux pyodbc integration tests (DSN, verified TLS) ==="
+uv run --with pyodbc python3 "$TEST_DIR/suites/test_integration.py" "DSN=trino_https"
+
+echo "=== Running Linux pyodbc integration tests (DSN, TlsVerify=false) ==="
 uv run --with pyodbc python3 "$TEST_DIR/suites/test_integration.py" "DSN=trino_https_verify_false"
 
 # --- Linux: SQL surface pen test ---
@@ -78,16 +95,14 @@ uv run --with pyodbc python3 "$TEST_DIR/suites/test_integration.py" "DSN=trino_h
 # one, the catalog functions, and the statement forms whose result columns have
 # no declared length (DESCRIBE, SHOW, EXPLAIN).
 echo "=== Running SQL surface pen test ==="
-uv run --with pyodbc python3 "$TEST_DIR/suites/test_sql_surface.py" \
-    "Driver=$DRIVER_PATH;Host=localhost;Port=8080;User=admin;Password=admin;Protocol=http;Catalog=tpcds"
+uv run --with pyodbc python3 "$TEST_DIR/suites/test_sql_surface.py" "$CONN_HTTPS"
 
 # --- Linux: Power Query folding contract ---
 # The connector's SQL declarations against the driver and Trino. Nothing else
 # loads the .pq, and the only other check on folding is a human clicking
 # "View Native Query" one step at a time.
 echo "=== Running folding contract test ==="
-uv run --with pyodbc python3 "$TEST_DIR/suites/test_folding_contract.py" \
-    "Driver=$DRIVER_PATH;Host=localhost;Port=8080;User=admin;Password=admin;Protocol=http;Catalog=tpcds"
+uv run --with pyodbc python3 "$TEST_DIR/suites/test_folding_contract.py" "$CONN_HTTPS"
 
 # --- Linux: raw C ABI pen test (no Driver Manager) ---
 # Calls the driver's exported entry points directly with ctypes. unixODBC
@@ -95,7 +110,7 @@ uv run --with pyodbc python3 "$TEST_DIR/suites/test_folding_contract.py" \
 # handling of out-of-order and malformed calls is invisible to every suite
 # above this one. Standard library only -- no uv, no pyodbc.
 echo "=== Running raw C ABI pen test ==="
-python3 "$TEST_DIR/suites/test_c_abi.py" "$DRIVER_PATH" "$CONN_HTTP"
+python3 "$TEST_DIR/suites/test_c_abi.py" "$DRIVER_PATH" "$CONN_HTTPS"
 
 # --- Linux: type-transform fuzz (no Driver Manager) ---
 # Every (Trino value, C data type) pair through SQLGetData, checked against
@@ -103,7 +118,7 @@ python3 "$TEST_DIR/suites/test_c_abi.py" "$DRIVER_PATH" "$CONN_HTTP"
 # boundary values, the IEEE specials, NULL per target type, and the statement
 # terminator forms. Standard library only.
 echo "=== Running type-transform fuzz ==="
-python3 "$TEST_DIR/suites/test_type_matrix.py" "$DRIVER_PATH" "$CONN_HTTP"
+python3 "$TEST_DIR/suites/test_type_matrix.py" "$DRIVER_PATH" "$CONN_HTTPS"
 
 # --- Linux: Rust FFI integration tests ---
 # Only FFI tests are run here. The backend::tests integration tests use a

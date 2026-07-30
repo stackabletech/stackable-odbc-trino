@@ -5,16 +5,16 @@
 //! plain checkout).
 //!
 //! Run:
-//!   ./test/setup.sh
-//!   TRINO_BENCH_URL=http://localhost:8080 cargo bench
+//!   ./integration-tests/setup.sh
+//!   TRINO_BENCH_URL=https://localhost:8443 cargo bench
 //!
 //! Override workload size:
-//!   TRINO_BENCH_URL=http://localhost:8080 BENCH_ROWS=1000000 cargo bench
+//!   TRINO_BENCH_URL=https://localhost:8443 BENCH_ROWS=1000000 cargo bench
 //!
 //! The default query uses Trino's `SEQUENCE` builtin and does not require any
 //! particular catalog. To override:
 //!   TRINO_BENCH_QUERY="SELECT * FROM tpcds.tiny.store_sales LIMIT 100000" \
-//!     TRINO_BENCH_URL=http://localhost:8080 cargo bench
+//!     TRINO_BENCH_URL=https://localhost:8443 cargo bench
 
 use std::ffi::c_void;
 use std::hint::black_box;
@@ -96,11 +96,11 @@ fn shape_a_query(rows: usize, cols: usize) -> String {
     )
 }
 
-/// Build the connection string. Trino setup.sh uses `Host=localhost;Port=8080;Protocol=http;User=admin`.
+/// Build the connection string. setup.sh serves HTTPS only, on 8443.
 fn connect_string(url: &str) -> String {
     // Parse `http://host:port` minimally; reject unsupported forms loudly.
     let (proto, rest) = url.split_once("://").unwrap_or(("http", url));
-    let (host, port) = rest.split_once(':').unwrap_or((rest, "8080"));
+    let (host, port) = rest.split_once(':').unwrap_or((rest, "8443"));
     format!("Host={host};Port={port};User=admin;Protocol={proto}")
 }
 

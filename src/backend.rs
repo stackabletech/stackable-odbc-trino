@@ -2173,6 +2173,29 @@ mod tests {
 
     use super::*;
 
+    /// Host, port, credentials and TLS for the tests that need a live
+    /// coordinator.
+    ///
+    /// `./integration-tests/setup.sh` serves HTTPS only, so these verify
+    /// against the test CA. The path is resolved from `CARGO_MANIFEST_DIR` at
+    /// compile time rather than written out: `generated/` is produced per
+    /// checkout, so a literal path would only work in one of them.
+    ///
+    /// The credentials are part of the constant because every request must now
+    /// carry them. They were previously omitted, and the tests passed anyway:
+    /// the coordinator ran with `allow-insecure-over-http=true`, which let
+    /// unauthenticated HTTP requests straight through, so several of these
+    /// tests had never authenticated at all. `admin` is the only principal in
+    /// the generated `password.db`.
+    ///
+    /// The parse-only tests below deliberately do *not* use this — their port
+    /// and protocol are incidental to what they assert.
+    const LIVE: &str = concat!(
+        "Host=localhost;Port=8443;Protocol=https;User=admin;Password=admin;Certificate=",
+        env!("CARGO_MANIFEST_DIR"),
+        "/integration-tests/generated/certs/ca.crt"
+    );
+
     /// A reqwest error whose `is_connect()` is set, which is what
     /// [`map_trino_error`] turns into `08S01`.
     ///
@@ -2394,10 +2417,9 @@ mod tests {
     /// The `LIKE ''` filter must return nothing even for a catalog with many
     /// schemas: the probe proves the catalog resolves, it is not a listing.
     #[test]
-    #[ignore = "requires Trino at localhost:8080 -- run with: cargo test -- --ignored backend"]
+    #[ignore = "requires Trino at localhost:8443 -- run with: cargo test -- --ignored backend"]
     fn validation_query_returns_no_rows_for_a_populated_catalog() {
-        let params =
-            ConnectParams::parse("Host=localhost;Port=8080;Protocol=http;User=test").unwrap();
+        let params = ConnectParams::parse(LIVE).unwrap();
         let conn = TrinoBackend::connect(&params).unwrap();
         let rows = query_all_rows(&conn, validation_query(Some("tpcds"))).unwrap();
         assert!(rows.is_empty(), "probe returned {} rows", rows.len());
@@ -2406,14 +2428,11 @@ mod tests {
     /// The validation query resolves the session catalog, so a catalog that
     /// does not exist is caught at connect rather than at the first query.
     #[test]
-    #[ignore = "requires Trino at localhost:8080 -- run with: cargo test -- --ignored backend"]
+    #[ignore = "requires Trino at localhost:8443 -- run with: cargo test -- --ignored backend"]
     fn connect_with_unknown_catalog_fails_with_08001() {
         use stackable_odbc_core::{errors::OdbcError, types::sql_state};
 
-        let params = ConnectParams::parse(
-            "Host=localhost;Port=8080;Protocol=http;User=test;Catalog=no_such_catalog",
-        )
-        .unwrap();
+        let params = ConnectParams::parse(&format!("{LIVE};Catalog=no_such_catalog")).unwrap();
         let Err(err) = TrinoBackend::connect(&params) else {
             panic!("connect with an unknown catalog must fail");
         };
@@ -2426,11 +2445,9 @@ mod tests {
     /// Ignored because `connect` now validates the connection with a real
     /// query: a successful connect requires a live Trino.
     #[test]
-    #[ignore = "requires Trino at localhost:8080 -- run with: cargo test -- --ignored backend"]
+    #[ignore = "requires Trino at localhost:8443 -- run with: cargo test -- --ignored backend"]
     fn connect_creates_runtime() {
-        let params =
-            ConnectParams::parse("Host=localhost;Port=8080;Protocol=http;User=test;Password=test")
-                .unwrap();
+        let params = ConnectParams::parse(LIVE).unwrap();
         let mut conn = TrinoBackend::connect(&params).unwrap();
         TrinoBackend::disconnect(&mut conn).unwrap();
     }
@@ -2541,10 +2558,7 @@ mod tests {
     #[serial(backend)]
     #[ignore = "requires Trino -- run in isolation: cargo test -- --ignored backend"]
     fn backend_current_catalog_follows_a_use_statement() {
-        let params = ConnectParams::parse(
-            "Host=localhost;Port=8080;Protocol=http;User=admin;Password=admin;Catalog=tpcds",
-        )
-        .expect("parse params");
+        let params = ConnectParams::parse(&format!("{LIVE};Catalog=tpcds")).expect("parse params");
         let conn = TrinoBackend::connect(&params).expect("connect");
 
         assert_eq!(
@@ -2751,10 +2765,8 @@ mod tests {
         use std::sync::OnceLock;
         static CONN: OnceLock<TrinoConnection> = OnceLock::new();
         CONN.get_or_init(|| {
-            let params = ConnectParams::parse(
-                "Host=localhost;Port=8080;Protocol=http;User=admin;Password=admin;Catalog=tpcds",
-            )
-            .expect("parse params");
+            let params =
+                ConnectParams::parse(&format!("{LIVE};Catalog=tpcds")).expect("parse params");
             TrinoBackend::connect(&params).expect("shared backend connection")
         })
     }
@@ -2836,10 +2848,7 @@ mod tests {
         // that has unread response bytes. Using a separate connection ensures
         // the dirty pool is destroyed when this test ends, rather than
         // poisoning subsequent tests on the shared connection.
-        let params = ConnectParams::parse(
-            "Host=localhost;Port=8080;Protocol=http;User=admin;Password=admin;Catalog=tpcds",
-        )
-        .expect("parse params");
+        let params = ConnectParams::parse(&format!("{LIVE};Catalog=tpcds")).expect("parse params");
         let conn = TrinoBackend::connect(&params).expect("connect");
         let cancel = TrinoBackend::cancel_token(&conn);
         let mut stmt = TrinoBackend::exec_direct(
@@ -2894,10 +2903,7 @@ mod tests {
     fn cancel_from_another_thread_while_fetching() {
         // Its own connection, for the dirty-socket reason `cancel_mid_stream`
         // documents above.
-        let params = ConnectParams::parse(
-            "Host=localhost;Port=8080;Protocol=http;User=admin;Password=admin;Catalog=tpcds",
-        )
-        .expect("parse params");
+        let params = ConnectParams::parse(&format!("{LIVE};Catalog=tpcds")).expect("parse params");
         let conn = TrinoBackend::connect(&params).expect("connect");
         let cancel = Arc::new(TrinoBackend::cancel_token(&conn));
 
@@ -2992,10 +2998,9 @@ mod tests {
     /// not 467 and malformed against the spec's ##.##.#### requirement
     /// regardless.
     #[test]
-    #[ignore = "requires Trino at localhost:8080 -- run with: cargo test -- --ignored backend"]
+    #[ignore = "requires Trino at localhost:8443 -- run with: cargo test -- --ignored backend"]
     fn dbms_version_is_read_from_the_server() {
-        let params =
-            ConnectParams::parse("Host=localhost;Port=8080;Protocol=http;User=test").unwrap();
+        let params = ConnectParams::parse(LIVE).unwrap();
         let conn = TrinoBackend::connect(&params).unwrap();
         assert!(
             !conn.dbms_version.is_empty(),
