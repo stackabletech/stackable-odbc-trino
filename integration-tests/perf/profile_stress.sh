@@ -2,8 +2,8 @@
 # Profile the Trino REST client during stress tests.
 #
 # Usage:
-#   ./test/profile_stress.sh "Driver=/path/to/driver.so;Host=localhost;Port=8080;User=admin;Protocol=http;Catalog=tpcds"
-#   ./test/profile_stress.sh "DSN=trino_http"
+#   ./integration-tests/perf/profile_stress.sh "Driver=/path/to/driver.so;Host=localhost;Port=8443;User=admin;Password=admin;Protocol=https;Catalog=tpcds;TlsVerify=false"
+#   ./integration-tests/perf/profile_stress.sh "DSN=trino_https"
 #
 # Output:
 #   - Stress test results (PASS/FAIL per test with elapsed time)
@@ -21,7 +21,7 @@ if [ $# -lt 1 ]; then
     echo "Usage: $0 <connection-string>"
     echo ""
     echo "Example:"
-    echo "  $0 \"Driver=\$(pwd)/target/debug/libstackable_odbc_trino.so;Host=localhost;Port=8080;User=admin;Protocol=http;Catalog=tpcds\""
+    echo "  $0 \"Driver=\$(pwd)/target/debug/libstackable_odbc_trino.so;Host=localhost;Port=8443;User=admin;Password=admin;Protocol=https;Catalog=tpcds;TlsVerify=false\""
     exit 2
 fi
 
@@ -35,9 +35,11 @@ echo "Log file: $LOG_FILE"
 echo ""
 
 # Set ODBC config if not already set (for DSN-less connections this is optional,
-# but needed if using DSN names).
-export ODBCSYSINI="${ODBCSYSINI:-$SCRIPT_DIR}"
-export ODBCINI="${ODBCINI:-$SCRIPT_DIR/odbc.ini}"
+# but needed if using DSN names). setup.sh writes both files into generated/,
+# with the driver path and the test CA of this checkout.
+GENERATED="$(cd "$SCRIPT_DIR/.." && pwd)/generated"
+export ODBCSYSINI="${ODBCSYSINI:-$GENERATED}"
+export ODBCINI="${ODBCINI:-$GENERATED/odbc.ini}"
 
 # Enable profiling: info-level logging with span timing to file.
 export ODBC_LOG_LEVEL=info
