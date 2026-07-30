@@ -361,6 +361,16 @@ fn trino_type_info() -> &'static [TypeInfoRow] {
 /// core's fall-through: the capability declarations `default_get_info` consults
 /// each take a connection now, so it answers the full set with `Some(conn)` and
 /// only what is knowable without a data source with `None`.
+/// One of the connection's own strings, or the empty string pre-connect.
+///
+/// The empty string is what core substitutes for every declaration it cannot
+/// reach without a connection, so answering it here keeps the pre-connect shape
+/// identical to the one `get_info_every_named_info_type_has_the_declared_shape_pre_connect`
+/// asserts.
+fn conn_string(conn: Option<&TrinoConnection>, field: fn(&TrinoConnection) -> &String) -> String {
+    conn.map(field).cloned().unwrap_or_default()
+}
+
 fn trino_get_info(
     conn: Option<&TrinoConnection>,
     info_type: InfoType,
@@ -430,6 +440,36 @@ fn trino_get_info(
         // against.
         InfoType::MultResultSets | InfoType::NeedLongDataLen | InfoType::MaxRowSizeIncludesLong => {
             return Ok(InfoValue::String("N".into()));
+        }
+        // The three identity strings core answers with the empty string
+        // because it has nothing else to give: "the DM supplies the DSN; core
+        // has none", and the other two are "carried in the connection string,
+        // not known here". True of core, false of this driver, which settles
+        // all three at connect.
+        //
+        // Only `SQL_DATA_SOURCE_NAME` has a spec-defined empty answer, and only
+        // for a connection string carrying no `DSN` keyword. The other two have
+        // no such clause, so an empty answer there is a non-answer: an
+        // application renders "connected as" from `SQL_USER_NAME`, and under
+        // `ExternalAuthentication` the connection string names nobody at all
+        // while the coordinator derives the identity from the token. See
+        // `session_user_name` for the rest of that argument.
+        //
+        // Arms rather than capability declarations because none of the three is
+        // a fact about Trino-the-engine: each is a property of the one
+        // connection, the way `SQL_DBMS_VER` is. Pre-connect, `conn` is `None`
+        // and core's empty default stands, which is all the driver could
+        // honestly say before a connection exists.
+        InfoType::DataSourceName => {
+            return Ok(InfoValue::String(conn_string(conn, |c| {
+                &c.data_source_name
+            })));
+        }
+        InfoType::ServerName => {
+            return Ok(InfoValue::String(conn_string(conn, |c| &c.server_name)));
+        }
+        InfoType::UserName => {
+            return Ok(InfoValue::String(conn_string(conn, |c| &c.user_name)));
         }
         // SQL_CATALOG_NAME, SQL_NULL_COLLATION, SQL_OJ_CAPABILITIES,
         // SQL_IDENTIFIER_CASE, SQL_DEFAULT_TXN_ISOLATION and
@@ -1135,7 +1175,8 @@ mod tests {
     }
     use super::*;
     use stackable_odbc_core::types::{
-        DEFAULT_IDENTIFIER_LEN, InfoType, InfoValue, SQL_AM_NONE, SQL_CA1_NEXT, SQL_CB_CLOSE,
+        DEFAULT_IDENTIFIER_LEN, InfoType, InfoValue, SQL_AM_NONE, SQL_ASYNC_DBC_NOT_CAPABLE,
+        SQL_CA1_NEXT, SQL_CA2_READ_ONLY_CONCURRENCY, SQL_CB_CLOSE, SQL_CB_NULL,
         SQL_DRIVER_ODBC_VER_STRING, SQL_FN_CVT_CAST, SQL_FN_STR_LOCATE, SQL_FN_STR_POSITION,
         SQL_FN_SYS_DBNAME, SQL_FN_SYS_USERNAME, SQL_FN_TD_CURDATE, SQL_FN_TD_CURRENT_DATE,
         SQL_FN_TD_CURRENT_TIME, SQL_FN_TD_CURRENT_TIMESTAMP, SQL_FN_TD_CURTIME,
@@ -1159,33 +1200,48 @@ mod tests {
         (InfoType::DriverName,                    Expected::Str("stackable-odbc-trino")),
         (InfoType::DbmsName,                      Expected::Str("Trino")),
         (InfoType::DriverOdbcVer,                 Expected::Str(SQL_DRIVER_ODBC_VER_STRING)),
-        (InfoType::SearchPatternEscape,            Expected::Str("\\")),
-        (InfoType::IdentifierQuoteChar,            Expected::Str("\"")),
+        (InfoType::SearchPatternEscape,           Expected::Str("\\")),
+        (InfoType::IdentifierQuoteChar,           Expected::Str("\"")),
         (InfoType::CatalogTerm,                   Expected::Str("catalog")),
         (InfoType::SchemaTerm,                    Expected::Str("schema")),
-        (InfoType::CatalogNameSeparator,           Expected::Str(".")),
+        (InfoType::CatalogNameSeparator,          Expected::Str(".")),
         (InfoType::ColumnAlias,                   Expected::Str("Y")),
-        (InfoType::OrderByColumnsInSelect,         Expected::Str("N")),
+        (InfoType::OrderByColumnsInSelect,        Expected::Str("N")),
         (InfoType::CatalogName,                   Expected::Str("Y")),
+        // The connection `disconnected_trino_conn` fabricates: no DSN, and the
+        // host and user its `ClientBuilder` was given. Empty only for the DSN,
+        // which is the one of the three the spec defines an empty answer for.
         (InfoType::DataSourceName,                Expected::Str("")),
-        (InfoType::ServerName,                    Expected::Str("")),
-        (InfoType::UserName,                      Expected::Str("")),
-        (InfoType::DataSourceReadOnly,             Expected::Str("N")),
+        (InfoType::ServerName,                    Expected::Str("localhost")),
+        (InfoType::UserName,                      Expected::Str("test")),
+        (InfoType::DataSourceReadOnly,            Expected::Str("N")),
         // "N": Trino can filter information_schema by privilege, but only
         // when the deployment configures access control -- see
         // TrinoBackend::accessible_tables.
         (InfoType::AccessibleTables,              Expected::Str("N")),
         (InfoType::AccessibleProcedures,          Expected::Str("N")),
         (InfoType::Integrity,                     Expected::Str("N")),
+        // "": no character beyond a-z, A-Z, 0-9 and _ is legal in an unquoted
+        // identifier. Trino's IDENTIFIER production is
+        // (LETTER | '_') (LETTER | DIGIT | '_')*, which is exactly the set this
+        // info type excludes, so the list of extras is empty. Measured in
+        // TrinoBackend::special_characters.
         (InfoType::SpecialCharacters,             Expected::Str("")),
         (InfoType::XopenCliYear,                  Expected::Str("1995")),
+        // "": the spec's "if this is unknown, an empty string will be
+        // returned". Trino has no collation concept to name, ordering varchar
+        // by Unicode code point with no server default to report.
         (InfoType::CollationSeq,                  Expected::Str("")),
         (InfoType::DescribeParameter,             Expected::Str("Y")),
         // --- U16 values ---
         (InfoType::GroupBy,                       Expected::U16(SQL_GB_GROUP_BY_CONTAINS_SELECT)),
+        // 0 = "no specified limit", not "unknown": both count something this
+        // driver imposes no cap on. A connection is one HTTP client and a Tokio
+        // runtime, and a statement is one query id, so nothing here runs out at
+        // a number either could name.
         (InfoType::MaxDriverConnections,          Expected::U16(0)),
         (InfoType::MaxConcurrentActivities,       Expected::U16(0)),
-        (InfoType::ConcatNullBehavior,            Expected::U16(0)),
+        (InfoType::ConcatNullBehavior,            Expected::U16(SQL_CB_NULL)),
         // Derived by stackable-odbc-core from Backend::cursor_commit_behavior,
         // which this driver declares as CursorBehavior::Close: Trino discards a
         // transaction's result sets when it ends, so a page request afterwards
@@ -1198,13 +1254,36 @@ mod tests {
         (InfoType::MaxCatalogNameLen,             Expected::U16(DEFAULT_IDENTIFIER_LEN)),
         (InfoType::MaxTableNameLen,               Expected::U16(DEFAULT_IDENTIFIER_LEN)),
         (InfoType::NullCollation,                 Expected::U16(SQL_NC_END)),
+        // The size limits. The spec gives every one of them the same `0`, for
+        // "no specified limit or the limit is unknown", so the value cannot say
+        // which of the two it means and the reason is recorded here instead.
+        // None of them is a placeholder awaiting a real number: the spec offers
+        // no other way to say what each of these says.
+        //
+        // No limit. Trino's grammar and planner cap none of these, so an
+        // application that reads a bound here would be told one that does not
+        // exist. The FIPS conformance minimums the spec lists for three of them
+        // (6 columns in GROUP BY, 100 in a select list, 15 tables in a FROM)
+        // are floors for a driver that reports a limit at all, and `0` is
+        // already more permissive than any of them.
         (InfoType::MaxColumnsInGroupBy,           Expected::U16(0)),
-        (InfoType::MaxColumnsInIndex,             Expected::U16(0)),
         (InfoType::MaxColumnsInOrderBy,           Expected::U16(0)),
         (InfoType::MaxColumnsInSelect,            Expected::U16(0)),
-        (InfoType::MaxColumnsInTable,             Expected::U16(0)),
         (InfoType::MaxTablesInSelect,             Expected::U16(0)),
         (InfoType::MaxUserNameLen,                Expected::U16(0)),
+        // Not applicable, which the spec has no separate value for. Trino has
+        // no `CREATE INDEX` in its grammar at all, which is also why
+        // `SQL_SCHEMA_USAGE` omits `SQL_SU_INDEX_DEFINITION` and why
+        // `SQLStatistics` returns no rows.
+        (InfoType::MaxColumnsInIndex,             Expected::U16(0)),
+        // Genuinely unknown, and the one of this group that is. The cap belongs
+        // to whichever connector backs the catalog and they disagree (PostgreSQL
+        // stops at 1600, Hive is effectively unbounded), while one connection
+        // spans catalogs. That is the same argument that keeps
+        // `txn_isolation_options` down to the level every catalog accepts.
+        (InfoType::MaxColumnsInTable,             Expected::U16(0)),
+        // No limit, and a driver fact rather than a Trino one: an environment
+        // holds a handle table, and nothing in core caps how many exist.
         (InfoType::ActiveEnvironments,            Expected::U16(0)),
         (InfoType::MaxIdentifierLen,              Expected::U16(DEFAULT_IDENTIFIER_LEN)),
         (InfoType::CatalogLocation,               Expected::U16(SQL_CL_START)),
@@ -1232,26 +1311,82 @@ mod tests {
         // it; see `TrinoBackend::txn_isolation_options`.
         (InfoType::TransactionIsolationProtocol,  Expected::U32(SQL_TXN_READ_UNCOMMITTED)),
         (InfoType::AlterTable,                    Expected::U32(SQL_AT_ADD_COLUMN_SINGLE | SQL_AT_ADD_CONSTRAINT | SQL_AT_DROP_COLUMN)),
+        // Not applicable: no `CREATE INDEX`, as for SQL_MAX_COLUMNS_IN_INDEX.
         (InfoType::MaxIndexSize,                  Expected::U32(0)),
+        // No limit. Trino caps no row width, and the FIPS floors the spec lists
+        // (2,000 bytes at Entry level) are again floors for a driver reporting
+        // a limit at all.
         (InfoType::MaxRowSize,                    Expected::U32(0)),
+        // Unknown, and unknowable from here. Trino does cap statement length,
+        // through the coordinator's `query.max-length` config property, but no
+        // `SHOW` or session property exposes it to a client. Reporting its
+        // 1,000,000-character default would name a bound wrong on any tuned
+        // deployment, in the direction that makes an application refuse SQL the
+        // server would have accepted.
         (InfoType::MaxStatementLen,               Expected::U32(0)),
         (InfoType::OuterJoinCapabilities,         Expected::U32(SQL_OJ_LEFT | SQL_OJ_RIGHT | SQL_OJ_FULL | SQL_OJ_NESTED | SQL_OJ_NOT_ORDERED | SQL_OJ_INNER | SQL_OJ_ALL_COMPARISON_OPS)),
+        // 0 is not one of the four SQL_SC_* values: the spec's list has no
+        // "conforms to nothing" entry, and Trino meets not even Entry level,
+        // whose referential-integrity requirement its grammar rejects outright.
+        // See `TrinoBackend::sql_conformance`.
         (InfoType::SqlConformance,                Expected::U32(0)),
         (InfoType::OdbcInterfaceConformance,      Expected::U32(SQL_OIC_CORE)),
         (InfoType::AsyncMode,                     Expected::U32(SQL_AM_NONE)),
-        (InfoType::AsyncDbcFunctions,             Expected::U32(0)),
+        (InfoType::AsyncDbcFunctions,             Expected::U32(SQL_ASYNC_DBC_NOT_CAPABLE)),
         (InfoType::SchemaUsage,                   Expected::U32(SQL_SU_DML_STATEMENTS | SQL_SU_PROCEDURE_INVOCATION | SQL_SU_TABLE_DEFINITION | SQL_SU_PRIVILEGE_DEFINITION)),
         (InfoType::CatalogUsage,                  Expected::U32(SQL_CU_DML_STATEMENTS | SQL_CU_PROCEDURE_INVOCATION | SQL_CU_TABLE_DEFINITION | SQL_CU_PRIVILEGE_DEFINITION)),
         (InfoType::GetDataExtensions,             Expected::U32(SQL_GD_ANY_COLUMN | SQL_GD_ANY_ORDER | SQL_GD_BOUND)),
+        // The cursor-attribute bitmaps, all core-owned: there is no `Backend`
+        // hook and no arm here, because which cursors exist is a fact about
+        // core's fetch rather than about Trino. Only the forward-only pair is
+        // non-empty, because `SQL_SCROLL_OPTIONS` above claims only
+        // `SQL_SO_FORWARD_ONLY`.
+        //
+        // The six zeros mean "supports none of these", which is not a
+        // placeholder: a dynamic, keyset-driven or static cursor cannot be
+        // opened here at all, and claiming a bit in one is what makes an
+        // application call `SQLFetchScroll` with an orientation core rejects.
         (InfoType::DynamicCursorAttributes1,      Expected::U32(0)),
         (InfoType::DynamicCursorAttributes2,      Expected::U32(0)),
         (InfoType::ForwardOnlyCursorAttributes1,  Expected::U32(SQL_CA1_NEXT)),
-        (InfoType::ForwardOnlyCursorAttributes2,  Expected::U32(0)),
+        // What `SQLSetStmtAttr` already does with `SQL_ATTR_CONCURRENCY`:
+        // `SQL_CONCUR_READ_ONLY` is the one value it accepts unchanged, so
+        // reporting `0` would contradict the attribute it just accepted. The
+        // rest of the bitmask describes updatable cursors, row-count exactness
+        // and positioned-statement simulation, and stays clear.
+        (InfoType::ForwardOnlyCursorAttributes2,  Expected::U32(SQL_CA2_READ_ONLY_CONCURRENCY)),
         (InfoType::KeysetCursorAttributes1,       Expected::U32(0)),
         (InfoType::KeysetCursorAttributes2,       Expected::U32(0)),
         (InfoType::StaticCursorAttributes1,       Expected::U32(0)),
         (InfoType::StaticCursorAttributes2,       Expected::U32(0)),
     ];
+
+    /// The three identity strings this driver knows and core cannot.
+    ///
+    /// Core answers each with the empty string, which the spec defines for
+    /// exactly one of them and only in one case: `SQL_DATA_SOURCE_NAME` is
+    /// empty "if the connection string did not contain the DSN keyword".
+    /// `SQL_SERVER_NAME` and `SQL_USER_NAME` have no such clause, so an empty
+    /// answer there is a non-answer rather than a defined value.
+    #[test]
+    fn the_identity_strings_are_read_from_the_connection() {
+        let mut conn = crate::backend::disconnected_trino_conn();
+        conn.data_source_name = "trino_https".to_string();
+        conn.server_name = "coordinator.internal".to_string();
+        conn.user_name = "mapped_by_the_idp".to_string();
+
+        for (info_type, expected) in [
+            (InfoType::DataSourceName, "trino_https"),
+            (InfoType::ServerName, "coordinator.internal"),
+            (InfoType::UserName, "mapped_by_the_idp"),
+        ] {
+            assert_eq!(
+                trino_get_info(Some(&conn), info_type).expect("get_info"),
+                InfoValue::String(expected.to_string()),
+                "{info_type:?} was not read from the connection"
+            );
+        }
+    }
 
     /// Asserted on the *connected* path. Several of these answers come from
     /// capability declarations that now take a `&TrinoConnection`, so

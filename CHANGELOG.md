@@ -634,6 +634,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`SQL_USER_NAME`, `SQL_SERVER_NAME` and `SQL_DATA_SOURCE_NAME` answered the
+  empty string.** All three fell through to a shared default whose reason —
+  that the value is carried in the connection string and not known to the
+  caller — is true of `stackable-odbc-core` and false of this driver, which
+  settles all three at connect. Only `SQL_DATA_SOURCE_NAME` has a spec-defined
+  empty answer, and only for a connection string carrying no `DSN` keyword; the
+  other two have no such clause, so an application rendering "connected as"
+  from `SQL_USER_NAME` had nothing to render.
+
+  `SQL_USER_NAME` is now Trino's own `current_user`, read at connect by
+  widening the existing `SELECT version()` probe rather than by adding a round
+  trip. The spec defines the value as "the name used in a particular database,
+  which can be different from the login name", and here it does: under
+  `ExternalAuthentication` there is no `User` at all, and the coordinator
+  derives the identity from the token, so the connection string names nobody
+  while the session runs as somebody. `SessionUser` is the other direction,
+  where the deployment grants impersonation. A failed probe falls back to
+  `SessionUser`, then `User`, then the empty string.
+
+  `SQL_SERVER_NAME` is the `Host` the application connected by.
+  `SQL_DATA_SOURCE_NAME` is the `DSN` it connected with, which core supplies on
+  both connection entry points.
+
 - **`SQL_ATTR_CURRENT_CATALOG` and `SQL_DATABASE_NAME` did not follow a
   `USE`.** Both reported the `Catalog` connection-string value for the life of
   the connection, so after `USE postgresql.public` a connection opened against

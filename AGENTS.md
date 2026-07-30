@@ -266,6 +266,65 @@ passes `Catalog` in the connection string — and all four
 `integration-tests/run-tests.sh` configurations (DSN and DSN-less, verified and
 unverified TLS) plus the Windows Driver Manager suite connect unaffected.
 
+### The three identity strings
+
+`SQL_DATA_SOURCE_NAME`, `SQL_SERVER_NAME` and `SQL_USER_NAME` are answered from
+arms in `backend/info.rs`, reading fields `connect` fills in. Core answers each
+with the empty string and says why: "the DM supplies the DSN; core has none",
+and the other two are "carried in the connection string, not known here". Both
+reasons are true of core and false of this driver.
+
+Only `SQL_DATA_SOURCE_NAME` has a spec-defined empty answer, and only "if the
+connection string did not contain the `DSN` keyword". The other two have no such
+clause, so an empty answer is a non-answer — which is what an application
+rendering "connected as" was getting.
+
+| Value | Source |
+|---|---|
+| `SQL_DATA_SOURCE_NAME` | `ConnectParams::dsn()`, empty when the application connected by driver |
+| `SQL_SERVER_NAME` | the `Host` connection-string value |
+| `SQL_USER_NAME` | Trino's `current_user`, read at connect |
+
+**`SQL_USER_NAME` is probed, not taken from `User`.** The spec defines it as
+"the name used in a particular database, which can be different from the login
+name", and here it does. Under `ExternalAuthentication` there is no `User` at
+all, since `connect` calls `ClientBuilder::without_user`, and the coordinator
+derives the identity from the token: the connection string names nobody while
+the session runs as somebody. `SessionUser` is the other direction, but only
+where the deployment grants impersonation. Against the test stack it is refused
+at connect with `Access Denied: User admin cannot impersonate user analyst`,
+which is the same rule `suites/test_oauth.py` measures for a disagreeing `User`,
+so **`SessionUser` cannot be demonstrated here** and the `ExternalAuthentication`
+case is the one that carries the argument.
+
+`session_user_name` orders the fallbacks for a failed probe: `SessionUser`,
+then `User`, then empty. `SessionUser` comes first because a connection that
+carried one and still succeeded is one whose impersonation Trino permitted. It
+is pinned by unit test.
+
+It costs no round trip: `connect` already asked `SELECT version()` for
+`SQL_DBMS_VER`, and `probe_session` widened that to
+`SELECT version(), current_user`. An unparseable version does not discard the
+user, which is why the two are read independently rather than through a shared
+early return.
+
+Unlike the catalog, this is a **connect-time capture rather than a
+`Client::session_snapshot` read**: Trino has no set-user response header and no
+statement that moves the identity a session runs as, so there is nothing for a
+snapshot to follow.
+
+Arms rather than capability declarations, because none of the three is a fact
+about Trino-the-engine — each is a property of the one connection, the way
+`SQL_DBMS_VER` is. Pre-connect, core passes `None` and its empty default stands.
+
+`disconnected_trino_conn` sets `server_name` and `user_name` to match the
+`ClientBuilder` it fabricates, so `get_info_snapshot` asserts real values;
+leaving them blank would let both regress to core's non-answer with the
+snapshot still green. The DSN path has no unit coverage at all — it arrives
+through `SQLDriverConnectW`'s connection string — so it is asserted in
+`suites/test_integration.py`, which `run-tests.sh` drives over both a DSN and a
+DSN-less configuration.
+
 ### The catalog functions return rows, not statements
 
 The ten catalog methods — `tables`, `columns`, `primary_keys`, `foreign_keys`,

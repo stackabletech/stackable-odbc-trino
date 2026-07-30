@@ -83,6 +83,43 @@ fn login_deadline(login_timeout: Option<u32>) -> Option<Duration> {
         Some(secs) => Some(Duration::from_secs(u64::from(secs))),
     }
 }
+
+/// The name to report as `SQL_USER_NAME`, which the spec defines as "the name
+/// used in a particular database, which can be different from the login name".
+///
+/// That distinction is real here. Under `ExternalAuthentication` there is no
+/// `User` at all, since `connect` calls `ClientBuilder::without_user`, and the
+/// coordinator derives the identity from the token: the connection string names
+/// nobody while the session runs as somebody. `SessionUser` is the other
+/// direction, setting `X-Trino-User` while `User` still authenticates, but only
+/// where the deployment grants impersonation. Against this stack's default
+/// access control the connect is refused outright with `Access Denied: User
+/// admin cannot impersonate user analyst`, which is the same rule
+/// `integration-tests/suites/test_oauth.py` measures for a disagreeing `User`.
+///
+/// So `probed`, Trino's own `current_user` as read by [`probe_session`], is the
+/// answer whenever it is available, for the same reason
+/// [`TrinoBackend::current_catalog`] reads the session rather than the
+/// connection string.
+///
+/// Only a failed probe reaches the fallbacks, and they are ordered by how close
+/// each is to the question. `SessionUser` comes first because a connection that
+/// carried one and still succeeded is one whose impersonation Trino permitted,
+/// so the session is running as that name; `User` merely authenticated. The
+/// empty string is the spec's "not available" for a string info type, and is
+/// reachable only when a failed probe meets an `ExternalAuthentication`
+/// connection that named no user.
+fn session_user_name(
+    probed: Option<&str>,
+    session_user: Option<&str>,
+    user: Option<&str>,
+) -> String {
+    probed
+        .or(session_user)
+        .or(user)
+        .unwrap_or_default()
+        .to_string()
+}
 // `pub(crate)` only under `cfg(test)`: the FFI integration tests
 // (`ffi_integration_tests.rs`, a sibling of this module under `lib.rs`) need to
 // reach the `TRINO_*` capability bitmap constants declared in `info`. Non-test
@@ -496,65 +533,84 @@ fn validate_connection(
     }
 }
 
-/// Ask the coordinator its version, for `SQL_DBMS_VER`.
+/// Ask the coordinator the two facts about itself the driver cannot derive,
+/// for `SQL_DBMS_VER` and `SQL_USER_NAME`.
 ///
-/// Returns the empty string on any failure. A driver must not refuse a
+/// One round trip for both. They are asked together because the alternative is
+/// a second one on every connect, and a BI tool opens connections far more
+/// often than it reads either value.
+///
+/// Any failure degrades rather than propagates. A driver must not refuse a
 /// connection because it could not learn the server version -- the connection
 /// is already proven usable by [`validate_connection`] before this runs, and
-/// `SQL_DBMS_VER` returning `""` is the spec's own "not available".
+/// `""` is the spec's own "not available" for both info types. The user has a
+/// further fallback in [`session_user_name`], which the caller applies.
 ///
 /// Trino's `version()` returns a bare integer for modern releases (`"467"`)
 /// and a dotted string for pre-0.216 releases (`"0.215"`); development builds
 /// append a suffix (`"468-SNAPSHOT"`). [`parse_dotted_version`] handles all
-/// three.
-fn fetch_server_version(conn: &TrinoConnection) -> ServerVersion {
-    let rows = match query_all_rows(conn, "SELECT version()".to_string()) {
+/// three. An unparseable version does not discard the user, which is why the
+/// two are read into the result independently rather than through a shared
+/// early return.
+fn probe_session(conn: &TrinoConnection) -> SessionProbe {
+    let rows = match query_all_rows(conn, "SELECT version(), current_user".to_string()) {
         Ok(rows) => rows,
         Err(e) => {
-            tracing::warn!(error = %e, "could not read the Trino server version");
-            return ServerVersion::default();
+            tracing::warn!(error = %e, "could not read the Trino server version and session user");
+            return SessionProbe::default();
         }
     };
 
-    let raw = rows
-        .first()
-        .and_then(|row| row.value().first())
-        .and_then(|v| v.as_str());
+    let values = rows.first().map(|row| row.value()).unwrap_or_default();
+    let column = |index: usize| values.get(index).and_then(|v| v.as_str());
 
-    let Some(raw) = raw else {
+    let mut probe = SessionProbe {
+        user: column(1).map(str::to_string),
+        ..SessionProbe::default()
+    };
+    if probe.user.is_none() {
+        tracing::warn!("SELECT current_user returned no usable value");
+    }
+
+    let Some(raw) = column(0) else {
         tracing::warn!("SELECT version() returned no usable value");
-        return ServerVersion::default();
+        return probe;
     };
 
     match parse_dotted_version(raw) {
         Some((major, minor, release)) => {
             let formatted = format_odbc_version(major, minor, release);
-            tracing::debug!(raw, formatted, major, "Trino server version");
-            ServerVersion {
-                // The spec permits appending the data source's own version
-                // string after the ##.##.#### prefix.
-                formatted: format!("{formatted} ({raw})"),
+            tracing::debug!(
+                raw,
+                formatted,
                 major,
-            }
+                user = probe.user,
+                "Trino session probe"
+            );
+            // The spec permits appending the data source's own version string
+            // after the ##.##.#### prefix.
+            probe.dbms_version = format!("{formatted} ({raw})");
+            probe.server_major = major;
         }
-        None => {
-            tracing::warn!(raw, "could not parse the Trino server version");
-            ServerVersion::default()
-        }
+        None => tracing::warn!(raw, "could not parse the Trino server version"),
     }
+    probe
 }
 
-/// What [`fetch_server_version`] learned from the coordinator.
+/// What [`probe_session`] learned from the coordinator.
 ///
-/// The default -- empty string, major `0` -- is the "probe failed" state. It
-/// makes `SQL_DBMS_VER` report the spec's "not available" and gates every
-/// version-dependent capability flag off.
+/// The default, an empty string with major `0` and no user, is the "probe failed"
+/// state. It makes `SQL_DBMS_VER` report the spec's "not available", gates
+/// every version-dependent capability flag off, and sends `SQL_USER_NAME` to
+/// [`session_user_name`]'s connection-string fallbacks.
 #[derive(Default)]
-struct ServerVersion {
+struct SessionProbe {
     /// Rendered for `SQL_DBMS_VER`, in the ODBC `##.##.####` form.
-    formatted: String,
+    dbms_version: String,
     /// The major version as a number, for capability gating.
-    major: u32,
+    server_major: u32,
+    /// Trino's `current_user`, for `SQL_USER_NAME`.
+    user: Option<String>,
 }
 
 /// The Trino [`stackable_odbc_core::backend::Backend`] implementation.
@@ -587,6 +643,37 @@ pub struct TrinoConnection {
     /// off. Understating capability is the safe direction: a BI tool folds
     /// less than it could, rather than emitting SQL the server rejects.
     pub server_major: u32,
+    /// The `DSN` the application connected with, for `SQL_DATA_SOURCE_NAME`.
+    ///
+    /// Empty when the connection string named no DSN, which is the one case the
+    /// spec defines the empty string for: the value "is the value of the DSN
+    /// keyword in the connection string passed to the driver", and empty "if
+    /// the connection string did not contain the DSN keyword (such as when it
+    /// contains the DRIVER keyword)". Both of `run-tests.sh`'s configurations
+    /// are covered by that pair.
+    ///
+    /// Core supplies it through `ConnectParams::dsn()` on both connection
+    /// entry points: `SQLDriverConnectW` from the connection string, and
+    /// `SQLConnectW` from its *ServerName* argument.
+    pub data_source_name: String,
+    /// The coordinator this connection was opened against, for
+    /// `SQL_SERVER_NAME`.
+    ///
+    /// The `Host` connection-string value rather than anything read back: the
+    /// spec asks for "the name of the server that the data source is associated
+    /// with", and the name the application reached the coordinator by is that
+    /// name. A coordinator does not report its own hostname, and reporting one
+    /// resolved from DNS would name a host the application never used.
+    pub server_name: String,
+    /// The session's own user, for `SQL_USER_NAME`.
+    ///
+    /// Trino's `current_user`, read once at connect by [`probe_session`] and
+    /// falling back through [`session_user_name`] when the probe failed. The
+    /// session cannot move it afterwards: Trino has no set-user response header
+    /// and no statement that changes the identity a session runs as, which is
+    /// what makes this a connect-time capture rather than a
+    /// [`Client::session_snapshot`] read like the catalog.
+    pub user_name: String,
     /// The catalog this connection was opened against, from the `Catalog`
     /// connection-string key, or `None` when it named none.
     ///
@@ -876,6 +963,18 @@ pub(crate) fn disconnected_trino_conn_with_catalog(catalog: Option<&str>) -> Tri
         // leave behind if `fetch_server_version` could not reach a coordinator.
         dbms_version: String::new(),
         server_major: 0,
+        // The three identity strings, matching the client built above rather
+        // than left empty: `TrinoBackend::connect` derives the first two
+        // without reaching the coordinator, so a fabricated connection that
+        // left them blank would let `SQL_SERVER_NAME` and `SQL_USER_NAME`
+        // regress to core's non-answer with the snapshot still passing.
+        //
+        // The DSN is the exception and is genuinely empty: nothing here
+        // connected by DSN, which is the one case the spec defines the empty
+        // string for.
+        data_source_name: String::new(),
+        server_name: "localhost".to_string(),
+        user_name: "test".to_string(),
         // `None` is the `SQL_DATABASE_NAME` / `SQL_ATTR_CURRENT_CATALOG`
         // "not available" case, which both readers render as the empty string.
         catalog: catalog.map(str::to_string),
@@ -1468,15 +1567,26 @@ impl Backend for TrinoBackend {
             client: Arc::new(client),
             dbms_version: String::new(),
             server_major: 0,
+            // Core supplies the DSN on both connection entry points, so this is
+            // the whole of `SQL_DATA_SOURCE_NAME`: absent means the application
+            // connected by driver rather than by DSN, which is the case the
+            // spec makes the empty string.
+            data_source_name: params.dsn().unwrap_or_default().to_string(),
+            server_name: p.host().to_string(),
+            // Filled in below, from the coordinator. Not `p.user()` here: that
+            // would be the login name, and the point of the probe is that the
+            // two differ.
+            user_name: String::new(),
             catalog: p.catalog().map(str::to_owned),
             describe_param_cache: Mutex::new(None),
             liveness: Liveness::default(),
             txn: Arc::new(TransactionState::default()),
         };
         validate_connection(&conn, p.catalog(), login_timeout)?;
-        let version = fetch_server_version(&conn);
-        conn.dbms_version = version.formatted;
-        conn.server_major = version.major;
+        let probe = probe_session(&conn);
+        conn.dbms_version = probe.dbms_version;
+        conn.server_major = probe.server_major;
+        conn.user_name = session_user_name(probe.user.as_deref(), p.session_user(), p.user());
         Ok(conn)
     }
 
@@ -1508,26 +1618,21 @@ impl Backend for TrinoBackend {
         ])
     }
 
-    /// This driver does not implement transactions, so every connection behaves
-    /// as if it were in autocommit mode. SQLEndTran calls are accepted as no-ops
-    /// so that tools like PowerBI do not fail.
+    /// Commits or rolls back the session's transaction, over Trino's own
+    /// `COMMIT` / `ROLLBACK` and the `X-Trino-Transaction-Id` header the client
+    /// tracks.
     ///
-    /// Trino itself does support transactions — `START TRANSACTION` / `COMMIT` /
-    /// `ROLLBACK` over the `X-Trino-Transaction-Id` headers — so this is a
-    /// driver limitation, not a platform one. Implementing it means changing
-    /// all of the following together, since each is observable and they must
-    /// agree:
+    /// Returns early with no I/O when nothing is open: Trino answers
+    /// `NOT_IN_TRANSACTION` there, while `SQLEndTran`'s page requires
+    /// `SQL_SUCCESS` when no transaction is active.
     ///
-    /// - `SQL_TXN_CAPABLE`, reported from `info::trino_get_info`, currently
-    ///   `SQL_TC_NONE`
-    /// - [`Backend::default_txn_isolation`] and
-    ///   [`Backend::txn_isolation_options`], both currently `0`
-    /// - [`Backend::set_txn_isolation`], whose default is unreachable while
-    ///   the options bitmask is `0`
-    /// - [`Backend::set_autocommit`], which currently reports `HYC00` for
-    ///   manual-commit mode
-    /// - [`Backend::cursor_commit_behavior`] / `cursor_rollback_behavior`,
-    ///   left at core's `Preserve` default because no transaction ever begins
+    /// This is one of a group that must agree, since each is separately
+    /// observable: [`Backend::txn_capable`] (`SQL_TC_DML`),
+    /// [`Backend::default_txn_isolation`] and
+    /// [`Backend::txn_isolation_options`] (both `SQL_TXN_READ_UNCOMMITTED`,
+    /// the only level every catalog accepts), [`Backend::set_autocommit`],
+    /// and [`Backend::cursor_commit_behavior`] / `cursor_rollback_behavior`
+    /// (both `Close`, measured).
     fn end_tran(conn: &TrinoConnection, commit: bool) -> Result<(), TrinoError> {
         tracing::debug!(commit, "TrinoBackend::end_tran");
         if !conn.in_transaction() {
@@ -1839,9 +1944,13 @@ impl Backend for TrinoBackend {
     /// Entry level requires referential integrity in `CREATE TABLE`, and
     /// Trino's grammar rejects all four constraint forms outright — `PRIMARY
     /// KEY`, `UNIQUE`, `CHECK` and `REFERENCES` each fail with `SYNTAX_ERROR`
-    /// — which is also why this driver reports `SQL_INTEGRITY = "N"`. Entry
-    /// level further requires `COMMIT`/`ROLLBACK`, and this driver reports
-    /// `SQL_TC_NONE` (see [`TrinoBackend::end_tran`]).
+    /// — which is also why this driver reports `SQL_INTEGRITY = "N"`. That one
+    /// requirement is enough to rule the level out.
+    ///
+    /// Entry level's other demand, `COMMIT` and `ROLLBACK`, *is* met: this
+    /// driver reports `SQL_TC_DML` and implements [`TrinoBackend::end_tran`].
+    /// So the constraint grammar is the whole of the argument, and a Trino
+    /// release that accepted `PRIMARY KEY` would be worth re-examining here.
     ///
     /// `0` is not one of the four `SQL_SC_*` values — the spec's list has no
     /// "conforms to nothing" entry — but it is the only honest answer when the
@@ -2480,7 +2589,7 @@ mod tests {
     use serial_test::serial;
     use stackable_odbc_core::{
         backend::StatementBackend,
-        types::{ColumnValue, FetchResult},
+        types::{ColumnValue, FetchResult, InfoType},
     };
 
     use super::*;
@@ -2664,6 +2773,42 @@ mod tests {
         assert_eq!(login_deadline(Some(15)), Some(Duration::from_secs(15)));
     }
 
+    /// `SQL_USER_NAME` is "the name used in a particular database, which can be
+    /// different from the login name", so what the session itself reports wins
+    /// over anything the connection string said. Under
+    /// `ExternalAuthentication` there is no `User` at all and the identity
+    /// provider's mapping is the only source; under `SessionUser` the two
+    /// genuinely differ.
+    #[test]
+    fn user_name_prefers_what_the_session_reports() {
+        assert_eq!(
+            session_user_name(Some("mapped_by_the_idp"), Some("run_as"), Some("login")),
+            "mapped_by_the_idp"
+        );
+    }
+
+    /// The probe is allowed to fail without failing the connection, so the
+    /// fallbacks have to be ordered. `SessionUser` is what statements would
+    /// have run as, which is what this info type asks for; `User` merely
+    /// authenticated.
+    #[test]
+    fn user_name_falls_back_to_session_user_before_the_login_name() {
+        assert_eq!(
+            session_user_name(None, Some("run_as"), Some("login")),
+            "run_as"
+        );
+        assert_eq!(session_user_name(None, None, Some("login")), "login");
+    }
+
+    /// `ExternalAuthentication` requires no `User`, so a failed probe can leave
+    /// nothing to report. The empty string is the spec's "not available" for a
+    /// string info type, the same answer `SQL_DBMS_VER` gives for a failed
+    /// version probe.
+    #[test]
+    fn user_name_is_empty_when_nothing_can_name_the_user() {
+        assert_eq!(session_user_name(None, None, None), "");
+    }
+
     #[test]
     fn get_type_info_returns_all_trino_types() {
         let conn = disconnected_trino_conn();
@@ -2833,19 +2978,9 @@ mod tests {
             .catalog("moved_to")
             .build()
             .expect("ClientBuilder::build performs no I/O and cannot fail here");
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("Runtime::build performs no I/O and cannot fail here");
         let conn = TrinoConnection {
-            runtime: Arc::new(runtime),
             client: Arc::new(client),
-            dbms_version: String::new(),
-            server_major: 0,
-            catalog: Some("connected_with".to_string()),
-            describe_param_cache: Mutex::new(None),
-            liveness: Liveness::default(),
-            txn: Arc::new(TransactionState::default()),
+            ..disconnected_trino_conn_with_catalog(Some("connected_with"))
         };
 
         assert_eq!(
@@ -2888,6 +3023,35 @@ mod tests {
             Some("postgresql"),
             "USE moved the session catalog, so the reported one has to move too"
         );
+    }
+
+    /// `SQL_USER_NAME` is answered from the coordinator, not from the
+    /// connection string: `SessionUser` and an `ExternalAuthentication` login
+    /// both make the effective user differ from the one that authenticated,
+    /// and `current_user` is the only thing that knows which.
+    ///
+    /// `SQL_SERVER_NAME` and `SQL_DATA_SOURCE_NAME` ride along because all
+    /// three are settled by the same connect, and `LIVE` is a DSN-less
+    /// connection string, which is the one case the spec does define the empty
+    /// string for.
+    #[test]
+    #[serial(backend)]
+    #[ignore = "requires Trino -- run in isolation: cargo test -- --ignored backend"]
+    fn backend_identity_strings_come_from_the_connection() {
+        let params = ConnectParams::parse(LIVE).expect("parse params");
+        let conn = TrinoBackend::connect(&params).expect("connect");
+
+        for (info_type, expected) in [
+            (InfoType::UserName, "admin"),
+            (InfoType::ServerName, "localhost"),
+            (InfoType::DataSourceName, ""),
+        ] {
+            assert_eq!(
+                TrinoBackend::get_info(&conn, info_type).expect("get_info"),
+                InfoValue::String(expected.to_string()),
+                "{info_type:?}"
+            );
+        }
     }
 
     /// The `Catalog` connection-string value is still reported while the

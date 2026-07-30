@@ -25,13 +25,18 @@ from harness import Results, Stack  # noqa: E402
 R = Results("integration")
 
 
-def conn_str_catalog(conn_str):
-    """The `Catalog` value of a connection string, or None for a DSN."""
+def conn_str_value(conn_str, wanted_key):
+    """The value of `wanted_key` in a connection string, or None if absent."""
     for part in conn_str.split(";"):
         key, _, value = part.partition("=")
-        if key.strip().lower() == "catalog":
+        if key.strip().lower() == wanted_key:
             return value.strip()
     return None
+
+
+def conn_str_catalog(conn_str):
+    """The `Catalog` value of a connection string, or None for a DSN."""
+    return conn_str_value(conn_str, "catalog")
 
 
 def main():
@@ -434,6 +439,47 @@ def main():
             )
 
     R.run("SQL_DATABASE_NAME is the connected catalog", test_database_name_is_the_connected_catalog)
+
+    # ------------------------------------------------------------------
+    # The three strings that identify this connection
+    # ------------------------------------------------------------------
+    # SQL_DATA_SOURCE_NAME is the only one of the three the spec gives a defined
+    # empty answer to, and only "if the connection string did not contain the
+    # DSN keyword". run-tests.sh drives this suite over both cases, which is
+    # what makes the pair assertable at all. The DSN half reaches the driver
+    # through SQLDriverConnectW's connection string, a route no unit test
+    # covers.
+    #
+    # SQL_SERVER_NAME and SQL_USER_NAME have no such clause, so an empty answer
+    # there is a non-answer. The user is asserted against Trino's own
+    # current_user rather than against the connection string's User: those two
+    # differ under SessionUser and under ExternalAuthentication, and the whole
+    # reason the driver probes is to report the former.
+
+    def test_identity_strings():
+        dsn = conn_str_value(conn_str, "dsn")
+        got_dsn = conn.getinfo(pyodbc.SQL_DATA_SOURCE_NAME)
+        if dsn is None:
+            assert got_dsn == "", (
+                f"a DSN-less connection string must report an empty "
+                f"SQL_DATA_SOURCE_NAME, got {got_dsn!r}"
+            )
+        else:
+            assert got_dsn == dsn, (
+                f"SQL_DATA_SOURCE_NAME is {got_dsn!r}, but the application connected "
+                f"with DSN={dsn!r}"
+            )
+
+        got_server = conn.getinfo(pyodbc.SQL_SERVER_NAME)
+        assert got_server, f"SQL_SERVER_NAME should name the coordinator, got {got_server!r}"
+
+        got_user = conn.getinfo(pyodbc.SQL_USER_NAME)
+        wanted_user = conn.cursor().execute("SELECT current_user").fetchval()
+        assert got_user == wanted_user, (
+            f"SQL_USER_NAME is {got_user!r}, but the session runs as {wanted_user!r}"
+        )
+
+    R.run("SQL_DATA_SOURCE_NAME, SQL_SERVER_NAME and SQL_USER_NAME", test_identity_strings)
 
     # ------------------------------------------------------------------
     # SQL_ATTR_METADATA_ID changes what the catalog functions match
