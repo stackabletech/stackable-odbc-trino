@@ -14,7 +14,9 @@ services:
       retries: 10
 
   trino:
-    image: trinodb/trino:467
+    # Pinned, never `latest`. The floor is 466: the spooling protocol the
+    # spooling profile needs did not exist before it.
+    image: trinodb/trino:483
     ports:
       - "8080:8080"
       - "8443:8443"
