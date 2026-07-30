@@ -6,6 +6,7 @@ use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 use stackable_odbc_core::types::{ConnectParams, Redacted};
+use trino_rust_client::TlsVerification;
 use trino_rust_client::Tz;
 use trino_rust_client::selected_role::{RoleType, SelectedRole};
 
@@ -19,10 +20,26 @@ pub(crate) const PARAM_HOST: &str = "host";
 pub(crate) const PARAM_PORT: &str = "port";
 /// Transport protocol: `"https"` (default) or `"http"`.
 pub(crate) const PARAM_PROTOCOL: &str = "protocol";
-/// TLS certificate verification: `"true"` (default) or `"false"`.
+/// How strictly the coordinator's TLS certificate is checked.
+///
+/// `"true"` (default) or `"full"` verify the chain and the hostname; `"ca"`
+/// verifies the chain only; `"false"` or `"none"` verify nothing. The booleans
+/// came first and keep working; the three words are JDBC's `SSLVerification`
+/// values, so a value copied out of a JDBC URL transfers.
 pub(crate) const PARAM_TLS_VERIFY: &str = "tlsverify";
+/// JDBC's name for [`PARAM_TLS_VERIFY`]. Setting both is an error unless they
+/// agree — see [`parse_tls_verification`].
+pub(crate) const PARAM_SSL_VERIFICATION: &str = "sslverification";
 /// Path to a PEM certificate file for TLS verification.
 pub(crate) const PARAM_CERTIFICATE: &str = "certificate";
+/// Path to a PEM file holding a client certificate chain and its PKCS#8
+/// private key, for mutual TLS.
+///
+/// One file, and PEM only: `trino-rust-client` builds `reqwest` on rustls,
+/// which accepts neither PKCS#12 nor JKS — so JDBC's `SSLKeyStorePath` and
+/// `SSLKeyStoreType` have no equivalent here and the key is named for what it
+/// actually takes.
+pub(crate) const PARAM_CLIENT_CERTIFICATE: &str = "clientcertificate";
 /// Per-request HTTP timeout in seconds. Default: 30.
 pub(crate) const PARAM_QUERY_TIMEOUT: &str = "querytimeout";
 /// ODBC-standard alias for [`PARAM_QUERY_TIMEOUT`].
@@ -285,6 +302,61 @@ fn selected_role(value: &str) -> SelectedRole {
 /// Rejects anything else rather than defaulting: every boolean here turns a
 /// protection or a behaviour off, and a typo silently reading as "leave it on"
 /// is the failure mode `TlsVerify` already guards against.
+/// Resolve `TlsVerify` and its JDBC alias `SSLVerification` into one value.
+///
+/// Both spellings accept both vocabularies, so `TlsVerify=CA` and
+/// `SSLVerification=false` are as valid as the pairings you would expect —
+/// there is no sense in which one key owns one set of words, and rejecting a
+/// mixed pairing would only surprise.
+///
+/// Setting both keys is an error unless they resolve to the same thing. They
+/// are one setting under two names, and silently preferring either would leave
+/// the other looking honoured when it was not — for a value whose failure mode
+/// is an unauthenticated connection.
+fn parse_tls_verification(
+    tls_verify: Option<&str>,
+    ssl_verification: Option<&str>,
+) -> Result<TlsVerification, TrinoError> {
+    let parse_one = |key: &str, raw: &str| match raw {
+        v if v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("full") => {
+            Ok(TlsVerification::Full)
+        }
+        v if v.eq_ignore_ascii_case("ca") => Ok(TlsVerification::CaOnly),
+        v if v.eq_ignore_ascii_case("false") || v.eq_ignore_ascii_case("none") => {
+            Ok(TlsVerification::None)
+        }
+        v => Err(TrinoError::General {
+            message: format!(
+                "invalid value for {key}: {v:?}, expected \"true\"/\"full\", \"ca\", \
+                 or \"false\"/\"none\""
+            ),
+        }),
+    };
+
+    match (tls_verify, ssl_verification) {
+        (None, None) => Ok(TlsVerification::Full),
+        (Some(v), None) => parse_one(PARAM_TLS_VERIFY, v),
+        (None, Some(v)) => parse_one(PARAM_SSL_VERIFICATION, v),
+        (Some(a), Some(b)) => {
+            let (a, b) = (
+                parse_one(PARAM_TLS_VERIFY, a)?,
+                parse_one(PARAM_SSL_VERIFICATION, b)?,
+            );
+            if a == b {
+                Ok(a)
+            } else {
+                Err(TrinoError::General {
+                    message: format!(
+                        "{PARAM_TLS_VERIFY} and {PARAM_SSL_VERIFICATION} are the same \
+                         setting and were given different values ({a:?} and {b:?}); \
+                         set only one"
+                    ),
+                })
+            }
+        }
+    }
+}
+
 fn parse_bool(key: &str, raw: &str) -> Result<bool, TrinoError> {
     match raw {
         v if v.eq_ignore_ascii_case("true") => Ok(true),
@@ -310,8 +382,9 @@ pub(crate) struct TrinoConnectParams {
     password: Redacted<Option<String>>,
     access_token: Redacted<Option<String>>,
     secure: bool,
-    tls_verify: bool,
+    tls_verification: TlsVerification,
     certificate: Option<String>,
+    client_certificate: Option<String>,
     query_timeout: Duration,
     catalog: Option<String>,
     schema: Option<String>,
@@ -378,8 +451,14 @@ impl TrinoConnectParams {
         &self.client_tags
     }
 
-    pub fn tls_verify(&self) -> bool {
-        self.tls_verify
+    pub fn tls_verification(&self) -> TlsVerification {
+        self.tls_verification
+    }
+
+    /// PEM holding a client certificate chain and its PKCS#8 key, for mutual
+    /// TLS. See [`PARAM_CLIENT_CERTIFICATE`].
+    pub fn client_certificate(&self) -> Option<&str> {
+        self.client_certificate.as_deref()
     }
 
     pub fn certificate(&self) -> Option<&str> {
@@ -543,19 +622,26 @@ impl TryFrom<&ConnectParams> for TrinoConnectParams {
                 });
             }
         };
-        let tls_verify = match params.get(PARAM_TLS_VERIFY) {
-            None => true,
-            Some(v) if v.eq_ignore_ascii_case("true") => true,
-            Some(v) if v.eq_ignore_ascii_case("false") => false,
-            Some(v) => {
-                return Err(TrinoError::General {
-                    message: format!(
-                        "invalid value for {PARAM_TLS_VERIFY}: {v:?}, expected \"true\" or \"false\""
-                    ),
-                });
-            }
-        };
+        let tls_verification = parse_tls_verification(
+            params.get(PARAM_TLS_VERIFY),
+            params.get(PARAM_SSL_VERIFICATION),
+        )?;
         let certificate = params.get(PARAM_CERTIFICATE).map(str::to_string);
+        let client_certificate = params.get(PARAM_CLIENT_CERTIFICATE).map(str::to_string);
+        // rustls only permits skipping hostname verification when the trust
+        // store is supplied explicitly, which excludes the platform's own
+        // roots -- so `CaOnly` without a root certificate would trust nothing
+        // at all. The client reports this at build time; catching it here names
+        // the two connection-string keys instead of the builder methods.
+        if tls_verification == TlsVerification::CaOnly && certificate.is_none() {
+            return Err(TrinoError::General {
+                message: format!(
+                    "{PARAM_TLS_VERIFY}=ca verifies the certificate chain but not the \
+                     hostname, and needs the chain to verify against: supply \
+                     {PARAM_CERTIFICATE}=<pem>"
+                ),
+            });
+        }
 
         let pairs = |key: &'static str| match params.get(key) {
             None => Ok(HashMap::new()),
@@ -674,8 +760,9 @@ impl TryFrom<&ConnectParams> for TrinoConnectParams {
             password: Redacted(password),
             access_token: Redacted(access_token),
             secure,
-            tls_verify,
+            tls_verification,
             certificate,
+            client_certificate,
             query_timeout: Duration::from_secs(query_timeout_secs),
             catalog: params.get(PARAM_CATALOG).map(str::to_string),
             schema: params.get(PARAM_SCHEMA).map(str::to_string),
@@ -1189,27 +1276,101 @@ mod tests {
     #[test]
     fn tls_verify_defaults_to_true() {
         let p = parse("Host=localhost;Port=8080;User=admin");
-        assert!(p.tls_verify());
+        assert_eq!(p.tls_verification(), TlsVerification::Full);
     }
 
     #[test]
     fn tls_verify_true_accepted() {
         let p = parse("Host=localhost;Port=8080;User=admin;TlsVerify=true");
-        assert!(p.tls_verify());
+        assert_eq!(p.tls_verification(), TlsVerification::Full);
     }
 
     #[test]
     fn tls_verify_false_accepted() {
         let p = parse("Host=localhost;Port=8080;User=admin;TlsVerify=false");
-        assert!(!p.tls_verify());
+        assert_eq!(p.tls_verification(), TlsVerification::None);
     }
 
     #[test]
     fn tls_verify_case_insensitive() {
         let p = parse("Host=localhost;Port=8080;User=admin;TlsVerify=True");
-        assert!(p.tls_verify());
+        assert_eq!(p.tls_verification(), TlsVerification::Full);
         let p = parse("Host=localhost;Port=8080;User=admin;TlsVerify=FALSE");
-        assert!(!p.tls_verify());
+        assert_eq!(p.tls_verification(), TlsVerification::None);
+    }
+
+    // JDBC spells the three modes FULL / CA / NONE. Both keys take both
+    // vocabularies, so a value copied out of a JDBC URL transfers and the
+    // booleans that came first keep working.
+
+    #[test]
+    fn tls_verify_accepts_the_jdbc_vocabulary() {
+        let base = "Host=localhost;Port=8443;User=admin";
+        for (value, expected) in [
+            ("full", TlsVerification::Full),
+            ("FULL", TlsVerification::Full),
+            ("none", TlsVerification::None),
+            ("None", TlsVerification::None),
+        ] {
+            assert_eq!(
+                parse(&format!("{base};TlsVerify={value}")).tls_verification(),
+                expected,
+                "TlsVerify={value}"
+            );
+        }
+    }
+
+    #[test]
+    fn ssl_verification_is_an_alias_and_takes_both_vocabularies() {
+        let base = "Host=localhost;Port=8443;User=admin";
+        assert_eq!(
+            parse(&format!("{base};SSLVerification=NONE")).tls_verification(),
+            TlsVerification::None
+        );
+        assert_eq!(
+            parse(&format!("{base};SSLVerification=false")).tls_verification(),
+            TlsVerification::None
+        );
+    }
+
+    /// `CaOnly` replaces the trust store under rustls, so without a chain to
+    /// verify against it would trust nothing at all.
+    #[test]
+    fn ca_only_requires_a_certificate() {
+        let base = "Host=localhost;Port=8443;User=admin";
+        let e = parse_err(&format!("{base};TlsVerify=ca"));
+        assert!(
+            matches!(&e, TrinoError::General { message } if message.contains(PARAM_CERTIFICATE)),
+            "the error must name the key that fixes it, got {e:?}"
+        );
+        assert_eq!(
+            parse(&format!("{base};TlsVerify=ca;Certificate=/tmp/root.pem")).tls_verification(),
+            TlsVerification::CaOnly
+        );
+    }
+
+    /// One setting under two names. Silently preferring either would leave the
+    /// other looking honoured for a value whose failure mode is an
+    /// unauthenticated connection.
+    #[test]
+    fn the_two_spellings_may_agree_but_not_disagree() {
+        let base = "Host=localhost;Port=8443;User=admin";
+        assert_eq!(
+            parse(&format!("{base};TlsVerify=false;SSLVerification=NONE")).tls_verification(),
+            TlsVerification::None
+        );
+        let e = parse_err(&format!("{base};TlsVerify=true;SSLVerification=NONE"));
+        assert!(matches!(e, TrinoError::General { .. }), "got {e:?}");
+    }
+
+    #[test]
+    fn the_client_certificate_is_a_path_and_defaults_to_none() {
+        let base = "Host=localhost;Port=8443;User=admin";
+        assert_eq!(parse(base).client_certificate(), None);
+        assert_eq!(
+            parse(&format!("{base};ClientCertificate=/tmp/client.pem")).client_certificate(),
+            Some("/tmp/client.pem")
+        );
     }
 
     #[test]

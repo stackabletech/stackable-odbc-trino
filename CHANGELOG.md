@@ -9,6 +9,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Three-mode TLS verification and mutual TLS.** `TlsVerify` now takes `ca`
+  alongside the booleans it already accepted, and `SSLVerification` is an alias
+  for it, so a value copied out of a JDBC URL transfers unchanged. Both keys
+  accept both vocabularies: `true`/`full` verify the certificate chain and the
+  hostname, `ca` verifies the chain only, `false`/`none` verify nothing. Setting
+  both keys is an error unless they agree — they are one setting under two
+  names, and silently preferring either would leave the other looking honoured
+  for a value whose failure mode is an unauthenticated connection.
+
+  `ca` is for a coordinator reached under a name its certificate does not carry,
+  such as an IP or an internal DNS name. It **requires `Certificate`**, and the
+  connection is refused without it: rustls only permits skipping hostname
+  verification when the trust store is supplied explicitly, which excludes the
+  platform's own roots, so `ca` alone would trust nothing at all.
+
+  The new `ClientCertificate` key is mutual TLS: a path to **one PEM file
+  holding the certificate chain followed by a PKCS#8 private key**. PEM is the
+  only format — the client builds `reqwest` on rustls, which accepts neither
+  PKCS#12 nor JKS, so JDBC's `SSLKeyStorePath` and `SSLKeyStoreType` have no
+  equivalent. It is independent of `Certificate`; either may be set alone.
+
 - **Interactive OAuth 2.0 authentication**, through the new
   `ExternalAuthentication` and `ExternalAuthenticationTimeout`
   connection-string keys. `ExternalAuthentication=true` selects Trino's

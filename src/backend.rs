@@ -1049,7 +1049,7 @@ impl Backend for TrinoBackend {
             port = p.port(),
             user = p.user(),
             secure = p.secure(),
-            tls_verify = p.tls_verify(),
+            tls_verification = ?p.tls_verification(),
             request_timeout_secs = request_timeout.as_secs(),
             login_timeout_secs = login_timeout.map(|d| d.as_secs()),
             "TrinoBackend::connect"
@@ -1207,20 +1207,48 @@ impl Backend for TrinoBackend {
         }
 
         if p.secure() {
-            if !p.tls_verify() {
-                tracing::warn!(
+            match p.tls_verification() {
+                TlsVerification::None => tracing::warn!(
                     "TlsVerify=false: TLS certificate verification is disabled. \
                      The connection is encrypted but not authenticated, so it is \
                      vulnerable to man-in-the-middle attacks. Use Certificate=<pem> \
                      to verify against a private CA instead."
-                );
-                builder = builder.tls_verification(TlsVerification::None);
-            } else if let Some(cert_path) = p.certificate() {
+                ),
+                // Still authenticated, just not to a name -- so this is a
+                // narrower compromise than `None` and gets a quieter notice.
+                TlsVerification::CaOnly => tracing::warn!(
+                    "TlsVerify=ca: the certificate chain is verified but the hostname \
+                     is not, so a certificate this CA issued for any name is accepted."
+                ),
+                _ => {}
+            }
+            builder = builder.tls_verification(p.tls_verification());
+
+            // One `Ssl` carries both: a private CA to verify the coordinator
+            // against, and this client's own certificate for mutual TLS. They
+            // are independent, and either may be set alone.
+            let mut ssl = Ssl::new();
+            let mut ssl_configured = false;
+            if let Some(cert_path) = p.certificate() {
                 let root_cert =
                     Ssl::read_pem(&cert_path.to_owned()).map_err(|e| TrinoError::General {
                         message: format!("failed to read certificate at {cert_path}: {e}"),
                     })?;
-                builder = builder.ssl(Ssl::new().root_cert(root_cert));
+                ssl = ssl.root_cert(root_cert);
+                ssl_configured = true;
+            }
+            if let Some(identity_path) = p.client_certificate() {
+                let identity = trino_rust_client::ssl::Identity::read_pem(
+                    &identity_path.to_owned(),
+                )
+                .map_err(|e| TrinoError::General {
+                    message: format!("failed to read client certificate at {identity_path}: {e}"),
+                })?;
+                ssl = ssl.identity(identity);
+                ssl_configured = true;
+            }
+            if ssl_configured {
+                builder = builder.ssl(ssl);
             }
         }
 

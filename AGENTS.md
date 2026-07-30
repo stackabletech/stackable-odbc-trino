@@ -704,8 +704,9 @@ list — keep this table in sync with it. Keys are case-insensitive.
 | `Schema` | No | Default schema |
 | `Source` | No | Query source Trino records and can route on. Default `stackable-odbc-trino/<version>` |
 | `ClientTags` | No | Comma-separated Trino client tags, which select a resource group |
-| `TlsVerify` | No | `true` (default) or `false` |
-| `Certificate` | No | Path to a PEM CA certificate for server verification |
+| `TlsVerify` | No | `true`/`full` (default), `ca`, or `false`/`none`. Alias: `SSLVerification` |
+| `Certificate` | No | Path to a PEM CA certificate for server verification. Required by `ca` |
+| `ClientCertificate` | No | Path to a PEM holding a client certificate chain and its PKCS#8 key, for mutual TLS |
 | `AccessToken` | No | JWT bearer token. Alias: `Token` |
 | `ExternalAuthentication` | No | `true` selects Trino's interactive OAuth 2.0 flow. Needs `https`, excludes `Password` and `AccessToken`, and is refused under `SQL_DRIVER_NOPROMPT` |
 | `ExternalAuthenticationTimeout` | No | Budget for one interactive login, seconds, default 300. Not bounded by `SQL_ATTR_LOGIN_TIMEOUT` — see below |
@@ -752,6 +753,39 @@ word: an application that sets `SQL_ATTR_CONNECTION_TIMEOUT` overrides it, and
 `SQL_ATTR_LOGIN_TIMEOUT` separately bounds the login round trip. Neither is a
 connection-string key — they reach `connect` as `ConnectParams` accessors. See
 [Timeouts, liveness, and the hooks left defaulted](#timeouts-liveness-and-the-hooks-left-defaulted).
+
+### TLS
+
+`TlsVerify` has three modes, not two, and takes both vocabularies: `true` and
+`full` verify the chain *and* the hostname, `ca` verifies the chain only, and
+`false` and `none` verify nothing. `SSLVerification` is an alias, so a value
+lifted from a JDBC URL transfers unchanged — and both keys accept both
+vocabularies, because there is no sense in which one name owns one set of
+words.
+
+Setting both keys is an error unless they resolve to the same mode. They are
+one setting, and silently preferring either would leave the other looking
+honoured when it was not — for a value whose failure mode is an
+unauthenticated connection.
+
+**`ca` requires `Certificate`**, and `connect_params` rejects the combination
+before the client sees it. rustls only permits skipping hostname verification
+when the trust store is supplied explicitly, which excludes the platform's own
+roots — so `ca` without a chain to verify against would trust nothing at all.
+The client reports this too; catching it here names the connection-string keys
+rather than the builder methods.
+
+`ca` exists for a coordinator reached under a name its certificate does not
+carry — an IP, or an internal DNS name. It is a much narrower compromise than
+`none`, which is why it gets a quieter `warn!`: the certificate is still
+verified, just not bound to a name.
+
+`ClientCertificate` is mutual TLS, and is independent of the two above: either
+may be set alone, and both feed one `Ssl`. **One PEM file holding the
+certificate chain followed by a PKCS#8 private key** — the client builds
+`reqwest` on rustls, which accepts neither PKCS#12 nor JKS, so JDBC's
+`SSLKeyStorePath` / `SSLKeyStoreType` have no equivalent and the key is named
+for what it actually takes rather than for JDBC parity it cannot deliver.
 
 ### Interactive OAuth 2.0
 
