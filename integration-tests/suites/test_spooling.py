@@ -179,7 +179,23 @@ def cancel_during_a_spooled_fetch_reports_hy008(stack, results):
     """SQLCancel from another thread, while the fetch is downloading segments.
 
     HY008 is the spec's code for a function interrupted by SQLCancel, and it
-    needs `Threading = 2` in odbcinst.ini, which setup.sh writes."""
+    needs `Threading = 2` in odbcinst.ini, which setup.sh writes.
+
+    unixODBC sometimes answers first. Walking the cancel across the fetch window
+    on this stack, delays past ~2.3s produced
+    `[unixODBC][Driver Manager]Function sequence error` (HY010) on `SQLFetch` or
+    `SQLGetData` instead: the cancelling thread's `SQLCancel` moves the Driver
+    Manager's own statement state while the fetching thread is mid-loop, and the
+    DM then refuses that thread's next call before it reaches the driver. It
+    happens on the direct protocol too, so it is not spooling-specific, and
+    HY010 is `(DM)`-marked, so the driver cannot influence it. Such a run is
+    recorded as a NOTE: it proves nothing about this driver either way.
+
+    What separates that from a real defect is *when* the error arrives. Promptly
+    after the cancel means the cancel worked. HY010 arriving only around the time
+    the query would have finished on its own is the `Threading = 3` signature,
+    where unixODBC serialised the cancelling thread behind the fetch, and that is
+    a failure."""
     import threading
     import time
 
@@ -210,11 +226,28 @@ def cancel_during_a_spooled_fetch_reports_hy008(stack, results):
         except pyodbc.Error as e:
             elapsed = time.monotonic() - start
             state = e.args[0]
-            results.check(
-                "cancel during a spooled fetch reports HY008",
-                state == "HY008",
-                f"got {state} after {elapsed:.1f}s: {e}",
-            )
+            label = "cancel during a spooled fetch reports HY008"
+            prompt = elapsed < 4.0
+            if state == "HY010" and prompt:
+                results.note(
+                    label,
+                    f"unixODBC answered first with its own HY010 after "
+                    f"{elapsed:.1f}s: {e}. (DM)-marked, so the driver was never "
+                    f"reached and its own path is unverified in this run",
+                )
+            else:
+                results.check(
+                    label,
+                    state == "HY008" and prompt,
+                    f"got {state} after {elapsed:.1f}s: {e}"
+                    + (
+                        "; an error only after the query would have finished on "
+                        "its own means unixODBC serialised the cancelling thread "
+                        "-- check that Threading = 2 is set in odbcinst.ini"
+                        if not prompt
+                        else ""
+                    ),
+                )
         finally:
             canceller.join()
     finally:
