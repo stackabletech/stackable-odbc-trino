@@ -24,7 +24,7 @@ services:
       # bind mount inside another one makes Docker create the mount point on
       # the *host*, inside the checked-in config directory and owned by root --
       # which is where the stray password.db and tls/ entries came from.
-      - ./tls-legacy:/etc/trino-secrets/tls:ro
+      - ../generated/certs:/etc/trino-secrets/tls:ro
       - ../generated/password.db:/etc/trino-secrets/password.db:ro
     depends_on:
       postgres:

@@ -45,7 +45,7 @@ echo "=== Generating secrets ==="
 "$SCRIPT_DIR/gen-secrets.sh"
 
 echo "=== Generating TLS material ==="
-bash "$STACK_DIR/tls-legacy/generate-cert.sh"
+"$SCRIPT_DIR/gen-certs.sh"
 
 echo "=== Starting the stack ==="
 compose up -d

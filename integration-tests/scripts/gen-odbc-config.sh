@@ -4,9 +4,9 @@ set -euo pipefail
 # shellcheck source=lib.sh
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib.sh"
 
-# The certificate the coordinator is verified against. Still the self-signed
-# leaf; it becomes the test CA once gen-certs.sh lands.
-SERVER_CERT="$STACK_DIR/tls-legacy/server.crt"
+# The certificate the coordinator is verified against: the test CA, which
+# signed the coordinator's leaf.
+SERVER_CERT="$CERT_DIR/ca.crt"
 
 # Threading = 2 must match packaging/linux/install.sh -- see the comment there.
 # unixODBC's default of 3 serialises a cross-thread SQLCancel behind the call it
