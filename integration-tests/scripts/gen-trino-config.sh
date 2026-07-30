@@ -44,12 +44,23 @@ done
 # --- computed values ---
 # CERTIFICATE first, so a connection presenting a client certificate is
 # authenticated by it and one that presents none falls through to PASSWORD.
+#
+# OAUTH2 goes last, and that ordering is load-bearing rather than cosmetic:
+# Trino emits one `WWW-Authenticate` header per configured type in this order, so
+# `Basic realm="Trino"` precedes the Bearer challenge. That is the arrangement
+# the client's header scan has to survive, and a stack that emitted the Bearer
+# challenge first would let a client reading only the first header pass.
 AUTH_TYPES="CERTIFICATE,PASSWORD"
 if [[ ",$PROFILES," == *",oauth,"* ]]; then
     AUTH_TYPES="$AUTH_TYPES,OAUTH2"
 fi
 
 sed -i "s|@AUTH_TYPES@|$AUTH_TYPES|g" "$OUT/config.properties"
+
+# Stated in lib.sh and used by both the Trino config and the Keycloak realm.
+sed -i -e "s|@OAUTH_CLIENT_ID@|$OAUTH_CLIENT_ID|g" \
+       -e "s|@OAUTH_CLIENT_SECRET@|$OAUTH_CLIENT_SECRET|g" \
+       "$OUT/config.properties"
 
 # An unresolved placeholder reaches Trino as a literal, which is why these are
 # @NAME@ rather than an empty default: a fragment added later that introduces
