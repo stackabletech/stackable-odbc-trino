@@ -96,6 +96,10 @@ SUITES=(
   "tls||uv run --with pyodbc python3 $TEST_DIR/suites/test_tls.py"
   "raw C ABI||python3 $TEST_DIR/suites/test_c_abi.py '$DRIVER_PATH' '$CONN_HTTPS'"
   "type matrix||python3 $TEST_DIR/suites/test_type_matrix.py '$DRIVER_PATH' '$CONN_HTTPS'"
+  # ctypes rather than pyodbc, and no connection string: pyodbc passes
+  # SQL_DRIVER_NOPROMPT unconditionally, which core reads as forbidding the
+  # prompt an interactive login needs, so this suite builds its own.
+  "oauth|oauth|python3 $TEST_DIR/suites/test_oauth.py '$DRIVER_PATH'"
 )
 
 failed_suites=()
