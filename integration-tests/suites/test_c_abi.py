@@ -103,6 +103,13 @@ SQL_BIGINT = -5
 SQL_PARAM_INPUT = 1
 SQL_NUMERIC = 2
 
+# SQL_ATTR_AUTOCOMMIT and its two values, plus SQLEndTran's completion types.
+SQL_ATTR_AUTOCOMMIT = 102
+SQL_AUTOCOMMIT_OFF = 0
+SQL_AUTOCOMMIT_ON = 1
+SQL_COMMIT = 0
+SQL_ROLLBACK = 1
+
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from harness import Results, Stack  # noqa: E402
@@ -884,17 +891,58 @@ def main():
         )
 
     # ---------------------------------------------------------------
+    # ---------------------------------------------------------------
+    print("\n--- transactions ---")
+    # SQL_ATTR_AUTOCOMMIT off is manual-commit mode. The driver records it and
+    # opens the transaction at the first statement, so this reaches no
+    # coordinator and cannot fail for a reason unrelated to the attribute.
+    r = lib.SQLSetConnectAttrW(dbc, SQL_ATTR_AUTOCOMMIT, SQL_AUTOCOMMIT_OFF, 0)
+    check(
+        "autocommit can be turned off",
+        r,
+        SQL_SUCCESS,
+        got_state=sqlstate(lib, SQL_HANDLE_DBC, dbc),
+    )
+
+    # SQLEndTran's own page: "calling SQLEndTran with either SQL_COMMIT or
+    # SQL_ROLLBACK when no transaction is active returns SQL_SUCCESS". Trino
+    # answers NOT_IN_TRANSACTION to the same statement, so a driver that
+    # forwards it would fail a call the spec requires to succeed.
+    check(
+        "commit with no transaction open",
+        lib.SQLEndTran(SQL_HANDLE_DBC, dbc, SQL_COMMIT),
+        SQL_SUCCESS,
+        got_state=sqlstate(lib, SQL_HANDLE_DBC, dbc),
+    )
+    check(
+        "rollback with no transaction open",
+        lib.SQLEndTran(SQL_HANDLE_DBC, dbc, SQL_ROLLBACK),
+        SQL_SUCCESS,
+        got_state=sqlstate(lib, SQL_HANDLE_DBC, dbc),
+    )
+
+    r = lib.SQLSetConnectAttrW(dbc, SQL_ATTR_AUTOCOMMIT, SQL_AUTOCOMMIT_ON, 0)
+    check(
+        "autocommit can be turned back on",
+        r,
+        SQL_SUCCESS,
+        got_state=sqlstate(lib, SQL_HANDLE_DBC, dbc),
+    )
+
     print("\n--- privilege catalog functions ---")
     # pyodbc exposes no tablePrivileges()/columnPrivileges(), so this is the
     # only suite that reaches SQLTablePrivilegesW and SQLColumnPrivilegesW at
-    # all. Both answer an empty result set here, but for different reasons:
+    # all. Against tpcds both answer an empty result set, for different
+    # reasons:
     #
     #  - SQLTablePrivileges runs a real query against
-    #    information_schema.table_privileges. It is empty because neither test
-    #    catalog implements permission management, not because the driver
-    #    declines to look. A SQL_ERROR here means the query was rejected.
-    #  - SQLColumnPrivileges reads nothing: Trino grants on tables, never on
-    #    columns, and publishes no column-privilege metadata.
+    #    information_schema.table_privileges. It is empty for tpcds because
+    #    that connector implements no permission management, not because the
+    #    driver declines to look. A SQL_ERROR here means the query was
+    #    rejected. The hive catalog, which runs sql-standard security, is
+    #    probed below and does return rows.
+    #  - SQLColumnPrivileges reads nothing anywhere: Trino grants on tables,
+    #    never on columns, and publishes no column-privilege metadata.
     #
     # Both must still describe their result set, because an application sizes
     # its buffers from SQLNumResultCols before it fetches anything.
@@ -944,6 +992,41 @@ def main():
         SQL_ERROR,
         state="HY009",
         got_state=sqlstate(lib, SQL_HANDLE_STMT, stmt),
+    )
+    lib.SQLFreeStmt(stmt, SQL_CLOSE)
+
+    # The hive catalog runs sql-standard security, so this is the only place
+    # metadata::table_privilege_row is exercised end to end rather than by its
+    # unit tests alone. The table is created here rather than assumed, so the
+    # probe does not depend on another suite having run first.
+    for setup_sql in (
+        "CREATE TABLE IF NOT EXISTS hive.tx.c_abi_privileges (id integer)",
+        "GRANT SELECT ON hive.tx.c_abi_privileges TO USER bob",
+    ):
+        sql, _kp = w(setup_sql)
+        rc = lib.SQLExecDirectW(stmt, sql, SQL_NTS)
+        check(
+            f"setup: {setup_sql.split()[0]} for the privileges probe",
+            rc in (SQL_SUCCESS, SQL_SUCCESS_WITH_INFO, SQL_NO_DATA),
+            True,
+            got_state=sqlstate(lib, SQL_HANDLE_STMT, stmt),
+        )
+        lib.SQLFreeStmt(stmt, SQL_CLOSE)
+
+    hcat, _kp5 = w("hive")
+    hsch, _kp6 = w("tx")
+    htbl, _kp7 = w("c_abi_privileges")
+    r = lib.SQLTablePrivilegesW(stmt, hcat, SQL_NTS, hsch, SQL_NTS, htbl, SQL_NTS)
+    check(
+        "table privileges on a hive table",
+        r,
+        SQL_SUCCESS,
+        got_state=sqlstate(lib, SQL_HANDLE_STMT, stmt),
+    )
+    check(
+        "table privileges returns rows where the connector grants",
+        lib.SQLFetch(stmt),
+        SQL_SUCCESS,
     )
     lib.SQLFreeStmt(stmt, SQL_CLOSE)
 

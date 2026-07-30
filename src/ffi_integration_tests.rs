@@ -33,9 +33,10 @@ use stackable_odbc_core::odbc_sys;
 use stackable_odbc_core::test_support::{attach_connection, detach_connection};
 use stackable_odbc_core::types::{
     AttrOdbcVersion, CDataType, Desc, EnvironmentAttribute, HandleType, HeaderDiagnosticIdentifier,
-    InfoType, ParamType, SQL_FETCH_BOOKMARK, SQL_IC_LOWER, SQL_INDEX_UNIQUE, SQL_LOCK_NO_CHANGE,
-    SQL_NTS, SQL_NULL_DATA, SQL_PARAM_ERROR, SQL_PARAM_SUCCESS, SQL_POSITION, SQL_QUICK,
-    SqlDataType, SqlReturn, StatementAttribute, expected_kind,
+    InfoType, ParamType, SQL_AUTOCOMMIT_OFF, SQL_AUTOCOMMIT_ON, SQL_FETCH_BOOKMARK, SQL_IC_LOWER,
+    SQL_INDEX_UNIQUE, SQL_LOCK_NO_CHANGE, SQL_NTS, SQL_NULL_DATA, SQL_PARAM_ERROR,
+    SQL_PARAM_SUCCESS, SQL_POSITION, SQL_QUICK, SqlDataType, SqlReturn, StatementAttribute,
+    expected_kind,
 };
 
 use crate::backend::info::{
@@ -560,10 +561,10 @@ fn get_info_every_named_info_type_has_the_declared_shape_pre_connect() {
 /// `SQL_CATALOG_NAME` (which core derives from
 /// [`crate::backend::TrinoBackend::supports_catalogs`], answering `true`), and
 /// `SQL_TXN_CAPABLE` against `SQL_TXN_ISOLATION_OPTION` and
-/// `SQL_DEFAULT_TXN_ISOLATION` — the three that
-/// [`crate::backend::TrinoBackend::end_tran`] names as moving together when
-/// transactions land. If `txn_capable` stops saying `SQL_TC_NONE` and the two
-/// isolation declarations stay at `0`, this fails.
+/// `SQL_DEFAULT_TXN_ISOLATION`. Those three move together: `SQL_TC_DML` with
+/// either isolation declaration left at `0` is the inconsistency this catches,
+/// and it is the shape a driver lands in by declaring transactions without
+/// declaring which isolation levels they run at.
 #[test]
 fn get_info_groups_that_constrain_each_other_agree() {
     unsafe {
@@ -4613,6 +4614,78 @@ fn set_connect_attr_enforces_the_rules_the_spec_assigns_to_the_driver() {
             ),
             SqlReturn::SUCCESS
         );
+
+        cleanup_injected_conn(env, conn);
+    }
+}
+
+/// `SQL_ATTR_AUTOCOMMIT` round-trips through the exported entry points, and
+/// `SQLEndTran` with nothing open succeeds.
+///
+/// Offline on purpose: `set_autocommit` records the mode and issues nothing,
+/// and `end_tran` reads the session's transaction id without touching the
+/// network, so both halves of the contract are exercised with no coordinator.
+/// The commit that reaches a coordinator is covered by the backend tests and by
+/// `integration-tests/suites/test_transactions.py`.
+///
+/// `SQLEndTran` returning `SQL_SUCCESS` here is the spec's own requirement:
+/// "calling SQLEndTran with either SQL_COMMIT or SQL_ROLLBACK when no
+/// transaction is active returns SQL_SUCCESS". Trino answers
+/// `NOT_IN_TRANSACTION` to the same statement, so the driver must not send it.
+#[test]
+fn autocommit_round_trips_and_end_tran_with_nothing_open_succeeds() {
+    unsafe {
+        let (env, conn) = alloc_conn_with_injected_trino_connection();
+
+        for (value, name) in [
+            (SQL_AUTOCOMMIT_OFF, "SQL_AUTOCOMMIT_OFF"),
+            (SQL_AUTOCOMMIT_ON, "SQL_AUTOCOMMIT_ON"),
+        ] {
+            assert_eq!(
+                ffi::connect_attr::sql_set_connect_attr_w::<TrinoBackend>(
+                    conn,
+                    odbc_sys::ConnectionAttribute::AUTOCOMMIT.0,
+                    std::ptr::without_provenance_mut(value),
+                    0,
+                ),
+                SqlReturn::SUCCESS,
+                "setting {name}"
+            );
+            assert_eq!(sqlstate_of(HandleType::Dbc, conn), "");
+
+            let mut read: u32 = u32::MAX;
+            assert_eq!(
+                ffi::connect_attr::sql_get_connect_attr_w::<TrinoBackend>(
+                    conn,
+                    odbc_sys::ConnectionAttribute::AUTOCOMMIT.0,
+                    (&raw mut read).cast(),
+                    0,
+                    std::ptr::null_mut(),
+                ),
+                SqlReturn::SUCCESS,
+                "reading back {name}"
+            );
+            assert_eq!(
+                read as usize, value,
+                "{name} did not survive the round trip"
+            );
+        }
+
+        for (completion, name) in [
+            (odbc_sys::CompletionType::Commit, "SQL_COMMIT"),
+            (odbc_sys::CompletionType::Rollback, "SQL_ROLLBACK"),
+        ] {
+            assert_eq!(
+                ffi::tran::sql_end_tran::<TrinoBackend>(
+                    HandleType::Dbc as i16,
+                    conn,
+                    completion as i16,
+                ),
+                SqlReturn::SUCCESS,
+                "SQLEndTran({name}) with no transaction open"
+            );
+            assert_eq!(sqlstate_of(HandleType::Dbc, conn), "");
+        }
 
         cleanup_injected_conn(env, conn);
     }

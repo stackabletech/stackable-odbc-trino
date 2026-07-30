@@ -86,6 +86,9 @@ def load(path):
             [P, ctypes.c_uint16, S, S, S, ctypes.c_size_t, S, P, L, ctypes.POINTER(L)],
             S,
         ),
+        # SQLRETURN is a 16-bit SQLSMALLINT: an undeclared function leaves
+        # ctypes reading a 32-bit register, where SQL_ERROR arrives as 65535.
+        "SQLEndTran": ([S, P, S], S),
         "SQLTablePrivilegesW": ([P, W, S, W, S, W, S], S),
         "SQLColumnPrivilegesW": ([P, W, S, W, S, W, S, W, S], S),
         "SQLProceduresW": ([P, W, S, W, S, W, S], S),
