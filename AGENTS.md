@@ -28,8 +28,11 @@ cargo test                                   # unit + FFI tests that need no ser
 cargo clippy --all-targets -- -D warnings
 pre-commit run --all-files                   # the gate; run before every commit
 
-./test/setup.sh                              # start Trino (Docker), write ODBC config
-./test/run-tests.sh                          # run the integration suite
+./integration-tests/setup.sh                 # start the stack (Docker), write ODBC config
+./integration-tests/run-tests.sh             # run the integration suite
+./integration-tests/setup.sh --profile all   # plus keycloak, minio and hive
+./integration-tests/run-tests.sh --suite tls # one suite by name
+./integration-tests/scripts/teardown.sh      # stop the stack
 ```
 
 ## Relationship to stackable-odbc-core
@@ -260,8 +263,8 @@ This is a behaviour change from the driver's previous store-and-succeed, so if
 a tool turns out to set the attribute during connection setup it will now see
 `SQL_ERROR`. Neither unixODBC nor the Power Query connector does — the connector
 passes `Catalog` in the connection string — and all four
-`test/run-tests.sh` configurations (DSN and DSN-less, HTTP and HTTPS) plus the
-Windows Driver Manager suite connect unaffected.
+`integration-tests/run-tests.sh` configurations (DSN and DSN-less, verified and
+unverified TLS) plus the Windows Driver Manager suite connect unaffected.
 
 ### The catalog functions return rows, not statements
 
@@ -324,7 +327,7 @@ unconditionally instead of gating on the catalog.
 
 Both catalogs in the test stack are in that group: `GRANT` on either answers
 `NOT_SUPPORTED: Catalog does not support permission management`. **Adding
-`GRANT` statements to `test/postgres-init.sql` would not change this** — Trino
+`GRANT` statements to `integration-tests/stack/postgres/init.sql` would not change this** — Trino
 synthesises its own `information_schema` rather than passing it through, and
 the base JDBC connector implements no permission management, so a grant made
 directly in PostgreSQL is visible in PostgreSQL's `information_schema.table_privileges`
@@ -433,7 +436,7 @@ complementary, which is why implementing `is_cancelled` did not replace the
 
 #### `Threading = 2` is required, not tuning
 
-`packaging/linux/install.sh` and `test/setup.sh` both write `Threading = 2`
+`packaging/linux/install.sh` and `integration-tests/setup.sh` both write `Threading = 2`
 into the driver's `odbcinst.ini` section. unixODBC's default is `3`, which
 serialises at the environment level and holds a cross-thread `SQLCancel` behind
 the call it was meant to interrupt. Measured against a live coordinator on a
@@ -447,18 +450,19 @@ query that runs ~24s, cancelling after 2s:
 `HY010` after the query completed on its own is the cancel accomplishing
 nothing, reported to the application as a sequence error it did not commit.
 
-**`SQL_ATTR_QUERY_TIMEOUT` is not affected and fires either way.** Core enforces
-that deadline from a timer thread that calls `Backend::cancel` *directly*,
-inside the `.so`, so it never crosses the Driver Manager and no threading policy
-can serialise it — `HYT00` at 2.0s under both settings, measured. Do not cite
-the query timeout as the reason for this setting; the reason is `SQLCancel`.
+**`SQL_ATTR_QUERY_TIMEOUT` is not affected by unixODBC's threading policy and
+fires under either setting.** Core enforces that deadline from a timer thread
+that calls `Backend::cancel` *directly*, inside the `.so`, so it does not cross
+unixODBC and no threading policy can serialise it: `HYT00` at 2.0s under both
+settings, measured. Do not cite the query timeout as the reason for
+`Threading = 2`; the reason is `SQLCancel`.
 
-Neither the Rust FFI tests nor `test/test_c_abi.py` catch a regression here:
+Neither the Rust FFI tests nor `integration-tests/suites/test_c_abi.py` catch a regression here:
 both call the exported entry points directly, with no Driver Manager in the
 loop, so unixODBC's threading policy never applies to them. Only the pyodbc and
 `isql` paths go through it, which is why
 `test_cross_thread_cancel_interrupts_a_running_fetch` lives in
-`test/test_integration.py` and says so in its failure message.
+`integration-tests/suites/test_integration.py` and says so in its failure message.
 
 That path yields `TrinoError::OperationCancelled`, which is `HY008` — the
 SQLSTATE the spec gives a function interrupted by `SQLCancel` from another
@@ -511,9 +515,9 @@ returned the requested result set") with no `(DM)` marker. `SQLGetData` is
 deliberately unarmed on core's side: its table carries `HYT01` and no `HYT00`
 row at all.
 
-Asserted end to end in two places, and both are needed. `test/test_c_abi.py`
+Asserted end to end in two places, and both are needed. `integration-tests/suites/test_c_abi.py`
 proves the driver and core cooperate with no Driver Manager in the loop;
-`test/test_integration.py` proves it survives unixODBC. Each also asserts the
+`integration-tests/suites/test_integration.py` proves it survives unixODBC. Each also asserts the
 *elapsed time*, because `HYT00` arriving after the query finished on its own is
 the timeout not working, reported as though it were. Each then runs a further
 query on the same connection: a server-side cancel leaves the pooled socket
@@ -869,6 +873,92 @@ never reaches the wire.
 
 ## Testing
 
+Everything lives under `integration-tests/`, split by kind: `scripts/` is the
+bash, `stack/` the docker material, `suites/` the Python, `perf/` the
+profiling tooling, `windows/` the VM harness, and `generated/` every produced
+artefact. `generated/` is gitignored and safe to delete; `setup.sh` rebuilds
+it.
+
+### The stack is HTTPS only
+
+The coordinator serves 8443 and nothing else: `http-server.http.enabled=false`,
+and 8080 is neither published nor bound. OAuth 2.0 requires TLS, and this is
+closer to a real deployment.
+
+**The driver's `Protocol=http` connection-string value therefore has no
+integration coverage.** Its parsing is unit-tested and nothing exercises the
+connection. That is an accepted consequence of the above, not an oversight.
+
+`internal-communication.https.required=true` is mandatory rather than tuning:
+with no plaintext listener there is no HTTP internal URI, and without it Trino
+fails to start with `NullPointerException: internalUri is null`.
+
+### Certificates
+
+`scripts/gen-certs.sh` builds one CA and signs the coordinator, client and
+Keycloak leaves from it, into `generated/certs/`.
+
+The truststore is built with **keytool, never `openssl pkcs12 -export
+-nokeys`**. openssl writes the certificate into a certBag carrying no Oracle
+trusted-certificate attribute, and Java reads the result as "0 entries": a
+valid PKCS12 file that is empty as a trust store. It fails silently, and the
+only symptoms are a client-certificate handshake dying with `tlsv1 alert
+internal error` and 503s fetching internal memory info. `gen-certs.sh` asserts
+the truststore holds a `trustedCertEntry`, because the file existing proves
+nothing.
+
+**Jetty selects the certificate on SNI, and serves Trino's internal
+self-signed `CN=<node.environment>` certificate for anything it cannot match.**
+So a name the coordinator's certificate does not carry yields a *different
+certificate*, not a hostname mismatch, and connecting by IP address is worse:
+TLS sends no SNI for an IP literal, so the fallback is served every time.
+Measured:
+
+| SNI sent | certificate served |
+|---|---|
+| `localhost` | `CN=localhost`, the CA-signed leaf |
+| `trino` | `CN=localhost`, since `DNS:trino` is in the SAN |
+| `nosuchname.example` | `CN=test`, Trino's internal certificate |
+| none, connecting by IP | `CN=test` |
+
+Two consequences. `suites/test_tls.py` cannot assert that `TlsVerify=ca`
+ignores the hostname, and records that as a `NOTE` with the two ways out that
+were tried and failed. And the Windows VM, which reaches the host by IP, maps
+`trino` to the gateway in its own hosts file so SNI is sent and the
+verified-TLS configurations stay meaningful.
+
+### Profiles
+
+Compose profiles make the heavier services opt-in. The unprofiled set is the
+core stack.
+
+| Profile | Services | Buys |
+|---|---|---|
+| *(none)* | `postgres`, `trino` | tpcds and postgresql catalogs, HTTPS, PASSWORD and CERTIFICATE auth |
+| `oauth` | `keycloak` | The OAuth 2.0 flow |
+| `spooling` | `minio`, `minio-init` | Spooling |
+| `hive` | `minio`, `minio-init`, `hive-metastore` | A non-empty `SQLTablePrivileges` |
+
+```bash
+./integration-tests/setup.sh --profile oauth,hive   # or PROFILES=all
+```
+
+Compose profiles select *services*; they cannot vary a mounted file's
+contents, and Trino will not start when `config.properties` names an OAuth
+issuer or an S3 endpoint that is not running. So `scripts/gen-trino-config.sh`
+assembles `generated/trino/` from `stack/trino/` fragments driven by the same
+profile list. A value that *changes* between profiles cannot be appended,
+because a duplicate key is a Trino startup error; those are `@PLACEHOLDER@`
+substitutions, and an unresolved one fails the assembly rather than reaching
+Trino as a literal.
+
+A profile change recreates the coordinator. Without that, compose would start
+the new service and leave `trino` on its previously assembled config, so
+enabling a profile would appear to do nothing.
+
+A suite that needs an inactive profile is **skipped, naming the profile that
+would enable it**. An unrun suite must never be printable as a passing one.
+
 ### Unit and FFI tests
 
 ```bash
@@ -929,12 +1019,12 @@ process exits 120 and the file is left empty. Piping is unaffected, so capture
 output with `tee`, never with `>`:
 
 ```bash
-uv run --with pyodbc python3 test/test_sql_surface.py "$CONN" 2>&1 | tee run.log   # good
-uv run --with pyodbc python3 test/test_sql_surface.py "$CONN" > run.log 2>&1       # loses everything
+uv run --with pyodbc python3 integration-tests/suites/test_sql_surface.py "$CONN" 2>&1 | tee run.log   # good
+uv run --with pyodbc python3 integration-tests/suites/test_sql_surface.py "$CONN" > run.log 2>&1       # loses everything
 ```
 
 Reproduced with `uv run --with pyodbc python3 -c "print('x')"` alone, so it is
-neither the driver nor any suite (uv 0.11.21). `test/test_c_abi.py` needs no
+neither the driver nor any suite (uv 0.11.21). `integration-tests/suites/test_c_abi.py` needs no
 `uv` — standard library only — and redirects fine.
 
 This is worth knowing because the failure looks like a hang: the run completes,
@@ -943,7 +1033,7 @@ the output vanishes, and the only evidence left is a non-zero exit.
 ### SQL surface pen test
 
 ```bash
-uv run --with pyodbc python3 test/test_sql_surface.py "<connection-string>"
+uv run --with pyodbc python3 integration-tests/suites/test_sql_surface.py "<connection-string>"
 ```
 
 Walks the SQL a BI tool emits — join shapes, aggregates and the `GROUP BY`
@@ -959,7 +1049,7 @@ says.
 ### Folding contract test
 
 ```bash
-uv run --with pyodbc python3 test/test_folding_contract.py "<connection-string>"
+uv run --with pyodbc python3 integration-tests/suites/test_folding_contract.py "<connection-string>"
 ```
 
 The Power Query connector's SQL declarations, checked against the driver and
@@ -992,10 +1082,10 @@ otherwise invisible.
 ### Raw C ABI pen test
 
 ```bash
-python3 test/test_c_abi.py    # needs a running Trino; standard library only
+python3 integration-tests/suites/test_c_abi.py    # needs a running Trino; standard library only
 ```
 
-`test/test_c_abi.py` loads the `.so` with `ctypes` and calls the exported entry
+`integration-tests/suites/test_c_abi.py` loads the `.so` with `ctypes` and calls the exported entry
 points **with no Driver Manager in the loop**. unixODBC answers a large part of
 the ODBC state machine itself, so the driver's own handling of out-of-order and
 malformed calls is invisible to the pyodbc and `isql` suites. This is the only
@@ -1074,7 +1164,7 @@ return code:
 ### Type-transform fuzz
 
 ```bash
-python3 test/test_type_matrix.py    # needs a running Trino; standard library only
+python3 integration-tests/suites/test_type_matrix.py    # needs a running Trino; standard library only
 ```
 
 Drives every (Trino value, C data type) pair through `SQLGetData` — 37 values
@@ -1106,8 +1196,8 @@ the TODO at the top of `.github/workflows/build.yaml`. Run it locally before a
 release.
 
 ```bash
-./test/setup.sh        # spin up Trino, build the driver, write ODBC config (~60s first run)
-./test/run-tests.sh    # run Linux tests, then tear Trino down
+./integration-tests/setup.sh        # spin up Trino, build the driver, write ODBC config (~60s first run)
+./integration-tests/run-tests.sh    # run Linux tests, then tear Trino down
 ```
 
 `--skip-build` skips the cargo build; `--skip-delete` leaves Trino running.
@@ -1117,20 +1207,20 @@ are added, so do not treat them as fixed.
 
 The test instance has two catalogs: `tpcds` (TPC-DS benchmark data, read-only,
 no constraints) and `postgresql` (PostgreSQL, whose test schema in
-`test/postgres-init.sql` provides primary keys, foreign keys, indexes and the
+`integration-tests/stack/postgres/init.sql` provides primary keys, foreign keys, indexes and the
 ODBC-relevant column types).
 
 For interactive testing with `isql`, after `setup.sh`:
 
 ```bash
 export ODBCSYSINI=$(pwd)/test
-export ODBCINI=$(pwd)/test/odbc.ini
-isql -3 trino_http -v
+export ODBCINI=$(pwd)/integration-tests/generated/odbc.ini
+isql -3 trino_https -v
 
-# DSNs in test/odbc.ini: trino_http, trino_https,
+# DSNs in integration-tests/generated/odbc.ini: trino_https,
 # trino_https_verify_false (TlsVerify=false), trino_postgresql
 
-docker compose -f test/docker-compose.yml logs -f    # watch incoming requests
+docker compose -f integration-tests/stack/compose.yaml logs -f    # watch incoming requests
 ```
 
 ### Blocked on an identity provider
@@ -1157,13 +1247,38 @@ doubt.
 ### Windows VM tests
 
 The same suites, driven through the Windows ODBC Driver Manager over WinRM. See
-[`windows/WINDOWS.md`](windows/WINDOWS.md) for VM creation and the full
+[`integration-tests/windows/WINDOWS.md`](integration-tests/windows/WINDOWS.md) for VM creation and the full
 reference.
 
 ```bash
-./test/run-tests.sh --windows                          # Linux + Windows
-uv run --with pywinrm python3 test/windows_test.py     # Windows only; Trino must be up
+./integration-tests/run-tests.sh --windows                          # Linux + Windows
+uv run --with pywinrm python3 integration-tests/windows/windows_test.py     # Windows only; Trino must be up
 ```
+
+Four configurations, matching the Linux run: DSN and DSN-less crossed with
+verified and unverified TLS. Each records its result rather than aborting the
+run, so one failing configuration no longer hides the other three.
+
+Three things the VM needs that the Linux run does not:
+
+- **`harness.py` travels with `test_integration.py`.** The suite imports it,
+  and the VM only receives the files this script deploys.
+- **`ca.crt` is deployed too**, so the verified configurations can verify
+  rather than only skip.
+- **`trino` is mapped to the gateway in the VM's own hosts file.** The VM
+  reaches the host by IP, TLS sends no SNI for an IP literal, and Jetty then
+  serves Trino's internal certificate. Connecting by a name the coordinator's
+  certificate carries is what makes verification possible at all. See
+  [Certificates](#certificates).
+
+**Do not diagnose a Windows failure without rebuilding the DLL first.**
+`--skip-build` reuses whatever is in `target/x86_64-pc-windows-gnu/release/`,
+which can predate the feature under test by days. A stale DLL produced four
+consecutive `SQL_ATTR_QUERY_TIMEOUT` failures that looked exactly like a
+Windows Driver Manager defect, and the driver's own log gave it away:
+`SQL_ATTR_QUERY_TIMEOUT=2 not supported, substituting 0` is what core reports
+for a backend with no `set_query_timeout`, which this driver has had since
+2026-07-29.
 
 ### Benchmarks
 

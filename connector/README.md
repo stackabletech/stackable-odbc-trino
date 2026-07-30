@@ -17,7 +17,7 @@ The connector tells PowerBI how to generate Trino-compatible SQL:
 ## Prerequisites
 
 - The `stackable_odbc_trino` ODBC driver must be registered on the
-  Windows machine (see `windows/WINDOWS.md` for driver registration)
+  Windows machine (see `integration-tests/windows/WINDOWS.md` for driver registration)
 - PowerBI Desktop (Windows only)
 
 ## Building

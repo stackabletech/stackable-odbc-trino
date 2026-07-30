@@ -10,7 +10,7 @@
 #   - Profiling summary table (per-query breakdown of Trino vs client overhead)
 #   - Raw log at /tmp/odbc_profile.log
 #
-# Requires: Trino running (./test/setup.sh), driver built (cargo build)
+# Requires: Trino running (./integration-tests/setup.sh), driver built (cargo build)
 
 set -euo pipefail
 

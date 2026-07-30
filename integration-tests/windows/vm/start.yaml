@@ -145,4 +145,4 @@
           Windows VM ready at {{ vm_ip }}.
           Note: FirstLogonCommands (Python, pyodbc) may still be running.
           The test script waits for setup to complete automatically.
-          Run tests with: uv run --with pywinrm python3 test/windows_test.py
+          Run tests with: uv run --with pywinrm python3 integration-tests/windows/windows_test.py

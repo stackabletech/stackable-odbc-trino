@@ -4,13 +4,13 @@ Run Trino integration tests on a Windows VM over WinRM.
 
 Builds the ODBC driver DLL, discovers the VM, deploys everything, registers
 the driver, and runs test_integration.py through the Windows Driver Manager.
-Trino must be running on the host (via test/setup.sh) before running
+Trino must be running on the host (via integration-tests/setup.sh) before running
 this script.
 
 Usage:
-    uv run --with pywinrm python3 test/windows_test.py
-    uv run --with pywinrm python3 test/windows_test.py --skip-build
-    uv run --with pywinrm python3 test/windows_test.py --host 192.168.197.138
+    uv run --with pywinrm python3 integration-tests/windows/windows_test.py
+    uv run --with pywinrm python3 integration-tests/windows/windows_test.py --skip-build
+    uv run --with pywinrm python3 integration-tests/windows/windows_test.py --host 192.168.197.138
 
 Requires: pywinrm (pip install pywinrm)
 """
@@ -34,6 +34,10 @@ OPENSSL_CNF = SCRIPT_DIR / "openssl_legacy.cnf"
 REMOTE_DIR = r"C:\odbc_test_trino"
 REMOTE_DLL = rf"{REMOTE_DIR}\stackable_odbc_trino.dll"
 REMOTE_TEST = rf"{REMOTE_DIR}\test_integration.py"
+# test_integration.py imports the shared harness, so it has to travel too.
+REMOTE_HARNESS = rf"{REMOTE_DIR}\harness.py"
+# The test CA, so the VM can verify the coordinator rather than only skip it.
+REMOTE_CA = rf"{REMOTE_DIR}\ca.crt"
 
 DRIVER_NAME = "stackable_odbc_trino"
 DSN_NAME = "test_trino"
@@ -44,7 +48,15 @@ REMOTE_PYTHON = r'"C:\Program Files\Python312\python.exe"'
 # The host-only network gateway — the VM reaches the host (and Docker) via this
 # IP. Override with --gateway or ODBC_TEST_HOST_GATEWAY for non-default subnets.
 DEFAULT_HOST_GATEWAY = "192.168.197.1"
-HTTP_PORT = 8081  # avoid conflict with Trino's 8080
+HTTP_PORT = 8081  # avoid conflict with the file server's own use
+
+# The VM reaches the host by IP, and TLS sends no SNI for an IP literal, so
+# Jetty serves Trino's internal self-signed certificate instead of the
+# CA-signed one and verification cannot succeed. Mapping a name the
+# coordinator's certificate carries (DNS:trino, see scripts/gen-certs.sh) to
+# the gateway in the VM's hosts file makes SNI work, which is what keeps the
+# verified-TLS configurations meaningful here.
+TRINO_VM_HOSTNAME = "trino"
 
 
 def main():
@@ -87,9 +99,18 @@ def main():
 
     # Serve files via HTTP and have the VM download them.
     print("=== Deploying files via HTTP ===")
+    harness_path = TEST_DIR / "suites" / "harness.py"
+    ca_path = TEST_DIR / "generated" / "certs" / "ca.crt"
+    for required in (harness_path, ca_path):
+        if not required.exists():
+            print(f"ERROR: {required} is missing; run ./integration-tests/setup.sh",
+                  file=sys.stderr)
+            sys.exit(1)
     files_to_serve = {
         dll_path.name: dll_path,
         "test_integration.py": test_path,
+        "harness.py": harness_path,
+        "ca.crt": ca_path,
     }
     with http_file_server(files_to_serve) as port:
         base_url = f"http://{args.gateway}:{port}"
@@ -98,7 +119,11 @@ def main():
             f'Invoke-WebRequest -Uri "{base_url}/{dll_path.name}" '
             f'-OutFile "{REMOTE_DLL}"; '
             f'Invoke-WebRequest -Uri "{base_url}/test_integration.py" '
-            f'-OutFile "{REMOTE_TEST}"'
+            f'-OutFile "{REMOTE_TEST}"; '
+            f'Invoke-WebRequest -Uri "{base_url}/harness.py" '
+            f'-OutFile "{REMOTE_HARNESS}"; '
+            f'Invoke-WebRequest -Uri "{base_url}/ca.crt" '
+            f'-OutFile "{REMOTE_CA}"'
         )
         r = session.run_ps(download_ps)
         if r.status_code != 0:
@@ -112,44 +137,77 @@ def main():
     register_driver(session)
 
     trino_host = args.trino_host or args.gateway
+    map_trino_hostname(session, trino_host)
 
-    # --- Run 1: DSN-less HTTP ---
-    print("=== Running integration tests (DSN-less, HTTP) ===")
-    conn_str = (
-        f"Driver={DRIVER_NAME};Host={trino_host};Port=8080;"
-        f"User=admin;Password=admin;Protocol=http;Catalog=tpcds"
-    )
-    exit_code = run_tests(session, conn_str)
-    if exit_code != 0:
-        sys.exit(exit_code)
+    # Four configurations, matching the Linux run: DSN and DSN-less crossed
+    # with verified and unverified TLS. The verified ones connect by
+    # TRINO_VM_HOSTNAME so that SNI is sent; the unverified ones use the
+    # address directly, which is what an operator who has not set up a name
+    # would do.
+    verified_extra = f"Certificate={REMOTE_CA}"
+    failed = []
 
-    # --- Run 2: DSN-less HTTPS (TlsVerify=false) ---
-    print("=== Running integration tests (DSN-less, HTTPS) ===")
-    conn_str_https = (
+    def run_config(label, conn_str):
+        """Run one configuration, recording rather than aborting on failure.
+
+        Aborting on the first failure hid the other three configurations
+        entirely, so a single flaky case cost the whole run's information.
+        """
+        print(f"=== Running integration tests ({label}) ===")
+        if run_tests(session, conn_str) != 0:
+            failed.append(label)
+
+    run_config("DSN-less, verified TLS", (
+        f"Driver={DRIVER_NAME};Host={TRINO_VM_HOSTNAME};Port=8443;"
+        f"User=admin;Password=admin;Protocol=https;Catalog=tpcds;{verified_extra}"
+    ))
+    run_config("DSN-less, TlsVerify=false", (
         f"Driver={DRIVER_NAME};Host={trino_host};Port=8443;"
         f"User=admin;Password=admin;Protocol=https;TlsVerify=false;Catalog=tpcds"
-    )
-    exit_code = run_tests(session, conn_str_https)
-    if exit_code != 0:
-        sys.exit(exit_code)
+    ))
 
-    # --- Run 3: DSN-based HTTP ---
-    print("=== Registering DSN (HTTP) ===")
-    register_dsn(session, trino_host, protocol="http", port=8080)
+    print("=== Registering DSN (verified TLS) ===")
+    register_dsn(session, TRINO_VM_HOSTNAME, protocol="https", port=8443,
+                 extra=verified_extra)
+    run_config("DSN, verified TLS", f"DSN={DSN_NAME}")
 
-    print("=== Running integration tests (DSN, HTTP) ===")
-    exit_code = run_tests(session, f"DSN={DSN_NAME}")
-    if exit_code != 0:
-        sys.exit(exit_code)
-
-    # --- Run 4: DSN-based HTTPS ---
-    print("=== Registering DSN (HTTPS) ===")
+    print("=== Registering DSN (TlsVerify=false) ===")
     register_dsn(session, trino_host, protocol="https", port=8443,
                  extra="TlsVerify=false")
+    run_config("DSN, TlsVerify=false", f"DSN={DSN_NAME}")
 
-    print("=== Running integration tests (DSN, HTTPS) ===")
-    exit_code = run_tests(session, f"DSN={DSN_NAME}")
-    sys.exit(exit_code)
+    print("")
+    print("=== Windows summary ===")
+    if failed:
+        for label in failed:
+            print(f"  FAIL  {label}")
+        print(f"{len(failed)} of 4 configurations failed")
+        sys.exit(1)
+    print("all 4 configurations passed")
+
+
+def map_trino_hostname(session, gateway: str):
+    """Point TRINO_VM_HOSTNAME at the host in the VM's hosts file.
+
+    TLS sends no SNI for an IP literal, and Jetty serves Trino's internal
+    self-signed certificate for anything it cannot match on SNI, so connecting
+    by address can never verify against the CA-signed certificate. A name the
+    certificate carries fixes that, and the VM's hosts file is the only place
+    to put it.
+    """
+    print(f"=== Mapping {TRINO_VM_HOSTNAME} -> {gateway} in the VM hosts file ===")
+    hosts = r"C:\Windows\System32\drivers\etc\hosts"
+    ps = (
+        f'$h = "{hosts}"; '
+        f'$line = "{gateway}`t{TRINO_VM_HOSTNAME}"; '
+        f'$kept = (Get-Content $h) | Where-Object {{ $_ -notmatch "\\s{TRINO_VM_HOSTNAME}\\s*$" }}; '
+        f'Set-Content -Path $h -Value ($kept + $line)'
+    )
+    r = session.run_ps(ps)
+    if r.status_code != 0:
+        print(f"ERROR: could not write the VM hosts file:\n{r.std_err.decode()}",
+              file=sys.stderr)
+        sys.exit(1)
 
 
 def parse_args():
@@ -222,7 +280,9 @@ def check_trino_reachable():
     print("=== Checking Trino is reachable on host ===")
     try:
         result = subprocess.run(
-            ["curl", "-sf", "http://localhost:8080/v1/info"],
+            ["curl", "-sf", "--cacert",
+             str(TEST_DIR / "generated" / "certs" / "ca.crt"),
+             "-u", "admin:admin", "https://localhost:8443/v1/info"],
             capture_output=True, timeout=5,
         )
         if result.returncode == 0:
@@ -231,8 +291,8 @@ def check_trino_reachable():
     except (FileNotFoundError, subprocess.TimeoutExpired):
         pass
     print(
-        "ERROR: Trino is not reachable at http://localhost:8080/v1/info\n"
-        "Start it with: ./test/setup.sh",
+        "ERROR: Trino is not reachable at https://localhost:8443/v1/info\n"
+        "Start it with: ./integration-tests/setup.sh",
         file=sys.stderr,
     )
     sys.exit(1)
@@ -444,8 +504,8 @@ def register_driver(session):
     print(f"Driver '{DRIVER_NAME}' registered")
 
 
-def register_dsn(session, trino_host: str, *, protocol: str = "http",
-                 port: int = 8080, extra: str = ""):
+def register_dsn(session, trino_host: str, *, protocol: str = "https",
+                 port: int = 8443, extra: str = ""):
     """Register (or re-register) a DSN for a Trino connection."""
     extra_fields = f"|{extra}" if extra else ""
     cmd = (

@@ -16,8 +16,8 @@ failure.
 Every query is read-only against the tpcds catalogue.
 
 Usage:
-    python3 test/test_sql_surface.py "<connection-string>"
-    python3 test/test_sql_surface.py "DSN=trino_http"
+    python3 integration-tests/suites/test_sql_surface.py "<connection-string>"
+    python3 integration-tests/suites/test_sql_surface.py "DSN=trino_http"
 
 Requires: pip install pyodbc (run through `uv run --with pyodbc`).
 """

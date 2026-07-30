@@ -23,7 +23,7 @@ This checks the two halves that are mechanically checkable:
    parse. Both are asserted by running them.
 
 Usage:
-    uv run --with pyodbc python3 test/test_folding_contract.py "<connection-string>"
+    uv run --with pyodbc python3 integration-tests/suites/test_folding_contract.py "<connection-string>"
 
 Output is PASS / FAIL / NOTE, matching test_c_abi.py. A NOTE is a folding gap:
 legal, but it means Power Query falls back to local evaluation for that type.

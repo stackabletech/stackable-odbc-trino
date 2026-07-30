@@ -20,9 +20,9 @@ use after free, connection state, cursor state, prepare / execute / re-execute,
 SQLFreeStmt options, and statement and connection attribute round-trips.
 
 Usage:
-    python3 test/test_c_abi.py [path/to/libstackable_odbc_trino.so] [conn-str]
+    python3 integration-tests/suites/test_c_abi.py [path/to/libstackable_odbc_trino.so] [conn-str]
 
-Requires a running Trino (test/setup.sh). Only the Python standard library is
+Requires a running Trino (integration-tests/setup.sh). Only the Python standard library is
 needed -- ctypes, not pyodbc.
 """
 

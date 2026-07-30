@@ -23,9 +23,9 @@ matrix, NULL and the IEEE specials per type, integer boundary values, and
 trailing semicolons.
 
 Usage:
-    python3 test/test_type_matrix.py [path/to/driver.so] [conn-str]
+    python3 integration-tests/suites/test_type_matrix.py [path/to/driver.so] [conn-str]
 
-Requires a running Trino (test/setup.sh). Standard library only -- ctypes, no
+Requires a running Trino (integration-tests/setup.sh). Standard library only -- ctypes, no
 pyodbc and no uv, so its output survives being redirected to a file.
 """
 
@@ -206,7 +206,7 @@ class Driver:
             ctypes.byref(ol), SQL_DRIVER_NOPROMPT,
         )
         if r not in (SQL_SUCCESS, SQL_SUCCESS_WITH_INFO):
-            raise SystemExit("could not connect; is Trino running? (test/setup.sh)")
+            raise SystemExit("could not connect; is Trino running? (integration-tests/setup.sh)")
 
     def fetch_as(self, expr, c_type):
         """Run `SELECT <expr>` and read column 1 as `c_type`.

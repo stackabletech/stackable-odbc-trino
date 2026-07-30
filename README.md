@@ -39,7 +39,7 @@ custom connector, also published as a standalone asset. Copy it to
 extension under *File > Options > Security*, and restart Power BI Desktop.
 
 See [`packaging/README.md`](packaging/README.md) for the full installation and
-uninstallation reference, and [`windows/WINDOWS.md`](windows/WINDOWS.md) for
+uninstallation reference, and [`integration-tests/windows/WINDOWS.md`](integration-tests/windows/WINDOWS.md) for
 manual driver and DSN management on Windows.
 
 ## Connecting
@@ -114,12 +114,12 @@ CI — the Trino + Postgres compose stack exceeds a standard GitHub runner — s
 run it locally before a release:
 
 ```bash
-./test/setup.sh       # spin up Trino, build the driver, write ODBC config
-./test/run-tests.sh   # run the tests, then tear Trino down
+./integration-tests/setup.sh       # spin up Trino, build the driver, write ODBC config
+./integration-tests/run-tests.sh   # run the tests, then tear Trino down
 ```
 
 Windows tests run the same suites through the Windows Driver Manager in a VM;
-see [`windows/WINDOWS.md`](windows/WINDOWS.md).
+see [`integration-tests/windows/WINDOWS.md`](integration-tests/windows/WINDOWS.md).
 
 For architecture, conventions and the full testing reference, see
 [AGENTS.md](AGENTS.md).

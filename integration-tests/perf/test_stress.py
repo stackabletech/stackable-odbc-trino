@@ -7,8 +7,8 @@ JOINs, UNIONs, subqueries, CTEs, window functions, large result sets, and
 wide rows. All queries are read-only against the tpcds sf1 catalogue.
 
 Usage:
-    python3 test/test_stress.py "Driver=/path/to/driver.so;Host=localhost;Port=8080;User=admin;Protocol=http;Catalog=tpcds"
-    python3 test/test_stress.py "DSN=test_trino"
+    python3 integration-tests/perf/test_stress.py "Driver=/path/to/driver.so;Host=localhost;Port=8080;User=admin;Protocol=http;Catalog=tpcds"
+    python3 integration-tests/perf/test_stress.py "DSN=test_trino"
 
 Requires: pip install pyodbc
 """

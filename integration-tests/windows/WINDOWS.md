@@ -12,27 +12,27 @@ virsh --connect qemu:///system start stackable-odbc-test
 
 Then run from the Linux host (`pywinrm` is installed automatically by `uv`).
 The suite runs once per config, across four configs — DSN-less HTTP/HTTPS and
-DSN HTTP/HTTPS — and requires Trino running on the host via `./test/setup.sh`:
+DSN HTTP/HTTPS — and requires Trino running on the host via `./integration-tests/setup.sh`:
 
 ```bash
-uv run --with pywinrm python3 test/windows_test.py
+uv run --with pywinrm python3 integration-tests/windows/windows_test.py
 ```
 
 Common options:
 
 ```bash
 # Skip the cargo build (use an already-built DLL)
-uv run --with pywinrm python3 test/windows_test.py --skip-build
+uv run --with pywinrm python3 integration-tests/windows/windows_test.py --skip-build
 
 # Target a specific VM IP (skip DHCP lease discovery)
-uv run --with pywinrm python3 test/windows_test.py --host 192.168.197.138
+uv run --with pywinrm python3 integration-tests/windows/windows_test.py --host 192.168.197.138
 
 # Non-default libvirt subnet (also applies to TLS cert generation)
 export ODBC_TEST_HOST_GATEWAY=10.0.0.1
 # or: --gateway 10.0.0.1
 
 # Full usage
-uv run --with pywinrm python3 test/windows_test.py --help
+uv run --with pywinrm python3 integration-tests/windows/windows_test.py --help
 ```
 
 ### Using a different hypervisor (VirtualBox, Hyper-V, etc.)
@@ -43,7 +43,7 @@ in a different hypervisor, the test script still works — just pass the VM's IP
 directly with `--host`:
 
 ```bash
-uv run --with pywinrm python3 test/windows_test.py --host <vm-ip>
+uv run --with pywinrm python3 integration-tests/windows/windows_test.py --host <vm-ip>
 ```
 
 The VM must have WinRM enabled on port 5985 with NTLM auth, and Python 3 +
@@ -54,7 +54,7 @@ they differ from the defaults.
 
 WinRM uses NTLM authentication, which requires MD4 — disabled by default in
 modern OpenSSL. The test script automatically sets `OPENSSL_CONF` to point at
-`windows/openssl_legacy.cnf`, which enables the legacy provider.
+`integration-tests/windows/openssl_legacy.cnf`, which enables the legacy provider.
 
 If you see `unsupported hash type md4` errors, check that the file exists and
 that you haven't overridden `OPENSSL_CONF` in your environment.
@@ -102,7 +102,7 @@ pipx install uv
 # Download from: https://www.microsoft.com/en-us/evalcenter/evaluate-windows-server-2022
 export WINDOWS_ISO=~/Downloads/SERVER_EVAL_x64FRE_en-us.iso
 
-cd windows/vm
+cd integration-tests/windows/vm
 nix-shell                # loads Ansible + libvirt Python bindings
 ansible-playbook start.yaml -i inventory.ini
 ```

@@ -276,6 +276,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **The integration test stack moved from `test/` to `integration-tests/`, and
+  the Trino coordinator now serves HTTPS only** behind a generated certificate
+  authority, with compose profiles making Keycloak, MinIO and Hive opt-in.
+  Test infrastructure only; no driver behaviour changed. The one user-visible
+  consequence is that `Protocol=http` keeps its unit-test coverage and loses
+  its integration coverage, since the plaintext listener is gone.
+
 - **A fetch stopped by a cancellation now reports `HY008` instead of an empty
   result set.** `SQLFetch` returned `SQL_NO_DATA` when it found the statement
   already cancelled, which says "your result set ended" for rows that were in

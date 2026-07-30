@@ -7,8 +7,8 @@ using pyodbc. Tests connection, metadata queries, SELECT, aggregation, and
 parameterised statements against the tpcds catalog (read-only, ships with Trino).
 
 Usage:
-    python3 test/test_integration.py "Driver=/path/to/driver.so;Host=localhost;Port=8080;User=admin;Protocol=http;Catalog=tpcds"
-    python3 test/test_integration.py "DSN=test_trino"
+    python3 integration-tests/suites/test_integration.py "Driver=/path/to/driver.so;Host=localhost;Port=8080;User=admin;Protocol=http;Catalog=tpcds"
+    python3 integration-tests/suites/test_integration.py "DSN=test_trino"
 
 Requires: pip install pyodbc
 """
@@ -375,7 +375,7 @@ def main():
     # ------------------------------------------------------------------
     # Connection attributes, through the Driver Manager
     # ------------------------------------------------------------------
-    # test/test_c_abi.py drives these with no DM in the loop; the point here is
+    # integration-tests/suites/test_c_abi.py drives these with no DM in the loop; the point here is
     # that unixODBC forwards them rather than answering them itself, so what an
     # ordinary application sees is what the driver decided.
 
@@ -413,7 +413,7 @@ def main():
     # names, and both now read the driver's `current_catalog` declaration. Only
     # the info-type half is asserted here: pyodbc's `set_attr` takes an integer
     # value and it exposes no string `SQLGetConnectAttr`, so the attribute half
-    # -- including that setting it reports HYC00 -- lives in test/test_c_abi.py,
+    # -- including that setting it reports HYC00 -- lives in integration-tests/suites/test_c_abi.py,
     # which calls both entry points directly.
     #
     # Still worth having on this path: what the connection string asked for has

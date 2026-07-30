@@ -1,11 +1,17 @@
 ---
 name: Build and Test
 
-# TODO(@maltesander): The Trino integration suite (./test/setup.sh followed by
-#                     ./test/run-tests.sh) is not run here. The Docker
-#                     Trino + Postgres stack exceeds the standard GitHub
-#                     runner. We can either try bigger runners or slim the
-#                     stack down. Until then, run it locally before a release.
+# TODO(@maltesander): The Trino integration suite (./integration-tests/setup.sh
+#                     followed by ./integration-tests/run-tests.sh) is not run
+#                     here. It is now a compose *profile* rather than the whole
+#                     stack: the unprofiled core is Trino plus Postgres, and
+#                     oauth, spooling and hive are opt-in and not proposed for
+#                     CI. Whether the core profile fits a standard runner has
+#                     not been measured; the claim that it does not predates
+#                     both this restructure and ubuntu-latest becoming 4 vCPU /
+#                     16 GB, so it should be tried rather than assumed. If it
+#                     does not fit, record the measured failure here in place of
+#                     this note. Until then, run it locally before a release.
 #                     Unit tests run on every PR below.
 
 permissions:
