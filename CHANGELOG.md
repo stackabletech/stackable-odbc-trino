@@ -45,9 +45,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (seconds, default 300) bounds it instead, and one `warn!` records the
   deviation when an application set both.
 
-  `User` remains required. The client sends `X-Trino-User` on every request and
-  cannot omit it, so making the key optional would mean inventing a value
-  rather than leaving the header off.
+  **`User` becomes optional**, and `X-Trino-User` is then not sent at all, so
+  Trino resolves the session user from the authenticated identity. It has to
+  work this way: Trino reads a `X-Trino-User` that *disagrees* with the
+  authenticated identity as an impersonation request rather than ignoring it,
+  so a name the operator was obliged to invent would have the connection
+  refused for their own account whenever it did not match the identity
+  provider's user-mapping exactly. A `User` given anyway is still honoured, and
+  `SessionUser` still expresses deliberate impersonation.
 
 - **`SQLCopyDesc` is now advertised by `SQLGetFunctions`.** Core implements
   explicit descriptor handles, so the function works; it had been withheld

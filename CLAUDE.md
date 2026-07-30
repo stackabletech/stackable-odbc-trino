@@ -24,6 +24,20 @@ Read and follow @AGENTS.md — it contains architecture, patterns, and procedure
   incompatible layouts for the same `#[repr(C)]` type.
 - **Convert raw integers to typed enums at the boundary** — use the
   `xxx_from_raw()` functions from core, never `transmute`.
+- **Never work around a defect or a gap in `stackable-odbc-core` or
+  `trino-rust-client`.** Both are ours — core is a sibling checkout, the client
+  is the `stackable-main` branch of our fork — so fix the cause where it lives
+  and adapt this driver to the corrected API. A local workaround is invisible
+  to the crate that owns the bug, outlives the eventual fix, and reproduces the
+  upstream behaviour by luck rather than by construction: the day upstream
+  changes, the copy silently stops matching. This applies to missing API just
+  as much as to wrong behaviour — if an accessor hands back a borrow where the
+  caller needs ownership, widen it upstream instead of rebuilding an equivalent
+  here.
+
+  When the upstream fix genuinely has to wait, leave the behaviour honest and
+  record the gap in `AGENTS.md` and `CHANGELOG.md` as a known defect. A
+  documented gap is recoverable; a workaround that hides one is not.
 - **Run `pre-commit run --all-files`** before every commit. This is the single
   source of truth for what must pass.
 

@@ -2340,7 +2340,7 @@ dependencies = [
 [[package]]
 name = "trino-rust-client"
 version = "0.11.0"
-source = "git+https://github.com/stackabletech/trino-rust-client.git?branch=stackable-main#548230e2baeaa3ad8b6f49bb9df1b4b5980dc024"
+source = "git+https://github.com/stackabletech/trino-rust-client.git?branch=stackable-main#444cc7e3fdc2cc0d0945fc01ed657fb88eab1bfc"
 dependencies = [
  "async-stream",
  "backon",
@@ -2373,7 +2373,7 @@ dependencies = [
 [[package]]
 name = "trino-rust-client-macros"
 version = "0.7.2"
-source = "git+https://github.com/stackabletech/trino-rust-client.git?branch=stackable-main#548230e2baeaa3ad8b6f49bb9df1b4b5980dc024"
+source = "git+https://github.com/stackabletech/trino-rust-client.git?branch=stackable-main#444cc7e3fdc2cc0d0945fc01ed657fb88eab1bfc"
 dependencies = [
  "proc-macro2",
  "quote",

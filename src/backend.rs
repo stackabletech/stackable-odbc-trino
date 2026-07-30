@@ -973,7 +973,11 @@ struct OAuth2Key {
     secure: bool,
     host: String,
     port: u16,
-    user: String,
+    /// Usually `None` — `ExternalAuthentication` makes `User` optional and the
+    /// identity provider decides. Kept in the key because a connection that
+    /// *does* name one is asking for a different session, and must not be
+    /// served from the login of a connection that did not.
+    user: Option<String>,
 }
 
 /// One interactive login per identity, for the life of the process.
@@ -1057,12 +1061,19 @@ impl Backend for TrinoBackend {
         // `source` is what Trino's query history and its resource-group rules
         // see; `client_tags` is what those rules match on. Both are set before
         // anything else so a query is attributable even if the rest fails.
-        let mut builder = ClientBuilder::new(p.user(), p.host())
-            .port(p.port())
-            .secure(p.secure())
-            .source(p.source())
-            .client_tags(p.client_tags().clone())
-            .client_request_timeout(request_timeout);
+        // No user means `ExternalAuthentication`: the identity provider decides
+        // who the session runs as, and `X-Trino-User` is left off so Trino takes
+        // the user from the authenticated identity rather than reading an
+        // invented name as an impersonation attempt.
+        let mut builder = match p.user() {
+            Some(user) => ClientBuilder::new(user, p.host()),
+            None => ClientBuilder::without_user(p.host()),
+        }
+        .port(p.port())
+        .secure(p.secure())
+        .source(p.source())
+        .client_tags(p.client_tags().clone())
+        .client_request_timeout(request_timeout);
         // `None` here means either that this driver declared no prompter or
         // that the application passed `SQL_DRIVER_NOPROMPT`. Core deliberately
         // does not distinguish the two, and neither does anything below.
@@ -1091,17 +1102,18 @@ impl Backend for TrinoBackend {
                         secure: p.secure(),
                         host: p.host().to_string(),
                         port: p.port(),
-                        user: p.user().to_string(),
+                        user: p.user().map(str::to_string),
                     },
                     prompter,
                     p.external_auth_timeout(),
                 )?)
             }
             AuthChoice::Jwt => p.access_token().map(|t| Auth::Jwt(t.to_string())),
-            AuthChoice::Basic => Some(Auth::Basic(
-                p.user().to_string(),
-                p.password().map(str::to_string),
-            )),
+            // Only reachable when `ExternalAuthentication` is off, which is
+            // exactly when `User` was required, so the name is always present.
+            AuthChoice::Basic => p
+                .user()
+                .map(|user| Auth::Basic(user.to_string(), p.password().map(str::to_string))),
             AuthChoice::None => None,
         };
         match auth {

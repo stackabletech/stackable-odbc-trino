@@ -697,7 +697,7 @@ list — keep this table in sync with it. Keys are case-insensitive.
 |-----|----------|---------|
 | `Host` | Yes | Trino coordinator hostname |
 | `Port` | Yes | Coordinator port |
-| `User` | Yes | Username (Basic Auth) |
+| `User` | Yes¹ | Username (Basic Auth). ¹Optional under `ExternalAuthentication`, where the identity provider supplies it |
 | `Password` | No | Password (Basic Auth) |
 | `Protocol` | No | `https` (default) or `http` |
 | `Catalog` | No | Default catalog |
@@ -792,9 +792,46 @@ defaulting to 15s would abort every login while the user was still typing.
 `ExternalAuthenticationTimeout` bounds it instead.
 
 `User` stays **required**. The client sends `X-Trino-User` on every request from
-`Session::user` and has no way to omit it, so making the key optional would
-mean inventing a value rather than leaving the header off — even though the
-identity that ends up authenticated is the identity provider's, not this one.
+**`User` is optional under `ExternalAuthentication`, and `X-Trino-User` is then
+left off entirely.**
+
+Trino settles why in `HttpRequestSessionContextFactory`. The header is
+*optional* whenever a request carries an authenticated identity — the user
+falls back to the token's, and `"User must be set"` fires only when neither
+exists:
+
+```java
+String user = trinoUser != null ? trinoUser : authenticatedIdentity.map(Identity::getUser).orElse(null);
+assertRequest(user != null, "User must be set");
+```
+
+And a header that *disagrees* with the authenticated identity is read as an
+impersonation request:
+
+```java
+if (!authenticatedIdentity.getUser().equals(originalIdentity.getUser())) {
+    accessControl.checkCanImpersonateUser(authenticatedIdentity, originalIdentity.getUser());
+}
+```
+
+So a `User` that does not match what the identity provider's user-mapping
+produces would fail the connection with an impersonation denial — for typing
+your own name in the wrong form — or, where the principal holds impersonation
+rights, silently run the session as somebody else. Asking the operator to
+invent one is therefore not a safe default, which is why `connect` calls
+`ClientBuilder::without_user` when none is given.
+
+A `User` supplied *alongside* `ExternalAuthentication` is still honoured: one
+that matches the provider's mapping is harmless, and one that does not is the
+application deliberately asking for impersonation, which Trino will judge on
+its own rules. `SessionUser` is unaffected — naming somebody to run as while
+authenticating as yourself is exactly what it is for.
+
+This needed `trino-rust-client` to be able to omit the header at all;
+`Session::user` is `Option<String>` and `ClientBuilder::without_user` exists
+for this. Building with neither a user nor authentication is the client's
+`Error::MissingUser`, so the case Trino would reject with `User must be set`
+never reaches the wire.
 
 ## Testing
 
@@ -1061,6 +1098,27 @@ isql -3 trino_http -v
 
 docker compose -f test/docker-compose.yml logs -f    # watch incoming requests
 ```
+
+### Blocked on an identity provider
+
+The compose stack has no identity provider, so **nothing below is covered by
+any automated test** — not the unit suite, not `test_c_abi.py`, not the
+integration suite. The planned test rework brings Keycloak into the stack; each
+of these becomes a test then, and until it does the only evidence is a manual
+run against a coordinator configured with
+`http-server.authentication.type=OAUTH2`.
+
+Do not work around the absence — a mock token endpoint would exercise the
+driver's own plumbing and none of the coordinator behaviour that is actually in
+doubt.
+
+| What | Why it needs a real IdP |
+|------|------------------------|
+| The end-to-end `ExternalAuthentication` flow | `401` → login URL → browser → poll → bearer token. Only the seams are unit-tested: `resolve_auth`, and the `Prompter` → `RedirectHandler` adapter against a recording prompter |
+| Which SQLSTATE a *failed* login reports | Which `trino_rust_client::Error` a rejected or abandoned flow produces, and whether `map_trino_error` lands it on `28000` rather than degrading to `HY000`. Unknown, and it needs an IdP that can refuse |
+| That `OAUTH2_LOGINS` opens exactly one browser | The cache is unit-testable by key equality; that ten pooled connections produce one login is not |
+| `ExternalAuthenticationTimeout` firing | Needs a login nobody completes |
+| That omitting `X-Trino-User` really works | The header's absence is unit-tested in `trino-rust-client`; that Trino then resolves the user from the token, and that a *disagreeing* `User` is refused, needs a coordinator with an IdP behind it |
 
 ### Windows VM tests
 

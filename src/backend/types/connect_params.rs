@@ -304,7 +304,9 @@ fn parse_bool(key: &str, raw: &str) -> Result<bool, TrinoError> {
 pub(crate) struct TrinoConnectParams {
     host: String,
     port: u16,
-    user: String,
+    /// `None` only under `ExternalAuthentication`, where the identity provider
+    /// supplies it and `X-Trino-User` is left off entirely.
+    user: Option<String>,
     password: Redacted<Option<String>>,
     access_token: Redacted<Option<String>>,
     secure: bool,
@@ -350,8 +352,10 @@ impl TrinoConnectParams {
         self.port
     }
 
-    pub fn user(&self) -> &str {
-        &self.user
+    /// `None` leaves `X-Trino-User` off, which only `ExternalAuthentication`
+    /// permits — see the field.
+    pub fn user(&self) -> Option<&str> {
+        self.user.as_deref()
     }
 
     pub fn password(&self) -> Option<&str> {
@@ -500,9 +504,26 @@ impl TryFrom<&ConnectParams> for TrinoConnectParams {
         let port: u16 = port_str.parse().map_err(|_| TrinoError::General {
             message: format!("invalid port: {port_str}"),
         })?;
-        let user = params.user().map_err(|_| TrinoError::MissingParam {
-            name: "user".into(),
-        })?;
+        let external_authentication = match params.get(PARAM_EXTERNAL_AUTHENTICATION) {
+            None => false,
+            Some(v) => parse_bool(PARAM_EXTERNAL_AUTHENTICATION, v)?,
+        };
+        // Required, except when the identity provider decides who you are.
+        // Trino takes the user from the authenticated identity when
+        // `X-Trino-User` is absent, and reads one that *disagrees* with that
+        // identity as an impersonation request — so under
+        // `ExternalAuthentication` a name we asked the operator to invent would
+        // be refused for their own account. `SessionUser` remains how
+        // deliberate impersonation is expressed.
+        let user = match params.user() {
+            Ok(u) => Some(u.to_string()),
+            Err(_) if external_authentication => None,
+            Err(_) => {
+                return Err(TrinoError::MissingParam {
+                    name: "user".into(),
+                });
+            }
+        };
         let password = params.password().map(str::to_string);
         let access_token = params
             .get(PARAM_ACCESS_TOKEN)
@@ -590,10 +611,6 @@ impl TryFrom<&ConnectParams> for TrinoConnectParams {
             Some(v) => parse_bool(PARAM_DISABLE_COMPRESSION, v)?,
         };
 
-        let external_authentication = match params.get(PARAM_EXTERNAL_AUTHENTICATION) {
-            None => false,
-            Some(v) => parse_bool(PARAM_EXTERNAL_AUTHENTICATION, v)?,
-        };
         // Rejected rather than defaulted, like `MaxAttempts` below: a login
         // budget quietly reverting to 300s is invisible until someone is sitting
         // in front of a browser wondering why the connection gave up early --
@@ -653,7 +670,7 @@ impl TryFrom<&ConnectParams> for TrinoConnectParams {
         Ok(TrinoConnectParams {
             host: host.to_string(),
             port,
-            user: user.to_string(),
+            user,
             password: Redacted(password),
             access_token: Redacted(access_token),
             secure,
@@ -727,6 +744,62 @@ mod tests {
     fn parse_err(s: &str) -> TrinoError {
         let params = ConnectParams::parse(s).unwrap();
         TrinoConnectParams::try_from(&params).unwrap_err()
+    }
+
+    // -----------------------------------------------------------------------
+    // User, and when it may be left out
+    // -----------------------------------------------------------------------
+
+    /// Trino takes the user from the authenticated identity when the header is
+    /// absent, and reads one that *disagrees* with that identity as an
+    /// impersonation request -- so under `ExternalAuthentication` the operator
+    /// must not have to invent a name that would then be refused.
+    #[test]
+    fn user_may_be_omitted_under_external_authentication() {
+        let p = parse("Host=localhost;Port=8443;Protocol=https;ExternalAuthentication=true");
+        assert_eq!(p.user(), None);
+        assert!(p.external_authentication());
+    }
+
+    /// The interactive flow does not stop an operator naming a user, and one
+    /// that matches the provider's mapping is harmless -- so it is still read.
+    #[test]
+    fn user_is_kept_when_given_alongside_external_authentication() {
+        let p =
+            parse("Host=localhost;Port=8443;Protocol=https;ExternalAuthentication=true;User=alice");
+        assert_eq!(p.user(), Some("alice"));
+    }
+
+    /// Without the interactive flow nothing else establishes an identity, so
+    /// omitting it would reach Trino as `User must be set`.
+    #[test]
+    fn user_is_still_required_without_external_authentication() {
+        let e = parse_err("Host=localhost;Port=8080");
+        assert!(
+            matches!(&e, TrinoError::MissingParam { name } if name == "user"),
+            "got {e:?}"
+        );
+    }
+
+    #[test]
+    fn the_external_auth_timeout_defaults_and_rejects_nonsense() {
+        let base = "Host=localhost;Port=8443;Protocol=https;ExternalAuthentication=true";
+        assert_eq!(
+            parse(base).external_auth_timeout(),
+            Duration::from_secs(DEFAULT_EXTERNAL_AUTH_TIMEOUT_SECS)
+        );
+        assert_eq!(
+            parse(&format!("{base};ExternalAuthenticationTimeout=90")).external_auth_timeout(),
+            Duration::from_secs(90)
+        );
+        // Zero would time the flow out before the browser opened.
+        for bad in ["0", "-1", "soon"] {
+            let e = parse_err(&format!("{base};ExternalAuthenticationTimeout={bad}"));
+            assert!(
+                matches!(e, TrinoError::General { .. }),
+                "{bad:?} must be rejected, got {e:?}"
+            );
+        }
     }
 
     #[test]
@@ -897,7 +970,7 @@ mod tests {
     #[test]
     fn session_user_is_separate_from_the_authenticating_user() {
         let p = parse("Host=localhost;Port=8080;User=svc_bi;SessionUser=alice");
-        assert_eq!(p.user(), "svc_bi");
+        assert_eq!(p.user(), Some("svc_bi"));
         assert_eq!(p.session_user(), Some("alice"));
     }
 
