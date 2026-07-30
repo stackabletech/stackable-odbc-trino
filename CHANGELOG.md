@@ -37,7 +37,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   driver presents it, and the client polls for the bearer token. It requires
   `Protocol=https` and cannot be combined with `Password` or `AccessToken`;
   either combination fails the connection as ambiguous rather than silently
-  preferring one.
+  preferring one. A login the identity provider refuses, and one nobody
+  completes inside `ExternalAuthenticationTimeout`, both fail the connection
+  with SQLSTATE `28000`.
 
   The URL is logged before the browser is opened, and unconditionally. A Driver
   Manager discards whatever the driver writes to stderr, so under `isql`, Power

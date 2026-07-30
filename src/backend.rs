@@ -302,6 +302,15 @@ pub(crate) fn map_trino_error(e: trino_rust_client::error::Error) -> TrinoError 
         Error::Forbidden { ref message } => TrinoError::AuthFailure {
             message: message.clone(),
         },
+        // A login that was refused by the identity provider, or one nobody
+        // completed inside `ExternalAuthenticationTimeout`. Both arrive as
+        // `Error::OAuth2`, and both are authentication failures rather than
+        // query failures. `validate_connection` keeps `AuthFailure` at its own
+        // SQLSTATE instead of reclassifying it to `08001`, which is what makes
+        // the code reach an application that failed during connect.
+        Error::OAuth2(ref message) => TrinoError::AuthFailure {
+            message: format!("OAuth2 authentication failed: {message}"),
+        },
         Error::ReachMaxAttempt(n) => TrinoError::QueryTimeout {
             message: format!("query failed after {n} retry attempts"),
         },
@@ -2748,6 +2757,30 @@ mod tests {
             message: "both a password and an access token were supplied; provide only one".into(),
         };
         let odbc_err: OdbcError = err.into();
+        assert_eq!(odbc_err.sqlstate().as_str(), sql_state::INVALID_AUTH_SPEC);
+    }
+
+    /// A refused or abandoned interactive login is an authentication failure.
+    ///
+    /// Without its own arm it falls into `map_trino_error`'s catch-all and
+    /// arrives as `HY000`, which tells a tool nothing about what to do next.
+    /// `28000` is also what `validate_connection` preserves rather than
+    /// reclassifying to `08001`, so the code survives the connect it happened
+    /// during.
+    #[test]
+    fn error_mapping_oauth2_failure_produces_28000() {
+        use stackable_odbc_core::{errors::OdbcError, types::sql_state};
+
+        let mapped = map_trino_error(trino_rust_client::error::Error::OAuth2(
+            "OAuth2 login not completed within 5s".into(),
+        ));
+
+        assert!(
+            matches!(mapped, TrinoError::AuthFailure { .. }),
+            "an OAuth2 failure is an authentication failure, not {mapped:?}"
+        );
+
+        let odbc_err: OdbcError = mapped.into();
         assert_eq!(odbc_err.sqlstate().as_str(), sql_state::INVALID_AUTH_SPEC);
     }
 
