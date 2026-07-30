@@ -33,9 +33,9 @@ use stackable_odbc_core::odbc_sys;
 use stackable_odbc_core::test_support::{attach_connection, detach_connection};
 use stackable_odbc_core::types::{
     AttrOdbcVersion, CDataType, Desc, EnvironmentAttribute, HandleType, HeaderDiagnosticIdentifier,
-    InfoType, ParamType, SQL_IC_LOWER, SQL_INDEX_UNIQUE, SQL_LOCK_NO_CHANGE, SQL_NTS,
-    SQL_NULL_DATA, SQL_PARAM_ERROR, SQL_PARAM_SUCCESS, SQL_POSITION, SQL_QUICK, SqlDataType,
-    SqlReturn, StatementAttribute, expected_kind,
+    InfoType, ParamType, SQL_FETCH_BOOKMARK, SQL_IC_LOWER, SQL_INDEX_UNIQUE, SQL_LOCK_NO_CHANGE,
+    SQL_NTS, SQL_NULL_DATA, SQL_PARAM_ERROR, SQL_PARAM_SUCCESS, SQL_POSITION, SQL_QUICK,
+    SqlDataType, SqlReturn, StatementAttribute, expected_kind,
 };
 
 use crate::backend::info::{
@@ -2511,6 +2511,166 @@ fn bind_col_and_fetch_reads_bound_column_values() {
         );
 
         cleanup_stmt(stmt);
+    }
+}
+
+/// `SQL_ROW_SUCCESS`, the row-status value the spec fixes at 0. Core keeps its
+/// own copy private to `ffi/fetch.rs`, and a test asserting a spec value names it
+/// rather than writing the literal.
+const SQL_ROW_SUCCESS: u16 = 0;
+
+/// `SQLGetFunctions` advertises `SQL_API_SQLEXTENDEDFETCH`, so this is the
+/// evidence for that claim: the function has to fetch rows rather than fail.
+///
+/// It reports through its own `RowCountPtr` and `RowStatusArray` arguments, which
+/// the spec keeps separate from `SQL_ATTR_ROWS_FETCHED_PTR` and
+/// `SQL_ATTR_ROW_STATUS_PTR` -- that buffer "is used only by SQLExtendedFetch".
+/// Asserting both arguments is what distinguishes a working implementation from
+/// one that fetched a row and told the application nothing about it.
+///
+/// The forward-only rejection is asserted alongside, because an advertised
+/// function that accepts an orientation it cannot honour is worse than one that
+/// refuses: `HY106` is the clause of that row carrying no `(DM)` marker, so it is
+/// this driver's to report.
+#[test]
+#[serial]
+#[ignore = "requires Trino at localhost:8443 -- run ./integration-tests/setup.sh first"]
+fn extended_fetch_reads_rows_and_reports_through_its_own_arguments() {
+    unsafe {
+        let (_env, _conn, stmt) = alloc_stmt();
+
+        assert_eq!(
+            exec_direct(stmt, "SELECT c FROM (VALUES (10), (20)) AS t(c) ORDER BY c"),
+            SqlReturn::SUCCESS
+        );
+
+        let mut val_buf: i32 = 0;
+        let mut val_ind: isize = 0;
+        assert_eq!(
+            ffi::bind::sql_bind_col::<TrinoBackend>(
+                stmt,
+                1,
+                CDataType::SLong as i16,
+                &mut val_buf as *mut i32 as *mut c_void,
+                std::mem::size_of::<i32>() as isize,
+                &mut val_ind,
+            ),
+            SqlReturn::SUCCESS
+        );
+
+        let mut row_count: usize = 0;
+        let mut row_status: u16 = 0xFFFF;
+        assert_eq!(
+            ffi::fetch::sql_extended_fetch::<TrinoBackend>(
+                stmt,
+                odbc_sys::FetchOrientation::Next as u16,
+                0,
+                &mut row_count,
+                &mut row_status,
+            ),
+            SqlReturn::SUCCESS
+        );
+        assert_eq!(val_buf, 10, "the bound column must carry the first row");
+        assert_eq!(row_count, 1, "RowCountPtr must report the rowset size");
+        assert_eq!(
+            row_status, SQL_ROW_SUCCESS,
+            "RowStatusArray element 0 must report the row's status"
+        );
+
+        assert_eq!(
+            ffi::fetch::sql_extended_fetch::<TrinoBackend>(
+                stmt,
+                odbc_sys::FetchOrientation::Next as u16,
+                0,
+                &mut row_count,
+                &mut row_status,
+            ),
+            SqlReturn::SUCCESS
+        );
+        assert_eq!(val_buf, 20);
+
+        // Exhausted. There is no row, so there is no status to report, but the
+        // count still has to say zero rather than keep the previous rowset's.
+        assert_eq!(
+            ffi::fetch::sql_extended_fetch::<TrinoBackend>(
+                stmt,
+                odbc_sys::FetchOrientation::Next as u16,
+                0,
+                &mut row_count,
+                &mut row_status,
+            ),
+            SqlReturn::NO_DATA
+        );
+        assert_eq!(row_count, 0, "an exhausted rowset holds no rows");
+
+        cleanup_stmt(stmt);
+    }
+}
+
+/// Null out-params are legal: both arguments are optional, and an application
+/// that wants neither must not be made to supply them.
+#[test]
+#[serial]
+#[ignore = "requires Trino at localhost:8443 -- run ./integration-tests/setup.sh first"]
+fn extended_fetch_accepts_null_row_count_and_status_arguments() {
+    unsafe {
+        let (_env, _conn, stmt) = alloc_stmt();
+
+        assert_eq!(exec_direct(stmt, "SELECT 1"), SqlReturn::SUCCESS);
+        assert_eq!(
+            ffi::fetch::sql_extended_fetch::<TrinoBackend>(
+                stmt,
+                odbc_sys::FetchOrientation::Next as u16,
+                0,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            ),
+            SqlReturn::SUCCESS
+        );
+
+        cleanup_stmt(stmt);
+    }
+}
+
+/// Every orientation but `SQL_FETCH_NEXT` is `HY106` on this driver's
+/// forward-only cursor, including `SQL_FETCH_BOOKMARK`, which `odbc-sys` has no
+/// variant for and which an application can nevertheless pass.
+#[test]
+#[serial]
+#[ignore = "requires Trino at localhost:8443 -- run ./integration-tests/setup.sh first"]
+fn extended_fetch_refuses_every_orientation_but_next() {
+    unsafe {
+        for orientation in [
+            odbc_sys::FetchOrientation::First as u16,
+            odbc_sys::FetchOrientation::Last as u16,
+            odbc_sys::FetchOrientation::Prior as u16,
+            odbc_sys::FetchOrientation::Absolute as u16,
+            odbc_sys::FetchOrientation::Relative as u16,
+            SQL_FETCH_BOOKMARK as u16,
+        ] {
+            let (_env, _conn, stmt) = alloc_stmt();
+            assert_eq!(exec_direct(stmt, "SELECT 1"), SqlReturn::SUCCESS);
+
+            let mut row_count: usize = 99;
+            assert_eq!(
+                ffi::fetch::sql_extended_fetch::<TrinoBackend>(
+                    stmt,
+                    orientation,
+                    0,
+                    &mut row_count,
+                    std::ptr::null_mut(),
+                ),
+                SqlReturn::ERROR,
+                "orientation {orientation} must be refused on a forward-only cursor"
+            );
+            assert_eq!(
+                last_sqlstate(stmt),
+                "HY106",
+                "orientation {orientation} must report HY106"
+            );
+
+            cleanup_stmt(stmt);
+        }
     }
 }
 

@@ -278,6 +278,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **`SQLGetFunctions` now reports `SQL_TRUE` for `SQL_API_SQLEXTENDEDFETCH`.**
+  `stackable-odbc-core` exports the function and fetches through the same body as
+  `SQLFetch`, so reporting `SQL_FALSE` denied a function the driver performs, and
+  an application that checks before calling would have fallen back needlessly.
+  `SQL_FETCH_NEXT` fetches; every other orientation, including
+  `SQL_FETCH_BOOKMARK`, is `HY106` on this driver's forward-only cursor. The rows
+  fetched and the row status are reported through the function's own
+  `RowCountPtr` and `RowStatusArray` arguments, which the spec keeps separate from
+  `SQL_ATTR_ROWS_FETCHED_PTR` and `SQL_ATTR_ROW_STATUS_PTR`.
+
+  `SQL_API_SQLSETSCROLLOPTIONS` is unaffected and still reports `SQL_FALSE`: the
+  Driver Manager maps `SQLSetScrollOptions` onto `SQLSetStmtAttr` and dispatches
+  to a driver's own entry point only when the driver exports one, so claiming it
+  would replace a capability-checked mapping with a refusal.
+
 - **The integration test stack moved from `test/` to `integration-tests/`, and
   the Trino coordinator now serves HTTPS only** behind a generated certificate
   authority, with compose profiles making Keycloak, MinIO and Hive opt-in.

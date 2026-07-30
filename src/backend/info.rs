@@ -944,6 +944,11 @@ const TRINO_ADVERTISED_FUNCTIONS: &[FunctionId] = &[
     FunctionId::Cancel,
     FunctionId::EndTran,
     FunctionId::FetchScroll,
+    // Core exports it and fetches through the same body as `SQLFetch`, so
+    // reporting false would deny a function this driver performs. `SQL_FETCH_NEXT`
+    // fetches; every other orientation is `HY106`, which is what a
+    // forward-only cursor owes an application.
+    FunctionId::ExtendedFetch,
     FunctionId::BindParameter,
     FunctionId::NativeSql,
     FunctionId::NumParams,
@@ -1016,10 +1021,6 @@ const TRINO_WITHHELD_FUNCTIONS: &[(FunctionId, &str)] = &[
         "ODBC 2.x, superseded by SQLAllocHandle",
     ),
     (FunctionId::Error, "ODBC 2.x, superseded by SQLGetDiagRec"),
-    (
-        FunctionId::ExtendedFetch,
-        "ODBC 2.x, superseded by SQLFetchScroll",
-    ),
     (
         FunctionId::FreeConnect,
         "ODBC 2.x, superseded by SQLFreeHandle",
