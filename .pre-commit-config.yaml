@@ -25,7 +25,10 @@ repos:
     rev: 2491238703a5d3415bb2b7ff11388bf775372f29 # 0.10.0
     hooks:
       - id: shellcheck
-        args: ["--severity=info"]
+        # -x follows `source`d files. The integration-test scripts share
+        # lib.sh, and without it every one of them reports SC1091 for a file
+        # that is right there and checkable.
+        args: ["--severity=info", "-x"]
 
   - repo: local
     hooks:
