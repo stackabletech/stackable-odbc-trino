@@ -13,6 +13,67 @@ Unicode (`W`) functions are exported.
 
 Both Linux and Windows are first-class targets.
 
+## Features
+
+**Authentication** — HTTP Basic (`User` / `Password`), a JWT bearer token
+(`AccessToken`), Trino's interactive OAuth 2.0 flow (`ExternalAuthentication`,
+where the driver presents a login URL and polls for the token), and client
+certificates for mutual TLS (`ClientCertificate`). Under OAuth 2.0 the identity
+provider supplies the user, so `User` is optional and the `X-Trino-User` header
+is omitted rather than invented — a name disagreeing with the token is an
+impersonation request to Trino, not a hint.
+
+**TLS** — three verification modes, not two: `TlsVerify=true`/`full` verifies the
+chain *and* the hostname, `ca` verifies the chain only (for a coordinator reached
+under a name its certificate does not carry), and `false`/`none` verifies
+nothing. A private CA is supplied with `Certificate`. `SSLVerification` is an
+alias, so a value copied out of a JDBC URL transfers unchanged.
+
+**Impersonation and roles** — `SessionUser` runs statements as another user while
+`User` still authenticates, matching JDBC's `sessionUser`. `Roles` sets the
+authorisation role per catalog (`catalog:role;catalog2:ALL`), which Hive and
+Iceberg need under `sql-standard` security.
+
+**Spooled result sets** — `Encoding=json+zstd` (or `json`, `json+lz4`) advertises
+Trino's spooling protocol, so large results travel through the coordinator's
+object storage instead of inline. Off by default, because in
+`retrieval-mode=storage` deployments the *client* fetches segments from the
+bucket directly and not every workstation can reach it. A coordinator that does
+not support the requested encoding ignores it and answers inline, so setting the
+key can never fail a connection. Separately, HTTP response compression is on by
+default and `DisableCompression=true` turns it off.
+
+**Query routing and session control** — `ClientTags` select a resource group,
+`ResourceEstimates` give the scheduler hints, `SessionProperties` set any Trino
+session property, `Path` sets the SQL path for unqualified function names,
+`TimeZone` and `Locale` set the session's time zone and formatting locale, and
+`Source`, `ClientInfo` and `TraceToken` are recorded against every query for
+auditing. `ExtraCredentials` passes connector-level credentials; `ExtraHeaders`
+adds arbitrary HTTP headers for gateways.
+
+**Networking** — an HTTP or HTTPS `Proxy` with optional Basic credentials, a
+per-request timeout (`QueryTimeout`), and a retry budget (`MaxAttempts`) that
+covers query submission and page fetches.
+
+**Cancellation and timeouts** — `SQLCancel` interrupts a running fetch from
+another thread and stops the query on the coordinator, and
+`SQL_ATTR_QUERY_TIMEOUT` is enforced per statement. `SQL_ATTR_CONNECTION_DEAD` is
+answered from an observed failure rather than a probe, so a connection pool pays
+nothing to ask.
+
+**Metadata** — the catalog functions (`SQLTables`, `SQLColumns`, `SQLGetTypeInfo`,
+`SQLTablePrivileges` and the catalog/schema/table-type enumerations),
+`SQLDescribeParam` answered from Trino's own `DESCRIBE INPUT` rather than
+guessed, and the ODBC escape sequences `{fn ...}`, `{d ...}` and `{oj ...}`
+translated to Trino SQL.
+
+**Not supported**, deliberately and reported as such rather than silently
+ignored: transactions (`SQL_TC_NONE`), `SQL_ATTR_CURRENT_CATALOG` as a *write*
+(`HYC00` — Trino cannot move the catalog without also moving the schema), and
+`SQL_ATTR_MAX_ROWS` / `SQL_ATTR_MAX_LENGTH` (`01S02`, since the spec forbids
+emulating them). Trino publishes no primary-key, foreign-key, index or procedure
+metadata, so those catalog functions return no rows.
+
 ## Installing
 
 Download a release archive from the
@@ -51,22 +112,53 @@ Keys are case-insensitive. The authoritative list is
 |-----|----------|---------|
 | `Host` | Yes | Trino coordinator hostname |
 | `Port` | Yes | Coordinator port |
-| `User` | Yes | Username (Basic Auth) |
+| `User` | Yes¹ | Username (Basic Auth). ¹Optional under `ExternalAuthentication`, where the identity provider supplies it |
 | `Password` | No | Password (Basic Auth) |
 | `Protocol` | No | `https` (default) or `http` |
 | `Catalog` | No | Default catalog |
 | `Schema` | No | Default schema |
 | `Source` | No | Query source Trino records and can route on. Default `stackable-odbc-trino/<version>` |
 | `ClientTags` | No | Comma-separated Trino client tags, which select a resource group |
-| `TlsVerify` | No | `true` (default) or `false` |
-| `Certificate` | No | Path to a PEM CA certificate for server verification |
+| `TlsVerify` | No | `true`/`full` (default), `ca`, or `false`/`none`. Alias: `SSLVerification` |
+| `Certificate` | No | Path to a PEM CA certificate for server verification. Required by `ca` |
+| `ClientCertificate` | No | Path to a PEM holding a client certificate chain and its PKCS#8 key, for mutual TLS |
 | `AccessToken` | No | JWT bearer token. Alias: `Token` |
+| `ExternalAuthentication` | No | `true` selects Trino's interactive OAuth 2.0 flow. Needs `https`, and excludes `Password` and `AccessToken` |
+| `ExternalAuthenticationTimeout` | No | Budget for one interactive login, in seconds. Default 300 |
 | `QueryTimeout` | No | Per-request HTTP timeout in seconds (default 30). Alias: `LoginTimeout` |
-| `Encoding` | No | Trino's spooled query-data encoding: `json`, `json+zstd` or `json+lz4`. Unset returns rows inline |
+| `Encoding` | No | Trino's spooled query-data encoding: `json`, `json+zstd` or `json+lz4`. Unset returns every row inline. JDBC's `encoding` |
+| `SessionProperties` | No | Trino session properties, `{name:value;name2:value2}` |
+| `ResourceEstimates` | No | Scheduling hints, same form |
+| `ExtraCredentials` | No | Connector-level credentials, same form |
+| `Roles` | No | Authorisation role per catalog, `{catalog:role;catalog2:ALL}` |
+| `SessionUser` | No | User statements run as, while `User` still authenticates. JDBC's `sessionUser` |
+| `Path` | No | Default SQL path for resolving unqualified function names |
+| `TimeZone` | No | IANA session time zone (`Europe/Berlin`). Unset leaves the coordinator's |
+| `Locale` | No | Locale for locale-dependent formatting, sent as `X-Trino-Language` |
+| `ClientInfo` | No | Free-form client metadata Trino records against the query |
+| `TraceToken` | No | Correlation token Trino records against the query |
+| `ExtraHeaders` | No | Extra HTTP headers, `{name:value;name2:value2}` |
+| `ClientCapabilities` | No | Comma-separated extra capabilities, on top of `PARAMETRIC_DATETIME` and `PATH` |
+| `Proxy` | No | HTTP/HTTPS proxy URL for every request. Credentials in the URL are rejected |
+| `ProxyUser` | No | Proxy Basic username. Requires `ProxyPassword` |
+| `ProxyPassword` | No | Proxy Basic password |
+| `DisableCompression` | No | `true` or `false` (default) |
+| `MaxAttempts` | No | Request retry budget. Unset leaves the client's own |
 
 ```text
 Driver=stackable_odbc_trino;Host=trino.example.com;Port=8443;User=admin;Password=secret;Protocol=https;Catalog=hive;Schema=default
 ```
+
+The five `name:value` keys take **JDBC's format verbatim**, so a value copied out
+of a JDBC URL transfers unchanged. That format uses `;`, which also separates one
+ODBC parameter from the next, so those values must be wrapped in braces:
+
+```text
+SessionProperties={query_max_run_time:10m;example.foo:bar};Encoding=json+zstd
+```
+
+Without the braces the connection string ends the value at the first `;` and
+every pair but the first is discarded.
 
 Transactions are not supported: the driver reports `SQL_TC_NONE` and behaves as
 if every connection were in autocommit mode.

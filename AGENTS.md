@@ -697,6 +697,10 @@ soon as `execute` / `exec_direct` returns, not merely after the first `fetch`.
 Parsed in `src/backend/types/connect_params.rs`, which is the authoritative
 list — keep this table in sync with it. Keys are case-insensitive.
 
+`README.md` carries the same table for the people who install the driver rather
+than work on it, so **a new key means three edits**: the parser, this table and
+that one. The two tables list identical keys today.
+
 | Key | Required | Meaning |
 |-----|----------|---------|
 | `Host` | Yes | Trino coordinator hostname |
