@@ -7,7 +7,14 @@ and deliberately have no dependency on a Driver Manager, on `uv` or on pyodbc;
 a module-scope pyodbc import here would give them one silently.
 """
 
+import os
 import time
+
+DEFAULT_STACK_ENV = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    "generated",
+    "stack.env",
+)
 
 
 class Results:
@@ -74,3 +81,72 @@ class Results:
             parts.append(f"{self.notes} notes")
         print(f"\n{', '.join(parts)}")
         return 1 if self.failed else 0
+
+
+class Stack:
+    """The running test stack, as described by `generated/stack.env`.
+
+    One file describes the stack and both bash and Python read it, so a port,
+    a credential or a certificate path is stated once. Every suite builds its
+    connection strings from here rather than hardcoding one, which is what
+    keeps a change like the move to HTTPS out of every suite at once.
+    """
+
+    def __init__(self, values):
+        self._values = values
+
+    @classmethod
+    def load(cls, path=None):
+        path = path or os.environ.get("ODBC_TEST_STACK_ENV") or DEFAULT_STACK_ENV
+        if not os.path.exists(path):
+            raise SystemExit(
+                f"stack.env not found at {path}\nrun: ./integration-tests/setup.sh"
+            )
+        values = {}
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, _, value = line.partition("=")
+                value = value.strip()
+                if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+                    value = value[1:-1]
+                values[key.strip()] = value
+        return cls(values)
+
+    def get(self, key, default=None):
+        return self._values.get(key, default)
+
+    @property
+    def profiles(self):
+        return [p for p in self.get("PROFILES", "").split(",") if p]
+
+    def has_profile(self, name):
+        return name in self.profiles
+
+    def conn_str(self, **overrides):
+        """A DSN-less connection string. An override of `None` removes the key,
+        which is how a suite tests, say, connecting with no `Password`."""
+        params = {
+            "Driver": self.get("DRIVER_PATH"),
+            "Host": self.get("TRINO_HOST"),
+            "Port": self.get("TRINO_HTTPS_PORT"),
+            "User": self.get("TRINO_USER"),
+            "Password": self.get("TRINO_PASSWORD"),
+            "Protocol": "https",
+            "Catalog": self.get("TRINO_CATALOG"),
+            "Certificate": self.get("CA_CERT"),
+        }
+        params.update(overrides)
+        return ";".join(f"{k}={v}" for k, v in params.items() if v is not None)
+
+    def dsn(self, name):
+        return f"DSN={name}"
+
+    def connect(self, **overrides):
+        """Connect through the Driver Manager. pyodbc is imported here rather
+        than at module scope so the ctypes suites keep their zero dependencies."""
+        import pyodbc
+
+        return pyodbc.connect(self.conn_str(**overrides), autocommit=True)
