@@ -106,13 +106,18 @@ pub(super) fn exec_direct(
     let sql = stripped;
     tracing::debug!(%sql, "TrinoBackend::exec_direct");
 
+    // Before the submit, so the statement runs inside the transaction rather
+    // than opening one behind itself. `execute` reaches here too, after
+    // interpolating its parameters, so this is the only site that needs it.
+    conn.ensure_transaction()?;
+
     // Submit the query to Trino.
     let submit_start = Instant::now();
     let mut page = {
         let _span = tracing::info_span!("trino.submit").entered();
         conn.runtime
             .block_on(conn.client.get::<Row>(sql.to_string()))
-            .map_err(|e| map_trino_error_on(&conn.liveness, e))?
+            .map_err(|e| conn.statement_error(e))?
     };
     let submit_elapsed = submit_start.elapsed();
 
@@ -134,7 +139,7 @@ pub(super) fn exec_direct(
         let _span = tracing::info_span!("trino.poll_metadata").entered();
         while page.columns.is_none() {
             if let Some(error) = page.error.take() {
-                return Err(map_trino_error_on(&conn.liveness, error.into()));
+                return Err(conn.statement_error(error.into()));
             }
             let next_url = page.next_uri.as_ref().ok_or_else(|| TrinoError::General {
                 message: "query returned no columns and no next page".into(),
@@ -145,7 +150,7 @@ pub(super) fn exec_direct(
             page = conn
                 .runtime
                 .block_on(conn.client.get_next(next_url))
-                .map_err(|e| map_trino_error_on(&conn.liveness, e))?;
+                .map_err(|e| conn.statement_error(e))?;
             total_fetch_time += fetch_start.elapsed();
             page_count += 1;
 
@@ -155,7 +160,7 @@ pub(super) fn exec_direct(
     }
 
     if let Some(error) = page.error.take() {
-        return Err(map_trino_error_on(&conn.liveness, error.into()));
+        return Err(conn.statement_error(error.into()));
     }
 
     // Extract column metadata.
@@ -237,7 +242,7 @@ pub(super) fn exec_direct(
     let batch = {
         let _span = tracing::info_span!("trino.convert_batch", page = page_count).entered();
         let rows = decode_page_rows(&conn.runtime, &conn.client, page.data, &kept_columns)
-            .map_err(|e| map_trino_error_on(&conn.liveness, e))?;
+            .map_err(|e| conn.statement_error(e))?;
         convert_rows(rows, &trino_types)
     };
     let total_convert_time = convert_start.elapsed();
@@ -263,6 +268,8 @@ pub(super) fn exec_direct(
         client: Some(Arc::clone(&conn.client)),
         runtime: Some(Arc::clone(&conn.runtime)),
         cancel_state: Some(Arc::clone(&cancel.state)),
+        txn: Some(Arc::clone(&conn.txn)),
+        txn_epoch: conn.txn.epoch(),
         liveness: Some(conn.liveness.clone()),
         page_count,
         empty_page_count,
@@ -296,6 +303,10 @@ pub(super) fn prepare(
         client: None,
         runtime: None,
         cancel_state: None,
+        // No network, so no failure to report and no result set a transaction
+        // could take with it.
+        txn: None,
+        txn_epoch: 0,
         liveness: None,
         page_count: 0,
         empty_page_count: 0,
@@ -393,6 +404,25 @@ pub(super) fn cancel(token: &TrinoCancelToken) -> Result<(), TrinoError> {
 }
 
 impl TrinoStatement {
+    /// Whether a commit or rollback has discarded this statement's result set.
+    ///
+    /// Trino answers `GENERIC_INTERNAL_ERROR: Already finished` for a page
+    /// request on a result set whose transaction has ended, so the drain that
+    /// normally keeps the pooled socket clean would fail instead — the same
+    /// shape of problem a server-side cancel creates, and solved the same way.
+    ///
+    /// The connection bumps its epoch before it sends the `COMMIT`, so a
+    /// statement whose recorded epoch has fallen behind is one whose rows the
+    /// coordinator is already discarding.
+    ///
+    /// `false` for a statement built without an epoch — the in-memory catalog
+    /// results, which hold no `next_uri` and so have nothing to drain.
+    fn result_set_died_with_a_transaction(&self) -> bool {
+        self.txn
+            .as_ref()
+            .is_some_and(|txn| txn.outlived(self.txn_epoch))
+    }
+
     /// Whether a `SQLCancel` on another thread has already stopped this
     /// statement's query server-side.
     ///
@@ -413,6 +443,13 @@ impl TrinoStatement {
     /// Falls back to the bare mapper for a statement built without a liveness
     /// handle, which is the in-memory catalog results that reach no network.
     fn map_client_error(&self, e: trino_rust_client::error::Error) -> TrinoError {
+        // A statement is where a Trino failure usually becomes visible, and a
+        // failure inside a transaction aborts the whole thing. `exec_direct`
+        // cannot see it on its own: Trino sends column metadata before it has
+        // evaluated a row, so `SELECT 1/0` returns a statement and fails here.
+        if let Some(txn) = &self.txn {
+            txn.note_statement_error();
+        }
         match &self.liveness {
             Some(liveness) => map_trino_error_on(liveness, e),
             None => map_trino_error(e),
@@ -671,6 +708,9 @@ impl StatementBackend for TrinoStatement {
     fn close_cursor(&mut self) -> Result<(), TrinoError> {
         // Drain remaining Trino response pages so the underlying HTTP
         // connection is cleanly returned to reqwest's connection pool.
+        //
+        // Skipped when a commit or rollback has already discarded the result
+        // set: see `result_set_died_with_a_transaction`.
         // Without this, residual bytes on the socket corrupt subsequent
         // queries that reuse the pooled connection.
         //
@@ -678,7 +718,7 @@ impl StatementBackend for TrinoStatement {
         // `get_next` then fails and leaves exactly the residual bytes this
         // drain exists to avoid.
         let mut drain_failure = None;
-        if self.is_cancelled() {
+        if self.is_cancelled() || self.result_set_died_with_a_transaction() {
             self.next_uri = None;
         } else if let (Some(client), Some(runtime)) = (&self.client, &self.runtime) {
             let mut next = self.next_uri.take();
@@ -752,6 +792,64 @@ impl Drop for TrinoStatement {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backend::TransactionState;
+
+    /// A statement carrying a `next_uri` and an epoch that has fallen behind
+    /// the connection's, which is what a commit leaves behind.
+    fn statement_at_epoch(txn: &Arc<TransactionState>) -> TrinoStatement {
+        TrinoStatement {
+            pending_sql: None,
+            columns: Vec::new(),
+            trino_types: Vec::new(),
+            raw_columns: Vec::new(),
+            batch: Vec::new(),
+            batch_cursor: 0,
+            fetch_failed: false,
+            // An unreachable host: a drain that is wrongly attempted fails
+            // rather than quietly succeeding against something real.
+            next_uri: Some("https://example.invalid/v1/statement/x/1".to_string()),
+            query_id: None,
+            client: None,
+            runtime: None,
+            cancel_state: None,
+            txn: Some(Arc::clone(txn)),
+            txn_epoch: txn.epoch(),
+            liveness: None,
+            page_count: 0,
+            empty_page_count: 0,
+            total_rows_fetched: 0,
+            total_fetch_time: std::time::Duration::ZERO,
+            total_convert_time: std::time::Duration::ZERO,
+        }
+    }
+
+    /// Trino answers `GENERIC_INTERNAL_ERROR: Already finished` for a page
+    /// request on a result set whose transaction has ended, so the drain that
+    /// keeps the pooled socket clean has to be skipped rather than attempted.
+    #[test]
+    fn close_cursor_skips_the_drain_when_a_transaction_ended_under_it() {
+        let txn = Arc::new(TransactionState::default());
+        let mut stmt = statement_at_epoch(&txn);
+
+        txn.ended();
+
+        stmt.close_cursor()
+            .expect("closing a cursor a commit already discarded succeeds");
+        assert!(stmt.next_uri.is_none());
+    }
+
+    /// The other half: with the epoch unchanged the statement still owns its
+    /// result set, so the guard must not fire and swallow the drain.
+    #[test]
+    fn close_cursor_drains_while_the_transaction_still_holds_the_result_set() {
+        let txn = Arc::new(TransactionState::default());
+        let stmt = statement_at_epoch(&txn);
+
+        assert!(
+            !stmt.result_set_died_with_a_transaction(),
+            "an unchanged epoch means the coordinator still holds these rows"
+        );
+    }
 
     #[test]
     fn a_trailing_semicolon_is_removed() {

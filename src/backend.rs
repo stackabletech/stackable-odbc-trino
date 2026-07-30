@@ -6,7 +6,7 @@
 
 use std::borrow::Cow;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
@@ -18,14 +18,15 @@ use stackable_odbc_core::{
     prompt::Prompter,
     types::{
         ColumnDescriptor, ColumnPrivilegeRow, ColumnRow, ColumnValue, ConnectParams,
-        ExecuteOutcome, ForeignKeyRow, IdentifierType, InfoValue, Nullable, ParamDescriptor,
-        PrimaryKeyRow, ProcedureColumnRow, ProcedureRow, SQL_CB_NULL, SQL_CN_ANY, SQL_FN_CVT_CAST,
-        SQL_FN_TSI_DAY, SQL_FN_TSI_HOUR, SQL_FN_TSI_MINUTE, SQL_FN_TSI_MONTH, SQL_FN_TSI_QUARTER,
-        SQL_FN_TSI_SECOND, SQL_FN_TSI_WEEK, SQL_FN_TSI_YEAR, SQL_GB_GROUP_BY_CONTAINS_SELECT,
-        SQL_IC_LOWER, SQL_NC_END, SQL_NNC_NON_NULL, SQL_SQ_COMPARISON,
-        SQL_SQ_CORRELATED_SUBQUERIES, SQL_SQ_EXISTS, SQL_SQ_IN, SQL_SQ_QUANTIFIED, SQL_TC_NONE,
-        SQL_U_UNION, SQL_U_UNION_ALL, Scope, SpecialColumnRow, StatisticsRow, TablePrivilegeRow,
-        TableRow, TypeInfoRow, format_odbc_version, parse_dotted_version,
+        CursorBehavior, ExecuteOutcome, ForeignKeyRow, IdentifierType, InfoValue, Nullable,
+        ParamDescriptor, PrimaryKeyRow, ProcedureColumnRow, ProcedureRow, SQL_CB_NULL, SQL_CN_ANY,
+        SQL_FN_CVT_CAST, SQL_FN_TSI_DAY, SQL_FN_TSI_HOUR, SQL_FN_TSI_MINUTE, SQL_FN_TSI_MONTH,
+        SQL_FN_TSI_QUARTER, SQL_FN_TSI_SECOND, SQL_FN_TSI_WEEK, SQL_FN_TSI_YEAR,
+        SQL_GB_GROUP_BY_CONTAINS_SELECT, SQL_IC_LOWER, SQL_NC_END, SQL_NNC_NON_NULL,
+        SQL_SQ_COMPARISON, SQL_SQ_CORRELATED_SUBQUERIES, SQL_SQ_EXISTS, SQL_SQ_IN,
+        SQL_SQ_QUANTIFIED, SQL_TC_DML, SQL_TXN_READ_UNCOMMITTED, SQL_U_UNION, SQL_U_UNION_ALL,
+        Scope, SpecialColumnRow, SqlState, StatisticsRow, TablePrivilegeRow, TableRow, TypeInfoRow,
+        format_odbc_version, parse_dotted_version,
     },
 };
 use trino_rust_client::{
@@ -314,6 +315,21 @@ pub(crate) fn map_trino_error(e: trino_rust_client::error::Error) -> TrinoError 
         Error::ReachMaxAttempt(n) => TrinoError::QueryTimeout {
             message: format!("query failed after {n} retry attempts"),
         },
+        // The client's own transaction-state errors: a nesting attempt, an end
+        // with nothing open, or a `START TRANSACTION` whose id never came back
+        // in `X-Trino-Started-Transaction-Id`. None is a server-side rejection,
+        // so none carries a Trino error code, and the catch-all below would
+        // present a driver-side protocol failure as a failed query with a
+        // native code of `0`.
+        //
+        // `HY000` by way of `TrinoError::General`, which is what the spec asks
+        // for: "an error occurred for which there was no specific SQLSTATE".
+        // ODBC's transaction-state codes are `25S01`, `25S02` and `25S03`, and
+        // all three belong to `SQLEndTran`'s table for *global* transaction
+        // outcomes, not to the statement functions this surfaces through.
+        Error::Transaction(ref message) => TrinoError::General {
+            message: format!("transaction error: {message}"),
+        },
         // Everything else, which is where a server-side `Error::Query` lands.
         // Its `QueryError` is the only shape carrying Trino's own error code;
         // a transport failure has none, and `0` is the spec's "no native
@@ -403,7 +419,11 @@ fn query_all_rows_within(
     };
 
     let rows = result
-        .map_err(|e| map_trino_error_on(&conn.liveness, e))?
+        // `statement_error`, not `map_trino_error_on`: this runs the catalog
+        // functions and `validate_connection`, and a statement failing inside
+        // an open transaction aborts the whole transaction whichever path
+        // submitted it.
+        .map_err(|e| conn.statement_error(e))?
         .into_vec();
 
     tracing::info!(total_rows = rows.len(), "query_all_rows complete");
@@ -590,6 +610,153 @@ pub struct TrinoConnection {
     /// [`map_trino_error_on`] from wherever the failure was seen, including a
     /// statement this connection produced. See [`Liveness`].
     pub(crate) liveness: Liveness,
+    /// The commit mode and transaction state, shared with every statement this
+    /// connection produces. See [`TransactionState`].
+    pub(crate) txn: Arc<TransactionState>,
+}
+
+/// The commit mode and the state of the session's transaction.
+///
+/// Shared behind an `Arc` by the connection and every statement it produces,
+/// for the same reason [`CancelState`] is: a statement learns things the
+/// connection has to know. A `SELECT 1/0` is the case that forces it —
+/// `exec_direct` polls only until column metadata arrives, and Trino sends
+/// metadata before it has evaluated a row, so a statement that fails at
+/// execution time returns `Ok` and reports the failure from `fetch` instead.
+/// Without a shared handle the connection would believe an aborted transaction
+/// was alive, and answer `SQLEndTran(SQL_COMMIT)` with a commit Trino refuses.
+#[derive(Debug)]
+pub(crate) struct TransactionState {
+    /// Whether the connection is in autocommit mode, which is ODBC's default.
+    ///
+    /// Written by [`Backend::set_autocommit`] and read by the statement paths,
+    /// which open a transaction only when it is off.
+    autocommit: AtomicBool,
+    /// Whether the open transaction has been aborted by a failed statement.
+    ///
+    /// Trino aborts the whole transaction on any statement error and then
+    /// refuses everything, `COMMIT` included, until a `ROLLBACK`.
+    aborted: AtomicBool,
+    /// Incremented by every [`Backend::end_tran`] that reaches the wire.
+    ///
+    /// A statement records the epoch it executed under and compares: ending a
+    /// transaction discards the coordinator's result sets, so the page drain
+    /// that normally keeps the pooled socket clean would fail instead.
+    epoch: AtomicU64,
+}
+
+impl Default for TransactionState {
+    fn default() -> Self {
+        Self {
+            // ODBC's default commit mode, which every connection starts in.
+            autocommit: AtomicBool::new(true),
+            aborted: AtomicBool::new(false),
+            epoch: AtomicU64::new(0),
+        }
+    }
+}
+
+impl TransactionState {
+    /// Whether the connection is in autocommit mode.
+    pub(crate) fn autocommit(&self) -> bool {
+        self.autocommit.load(Ordering::SeqCst)
+    }
+
+    /// Record the commit mode `SQLSetConnectAttr` asked for.
+    pub(crate) fn set_autocommit(&self, enabled: bool) {
+        self.autocommit.store(enabled, Ordering::SeqCst);
+    }
+
+    /// Whether a failed statement has aborted the open transaction.
+    pub(crate) fn aborted(&self) -> bool {
+        self.aborted.load(Ordering::SeqCst)
+    }
+
+    /// Record that a statement inside the transaction failed.
+    ///
+    /// A no-op in autocommit mode, where each statement stands alone and one
+    /// failure says nothing about the next.
+    pub(crate) fn note_statement_error(&self) {
+        if !self.autocommit() {
+            self.aborted.store(true, Ordering::SeqCst);
+        }
+    }
+
+    /// The epoch a statement executing now would record.
+    pub(crate) fn epoch(&self) -> u64 {
+        self.epoch.load(Ordering::SeqCst)
+    }
+
+    /// End the current transaction's epoch and clear the aborted flag.
+    pub(crate) fn ended(&self) {
+        self.epoch.fetch_add(1, Ordering::SeqCst);
+        self.aborted.store(false, Ordering::SeqCst);
+    }
+
+    /// Whether a result set recorded at `epoch` has outlived its transaction.
+    pub(crate) fn outlived(&self, epoch: u64) -> bool {
+        self.epoch() != epoch
+    }
+}
+
+impl TrinoConnection {
+    /// Whether the session currently holds a Trino transaction id.
+    ///
+    /// Read from the client rather than tracked here: the client owns the id,
+    /// captures it from `X-Trino-Started-Transaction-Id` and clears it on the
+    /// response to a `COMMIT`. A second copy here could disagree with the
+    /// headers actually going out.
+    pub(crate) fn in_transaction(&self) -> bool {
+        self.runtime
+            .block_on(self.client.transaction_id())
+            .is_active()
+    }
+
+    /// Open a transaction if manual-commit mode wants one and none is open.
+    ///
+    /// Called from the statement paths rather than from
+    /// [`Backend::set_autocommit`], because `SQLSetConnectAttr` is not a call
+    /// applications expect to block on a round trip, and a transaction opened
+    /// there would be held for however long the application takes to run its
+    /// first statement.
+    ///
+    /// The choke point is narrower than the guarantee. Trino carries the
+    /// transaction id in a *session* header, so once one is open every request
+    /// the client makes joins it, the catalog functions included, and a failing
+    /// one aborts the application's transaction. This decides when the window
+    /// opens, never who is inside it.
+    pub(crate) fn ensure_transaction(&self) -> Result<(), TrinoError> {
+        if self.txn.autocommit() || self.in_transaction() {
+            return Ok(());
+        }
+        tracing::debug!("opening a transaction for manual-commit mode");
+        self.runtime
+            .block_on(self.client.begin_transaction())
+            .map_err(|e| map_trino_error_on(&self.liveness, e))?;
+        Ok(())
+    }
+
+    /// Record that a statement inside the transaction failed.
+    ///
+    /// Trino aborts the whole transaction on any statement error, a
+    /// `NOT_SUPPORTED` one included, and then refuses everything until a
+    /// `ROLLBACK` — `COMMIT` included, which is what makes this flag necessary
+    /// rather than merely informative. [`TrinoBackend::end_tran`] reads it to
+    /// send the rollback the session actually needs.
+    pub(crate) fn note_statement_error(&self) {
+        self.txn.note_statement_error();
+    }
+
+    /// Map a client error from a statement this connection is running.
+    ///
+    /// Delegates the whole classification to [`map_trino_error_on`], so the
+    /// single place that decides the SQLSTATE is still the only one; what this
+    /// adds is [`TrinoConnection::note_statement_error`], which every statement
+    /// failure has to reach for an open transaction to be known dead.
+    pub(crate) fn statement_error(&self, e: trino_rust_client::error::Error) -> TrinoError {
+        self.note_statement_error();
+        map_trino_error_on(&self.liveness, e)
+    }
 }
 
 /// The state a `SQLCancel` on one thread and the executing statement on
@@ -716,6 +883,9 @@ pub(crate) fn disconnected_trino_conn_with_catalog(catalog: Option<&str>) -> Tri
         // Nothing has been attempted, so nothing has been observed to fail --
         // which is `SQL_CD_FALSE`, "not known to be dead".
         liveness: Liveness::default(),
+        // Autocommit, and no transaction: this connection reaches no
+        // coordinator, so none can be opened on it.
+        txn: Arc::new(TransactionState::default()),
     }
 }
 
@@ -754,6 +924,16 @@ pub struct TrinoStatement {
     /// results and `tables_list_table_types` — which hold no `next_uri` and so
     /// have nothing for a cancellation to stop.
     pub(crate) cancel_state: Option<Arc<CancelState>>,
+    /// The connection's transaction state, shared so this statement can both
+    /// report a failure that aborts the transaction and tell whether one ended
+    /// under it.
+    ///
+    /// `None` for the statements built entirely in memory, which reach no
+    /// coordinator and hold no `next_uri`.
+    pub(crate) txn: Option<Arc<TransactionState>>,
+    /// The transaction epoch this statement executed under, compared against
+    /// [`TransactionState::epoch`] by `close_cursor`.
+    pub(crate) txn_epoch: u64,
     /// The connection's liveness flag, for the page fetches this statement
     /// issues itself. `None` alongside `client` and `runtime`, for the
     /// statements built entirely in memory, which reach no network.
@@ -1291,6 +1471,7 @@ impl Backend for TrinoBackend {
             catalog: p.catalog().map(str::to_owned),
             describe_param_cache: Mutex::new(None),
             liveness: Liveness::default(),
+            txn: Arc::new(TransactionState::default()),
         };
         validate_connection(&conn, p.catalog(), login_timeout)?;
         let version = fetch_server_version(&conn);
@@ -1299,7 +1480,23 @@ impl Backend for TrinoBackend {
         Ok(conn)
     }
 
-    fn disconnect(_conn: &mut TrinoConnection) -> Result<(), TrinoError> {
+    /// Rolls back an open transaction before dropping the connection.
+    ///
+    /// An abandoned transaction stays open on the coordinator until Trino's own
+    /// idle timeout, holding whatever it has locked. A failure here is logged
+    /// rather than returned: the application is disconnecting, and there is
+    /// nothing it could do with the error.
+    fn disconnect(conn: &mut TrinoConnection) -> Result<(), TrinoError> {
+        tracing::debug!("TrinoBackend::disconnect");
+        if conn.in_transaction()
+            && let Err(e) = Self::end_tran(conn, false)
+        {
+            tracing::warn!(
+                error = %e,
+                "failed to roll back on disconnect; the transaction stays open on the \
+                 coordinator until its idle timeout"
+            );
+        }
         Ok(()) // runtime drops on its own
     }
 
@@ -1331,8 +1528,65 @@ impl Backend for TrinoBackend {
     ///   manual-commit mode
     /// - [`Backend::cursor_commit_behavior`] / `cursor_rollback_behavior`,
     ///   left at core's `Preserve` default because no transaction ever begins
-    fn end_tran(_conn: &TrinoConnection, _commit: bool) -> Result<(), TrinoError> {
-        tracing::debug!("TrinoBackend::end_tran (no-op: this driver has no transaction support)");
+    fn end_tran(conn: &TrinoConnection, commit: bool) -> Result<(), TrinoError> {
+        tracing::debug!(commit, "TrinoBackend::end_tran");
+        if !conn.in_transaction() {
+            return Ok(());
+        }
+
+        // Read before `ended()` clears it.
+        //
+        // Trino refuses a COMMIT on an aborted transaction and leaves the id in
+        // place, so the session stays wedged until something rolls back. A
+        // rollback is therefore what actually goes out, and the commit is
+        // reported as the failure it is: telling an application its writes
+        // landed when they were discarded is the one outcome worth avoiding.
+        let aborted = conn.txn.aborted();
+
+        // Every open result set on this connection dies with the transaction,
+        // so the epoch moves before the wire call rather than after: a
+        // `close_cursor` racing this must not drain pages the coordinator is
+        // already discarding.
+        conn.txn.ended();
+        let result = if commit && !aborted {
+            conn.runtime.block_on(conn.client.commit())
+        } else {
+            conn.runtime.block_on(conn.client.rollback())
+        };
+        result.map_err(|e| map_trino_error_on(&conn.liveness, e))?;
+
+        if aborted && commit {
+            // `25S03` rather than `HY000`, and the difference is load-bearing.
+            // `SQLEndTran`'s Suspended State section names `25S03`, `40001`,
+            // `40002` and `HYC00` as the four SQLSTATEs that confirm the
+            // transaction did not complete; any other one leaves the Driver
+            // Manager holding the connection in a suspended state, where only
+            // read-only functions work until `SQLDisconnect`. The rollback
+            // above left this connection perfectly usable, so suspending it
+            // would be a worse outcome than the failed commit itself.
+            return Err(OdbcError::general(
+                "the transaction was rolled back: Trino aborted it when an earlier \
+                 statement failed, and refuses to commit an aborted transaction",
+                SqlState::transaction_rolled_back(),
+            )
+            .into());
+        }
+        Ok(())
+    }
+
+    /// Trino has no manual-commit session mode, so this records the mode and
+    /// issues nothing. The transaction opens at the first statement that needs
+    /// one; see [`TrinoConnection::ensure_transaction`].
+    ///
+    /// Switching *to* autocommit commits what is open first, which the
+    /// `SQL_ATTR_AUTOCOMMIT` page requires of a driver whose data source has
+    /// no autocommit mode of its own.
+    fn set_autocommit(conn: &TrinoConnection, enabled: bool) -> Result<(), TrinoError> {
+        tracing::debug!(enabled, "TrinoBackend::set_autocommit");
+        if enabled && conn.in_transaction() {
+            Self::end_tran(conn, true)?;
+        }
+        conn.txn.set_autocommit(enabled);
         Ok(())
     }
 
@@ -1721,45 +1975,81 @@ impl Backend for TrinoBackend {
         Cow::Borrowed(info::reserved_keywords())
     }
 
-    /// `SQL_TC_NONE`: this driver implements no `SQLEndTran`/manual-commit, so
-    /// nothing may be run inside a transaction.
+    /// `SQL_TC_DML`: transactions carry DML, and DDL inside one is an error.
     ///
-    /// Trino itself *does* support transactions, so this reports a driver
-    /// limitation rather than a platform one — see [`TrinoBackend::end_tran`]
-    /// for the full list of declarations that move together when that changes.
-    /// Core pins the invariant this is one half of: `SQL_TC_NONE` if and only
-    /// if [`Backend::txn_isolation_options`] is `0`, which is why the three
-    /// sit together here.
+    /// True for `postgresql` and every JDBC-backed catalog, where a
+    /// `CREATE TABLE` inside a transaction is `AUTOCOMMIT_WRITE_CONFLICT`. It
+    /// understates the `hive` catalog, where DDL in a transaction works, and
+    /// understating is the safe direction: an application that believes this is
+    /// never wrong, while one believing `SQL_TC_ALL` would be wrong on the
+    /// catalog most applications use.
     ///
     /// `u16`, not `u32`: `SQL_TXN_CAPABLE` is an `SQLUSMALLINT` per the
     /// `SQLGetInfo` page, while the `SQL_TC_*` constants are typed `u32` for
     /// use in bitmask expressions.
     fn txn_capable(_conn: &TrinoConnection) -> u16 {
-        SQL_TC_NONE as u16
+        SQL_TC_DML as u16
     }
 
-    /// `false`. With [`TrinoBackend::txn_capable`] reporting `SQL_TC_NONE` this
-    /// driver can never have even one transaction active, so it certainly
-    /// cannot have two. Revisit alongside `end_tran`: Trino gives each session
-    /// its own `X-Trino-Transaction-Id`, and connections are independent, so
-    /// the answer becomes `true` the moment transactions are implemented.
+    /// `true`. Each connection carries its own Trino session and therefore its
+    /// own `X-Trino-Transaction-Id`, so transactions on separate connections
+    /// are independent.
+    ///
+    /// One *session* holds at most one transaction, which is what Trino reports
+    /// as `NOT_SUPPORTED: Nested transactions not supported`, and is a
+    /// different question from this one.
     fn multiple_active_txn(_conn: &TrinoConnection) -> bool {
-        false
+        true
     }
 
-    /// `0`, the spec's value for a data source that does not support
-    /// transactions, matching the `SQL_TC_NONE` this driver reports. See
-    /// [`TrinoBackend::end_tran`] for why that is a driver limitation rather
-    /// than a Trino one.
+    /// `SQL_TXN_READ_UNCOMMITTED`, the level Trino applies to a bare
+    /// `START TRANSACTION`, which is what this driver issues.
     fn default_txn_isolation(_conn: &TrinoConnection) -> u32 {
-        0
+        SQL_TXN_READ_UNCOMMITTED
     }
 
-    /// `0`: with no supported level, core's `validate_txn_isolation` rejects
-    /// every `SQLSetConnectAttr(SQL_ATTR_TXN_ISOLATION)` with `HY024`, and
-    /// [`Backend::set_txn_isolation`] is never reached.
+    /// `SQL_TXN_READ_UNCOMMITTED` alone, the only level every catalog accepts.
+    ///
+    /// Trino's grammar takes all four, but the *connector* vets the level, and
+    /// not until the first statement that touches a catalog. Measured against
+    /// the test stack:
+    ///
+    /// | Level | tpcds | postgresql | hive |
+    /// |---|---|---|---|
+    /// | READ UNCOMMITTED | ok | ok | ok |
+    /// | READ COMMITTED | ok | ok | `UNSUPPORTED_ISOLATION_LEVEL` |
+    /// | REPEATABLE READ | ok | `UNSUPPORTED_ISOLATION_LEVEL` | same |
+    /// | SERIALIZABLE | ok | `UNSUPPORTED_ISOLATION_LEVEL` | same |
+    ///
+    /// One connection can span catalogs that disagree, so anything wider would
+    /// be a promise this driver cannot keep — and it would be broken as a
+    /// failed query rather than as a refused attribute. Core's
+    /// `validate_txn_isolation` rejects every other level with `HY024` before
+    /// it reaches the wire.
     fn txn_isolation_options(_conn: &TrinoConnection) -> u32 {
-        0
+        SQL_TXN_READ_UNCOMMITTED
+    }
+
+    /// `SQL_CB_CLOSE`. Trino discards a transaction's result sets when it ends:
+    /// a page request afterwards answers `GENERAL_INTERNAL_ERROR: Already
+    /// finished`.
+    ///
+    /// Measured against a live coordinator, with controls that rule out the
+    /// alternatives: the same held cursor resumes across an unrelated statement
+    /// on the same session, and across no transaction at all, delivering every
+    /// remaining row. Only the transaction ending kills it.
+    ///
+    /// `Close` rather than `Delete` because the access plan survives; Trino has
+    /// nothing that a commit unprepares.
+    fn cursor_commit_behavior() -> CursorBehavior {
+        CursorBehavior::Close
+    }
+
+    /// `SQL_CB_CLOSE`, for the reason given on
+    /// [`TrinoBackend::cursor_commit_behavior`]: a rollback ends the
+    /// transaction exactly as a commit does, and takes the result sets with it.
+    fn cursor_rollback_behavior() -> CursorBehavior {
+        CursorBehavior::Close
     }
 
     // --- Identity ---
@@ -2555,6 +2845,7 @@ mod tests {
             catalog: Some("connected_with".to_string()),
             describe_param_cache: Mutex::new(None),
             liveness: Liveness::default(),
+            txn: Arc::new(TransactionState::default()),
         };
 
         assert_eq!(
@@ -3065,5 +3356,236 @@ mod tests {
             "SQL_DBMS_VER prefix must be all digits and dots: {:?}",
             conn.dbms_version
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Transactions
+    //
+    // The write scenarios name the `hive` catalog deliberately. It is the only
+    // connector Trino ships that accepts a write outside autocommit; `tpcds`
+    // and `postgresql` answer AUTOCOMMIT_WRITE_CONFLICT. See the hive catalog
+    // section in AGENTS.md.
+    // -----------------------------------------------------------------------
+
+    /// A transaction-state error from the client is not a server-side query
+    /// rejection, and must not be reported as one: `TrinoError::Query` carries
+    /// a native error code it would have to invent.
+    #[test]
+    fn a_client_transaction_error_is_not_reported_as_a_query_failure() {
+        let mapped = map_trino_error(trino_rust_client::error::Error::Transaction(
+            "a transaction is already active".to_string(),
+        ));
+        assert!(
+            !matches!(mapped, TrinoError::Query { .. }),
+            "expected a general error, got {mapped:?}"
+        );
+        assert!(
+            mapped
+                .to_string()
+                .contains("a transaction is already active"),
+            "the client's own message has to survive: {mapped}"
+        );
+    }
+
+    /// Manual-commit mode records the mode and issues nothing: the transaction
+    /// opens at the first statement, not inside `SQLSetConnectAttr`.
+    #[test]
+    #[ignore = "requires Trino -- run in isolation: cargo test -- --ignored backend"]
+    fn set_autocommit_off_opens_no_transaction_by_itself() {
+        let params = ConnectParams::parse(LIVE).unwrap();
+        let conn = TrinoBackend::connect(&params).unwrap();
+        TrinoBackend::set_autocommit(&conn, false).expect("manual-commit mode is supported");
+        assert!(!conn.in_transaction());
+    }
+
+    #[test]
+    #[ignore = "requires Trino -- run in isolation: cargo test -- --ignored backend"]
+    fn a_statement_opens_the_transaction_in_manual_commit_mode() {
+        let params = ConnectParams::parse(LIVE).unwrap();
+        let conn = TrinoBackend::connect(&params).unwrap();
+        let cancel = TrinoBackend::cancel_token(&conn);
+
+        TrinoBackend::set_autocommit(&conn, false).expect("manual-commit mode is supported");
+        execute::exec_direct(&conn, &cancel, "SELECT 1").expect("query runs");
+        assert!(conn.in_transaction(), "the first statement opens it");
+
+        TrinoBackend::end_tran(&conn, false).expect("rollback");
+        assert!(!conn.in_transaction());
+    }
+
+    #[test]
+    #[ignore = "requires Trino -- run in isolation: cargo test -- --ignored backend"]
+    fn autocommit_mode_opens_no_transaction() {
+        let params = ConnectParams::parse(LIVE).unwrap();
+        let conn = TrinoBackend::connect(&params).unwrap();
+        let cancel = TrinoBackend::cancel_token(&conn);
+        execute::exec_direct(&conn, &cancel, "SELECT 1").expect("query runs");
+        assert!(!conn.in_transaction());
+    }
+
+    /// `COMMIT` with nothing open is `NOT_IN_TRANSACTION` on the wire, while
+    /// `SQLEndTran` is required to succeed, so neither may reach the
+    /// coordinator.
+    #[test]
+    #[ignore = "requires Trino -- run in isolation: cargo test -- --ignored backend"]
+    fn end_tran_is_a_no_op_when_no_transaction_is_open() {
+        let params = ConnectParams::parse(LIVE).unwrap();
+        let conn = TrinoBackend::connect(&params).unwrap();
+        TrinoBackend::end_tran(&conn, true).expect("a commit with nothing open succeeds");
+        TrinoBackend::end_tran(&conn, false).expect("so does a rollback");
+    }
+
+    /// The contract in one test: a write inside a transaction, discarded.
+    #[test]
+    #[ignore = "requires Trino -- run in isolation: cargo test -- --ignored backend"]
+    fn a_rollback_discards_a_write() {
+        let params = ConnectParams::parse(LIVE).unwrap();
+        let conn = TrinoBackend::connect(&params).unwrap();
+        let cancel = TrinoBackend::cancel_token(&conn);
+        let table = "hive.tx.backend_rollback_probe";
+
+        exec(&conn, &cancel, &format!("DROP TABLE IF EXISTS {table}"));
+        exec(
+            &conn,
+            &cancel,
+            &format!("CREATE TABLE {table} (id integer)"),
+        );
+
+        TrinoBackend::set_autocommit(&conn, false).expect("manual-commit mode is supported");
+        exec(&conn, &cancel, &format!("INSERT INTO {table} VALUES (1)"));
+        TrinoBackend::end_tran(&conn, false).expect("rollback");
+        TrinoBackend::set_autocommit(&conn, true).expect("back to autocommit");
+
+        assert_eq!(
+            count_rows(&conn, table),
+            0,
+            "the rolled-back insert must be gone"
+        );
+        exec(&conn, &cancel, &format!("DROP TABLE IF EXISTS {table}"));
+    }
+
+    #[test]
+    #[ignore = "requires Trino -- run in isolation: cargo test -- --ignored backend"]
+    fn a_commit_publishes_a_write() {
+        let params = ConnectParams::parse(LIVE).unwrap();
+        let conn = TrinoBackend::connect(&params).unwrap();
+        let cancel = TrinoBackend::cancel_token(&conn);
+        let table = "hive.tx.backend_commit_probe";
+
+        exec(&conn, &cancel, &format!("DROP TABLE IF EXISTS {table}"));
+        exec(
+            &conn,
+            &cancel,
+            &format!("CREATE TABLE {table} (id integer)"),
+        );
+
+        TrinoBackend::set_autocommit(&conn, false).expect("manual-commit mode is supported");
+        exec(&conn, &cancel, &format!("INSERT INTO {table} VALUES (1)"));
+        TrinoBackend::end_tran(&conn, true).expect("commit");
+        TrinoBackend::set_autocommit(&conn, true).expect("back to autocommit");
+
+        assert_eq!(count_rows(&conn, table), 1, "the committed insert survives");
+        exec(&conn, &cancel, &format!("DROP TABLE IF EXISTS {table}"));
+    }
+
+    /// Trino aborts the whole transaction on any statement error, so the
+    /// driver has to know the transaction is dead before `SQLEndTran` asks it
+    /// to commit.
+    #[test]
+    #[ignore = "requires Trino -- run in isolation: cargo test -- --ignored backend"]
+    fn a_failed_statement_aborts_the_transaction() {
+        let params = ConnectParams::parse(LIVE).unwrap();
+        let conn = TrinoBackend::connect(&params).unwrap();
+        let cancel = TrinoBackend::cancel_token(&conn);
+
+        TrinoBackend::set_autocommit(&conn, false).expect("manual-commit mode is supported");
+        execute::exec_direct(&conn, &cancel, "SELECT 1").expect("opens the transaction");
+        // Through `query_all_rows`, because `exec_direct` alone does not see
+        // this failure: Trino sends column metadata before it has evaluated a
+        // row, so the statement is created and the division fails while its
+        // pages are read.
+        assert!(
+            query_all_rows(&conn, "SELECT 1/0".to_string()).is_err(),
+            "division by zero must fail"
+        );
+
+        assert!(
+            conn.txn.aborted(),
+            "any statement error aborts a Trino transaction"
+        );
+        TrinoBackend::end_tran(&conn, false).expect("rollback frees the session");
+    }
+
+    /// Committing an aborted transaction reports the failure it is, rolls back
+    /// so the session survives, and reports `25S03` so the Driver Manager does
+    /// not suspend a connection that is perfectly usable.
+    #[test]
+    #[ignore = "requires Trino -- run in isolation: cargo test -- --ignored backend"]
+    fn committing_an_aborted_transaction_reports_25s03_and_frees_the_session() {
+        use stackable_odbc_core::types::sql_state;
+
+        let params = ConnectParams::parse(LIVE).unwrap();
+        let conn = TrinoBackend::connect(&params).unwrap();
+        let cancel = TrinoBackend::cancel_token(&conn);
+
+        TrinoBackend::set_autocommit(&conn, false).expect("manual-commit mode is supported");
+        execute::exec_direct(&conn, &cancel, "SELECT 1").expect("opens the transaction");
+        // Through `query_all_rows`, because `exec_direct` alone does not see
+        // this failure: Trino sends column metadata before it has evaluated a
+        // row, so the statement is created and the division fails while its
+        // pages are read.
+        assert!(
+            query_all_rows(&conn, "SELECT 1/0".to_string()).is_err(),
+            "division by zero must fail"
+        );
+
+        let Err(err) = TrinoBackend::end_tran(&conn, true) else {
+            panic!("committing an aborted transaction must not report success");
+        };
+        assert_eq!(
+            OdbcError::from(err).sqlstate().as_str(),
+            sql_state::TRANSACTION_ROLLED_BACK
+        );
+        assert!(
+            !conn.in_transaction(),
+            "the rollback has to have run, or every later statement fails"
+        );
+
+        TrinoBackend::set_autocommit(&conn, true).expect("back to autocommit");
+        execute::exec_direct(&conn, &cancel, "SELECT 1").expect("the session recovered");
+    }
+
+    /// An abandoned transaction holds coordinator state until Trino's idle
+    /// timeout, so disconnecting rolls it back.
+    #[test]
+    #[ignore = "requires Trino -- run in isolation: cargo test -- --ignored backend"]
+    fn disconnect_rolls_back_an_open_transaction() {
+        let params = ConnectParams::parse(LIVE).unwrap();
+        let mut conn = TrinoBackend::connect(&params).unwrap();
+        let cancel = TrinoBackend::cancel_token(&conn);
+
+        TrinoBackend::set_autocommit(&conn, false).expect("manual-commit mode is supported");
+        execute::exec_direct(&conn, &cancel, "SELECT 1").expect("opens the transaction");
+        assert!(conn.in_transaction());
+
+        TrinoBackend::disconnect(&mut conn).expect("disconnect succeeds");
+        assert!(!conn.in_transaction());
+    }
+
+    /// Run a statement for its effect, failing with the SQL that broke rather
+    /// than a bare unwrap.
+    fn exec(conn: &TrinoConnection, cancel: &TrinoCancelToken, sql: &str) {
+        if let Err(e) = execute::exec_direct(conn, cancel, sql) {
+            panic!("{sql} failed: {e}");
+        }
+    }
+
+    /// `SELECT count(*)` through the query path the catalog functions use.
+    fn count_rows(conn: &TrinoConnection, table: &str) -> i64 {
+        let rows: Vec<trino_rust_client::Row> =
+            query_all_rows(conn, format!("SELECT count(*) FROM {table}")).expect("count runs");
+        rows.first()
+            .and_then(|r| r.clone().into_json().first().and_then(|v| v.as_i64()))
+            .expect("count(*) returns one integer")
     }
 }

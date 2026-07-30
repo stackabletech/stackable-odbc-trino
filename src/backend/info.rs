@@ -1135,7 +1135,7 @@ mod tests {
     }
     use super::*;
     use stackable_odbc_core::types::{
-        DEFAULT_IDENTIFIER_LEN, InfoType, InfoValue, SQL_AM_NONE, SQL_CA1_NEXT, SQL_CB_PRESERVE,
+        DEFAULT_IDENTIFIER_LEN, InfoType, InfoValue, SQL_AM_NONE, SQL_CA1_NEXT, SQL_CB_CLOSE,
         SQL_DRIVER_ODBC_VER_STRING, SQL_FN_CVT_CAST, SQL_FN_STR_LOCATE, SQL_FN_STR_POSITION,
         SQL_FN_SYS_DBNAME, SQL_FN_SYS_USERNAME, SQL_FN_TD_CURDATE, SQL_FN_TD_CURRENT_DATE,
         SQL_FN_TD_CURRENT_TIME, SQL_FN_TD_CURRENT_TIMESTAMP, SQL_FN_TD_CURTIME,
@@ -1143,7 +1143,8 @@ mod tests {
         SQL_GB_GROUP_BY_CONTAINS_SELECT, SQL_GD_ANY_COLUMN, SQL_GD_ANY_ORDER, SQL_GD_BOUND,
         SQL_IC_LOWER, SQL_MAX_CURSOR_NAME_LEN, SQL_NC_END, SQL_OIC_CORE, SQL_SO_FORWARD_ONLY,
         SQL_SQ_COMPARISON, SQL_SQ_CORRELATED_SUBQUERIES, SQL_SQ_EXISTS, SQL_SQ_IN,
-        SQL_SQ_QUANTIFIED, SQL_U_UNION, SQL_U_UNION_ALL, SQL_UNSPECIFIED,
+        SQL_SQ_QUANTIFIED, SQL_TC_DML, SQL_TXN_READ_UNCOMMITTED, SQL_U_UNION, SQL_U_UNION_ALL,
+        SQL_UNSPECIFIED,
     };
 
     enum Expected {
@@ -1186,9 +1187,10 @@ mod tests {
         (InfoType::MaxConcurrentActivities,       Expected::U16(0)),
         (InfoType::ConcatNullBehavior,            Expected::U16(0)),
         // Derived by stackable-odbc-core from Backend::cursor_commit_behavior,
-        // which this driver leaves at CursorBehavior::Preserve: Trino reports
-        // SQL_TC_NONE, so no transaction ever closes a cursor.
-        (InfoType::CursorCommitBehaviour,         Expected::U16(SQL_CB_PRESERVE)),
+        // which this driver declares as CursorBehavior::Close: Trino discards a
+        // transaction's result sets when it ends, so a page request afterwards
+        // answers GENERIC_INTERNAL_ERROR: Already finished.
+        (InfoType::CursorCommitBehaviour,         Expected::U16(SQL_CB_CLOSE)),
         (InfoType::IdentifierCase,                Expected::U16(SQL_IC_LOWER)),
         (InfoType::MaxColumnNameLen,              Expected::U16(DEFAULT_IDENTIFIER_LEN)),
         (InfoType::MaxCursorNameLen,              Expected::U16(SQL_MAX_CURSOR_NAME_LEN)),
@@ -1207,8 +1209,9 @@ mod tests {
         (InfoType::MaxIdentifierLen,              Expected::U16(DEFAULT_IDENTIFIER_LEN)),
         (InfoType::CatalogLocation,               Expected::U16(SQL_CL_START)),
         // TransactionCapable is SQLUSMALLINT per spec, not SQLUINTEGER, and is
-        // declared by `TrinoBackend::txn_capable`.
-        (InfoType::TransactionCapable,            Expected::U16(SQL_TC_NONE as u16)),
+        // declared by `TrinoBackend::txn_capable`. SQL_TC_DML because DDL
+        // inside a transaction is an error on every JDBC-backed catalog.
+        (InfoType::TransactionCapable,            Expected::U16(SQL_TC_DML as u16)),
         // --- U32 values ---
         // CursorSensitivity is SQLUINTEGER per spec, not SQLUSMALLINT -- see
         // the matching comment in stackable-odbc-core's default_get_info.
@@ -1219,10 +1222,15 @@ mod tests {
         (InfoType::CursorSensitivity,             Expected::U32(SQL_UNSPECIFIED as u32)),
         (InfoType::Subqueries,                    Expected::U32(SQL_SQ_COMPARISON | SQL_SQ_EXISTS | SQL_SQ_IN | SQL_SQ_QUANTIFIED | SQL_SQ_CORRELATED_SUBQUERIES)),
         (InfoType::UnionStatement,                Expected::U32(SQL_U_UNION | SQL_U_UNION_ALL)),
-        (InfoType::DefaultTxnIsolation,           Expected::U32(0)),
+        // Trino's level for a bare START TRANSACTION, which is what this
+        // driver issues.
+        (InfoType::DefaultTxnIsolation,           Expected::U32(SQL_TXN_READ_UNCOMMITTED)),
         (InfoType::ScrollOptions,                 Expected::U32(SQL_SO_FORWARD_ONLY)),
         (InfoType::ConvertFunctions,              Expected::U32(SQL_FN_CVT_CAST)),
-        (InfoType::TransactionIsolationProtocol,  Expected::U32(0)),
+        // SQL_TXN_ISOLATION_OPTION. Only READ UNCOMMITTED, because the
+        // connector vets the level and the three test catalogs disagree above
+        // it; see `TrinoBackend::txn_isolation_options`.
+        (InfoType::TransactionIsolationProtocol,  Expected::U32(SQL_TXN_READ_UNCOMMITTED)),
         (InfoType::AlterTable,                    Expected::U32(SQL_AT_ADD_COLUMN_SINGLE | SQL_AT_ADD_CONSTRAINT | SQL_AT_DROP_COLUMN)),
         (InfoType::MaxIndexSize,                  Expected::U32(0)),
         (InfoType::MaxRowSize,                    Expected::U32(0)),
