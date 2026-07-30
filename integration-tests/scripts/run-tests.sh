@@ -4,16 +4,18 @@
 # Tears down the Docker Compose stack on exit (unless --skip-delete is passed).
 #
 # Usage:
-#   ./test/run-tests.sh                         # Linux tests only
+#   ./integration-tests/run-tests.sh                         # Linux tests only
 #   ./test/run-tests.sh --windows               # Linux + Windows VM tests
 #   ./test/run-tests.sh --skip-build            # skip the cargo build (also passed to windows_test.py)
 #   ./test/run-tests.sh --skip-delete           # keep Trino running after tests
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+TEST_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+PROJECT_DIR="$(cd "$TEST_DIR/.." && pwd)"
 
-COMPOSE_FILE="$SCRIPT_DIR/docker-compose.yml"
+COMPOSE_FILE="$TEST_DIR/stack/compose.yaml"
+GENERATED="$TEST_DIR/generated"
 DRIVER_PATH="$PROJECT_DIR/target/debug/libstackable_odbc_trino.so"
 
 RUN_WINDOWS=false
@@ -50,22 +52,22 @@ if [[ "$SKIP_BUILD" == false ]]; then
 fi
 
 # --- Linux: pyodbc integration tests (4 configs, matching Windows) ---
-export ODBCSYSINI="$SCRIPT_DIR"
-export ODBCINI="$SCRIPT_DIR/odbc.ini"
+export ODBCSYSINI="$GENERATED"
+export ODBCINI="$GENERATED/odbc.ini"
 
 echo "=== Running Linux pyodbc integration tests (DSN-less, HTTP) ==="
-uv run --with pyodbc python3 "$SCRIPT_DIR/test_integration.py" \
+uv run --with pyodbc python3 "$TEST_DIR/suites/test_integration.py" \
     "Driver=$DRIVER_PATH;Host=localhost;Port=8080;User=admin;Password=admin;Protocol=http;Catalog=tpcds"
 
 echo "=== Running Linux pyodbc integration tests (DSN-less, HTTPS) ==="
-uv run --with pyodbc python3 "$SCRIPT_DIR/test_integration.py" \
+uv run --with pyodbc python3 "$TEST_DIR/suites/test_integration.py" \
     "Driver=$DRIVER_PATH;Host=localhost;Port=8443;User=admin;Password=admin;Protocol=https;TlsVerify=false;Catalog=tpcds"
 
 echo "=== Running Linux pyodbc integration tests (DSN, HTTP) ==="
-uv run --with pyodbc python3 "$SCRIPT_DIR/test_integration.py" "DSN=trino_http"
+uv run --with pyodbc python3 "$TEST_DIR/suites/test_integration.py" "DSN=trino_http"
 
 echo "=== Running Linux pyodbc integration tests (DSN, HTTPS) ==="
-uv run --with pyodbc python3 "$SCRIPT_DIR/test_integration.py" "DSN=trino_https_verify_false"
+uv run --with pyodbc python3 "$TEST_DIR/suites/test_integration.py" "DSN=trino_https_verify_false"
 
 # --- Linux: SQL surface pen test ---
 # The SQL a BI tool actually emits: every join shape, the GROUP BY extensions,
@@ -73,7 +75,7 @@ uv run --with pyodbc python3 "$SCRIPT_DIR/test_integration.py" "DSN=trino_https_
 # one, the catalog functions, and the statement forms whose result columns have
 # no declared length (DESCRIBE, SHOW, EXPLAIN).
 echo "=== Running SQL surface pen test ==="
-uv run --with pyodbc python3 "$SCRIPT_DIR/test_sql_surface.py" \
+uv run --with pyodbc python3 "$TEST_DIR/suites/test_sql_surface.py" \
     "Driver=$DRIVER_PATH;Host=localhost;Port=8080;User=admin;Password=admin;Protocol=http;Catalog=tpcds"
 
 # --- Linux: Power Query folding contract ---
@@ -81,7 +83,7 @@ uv run --with pyodbc python3 "$SCRIPT_DIR/test_sql_surface.py" \
 # loads the .pq, and the only other check on folding is a human clicking
 # "View Native Query" one step at a time.
 echo "=== Running folding contract test ==="
-uv run --with pyodbc python3 "$SCRIPT_DIR/test_folding_contract.py" \
+uv run --with pyodbc python3 "$TEST_DIR/suites/test_folding_contract.py" \
     "Driver=$DRIVER_PATH;Host=localhost;Port=8080;User=admin;Password=admin;Protocol=http;Catalog=tpcds"
 
 # --- Linux: raw C ABI pen test (no Driver Manager) ---
@@ -90,7 +92,7 @@ uv run --with pyodbc python3 "$SCRIPT_DIR/test_folding_contract.py" \
 # handling of out-of-order and malformed calls is invisible to every suite
 # above this one. Standard library only -- no uv, no pyodbc.
 echo "=== Running raw C ABI pen test ==="
-python3 "$SCRIPT_DIR/test_c_abi.py" "$DRIVER_PATH"
+python3 "$TEST_DIR/suites/test_c_abi.py" "$DRIVER_PATH"
 
 # --- Linux: type-transform fuzz (no Driver Manager) ---
 # Every (Trino value, C data type) pair through SQLGetData, checked against
@@ -98,7 +100,7 @@ python3 "$SCRIPT_DIR/test_c_abi.py" "$DRIVER_PATH"
 # boundary values, the IEEE specials, NULL per target type, and the statement
 # terminator forms. Standard library only.
 echo "=== Running type-transform fuzz ==="
-python3 "$SCRIPT_DIR/test_type_matrix.py" "$DRIVER_PATH"
+python3 "$TEST_DIR/suites/test_type_matrix.py" "$DRIVER_PATH"
 
 # --- Linux: Rust FFI integration tests ---
 # Only FFI tests are run here. The backend::tests integration tests use a
@@ -113,5 +115,5 @@ cargo test -- --ignored ffi_integration_tests
 # --- Windows VM tests (optional) ---
 if [[ "$RUN_WINDOWS" == true ]]; then
     echo "=== Running Windows VM integration tests ==="
-    uv run --with pywinrm python3 "$SCRIPT_DIR/windows_test.py" "${WINDOWS_EXTRA_ARGS[@]+"${WINDOWS_EXTRA_ARGS[@]}"}"
+    uv run --with pywinrm python3 "$TEST_DIR/windows/windows_test.py" "${WINDOWS_EXTRA_ARGS[@]+"${WINDOWS_EXTRA_ARGS[@]}"}"
 fi

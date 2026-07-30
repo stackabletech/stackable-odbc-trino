@@ -40,7 +40,7 @@ failed = 0
 notes = 0
 
 CONNECTOR = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)), "..", "connector", "StackableTrinoODBC.pq"
+    os.path.dirname(os.path.abspath(__file__)), "..", "..", "connector", "StackableTrinoODBC.pq"
 )
 
 # A literal of each type, for the CAST the connector would emit. The value only

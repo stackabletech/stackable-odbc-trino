@@ -5,14 +5,18 @@
 #
 # Trino keeps running after this script exits. Use run-tests.sh to execute
 # tests and tear down, or manage the compose stack manually:
-#   docker compose -f test/docker-compose.yml down
+#   docker compose -f integration-tests/stack/compose.yaml down
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+TEST_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+PROJECT_DIR="$(cd "$TEST_DIR/.." && pwd)"
 
-COMPOSE_FILE="$SCRIPT_DIR/docker-compose.yml"
-PASSFILE="$SCRIPT_DIR/trino-config/password.db"
+COMPOSE_FILE="$TEST_DIR/stack/compose.yaml"
+PASSFILE="$TEST_DIR/stack/trino/base/password.db"
+GENERATED="$TEST_DIR/generated"
+
+mkdir -p "$GENERATED"
 
 # --- Dependency checks (fail fast) ---
 missing=()
@@ -37,7 +41,7 @@ if [[ ${#missing[@]} -gt 0 ]]; then
 fi
 
 echo "=== Generating TLS certificate ==="
-bash "$SCRIPT_DIR/tls/generate-cert.sh"
+bash "$TEST_DIR/stack/tls-legacy/generate-cert.sh"
 
 echo "=== Generating password.db (admin/admin) ==="
 if [[ ! -f "$PASSFILE" ]]; then
@@ -57,7 +61,7 @@ else
 fi
 
 echo "=== Starting Trino via Docker Compose ==="
-cd "$SCRIPT_DIR"
+cd "$TEST_DIR/stack"
 docker compose up -d
 
 echo "=== Waiting for Trino to be healthy (up to 600s) ==="
@@ -107,14 +111,14 @@ echo "=== Writing ODBC install config ==="
 # Without it the suites run against a Driver Manager that serialises a
 # cross-thread SQLCancel against the executing call, which is a configuration no
 # user has. test_integration.py's cross-thread cancel test is what notices.
-cat > "$SCRIPT_DIR/odbcinst.ini" << EOF
+cat > "$GENERATED/odbcinst.ini" << EOF
 [stackable_odbc_trino]
 Driver = $DRIVER_PATH
 Threading = 2
 EOF
 
 echo "=== Writing ODBC driver config ==="
-cat > "$SCRIPT_DIR/odbc.ini" << EOF
+cat > "$GENERATED/odbc.ini" << EOF
 [trino_https]
 Driver = stackable_odbc_trino
 Host = localhost
@@ -123,7 +127,7 @@ User = admin
 Password = admin
 Protocol = https
 Catalog = tpcds
-Certificate = $SCRIPT_DIR/tls/server.crt
+Certificate = $TEST_DIR/stack/tls-legacy/server.crt
 
 [trino_https_verify_false]
 Driver = stackable_odbc_trino
@@ -156,12 +160,12 @@ EOF
 echo ""
 echo "=== Setup complete — Trino is running ==="
 echo ""
-echo "Run tests:    ./test/run-tests.sh [--windows]"
+echo "Run tests:    ./integration-tests/run-tests.sh [--windows]"
 echo "Tear down:    docker compose -f $COMPOSE_FILE down"
 echo ""
 echo "To test interactively:"
-echo "  export ODBCSYSINI=$SCRIPT_DIR"
-echo "  export ODBCINI=$SCRIPT_DIR/odbc.ini"
+echo "  export ODBCSYSINI=$GENERATED"
+echo "  export ODBCINI=$GENERATED/odbc.ini"
 echo "  isql -3 trino_https -v"
 echo "  isql -3 trino_https_verify_false -v"
 echo "  isql -3 trino_http -v"

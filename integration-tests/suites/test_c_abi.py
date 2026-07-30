@@ -268,7 +268,7 @@ def main():
 
     here = os.path.dirname(os.path.abspath(__file__))
     default_so = os.path.join(
-        here, "..", "target", "debug", "libstackable_odbc_trino.so"
+        here, "..", "..", "target", "debug", "libstackable_odbc_trino.so"
     )
     so = sys.argv[1] if len(sys.argv) > 1 else default_so
     conn_str = sys.argv[2] if len(sys.argv) > 2 else DEFAULT_CONN_STR

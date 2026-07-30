@@ -26,9 +26,10 @@ import threading
 import time
 from pathlib import Path
 
-SCRIPT_DIR = Path(__file__).resolve().parent
-PROJECT_DIR = (SCRIPT_DIR / "..").resolve()
-OPENSSL_CNF = PROJECT_DIR / "windows" / "openssl_legacy.cnf"
+SCRIPT_DIR = Path(__file__).resolve().parent            # integration-tests/windows
+TEST_DIR = SCRIPT_DIR.parent                            # integration-tests
+PROJECT_DIR = TEST_DIR.parent
+OPENSSL_CNF = SCRIPT_DIR / "openssl_legacy.cnf"
 
 REMOTE_DIR = r"C:\odbc_test_trino"
 REMOTE_DLL = rf"{REMOTE_DIR}\stackable_odbc_trino.dll"
@@ -57,7 +58,7 @@ def main():
         build_dll(args.target)
 
     dll_path = resolve_dll_path(args.target)
-    test_path = SCRIPT_DIR / "test_integration.py"
+    test_path = TEST_DIR / "suites" / "test_integration.py"
 
     host = args.host or discover_vm_ip(args.vm_network)
 

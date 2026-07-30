@@ -6,7 +6,7 @@ services:
       POSTGRES_USER: trino
       POSTGRES_PASSWORD: trino
     volumes:
-      - ./postgres-init.sql:/docker-entrypoint-initdb.d/init.sql
+      - ./postgres/init.sql:/docker-entrypoint-initdb.d/init.sql
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U trino -d testdb"]
       interval: 5s
@@ -19,8 +19,8 @@ services:
       - "8080:8080"
       - "8443:8443"
     volumes:
-      - ./trino-config:/etc/trino
-      - ./tls:/etc/trino/tls
+      - ./trino/base:/etc/trino
+      - ./tls-legacy:/etc/trino/tls
     depends_on:
       postgres:
         condition: service_healthy
