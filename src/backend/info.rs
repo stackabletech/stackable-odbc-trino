@@ -1041,10 +1041,6 @@ const TRINO_WITHHELD_FUNCTIONS: &[(FunctionId, &str)] = &[
         FunctionId::SetStmtOption,
         "ODBC 2.x, superseded by SQLSetStmtAttr",
     ),
-    (
-        FunctionId::SetScrollOptions,
-        "ODBC 2.x, superseded by the SQL_ATTR_CURSOR_* statement attributes",
-    ),
     (FunctionId::Transact, "ODBC 2.x, superseded by SQLEndTran"),
 ];
 
