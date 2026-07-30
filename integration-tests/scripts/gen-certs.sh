@@ -60,12 +60,30 @@ openssl pkcs12 -export \
     -out "$CERT_DIR/keystore.p12" -passout "pass:${KEYSTORE_PASSWORD}"
 
 echo "--- truststore (the CA alone) ---"
-# Serves two jobs: Trino's client-certificate truststore, and the JVM
-# truststore that lets the coordinator trust its own certificate over the
-# HTTPS-only internal discovery loop.
-openssl pkcs12 -export -nokeys \
-    -in "$CERT_DIR/ca.crt" -name ca \
-    -out "$CERT_DIR/truststore.p12" -passout "pass:${KEYSTORE_PASSWORD}"
+# Serves two jobs: Trino's client-certificate truststore, and -- because Trino
+# derives its internal http clients' truststore from the same setting -- the
+# trust anchor for the HTTPS-only internal discovery loop.
+#
+# keytool, not `openssl pkcs12 -export -nokeys`. openssl writes the certificate
+# into a certBag with no Oracle trusted-certificate attribute, and Java then
+# reports "Your keystore contains 0 entries" -- an empty truststore that fails
+# silently: the coordinator still starts, but it validates no client
+# certificate and logs 503s fetching its own memory info over TLS.
+rm -f "$CERT_DIR/truststore.p12"
+keytool -importcert -noprompt -trustcacerts \
+    -alias ca -file "$CERT_DIR/ca.crt" \
+    -keystore "$CERT_DIR/truststore.p12" -storetype PKCS12 \
+    -storepass "$KEYSTORE_PASSWORD"
+
+# Assert it is readable and non-empty. The failure above produced a valid
+# PKCS12 file that Java saw as empty, so the file existing proves nothing.
+entries="$(keytool -list -keystore "$CERT_DIR/truststore.p12" -storetype PKCS12 \
+    -storepass "$KEYSTORE_PASSWORD" 2>/dev/null | grep -c 'trustedCertEntry' || true)"
+if [[ "$entries" -lt 1 ]]; then
+    echo "ERROR: truststore.p12 holds no trustedCertEntry -- Java would read it as empty" >&2
+    exit 1
+fi
+echo "truststore holds $entries trusted certificate(s)."
 
 echo "--- client PEM for the driver's ClientCertificate key ---"
 # One file: the certificate chain, then the PKCS#8 private key. The driver

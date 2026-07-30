@@ -30,6 +30,9 @@ docker compose version &>/dev/null || missing+=("'docker compose' v2 plugin — 
 command -v cargo &>/dev/null || missing+=("'cargo' — https://rustup.rs")
 command -v curl &>/dev/null || missing+=("'curl' — sudo apt install curl")
 command -v openssl &>/dev/null || missing+=("'openssl' — sudo apt install openssl")
+# keytool builds the truststore: openssl cannot write a PKCS12 that Java reads
+# as a trust anchor. See the comment in gen-certs.sh.
+command -v keytool &>/dev/null || missing+=("'keytool' — sudo apt install default-jdk-headless")
 if [[ ! -f "$GENERATED/password.db" ]] && ! command -v htpasswd &>/dev/null && ! python3 -c "import bcrypt" 2>/dev/null; then
     missing+=("'htpasswd' or 'python3-bcrypt' — sudo apt install apache2-utils  OR  pip install bcrypt")
 fi
