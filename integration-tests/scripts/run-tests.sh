@@ -100,6 +100,9 @@ SUITES=(
   # and without it asserts the fallback a coordinator with no spooling manager
   # produces. Both are real assertions, so neither stack state is a blind spot.
   "spooling||uv run --with pyodbc python3 $TEST_DIR/suites/test_spooling.py"
+  # No required profile either: the hive catalog it writes to is in the base
+  # stack, because a file metastore costs no container.
+  "transactions||uv run --with pyodbc python3 $TEST_DIR/suites/test_transactions.py"
   # ctypes rather than pyodbc, and no connection string: pyodbc passes
   # SQL_DRIVER_NOPROMPT unconditionally, which core reads as forbidding the
   # prompt an interactive login needs, so this suite builds its own.

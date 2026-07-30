@@ -9,6 +9,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Transactions.** `SQL_ATTR_AUTOCOMMIT` selects manual-commit mode and
+  `SQLEndTran` commits or rolls back, over Trino's own `START TRANSACTION` /
+  `COMMIT` / `ROLLBACK`. The transaction opens at the first statement rather
+  than inside `SQLSetConnectAttr`, and `SQLDisconnect` rolls back an open one
+  instead of leaving it to Trino's idle timeout.
+
+  Trino aborts a whole transaction on any statement error and then refuses
+  everything including the commit, so `SQLEndTran(SQL_COMMIT)` on an aborted
+  transaction rolls back and reports `25S03` — the SQLSTATE that tells the
+  Driver Manager the transaction did not complete, and so keeps a connection
+  that is still perfectly usable out of the suspended state `HY000` would put
+  it in.
+
+  Writes inside a transaction need a connector that accepts them: of the
+  connectors Trino ships, only Hive does, and the rest answer
+  `AUTOCOMMIT_WRITE_CONFLICT`. Reads inside a transaction work everywhere.
+
 - **Three-mode TLS verification and mutual TLS.** `TlsVerify` now takes `ca`
   alongside the booleans it already accepted, and `SSLVerification` is an alias
   for it, so a value copied out of a JDBC URL transfers unchanged. Both keys
@@ -292,6 +309,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   accepted forms.
 
 ### Changed
+
+- **`SQL_TXN_CAPABLE` reports `SQL_TC_DML`, where it reported `SQL_TC_NONE`.**
+  An application that branches on it now finds transactions available.
+  `SQL_TXN_ISOLATION_OPTION` and `SQL_DEFAULT_TXN_ISOLATION` move with it, from
+  `0` to `SQL_TXN_READ_UNCOMMITTED` — the only level every catalog accepts,
+  since Trino's *connector* vets the level rather than its parser and one
+  connection can span catalogs that disagree. Core refuses every other level
+  with `HY024` rather than letting it fail later as a query.
+
+- **`SQL_CURSOR_COMMIT_BEHAVIOR` and `SQL_CURSOR_ROLLBACK_BEHAVIOR` report
+  `SQL_CB_CLOSE`, where both reported `SQL_CB_PRESERVE`.** Trino discards a
+  transaction's result sets when it ends, so an application must not expect a
+  cursor to survive `SQLEndTran`.
+
+- **`SQL_MULTIPLE_ACTIVE_TXN` reports `Y`, where it reported `N`.** Each
+  connection carries its own Trino session and therefore its own transaction.
 
 - **The driver binary no longer exports the deprecated ODBC 2.x entry points.**
   `SQLAllocConnect`, `SQLAllocEnv`, `SQLAllocStmt`, `SQLFreeConnect`,

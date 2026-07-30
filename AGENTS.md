@@ -111,7 +111,7 @@ say). Do not `error!` for failures already expressed as a returned
 
 ODBC attribute values, info values, and bitmap constants must use named `const`
 definitions — never raw integer literals for spec-defined values. Name them after
-the ODBC spec name (`SQL_CB_PRESERVE`, `SQL_TC_NONE`, `SQL_OJ_LEFT`).
+the ODBC spec name (`SQL_CB_CLOSE`, `SQL_TC_DML`, `SQL_OJ_LEFT`).
 
 **This applies to tests too**, and `src/backend/info.rs`'s `EXPECTED` snapshot
 table is where raw literals creep back in most easily, with the spec name
@@ -647,17 +647,130 @@ This driver's `connect` performs no network I/O — it only builds the HTTP clie
 
 ### Transactions
 
-The driver reports `SQL_TC_NONE` and its `end_tran` is a no-op. This is a driver
-limitation, not a Trino one: Trino supports `START TRANSACTION` / `COMMIT` /
-`ROLLBACK` over the `X-Trino-Transaction-Id` headers, and `trino-rust-client`
-models them. Because no transaction ever begins, `Backend::cursor_commit_behavior`
-is correctly left at core's `CursorBehavior::Preserve` default, which is what
-`SQL_CURSOR_COMMIT_BEHAVIOR` reports, and `default_txn_isolation` /
-`txn_isolation_options` are both `0` — the spec's value for a data source
-without transactions, which also makes core reject every
-`SQLSetConnectAttr(SQL_ATTR_TXN_ISOLATION)` with `HY024`. Implementing
-transactions means revisiting all of those together; see
-`TrinoBackend::end_tran` for the full list.
+`SQL_ATTR_AUTOCOMMIT` selects manual-commit mode and `SQLEndTran` commits or
+rolls back, over Trino's own `START TRANSACTION` / `COMMIT` / `ROLLBACK` and the
+`X-Trino-Transaction-Id` header the client tracks.
+
+`SQLSetConnectAttr` records the mode and issues nothing; the transaction opens
+at the first statement, from `TrinoConnection::ensure_transaction` in
+`exec_direct`. That is narrower than it looks, and the limit is worth stating:
+Trino carries the transaction id in a **session** header, so once one is open
+every request the client makes joins it, the catalog functions included, and a
+failing one aborts the application's transaction. The lazy open decides when the
+window opens, never who is inside it.
+
+#### Any statement error aborts the whole transaction
+
+Measured against Trino 483. After any failure — a `NOT_SUPPORTED` one included —
+every later statement answers `TRANSACTION_ALREADY_ABORTED`, **`COMMIT`
+included**, and the transaction id is left in place. Only `ROLLBACK` recovers
+the session and clears it.
+
+So `SQLEndTran(SQL_COMMIT)` on an aborted transaction sends a `ROLLBACK` and
+then reports failure, with `25S03`. Both halves matter:
+
+- Reporting success would tell an application its writes landed when they were
+  discarded.
+- `25S03` rather than `HY000` because `SQLEndTran`'s **Suspended State** section
+  names `25S03`, `40001`, `40002` and `HYC00` as the four SQLSTATEs that confirm
+  the transaction did not complete. Any other one leaves the Driver Manager
+  holding the connection in a suspended state, where only read-only functions
+  work until `SQLDisconnect` — and the rollback has just left this connection
+  perfectly usable. Core has no named constructor for it, so `sql_state`
+  gained `TRANSACTION_ROLLED_BACK`.
+
+**The failure is not always visible where the statement was submitted.** Trino
+sends column metadata before it has evaluated a row, so `SELECT 1/0` returns
+successfully from `exec_direct` and fails while its pages are read. `TransactionState`
+is therefore shared between the connection and every statement it produces, the
+way `CancelState` already is, and `TrinoStatement::map_client_error` marks the
+abort. `query_all_rows` routes through the same place.
+
+#### A commit closes every open cursor
+
+`cursor_commit_behavior` and `cursor_rollback_behavior` are both
+`CursorBehavior::Close` (`SQL_CB_CLOSE`), measured rather than assumed: paging a
+result set after its transaction ends answers `GENERIC_INTERNAL_ERROR: Already
+finished`. Three controls rule out the alternatives — the same held cursor
+resumes across an unrelated statement on the same session, and across no
+transaction at all, delivering every remaining row.
+
+That has a sharp edge for `close_cursor`, which drains the remaining pages to
+keep the pooled socket clean. After a commit those pages are dead, so the drain
+would fail rather than clean anything. `TransactionState` carries an epoch, a
+statement records the one it executed under, and `close_cursor` skips the drain
+when the connection has moved past it. The connection bumps the epoch *before*
+sending the `COMMIT`, so a `close_cursor` racing it cannot slip through.
+
+#### Isolation levels are vetted by the connector, not the parser
+
+`START TRANSACTION ISOLATION LEVEL X` always parses; the failure lands on the
+first statement that touches a catalog, as `UNSUPPORTED_ISOLATION_LEVEL`:
+
+| Level | tpcds | postgresql | hive |
+|---|---|---|---|
+| READ UNCOMMITTED | ok | ok | ok |
+| READ COMMITTED | ok | ok | `UNSUPPORTED_ISOLATION_LEVEL` |
+| REPEATABLE READ | ok | `UNSUPPORTED_ISOLATION_LEVEL` | same |
+| SERIALIZABLE | ok | `UNSUPPORTED_ISOLATION_LEVEL` | same |
+
+One connection can span catalogs that disagree, so `txn_isolation_options`
+advertises `SQL_TXN_READ_UNCOMMITTED` alone — the level a bare
+`START TRANSACTION` gets, and the only one every catalog accepts. Core then
+rejects the rest with `HY024` before they reach the wire, which is a refused
+attribute rather than a mysterious failed query. `SQL_TXN_CAPABLE` is
+`SQL_TC_DML`: DDL in a transaction is an error on every JDBC-backed catalog,
+and understating the hive catalog, where it works, is the safe direction.
+
+#### `SQLEndTran` with nothing open must not reach the coordinator
+
+Trino answers `NOT_IN_TRANSACTION`, while `SQLEndTran`'s page requires
+`SQL_SUCCESS` when no transaction is active. `end_tran` therefore returns early
+without I/O. `disconnect` rolls back an open transaction rather than leaving it
+to Trino's idle timeout.
+
+#### A pooled connection keeps the commit mode it was returned with
+
+**Measured, and it bites.** pyodbc enables ODBC connection pooling by default. A
+pooled connection is handed back to the application without the driver being
+reconnected — a dozen pyodbc connections produced two `TrinoBackend::connect`
+calls and no `disconnect` at all — so it arrives still in whatever commit mode
+the previous borrower left. A `CREATE TABLE` on a "fresh" connection then runs
+inside that manual-commit transaction, reports success, and is discarded when
+the connection is next recycled.
+
+The driver cannot see the reuse: the Driver Manager neither disconnects nor
+tells it. The ODBC-sanctioned signal is `SQL_ATTR_RESET_CONNECTION`, which the
+Driver Manager sets before returning a connection to the pool and which core
+does not implement yet. Until it does, this is a real hazard for a pooling
+application that ever turns autocommit off, and `suites/test_transactions.py`
+sets `pyodbc.pooling = False` so it measures the driver rather than the pool.
+
+#### Where this is tested
+
+`suites/test_transactions.py` drives the whole contract through unixODBC and
+needs no profile, since the hive catalog is in the base stack. The backend tests
+in `src/backend.rs` cover the same ground against the `Backend` impl directly
+(`cargo test -- --ignored backend`), and
+`autocommit_round_trips_and_end_tran_with_nothing_open_succeeds` plus the
+`transactions` group in `suites/test_c_abi.py` cover the entry points with no
+Driver Manager in the loop.
+
+Every scenario that writes names the `hive` catalog. Two Hive limits shape them,
+and both look like test bugs when met cold: two inserts into the same
+*unpartitioned* table in one transaction fail (`Inserting into an unpartitioned
+table that were added, altered, or inserted into in the same transaction is not
+supported`), so the multi-statement case uses two tables; and a table written in
+a transaction cannot be read back before the commit, so row counts are taken
+from a second connection afterwards.
+
+#### What is not implemented
+
+Trino's `SET SESSION` transaction access mode has no ODBC counterpart here:
+`set_access_mode` stays defaulted, since the spec makes `SQL_ATTR_ACCESS_MODE` a
+hint. `multiple_active_txn` is `true` — each connection carries its own Trino
+session and therefore its own transaction, while one *session* holds at most
+one, which is what `NOT_SUPPORTED: Nested transactions not supported` reports.
 
 ## Architecture of this crate
 
@@ -1041,7 +1154,7 @@ message per violation. Core cannot police these at runtime, because
 `TrinoBackend::get_info` runs first and is entitled to answer anything, so the
 invariants live in the shared harness and each driver runs them against its own
 backend. `get_info_groups_that_constrain_each_other_agree` is the call site
-here; it is what would catch `txn_capable` moving off `SQL_TC_NONE` while
+here; it is what would catch `txn_capable` reporting `SQL_TC_DML` while
 `default_txn_isolation` and `txn_isolation_options` stayed at `0`.
 
 `SQLFreeHandle` refuses a connection handle that still holds a connection

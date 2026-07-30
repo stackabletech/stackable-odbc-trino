@@ -498,7 +498,9 @@ def main():
 
     def test_backend_declared_info_values():
         SQL_IC_LOWER = 2
-        SQL_TC_NONE = 0
+        SQL_TC_DML = 1
+        SQL_CB_CLOSE = 1
+        SQL_TXN_READ_UNCOMMITTED = 1
 
         expected = {
             "SQL_DRIVER_NAME": (pyodbc.SQL_DRIVER_NAME, "stackable-odbc-trino"),
@@ -508,12 +510,34 @@ def main():
             # SQL_IDENTIFIER_CASE rather than being SQL_IC_SENSITIVE.
             "SQL_QUOTED_IDENTIFIER_CASE": (pyodbc.SQL_QUOTED_IDENTIFIER_CASE, SQL_IC_LOWER),
             "SQL_IDENTIFIER_CASE": (pyodbc.SQL_IDENTIFIER_CASE, SQL_IC_LOWER),
-            # This driver implements no SQLEndTran; see TrinoBackend::end_tran.
-            "SQL_TXN_CAPABLE": (pyodbc.SQL_TXN_CAPABLE, SQL_TC_NONE),
+            # DML only: DDL inside a transaction is AUTOCOMMIT_WRITE_CONFLICT
+            # on every JDBC-backed catalog. See TrinoBackend::txn_capable.
+            "SQL_TXN_CAPABLE": (pyodbc.SQL_TXN_CAPABLE, SQL_TC_DML),
+            # The only level every catalog accepts: Trino's connectors vet the
+            # level, not its parser, and they disagree above this one.
+            "SQL_TXN_ISOLATION_OPTION": (
+                pyodbc.SQL_TXN_ISOLATION_OPTION,
+                SQL_TXN_READ_UNCOMMITTED,
+            ),
+            "SQL_DEFAULT_TXN_ISOLATION": (
+                pyodbc.SQL_DEFAULT_TXN_ISOLATION,
+                SQL_TXN_READ_UNCOMMITTED,
+            ),
+            # Trino discards a transaction's result sets when it ends, so a
+            # cursor does not survive SQLEndTran.
+            "SQL_CURSOR_COMMIT_BEHAVIOR": (
+                pyodbc.SQL_CURSOR_COMMIT_BEHAVIOR,
+                SQL_CB_CLOSE,
+            ),
+            "SQL_CURSOR_ROLLBACK_BEHAVIOR": (
+                pyodbc.SQL_CURSOR_ROLLBACK_BEHAVIOR,
+                SQL_CB_CLOSE,
+            ),
             # Trino's grammar rejects every referential-integrity constraint.
             "SQL_INTEGRITY": (pyodbc.SQL_INTEGRITY, False),
-            # No transaction can be active, so certainly not two.
-            "SQL_MULTIPLE_ACTIVE_TXN": (pyodbc.SQL_MULTIPLE_ACTIVE_TXN, False),
+            # Each connection carries its own Trino session, and therefore
+            # its own transaction. One session holds at most one.
+            "SQL_MULTIPLE_ACTIVE_TXN": (pyodbc.SQL_MULTIPLE_ACTIVE_TXN, True),
             # Trino publishes no metadata naming its procedures.
             "SQL_ACCESSIBLE_PROCEDURES": (pyodbc.SQL_ACCESSIBLE_PROCEDURES, False),
             # Trino's identifier production is (LETTER | '_') (LETTER | DIGIT |
