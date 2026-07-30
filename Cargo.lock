@@ -1987,6 +1987,7 @@ dependencies = [
  "chrono",
  "chrono-tz",
  "criterion",
+ "open",
  "proptest",
  "serde_json",
  "serial_test",

@@ -666,6 +666,7 @@ transactions means revisiting all of those together; see
 | `src/backend/metadata.rs` | All ten catalog functions, plus the catalog / schema / table-type enumerations. Each returns typed rows; core builds and sorts the result set |
 | `src/backend/describe_param.rs` | `SQLDescribeParam`, answered from `DESCRIBE INPUT` on a prepared statement, plus the per-connection cache that keeps it to one round trip per statement |
 | `src/backend/params.rs` | Parameter interpolation. Trino has no wire-level parameter binding, so bound values are rendered into the SQL as literals — the escaping rules live here |
+| `src/backend/prompt.rs` | Presenting an interactive OAuth 2.0 login URL: core's `Prompter` implemented as `BrowserPrompter`, and the adapter to the client's `RedirectHandler`. The only user of the `open` dependency |
 | `src/backend/types/connect_params.rs` | Connection-string parsing, with `Redacted` secrets |
 | `src/escape_dialect.rs` | ODBC escape sequences (`{fn ...}`, `{d ...}`, `{oj ...}`) → Trino SQL |
 | `src/type_conversion.rs` | Trino type signatures → `SqlDataType`, and Trino values → `ColumnValue` |
@@ -706,6 +707,8 @@ list — keep this table in sync with it. Keys are case-insensitive.
 | `TlsVerify` | No | `true` (default) or `false` |
 | `Certificate` | No | Path to a PEM CA certificate for server verification |
 | `AccessToken` | No | JWT bearer token. Alias: `Token` |
+| `ExternalAuthentication` | No | `true` selects Trino's interactive OAuth 2.0 flow. Needs `https`, excludes `Password` and `AccessToken`, and is refused under `SQL_DRIVER_NOPROMPT` |
+| `ExternalAuthenticationTimeout` | No | Budget for one interactive login, seconds, default 300. Not bounded by `SQL_ATTR_LOGIN_TIMEOUT` — see below |
 | `QueryTimeout` | No | Per-request HTTP timeout in seconds (default 30). Alias: `LoginTimeout` |
 | `SessionProperties` | No | Trino session properties, `name:value;name2:value2`. Needs `{braces}` — see below |
 | `ExtraCredentials` | No | Connector-level credentials, same form. **Secret** — declared in `sensitive_connect_keywords` |
@@ -749,6 +752,49 @@ word: an application that sets `SQL_ATTR_CONNECTION_TIMEOUT` overrides it, and
 `SQL_ATTR_LOGIN_TIMEOUT` separately bounds the login round trip. Neither is a
 connection-string key — they reach `connect` as `ConnectParams` accessors. See
 [Timeouts, liveness, and the hooks left defaulted](#timeouts-liveness-and-the-hooks-left-defaulted).
+
+### Interactive OAuth 2.0
+
+`ExternalAuthentication=true` selects Trino's external-authentication flow: the
+coordinator answers with a login URL, a person visits it, and the client polls
+for the bearer token. Three things about the path are load-bearing.
+
+**Core decides whether a connect may prompt; this driver decides how.**
+`SQLDriverConnect`'s *DriverCompletion* is the spec's control over interaction,
+and only core sees it. `TrinoBackend::prompter` declares what the driver
+*could* do — `BrowserPrompter`, in `src/backend/prompt.rs`, which logs the URL
+and then opens a browser — and core hands it back through
+`ConnectParams::prompter` only when the call permits prompting. `connect` reads
+it from there and never calls `Backend::prompter` itself: under
+`SQL_DRIVER_NOPROMPT` it receives `None` and there is nothing to call, so the
+rule cannot be forgotten. `open` is a dependency of this crate and deliberately
+not of core.
+
+The log comes before the browser and happens unconditionally, because a Driver
+Manager discards the driver's stderr — under `isql`, Power BI or Excel,
+`ODBC_LOG_FILE` / `ODBC_LOG_LEVEL` are the only channel that survives. A failed
+browser launch is therefore **not** an error: the flow can still be completed
+from the logged URL, since the client polls rather than waiting on the handler.
+
+**One login per identity per process.** The client caches the token in the
+`Arc<OAuth2State>` behind an `Auth`, so clones share a login and a second
+`Auth::new_oauth2` means a second browser. This driver builds a `Client` per
+connection, so `OAUTH2_LOGINS` in `src/backend.rs` keys an `Auth` on
+`(secure, host, port, user)` and hands out clones. Without it a pool warming
+ten connections would open ten browsers. Expiry needs no handling: a stale
+token yields a `401` and the client re-runs the flow behind the same `Arc`.
+
+**`SQL_ATTR_LOGIN_TIMEOUT` does not bound the interactive wait**, and one
+`warn!` says so when both are set. The flow fires on the first `401`, inside
+`validate_connection` — the very round trip `login_deadline` bounds — but
+applications set login timeouts assuming a machine round trip, and a tool
+defaulting to 15s would abort every login while the user was still typing.
+`ExternalAuthenticationTimeout` bounds it instead.
+
+`User` stays **required**. The client sends `X-Trino-User` on every request from
+`Session::user` and has no way to omit it, so making the key optional would
+mean inventing a value rather than leaving the header off — even though the
+identity that ends up authenticated is the identity provider's, not this one.
 
 ## Testing
 

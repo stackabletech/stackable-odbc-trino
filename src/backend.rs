@@ -5,8 +5,9 @@
 //! live in the submodules.
 
 use std::borrow::Cow;
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use snafu::Snafu;
@@ -14,6 +15,7 @@ use stackable_odbc_core::types::QueryTimeout;
 use stackable_odbc_core::{
     backend::Backend,
     errors::OdbcError,
+    prompt::Prompter,
     types::{
         ColumnDescriptor, ColumnPrivilegeRow, ColumnRow, ColumnValue, ConnectParams,
         ExecuteOutcome, ForeignKeyRow, IdentifierType, InfoValue, Nullable, ParamDescriptor,
@@ -27,11 +29,17 @@ use stackable_odbc_core::{
     },
 };
 use trino_rust_client::{
-    Client, ClientBuilder, TlsVerification, Trino, auth::Auth, proxy::Proxy, ssl::Ssl,
+    Client, ClientBuilder, TlsVerification, Trino,
+    auth::{Auth, OAuth2Config},
+    proxy::Proxy,
+    ssl::Ssl,
 };
+
+use crate::backend::prompt::{BrowserPrompter, ClientRedirect};
 
 mod describe_param;
 mod execute;
+mod prompt;
 
 /// The request timeout used for `SQL_ATTR_CONNECTION_TIMEOUT = 0`, the spec's
 /// "there is no timeout".
@@ -898,27 +906,116 @@ impl From<TrinoError> for OdbcError {
 ///   supplied over HTTP is dropped with a warning by `connect`, not here)
 fn resolve_auth(
     secure: bool,
-    user: &str,
     password: Option<&str>,
     access_token: Option<&str>,
-) -> Result<Option<Auth>, TrinoError> {
-    match (access_token, password) {
-        (Some(_), Some(_)) => Err(TrinoError::AuthConfig {
+    external: bool,
+    may_prompt: bool,
+) -> Result<AuthChoice, TrinoError> {
+    match (external, access_token, password) {
+        (true, Some(_), _) | (true, _, Some(_)) => Err(TrinoError::AuthConfig {
+            message: "ExternalAuthentication cannot be combined with a password or an access \
+                      token; provide only one"
+                .into(),
+        }),
+        (true, None, None) if !secure => Err(TrinoError::AuthConfig {
+            message: "ExternalAuthentication requires Protocol=https; the bearer token it \
+                      obtains will not be sent over plain HTTP"
+                .into(),
+        }),
+        // The application passed `SQL_DRIVER_NOPROMPT`, or something else in
+        // the stack forbade prompting. `SQL_DRIVER_NOPROMPT`'s own clause says
+        // a driver without enough information to connect returns `SQL_ERROR`,
+        // and an interactive login is exactly the information we lack.
+        (true, None, None) if !may_prompt => Err(TrinoError::AuthConfig {
+            message: "ExternalAuthentication needs to show a login URL, and this connection \
+                      was made with SQL_DRIVER_NOPROMPT; supply AccessToken instead"
+                .into(),
+        }),
+        (true, None, None) => Ok(AuthChoice::External),
+        (false, Some(_), Some(_)) => Err(TrinoError::AuthConfig {
             message: "both a password and an access token were supplied; provide only one".into(),
         }),
-        (Some(_), None) if !secure => Err(TrinoError::AuthConfig {
+        (false, Some(_), None) if !secure => Err(TrinoError::AuthConfig {
             message: "an access token requires Protocol=https; it will not be sent over plain HTTP"
                 .into(),
         }),
-        (Some(token), None) => Ok(Some(Auth::Jwt(token.to_string()))),
+        (false, Some(_), None) => Ok(AuthChoice::Jwt),
         // No token: preserve the pre-existing behavior, Basic over HTTPS
         // (even with no password: Basic(user, None)), user-only over HTTP.
-        (None, _) if secure => Ok(Some(Auth::Basic(
-            user.to_string(),
-            password.map(str::to_string),
-        ))),
-        (None, _) => Ok(None),
+        (false, None, _) if secure => Ok(AuthChoice::Basic),
+        (false, None, _) => Ok(AuthChoice::None),
     }
+}
+
+/// Which authentication the connection parameters select.
+///
+/// Deciding is kept apart from constructing because `Auth::OAuth2` is not built
+/// per connection: it carries the shared token cache below, so `connect` looks
+/// one up rather than minting a second interactive login. Keeping this a plain
+/// decision leaves [`resolve_auth`] pure and directly testable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AuthChoice {
+    /// No `Authorization` header; the user travels as `X-Trino-User` alone.
+    None,
+    Basic,
+    Jwt,
+    External,
+}
+
+/// The identity an OAuth 2.0 token was issued for.
+///
+/// The coordinator and the user are the most this driver can know: the real
+/// identity is decided by the identity provider during the browser flow and is
+/// never visible here. Keying on what the application asked for is what stops
+/// two connections with different credentials sharing one token.
+#[derive(Debug, PartialEq, Eq, Hash)]
+struct OAuth2Key {
+    secure: bool,
+    host: String,
+    port: u16,
+    user: String,
+}
+
+/// One interactive login per identity, for the life of the process.
+///
+/// The client caches the bearer token in the `Arc<OAuth2State>` behind an
+/// `Auth`, so clones of one `Auth` share a login and a second
+/// `Auth::new_oauth2` means a second browser. This driver builds a `Client` per
+/// connection, so without this a pool warming ten connections would open ten
+/// browsers.
+///
+/// Expiry needs no handling: a stale token yields a `401`, and the client
+/// re-runs the flow and re-caches behind the same `Arc`.
+static OAUTH2_LOGINS: OnceLock<Mutex<HashMap<OAuth2Key, Auth>>> = OnceLock::new();
+
+/// The shared `Auth` for `key`, running the interactive flow only the first time.
+fn oauth2_auth(
+    key: OAuth2Key,
+    prompter: Arc<dyn Prompter>,
+    poll_timeout: Duration,
+) -> Result<Auth, TrinoError> {
+    let logins = OAUTH2_LOGINS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut logins = logins.lock().map_err(|_| {
+        // Hand-built: a poisoned mutex is an internal invariant violation that
+        // never came from the client, which is what this exception is for.
+        OdbcError::general(
+            "the OAuth2 login cache is poisoned",
+            stackable_odbc_core::types::SqlState::general_error(),
+        )
+    })?;
+
+    if let Some(auth) = logins.get(&key) {
+        tracing::debug!(host = key.host, port = key.port, "reusing the OAuth2 login");
+        return Ok(auth.clone());
+    }
+
+    let auth = Auth::new_oauth2_with_config(OAuth2Config {
+        handler: Arc::new(ClientRedirect::new(prompter)),
+        poll_timeout,
+        ..OAuth2Config::default()
+    });
+    logins.insert(key, auth.clone());
+    Ok(auth)
 }
 
 impl Backend for TrinoBackend {
@@ -926,6 +1023,16 @@ impl Backend for TrinoBackend {
     type Connection = TrinoConnection;
     type Error = TrinoError;
     type Statement = TrinoStatement;
+
+    /// How this driver shows an interactive OAuth 2.0 login URL.
+    ///
+    /// Declaring it says only what the driver *could* do. Whether a given
+    /// connect may use it is core's decision, from `SQLDriverConnect`'s
+    /// *DriverCompletion*, and `connect` reads the answer back from
+    /// [`ConnectParams::prompter`] rather than calling this.
+    fn prompter() -> Option<Arc<dyn Prompter>> {
+        Some(Arc::new(BrowserPrompter))
+    }
 
     fn connect(params: &ConnectParams) -> Result<TrinoConnection, TrinoError> {
         let p = types::connect_params::TrinoConnectParams::try_from(params)?;
@@ -956,7 +1063,48 @@ impl Backend for TrinoBackend {
             .source(p.source())
             .client_tags(p.client_tags().clone())
             .client_request_timeout(request_timeout);
-        match resolve_auth(p.secure(), p.user(), p.password(), p.access_token())? {
+        // `None` here means either that this driver declared no prompter or
+        // that the application passed `SQL_DRIVER_NOPROMPT`. Core deliberately
+        // does not distinguish the two, and neither does anything below.
+        let prompter = params.prompter();
+        let auth = match resolve_auth(
+            p.secure(),
+            p.password(),
+            p.access_token(),
+            p.external_authentication(),
+            prompter.is_some(),
+        )? {
+            AuthChoice::External => {
+                if params.login_timeout().is_some() {
+                    tracing::warn!(
+                        external_auth_timeout_secs = p.external_auth_timeout().as_secs(),
+                        "SQL_ATTR_LOGIN_TIMEOUT is not applied to an interactive OAuth2 login: \
+                         it waits on a person, not on the data source. The login is bounded by \
+                         ExternalAuthenticationTimeout instead."
+                    );
+                }
+                let prompter = prompter.ok_or_else(|| TrinoError::AuthConfig {
+                    message: "ExternalAuthentication was selected without a prompter".into(),
+                })?;
+                Some(oauth2_auth(
+                    OAuth2Key {
+                        secure: p.secure(),
+                        host: p.host().to_string(),
+                        port: p.port(),
+                        user: p.user().to_string(),
+                    },
+                    prompter,
+                    p.external_auth_timeout(),
+                )?)
+            }
+            AuthChoice::Jwt => p.access_token().map(|t| Auth::Jwt(t.to_string())),
+            AuthChoice::Basic => Some(Auth::Basic(
+                p.user().to_string(),
+                p.password().map(str::to_string),
+            )),
+            AuthChoice::None => None,
+        };
+        match auth {
             Some(auth) => {
                 builder = builder.auth(auth).auth_http_insecure(false);
             }
@@ -1869,44 +2017,108 @@ impl Backend for TrinoBackend {
 mod auth_tests {
     use super::*;
 
+    /// Not requesting external authentication, and being allowed to prompt,
+    /// is the shape every pre-existing case has.
+    fn without_external(
+        secure: bool,
+        password: Option<&str>,
+        access_token: Option<&str>,
+    ) -> Result<AuthChoice, TrinoError> {
+        resolve_auth(secure, password, access_token, false, true)
+    }
+
     #[test]
     fn jwt_over_https_selected() {
-        let a = resolve_auth(true, "u", None, Some("tok")).unwrap();
-        assert!(matches!(a, Some(Auth::Jwt(t)) if t == "tok"));
+        assert_eq!(
+            without_external(true, None, Some("tok")).unwrap(),
+            AuthChoice::Jwt
+        );
     }
 
     #[test]
     fn jwt_over_http_rejected() {
-        let e = resolve_auth(false, "u", None, Some("tok")).unwrap_err();
+        let e = without_external(false, None, Some("tok")).unwrap_err();
         assert!(matches!(e, TrinoError::AuthConfig { .. }), "got {e:?}");
     }
 
     #[test]
     fn token_and_password_rejected() {
-        let e = resolve_auth(true, "u", Some("pw"), Some("tok")).unwrap_err();
+        let e = without_external(true, Some("pw"), Some("tok")).unwrap_err();
         assert!(matches!(e, TrinoError::AuthConfig { .. }), "got {e:?}");
     }
 
     #[test]
     fn basic_over_https_when_password_only() {
-        let a = resolve_auth(true, "u", Some("pw"), None).unwrap();
-        assert!(matches!(a, Some(Auth::Basic(u, Some(p))) if u == "u" && p == "pw"));
+        assert_eq!(
+            without_external(true, Some("pw"), None).unwrap(),
+            AuthChoice::Basic
+        );
     }
 
     #[test]
     fn basic_over_https_when_no_credentials_preserves_prior_behavior() {
-        let a = resolve_auth(true, "u", None, None).unwrap();
-        assert!(matches!(a, Some(Auth::Basic(u, None)) if u == "u"));
+        assert_eq!(
+            without_external(true, None, None).unwrap(),
+            AuthChoice::Basic
+        );
+    }
+
+    #[test]
+    fn external_over_https_selected() {
+        assert_eq!(
+            resolve_auth(true, None, None, true, true).unwrap(),
+            AuthChoice::External
+        );
+    }
+
+    #[test]
+    fn external_over_http_rejected() {
+        let e = resolve_auth(false, None, None, true, true).unwrap_err();
+        assert!(matches!(e, TrinoError::AuthConfig { .. }), "got {e:?}");
+    }
+
+    /// The application passed `SQL_DRIVER_NOPROMPT`, so there is no way to show
+    /// a login URL and no non-interactive credential to fall back to.
+    #[test]
+    fn external_without_a_prompter_rejected() {
+        let e = resolve_auth(true, None, None, true, false).unwrap_err();
+        assert!(
+            matches!(&e, TrinoError::AuthConfig { message } if message.contains("SQL_DRIVER_NOPROMPT")),
+            "got {e:?}"
+        );
+    }
+
+    #[test]
+    fn external_with_a_password_or_token_rejected() {
+        for (password, token) in [(Some("pw"), None), (None, Some("tok"))] {
+            let e = resolve_auth(true, password, token, true, true).unwrap_err();
+            assert!(
+                matches!(e, TrinoError::AuthConfig { .. }),
+                "expected ambiguous-authentication for {password:?}/{token:?}, got {e:?}"
+            );
+        }
+    }
+
+    /// A prompter being available changes nothing when nobody asked for the
+    /// interactive flow.
+    #[test]
+    fn a_prompter_alone_does_not_select_external() {
+        assert_eq!(
+            resolve_auth(true, Some("pw"), None, false, true).unwrap(),
+            AuthChoice::Basic
+        );
     }
 
     #[test]
     fn no_auth_when_neither() {
-        assert!(resolve_auth(false, "u", None, None).unwrap().is_none());
+        assert_eq!(
+            without_external(false, None, None).unwrap(),
+            AuthChoice::None
+        );
         // password over http is dropped upstream in connect(), not here:
-        assert!(
-            resolve_auth(false, "u", Some("pw"), None)
-                .unwrap()
-                .is_none()
+        assert_eq!(
+            without_external(false, Some("pw"), None).unwrap(),
+            AuthChoice::None
         );
     }
 }

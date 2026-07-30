@@ -18,6 +18,7 @@ crate-type = ["cdylib", "rlib"]
 base64 = "0.23"
 chrono = { version = "0.4", default-features = false }
 chrono-tz = "0.10"
+open = "5"
 serde_json = "1"
 snafu = "0.9"
 # TODO: switch to a crates.io version dep once stackable-odbc-core is published.

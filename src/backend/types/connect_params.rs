@@ -113,6 +113,27 @@ pub(crate) const PARAM_LOCALE: &str = "locale";
 pub(crate) const PARAM_DISABLE_COMPRESSION: &str = "disablecompression";
 /// How many times a request is attempted before it fails.
 pub(crate) const PARAM_MAX_ATTEMPTS: &str = "maxattempts";
+/// Authenticate with Trino's interactive OAuth 2.0 external-authentication
+/// flow: `"true"` or `"false"` (default). JDBC's `externalAuthentication`.
+///
+/// Needs `Protocol=https`, and cannot be combined with `Password` or
+/// [`PARAM_ACCESS_TOKEN`]. Interactive by nature — a person has to visit the
+/// login URL the driver presents — so it is refused on a connection made with
+/// `SQL_DRIVER_NOPROMPT`. Unattended callers use [`PARAM_ACCESS_TOKEN`].
+///
+/// `User` remains required: the client sends `X-Trino-User` on every request
+/// and cannot omit it, so making the key optional would mean inventing a value
+/// rather than leaving the header off.
+pub(crate) const PARAM_EXTERNAL_AUTHENTICATION: &str = "externalauthentication";
+/// Whole budget for one interactive login, in seconds. Default
+/// [`DEFAULT_EXTERNAL_AUTH_TIMEOUT_SECS`]. JDBC's
+/// `externalAuthenticationTimeout`, which counts minutes rather than seconds.
+///
+/// Deliberately separate from `SQL_ATTR_LOGIN_TIMEOUT`, which does **not**
+/// bound this wait: applications set login timeouts assuming a machine round
+/// trip, and a tool defaulting to 15s would otherwise abort every login while
+/// the user was still typing their password.
+pub(crate) const PARAM_EXTERNAL_AUTH_TIMEOUT: &str = "externalauthenticationtimeout";
 
 /// Separator between the pairs of a key-value connection-string parameter.
 ///
@@ -136,6 +157,14 @@ const KEY_VALUE_SEPARATOR: char = ':';
 /// serving plaintext needs an explicit `Protocol=http`.
 const DEFAULT_PROTOCOL: &str = "https";
 const DEFAULT_QUERY_TIMEOUT_SECS: u64 = 30;
+
+/// Default budget for one interactive OAuth 2.0 login.
+///
+/// Matches `trino-rust-client`'s own default, which is what the flow gets when
+/// [`PARAM_EXTERNAL_AUTH_TIMEOUT`] is unset. Generous on purpose: it bounds a
+/// person finding a browser window, signing in, and possibly completing a
+/// second factor.
+const DEFAULT_EXTERNAL_AUTH_TIMEOUT_SECS: u64 = 300;
 
 /// Query source reported when the connection string names none.
 ///
@@ -306,6 +335,8 @@ pub(crate) struct TrinoConnectParams {
     proxy: Option<String>,
     proxy_user: Option<String>,
     proxy_password: Redacted<Option<String>>,
+    external_authentication: bool,
+    external_auth_timeout: Duration,
     compression_disabled: bool,
     max_attempts: Option<usize>,
 }
@@ -411,6 +442,17 @@ impl TrinoConnectParams {
     /// does not read the `HTTP_PROXY` environment.
     pub fn proxy(&self) -> Option<&str> {
         self.proxy.as_deref()
+    }
+
+    /// Whether to authenticate with the interactive OAuth 2.0 flow.
+    pub fn external_authentication(&self) -> bool {
+        self.external_authentication
+    }
+
+    /// Budget for one interactive login. Meaningless unless
+    /// [`Self::external_authentication`] is set.
+    pub fn external_auth_timeout(&self) -> Duration {
+        self.external_auth_timeout
     }
 
     /// The proxy's Basic credentials, both or neither.
@@ -548,6 +590,30 @@ impl TryFrom<&ConnectParams> for TrinoConnectParams {
             Some(v) => parse_bool(PARAM_DISABLE_COMPRESSION, v)?,
         };
 
+        let external_authentication = match params.get(PARAM_EXTERNAL_AUTHENTICATION) {
+            None => false,
+            Some(v) => parse_bool(PARAM_EXTERNAL_AUTHENTICATION, v)?,
+        };
+        // Rejected rather than defaulted, like `MaxAttempts` below: a login
+        // budget quietly reverting to 300s is invisible until someone is sitting
+        // in front of a browser wondering why the connection gave up early --
+        // or did not give up at all.
+        let external_auth_timeout = match params.get(PARAM_EXTERNAL_AUTH_TIMEOUT) {
+            None => DEFAULT_EXTERNAL_AUTH_TIMEOUT_SECS,
+            Some(v) => match v.parse::<u64>() {
+                // Zero would mean the flow times out before the browser opens.
+                Ok(0) | Err(_) => {
+                    return Err(TrinoError::General {
+                        message: format!(
+                            "invalid value for {PARAM_EXTERNAL_AUTH_TIMEOUT}: {v:?}, \
+                             expected a positive number of seconds"
+                        ),
+                    });
+                }
+                Ok(n) => n,
+            },
+        };
+
         // Rejected rather than defaulted, unlike `QueryTimeout` above. That one
         // predates this and warns for compatibility; a new key is better off
         // telling the operator the value never took effect, since a retry
@@ -641,6 +707,8 @@ impl TryFrom<&ConnectParams> for TrinoConnectParams {
                         .collect()
                 })
                 .unwrap_or_default(),
+            external_authentication,
+            external_auth_timeout: Duration::from_secs(external_auth_timeout),
             compression_disabled,
             max_attempts,
         })

@@ -9,6 +9,52 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Interactive OAuth 2.0 authentication**, through the new
+  `ExternalAuthentication` and `ExternalAuthenticationTimeout`
+  connection-string keys. `ExternalAuthentication=true` selects Trino's
+  external-authentication flow: the coordinator answers with a login URL, the
+  driver presents it, and the client polls for the bearer token. It requires
+  `Protocol=https` and cannot be combined with `Password` or `AccessToken`;
+  either combination fails the connection as ambiguous rather than silently
+  preferring one.
+
+  The URL is logged before the browser is opened, and unconditionally. A Driver
+  Manager discards whatever the driver writes to stderr, so under `isql`, Power
+  BI or Excel the log is the only channel that survives — `ODBC_LOG_FILE` and
+  `ODBC_LOG_LEVEL` are what make it reachable. A browser that will not launch is
+  therefore not an error: there may be no display or no permission to start one,
+  and the login can still be completed from the logged URL, because the client
+  polls for the token rather than waiting on the handler.
+
+  **One login serves every connection to the same coordinator**, for the life of
+  the process, keyed on protocol, host, port and user. The client caches the
+  token behind one `Auth` value, and this driver builds a client per connection,
+  so without the cache a pool warming ten connections would open ten browsers.
+  An expired token needs no handling: it yields a `401` and the flow re-runs.
+
+  `SQL_DRIVER_NOPROMPT` is honoured. An application that passed it gets
+  `SQL_ERROR` naming `AccessToken` as the non-interactive alternative, rather
+  than a browser it asked not to see — which is what the matching
+  `stackable-odbc-core` change exists for: core decides whether a connect may
+  prompt, this driver decides how, and the browser dependency stays here.
+
+  **`SQL_ATTR_LOGIN_TIMEOUT` does not bound the interactive wait.** It waits on
+  a person, not on the data source, and applications set login timeouts
+  assuming a machine round trip — a tool defaulting to 15s would abort every
+  login while the user was still typing. `ExternalAuthenticationTimeout`
+  (seconds, default 300) bounds it instead, and one `warn!` records the
+  deviation when an application set both.
+
+  `User` remains required. The client sends `X-Trino-User` on every request and
+  cannot omit it, so making the key optional would mean inventing a value
+  rather than leaving the header off.
+
+- **`SQLCopyDesc` is now advertised by `SQLGetFunctions`.** Core implements
+  explicit descriptor handles, so the function works; it had been withheld
+  because it once did not. `SQLGetFunctions` is what the Windows Driver Manager
+  builds its dispatch table from, so reporting a working function unsupported
+  means the DM answers `IM001` and the application never calls it.
+
 - **Eight connection-string keys covering the Trino client options the driver
   never exposed**: `SessionProperties`, `ExtraCredentials`, `ResourceEstimates`,
   `Path`, `ClientInfo`, `TraceToken`, `DisableCompression` and `MaxAttempts`.
