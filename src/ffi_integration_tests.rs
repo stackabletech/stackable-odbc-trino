@@ -494,9 +494,14 @@ fn get_info_every_named_info_type_has_the_declared_shape_connected() {
         for info_type in all_info_types() {
             let (ret, kind, _string_length) =
                 observe_info_value_kind::<TrinoBackend>(conn, info_type as u16);
-            assert_eq!(
+            // Not `== SUCCESS`: `observe_info_value_kind` probes the write
+            // shape with a non-null buffer it declares to be zero-length, and
+            // core reports that as total truncation (SQL_SUCCESS_WITH_INFO plus
+            // 01004) for a String-shaped info type. The assertion below is what
+            // this message always said it was.
+            assert_ne!(
                 ret,
-                SqlReturn::SUCCESS,
+                SqlReturn::ERROR,
                 "{info_type:?}: SQLGetInfoW must not return SQL_ERROR"
             );
             assert_eq!(
@@ -526,9 +531,14 @@ fn get_info_every_named_info_type_has_the_declared_shape_pre_connect() {
         for info_type in all_info_types() {
             let (ret, kind, _string_length) =
                 observe_info_value_kind::<TrinoBackend>(conn, info_type as u16);
-            assert_eq!(
+            // Not `== SUCCESS`: `observe_info_value_kind` probes the write
+            // shape with a non-null buffer it declares to be zero-length, and
+            // core reports that as total truncation (SQL_SUCCESS_WITH_INFO plus
+            // 01004) for a String-shaped info type. The assertion below is what
+            // this message always said it was.
+            assert_ne!(
                 ret,
-                SqlReturn::SUCCESS,
+                SqlReturn::ERROR,
                 "{info_type:?}: SQLGetInfoW must not return SQL_ERROR pre-connect"
             );
             assert_eq!(
