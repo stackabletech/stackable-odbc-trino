@@ -96,6 +96,10 @@ SUITES=(
   "tls||uv run --with pyodbc python3 $TEST_DIR/suites/test_tls.py"
   "raw C ABI||python3 $TEST_DIR/suites/test_c_abi.py '$DRIVER_PATH' '$CONN_HTTPS'"
   "type matrix||python3 $TEST_DIR/suites/test_type_matrix.py '$DRIVER_PATH' '$CONN_HTTPS'"
+  # No required profile: with `spooling` active it drives the spooled protocol,
+  # and without it asserts the fallback a coordinator with no spooling manager
+  # produces. Both are real assertions, so neither stack state is a blind spot.
+  "spooling||uv run --with pyodbc python3 $TEST_DIR/suites/test_spooling.py"
   # ctypes rather than pyodbc, and no connection string: pyodbc passes
   # SQL_DRIVER_NOPROMPT unconditionally, which core reads as forbidding the
   # prompt an interactive login needs, so this suite builds its own.
