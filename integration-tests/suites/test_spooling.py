@@ -6,17 +6,20 @@ spool: `./integration-tests/setup.sh --profile spooling`. The fallback scenario
 is the other way round and runs when the profile is *off*, since a coordinator
 with no spooling manager is what most deployments are.
 
-Measured thresholds this suite depends on (2026-07-30, against the profile's
-`initial-segment-size=16kB` / `max-segment-size=64kB` and Trino's default
-inlining of the first 1000 rows or 128kB):
+Measured against the running stack (2026-07-30), driving the REST API directly
+with an `X-Trino-Query-Data-Encoding` header and counting segments by type:
 
-    SELECT 1                    -> 1 inline segment, 0 spooled
-    900 rows of customer        -> 1 inline segment, 0 spooled
-    20,000 rows of customer     -> 2 inline, 25 spooled
+    SELECT 1                              -> 1 inline segment, 0 spooled
+    900 rows of customer                  -> 1 inline segment, 0 spooled
+    20,000 rows, all columns              -> 2 inline, 25 spooled
+    20,000 rows, 4 columns                -> inline only, 0 spooled
 
-So a suite querying under ~1000 rows passes without a single segment being
-fetched from object storage, which is why the scenarios below read the driver's
-log rather than trusting a row count.
+The last row is the trap: **what spools is bytes, not rows.** A narrow
+projection of the same 20,000 rows stays under the coordinator's inlining
+threshold and never reaches object storage, so `SELECT *` is deliberate here and
+not laziness. The scenarios read the driver's log for the segment fetches rather
+than trusting a row count, because rows that arrive inline are byte-identical to
+rows that arrive spooled and prove nothing about this driver's decode path.
 """
 
 import os
@@ -32,13 +35,40 @@ from harness import Results, Stack  # noqa: E402
 # one, which is exactly the distinction the thresholds above turn on.
 SEGMENT_LOG_LINE = "Successfully fetched remote spooled segment"
 
-# 20,000 rows is over the inlining threshold with room to spare: measured at 25
-# spooled segments. Ordered so two runs' results are comparable row by row.
-BIG_QUERY = (
-    "SELECT c_customer_sk, c_customer_id, c_first_name, c_last_name "
-    "FROM tpcds.sf1.customer ORDER BY c_customer_sk LIMIT 20000"
-)
+# Every column of 20,000 rows: measured at 25 spooled segments, where the same
+# rows projected to four columns spool nothing at all. Ordered so two runs'
+# results are comparable row by row.
+BIG_QUERY = "SELECT * FROM tpcds.sf1.customer ORDER BY c_customer_sk LIMIT 20000"
 BIG_QUERY_ROWS = 20000
+
+
+LOG = {"path": None, "offset": 0}
+
+
+def start_logging(directory):
+    """Point the driver's log at one file for the whole process.
+
+    Core initialises its `tracing` subscriber on the first connection and pins
+    the file for good (a `std::sync::Once`), so setting `ODBC_LOG_FILE` per query
+    would be silently ignored after the first connect and every later scenario
+    would read an empty file. One file, read in deltas, is what makes the
+    per-query counts meaningful."""
+    LOG["path"] = os.path.join(directory, "driver.log")
+    LOG["offset"] = 0
+    os.environ["ODBC_LOG_LEVEL"] = "info"
+    os.environ["ODBC_LOG_FILE"] = LOG["path"]
+
+
+def new_log_text():
+    """Everything the driver appended to the log since the previous call."""
+    path = LOG["path"]
+    if not path or not os.path.exists(path):
+        return ""
+    with open(path, "rb") as f:
+        f.seek(LOG["offset"])
+        data = f.read()
+    LOG["offset"] += len(data)
+    return data.decode("utf-8", errors="replace")
 
 
 def scenario(results, label, fn):
@@ -57,14 +87,8 @@ def scenario(results, label, fn):
         print(f"      {label}: {time.monotonic() - start:.1f}s")
 
 
-def run_query(stack, log_path, sql, **overrides):
-    """Run `sql` on a fresh connection with the driver logging to `log_path`,
-    and return (rows, log text).
-
-    The log environment is set before pyodbc loads the driver, because core
-    reads it once when the library is loaded."""
-    os.environ["ODBC_LOG_LEVEL"] = "info"
-    os.environ["ODBC_LOG_FILE"] = log_path
+def run_query(stack, sql, **overrides):
+    """Run `sql` on a fresh connection and return (rows, the log it produced)."""
     import pyodbc
 
     conn = pyodbc.connect(stack.conn_str(**overrides), autocommit=True)
@@ -75,22 +99,15 @@ def run_query(stack, log_path, sql, **overrides):
     finally:
         conn.close()
 
-    log = ""
-    if os.path.exists(log_path):
-        with open(log_path, encoding="utf-8", errors="replace") as f:
-            log = f.read()
-    return rows, log
+    return rows, new_log_text()
 
 
 def spooled_matches_direct(stack, results):
     """A spooled result set equals the inline one, and segments were really
     fetched. Without the log check this would pass on an inlined result and
     prove nothing."""
-    with tempfile.TemporaryDirectory() as d:
-        direct, direct_log = run_query(stack, os.path.join(d, "direct.log"), BIG_QUERY)
-        spooled, spooled_log = run_query(
-            stack, os.path.join(d, "spooled.log"), BIG_QUERY, Encoding="json+zstd"
-        )
+    direct, direct_log = run_query(stack, BIG_QUERY)
+    spooled, spooled_log = run_query(stack, BIG_QUERY, Encoding="json+zstd")
 
     results.check(
         "spooled row count matches direct",
@@ -116,10 +133,7 @@ def an_inline_segment_decodes(stack, results):
     """With an encoding set, a small result arrives as one *inline* segment.
     That is a different decode path from a remote fetch, and the one every short
     query takes once spooling is on."""
-    with tempfile.TemporaryDirectory() as d:
-        rows, log = run_query(
-            stack, os.path.join(d, "inline.log"), "SELECT 1", Encoding="json+zstd"
-        )
+    rows, log = run_query(stack, "SELECT 1", Encoding="json+zstd")
 
     results.check("an inline segment decodes", rows == [(1,)], f"got {rows}")
     results.check(
@@ -132,28 +146,21 @@ def an_inline_segment_decodes(stack, results):
 
 def every_encoding_agrees(stack, results):
     """The three encodings are three wire formats for one result."""
-    with tempfile.TemporaryDirectory() as d:
-        baseline, _ = run_query(stack, os.path.join(d, "direct.log"), BIG_QUERY)
-        for encoding in ("json", "json+zstd", "json+lz4"):
-            log_name = encoding.replace("+", "_") + ".log"
-            rows, log = run_query(
-                stack, os.path.join(d, log_name), BIG_QUERY, Encoding=encoding
-            )
-            results.check(
-                f"{encoding} returns the direct result",
-                rows == baseline,
-                f"{len(rows)} rows, {log.count(SEGMENT_LOG_LINE)} segments fetched",
-            )
+    baseline, _ = run_query(stack, BIG_QUERY)
+    for encoding in ("json", "json+zstd", "json+lz4"):
+        rows, log = run_query(stack, BIG_QUERY, Encoding=encoding)
+        results.check(
+            f"{encoding} returns the direct result",
+            rows == baseline,
+            f"{len(rows)} rows, {log.count(SEGMENT_LOG_LINE)} segments fetched",
+        )
 
 
 def a_coordinator_without_spooling_falls_back(stack, results):
     """Most coordinators have no spooling manager configured. The header is then
     ignored and the rows arrive inline, so setting `Encoding` must not fail the
     query."""
-    with tempfile.TemporaryDirectory() as d:
-        rows, log = run_query(
-            stack, os.path.join(d, "fallback.log"), BIG_QUERY, Encoding="json+zstd"
-        )
+    rows, log = run_query(stack, BIG_QUERY, Encoding="json+zstd")
 
     results.check(
         "rows arrive inline when the coordinator does not spool",
@@ -181,10 +188,10 @@ def cancel_during_a_spooled_fetch_reports_hy008(stack, results):
     conn = pyodbc.connect(stack.conn_str(Encoding="json+zstd"), autocommit=True)
     try:
         cur = conn.cursor()
-        cur.execute(
-            "SELECT c_customer_sk, c_customer_id, c_first_name, c_last_name "
-            "FROM tpcds.sf10.customer ORDER BY c_customer_sk"
-        )
+        # Every column, for the same reason as `BIG_QUERY`: a narrow projection
+        # never leaves the coordinator, so the cancel would not land on a segment
+        # download. sf10 keeps the query running past the two-second mark.
+        cur.execute("SELECT * FROM tpcds.sf10.customer ORDER BY c_customer_sk")
 
         def cancel_after_two_seconds():
             time.sleep(2)
@@ -218,6 +225,8 @@ def main():
     stack = Stack.load()
     results = Results("spooling")
     absent = "profile 'spooling' is not active (setup.sh --profile spooling)"
+    log_dir = tempfile.TemporaryDirectory()
+    start_logging(log_dir.name)
 
     if stack.has_profile("spooling"):
         scenario(
@@ -257,7 +266,9 @@ def main():
             lambda: a_coordinator_without_spooling_falls_back(stack, results),
         )
 
-    sys.exit(results.summary())
+    code = results.summary()
+    log_dir.cleanup()
+    sys.exit(code)
 
 
 if __name__ == "__main__":
