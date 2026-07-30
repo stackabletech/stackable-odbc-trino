@@ -34,24 +34,8 @@ import time
 # --- ODBC constants -------------------------------------------------------
 # Named rather than inlined, per the project's own rule about spec values.
 
-SQL_HANDLE_ENV = 1
-SQL_HANDLE_DBC = 2
-SQL_HANDLE_STMT = 3
-SQL_HANDLE_DESC = 4
-
-SQL_SUCCESS = 0
-SQL_SUCCESS_WITH_INFO = 1
-SQL_NO_DATA = 100
-SQL_ERROR = -1
-SQL_INVALID_HANDLE = -2
-
-SQL_NTS = -3
-SQL_NULL_HANDLE = None
-
-SQL_ATTR_ODBC_VERSION = 200
-SQL_OV_ODBC3 = 3
-
-SQL_DRIVER_NOPROMPT = 0
+# The handle types, return codes and DriverCompletion values live in odbc_abi,
+# which this suite shares with test_oauth.py; they are imported below.
 
 # SQLFreeStmt options
 SQL_CLOSE = 0
@@ -122,103 +106,28 @@ SQL_NUMERIC = 2
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from harness import Results, Stack  # noqa: E402
+from odbc_abi import (  # noqa: E402
+    SQL_ATTR_ODBC_VERSION,
+    SQL_DRIVER_NOPROMPT,
+    SQL_ERROR,
+    SQL_HANDLE_DBC,
+    SQL_HANDLE_DESC,
+    SQL_HANDLE_ENV,
+    SQL_HANDLE_STMT,
+    SQL_INVALID_HANDLE,
+    SQL_NO_DATA,
+    SQL_NTS,
+    SQL_NULL_HANDLE,
+    SQL_OV_ODBC3,
+    SQL_SUCCESS,
+    SQL_SUCCESS_WITH_INFO,
+    load,
+    read_wide_info,
+    sqlstate,
+    w,
+)
 
 R = Results("raw C ABI")
-
-
-def w(s):
-    """A SQLWCHAR buffer for `s`. SQLWCHAR is 16-bit on Linux."""
-    buf = ctypes.create_string_buffer(s.encode("utf-16-le") + b"\x00\x00")
-    return ctypes.cast(buf, ctypes.POINTER(ctypes.c_uint16)), buf
-
-
-def load(path):
-    lib = ctypes.CDLL(path)
-    P = ctypes.c_void_p
-    W = ctypes.POINTER(ctypes.c_uint16)
-    S, I, L = ctypes.c_int16, ctypes.c_int32, ctypes.c_int64
-
-    sig = {
-        "SQLAllocHandle": ([S, P, ctypes.POINTER(P)], S),
-        "SQLFreeHandle": ([S, P], S),
-        "SQLSetEnvAttr": ([P, I, P, I], S),
-        "SQLGetEnvAttr": ([P, I, P, I, ctypes.POINTER(I)], S),
-        "SQLDriverConnectW": ([P, P, W, S, W, S, ctypes.POINTER(S), ctypes.c_uint16], S),
-        "SQLDisconnect": ([P], S),
-        "SQLExecDirectW": ([P, W, I], S),
-        "SQLPrepareW": ([P, W, I], S),
-        "SQLExecute": ([P], S),
-        "SQLFetch": ([P], S),
-        "SQLGetData": ([P, ctypes.c_uint16, S, P, L, ctypes.POINTER(L)], S),
-        "SQLNumResultCols": ([P, ctypes.POINTER(S)], S),
-        "SQLRowCount": ([P, ctypes.POINTER(L)], S),
-        "SQLCloseCursor": ([P], S),
-        "SQLFreeStmt": ([P, ctypes.c_uint16], S),
-        "SQLSetStmtAttrW": ([P, I, P, I], S),
-        "SQLGetStmtAttrW": ([P, I, P, I, ctypes.POINTER(I)], S),
-        "SQLSetConnectAttrW": ([P, I, P, I], S),
-        "SQLGetConnectAttrW": ([P, I, P, I, ctypes.POINTER(I)], S),
-        "SQLGetDiagRecW": (
-            [S, P, S, W, ctypes.POINTER(I), W, S, ctypes.POINTER(S)],
-            S,
-        ),
-        "SQLGetInfoW": ([P, ctypes.c_uint16, P, S, ctypes.POINTER(S)], S),
-        "SQLCancel": ([P], S),
-        "SQLNumParams": ([P, ctypes.POINTER(S)], S),
-        "SQLBindParameter": (
-            [P, ctypes.c_uint16, S, S, S, ctypes.c_size_t, S, P, L, ctypes.POINTER(L)],
-            S,
-        ),
-        # SQLRETURN is a 16-bit SQLSMALLINT. Every entry point called here
-        # needs its restype declared, or ctypes reads the return register as a
-        # 32-bit int and SQL_ERROR (-1) arrives as 65535.
-        "SQLTablePrivilegesW": ([P, W, S, W, S, W, S], S),
-        "SQLColumnPrivilegesW": ([P, W, S, W, S, W, S, W, S], S),
-        "SQLProceduresW": ([P, W, S, W, S, W, S], S),
-        "SQLProcedureColumnsW": ([P, W, S, W, S, W, S, W, S], S),
-    }
-    for name, (args, res) in sig.items():
-        fn = getattr(lib, name)
-        fn.argtypes = args
-        fn.restype = res
-    return lib
-
-
-def sqlstate(lib, htype, handle):
-    """The SQLSTATE of diagnostic record 1, or '' when there is none."""
-    state = (ctypes.c_uint16 * 6)()
-    msg = (ctypes.c_uint16 * 1024)()
-    native = ctypes.c_int32(0)
-    textlen = ctypes.c_int16(0)
-    ret = lib.SQLGetDiagRecW(
-        htype,
-        handle,
-        1,
-        ctypes.cast(state, ctypes.POINTER(ctypes.c_uint16)),
-        ctypes.byref(native),
-        ctypes.cast(msg, ctypes.POINTER(ctypes.c_uint16)),
-        1024,
-        ctypes.byref(textlen),
-    )
-    if ret not in (SQL_SUCCESS, SQL_SUCCESS_WITH_INFO):
-        return ""
-    return "".join(chr(c) for c in state if c).strip()
-
-
-def read_wide_info(lib, dbc, info_type):
-    """A character-shaped SQLGetInfoW answer, as a str."""
-    buf = (ctypes.c_uint16 * 256)()
-    length = ctypes.c_int16(0)
-    ret = lib.SQLGetInfoW(
-        dbc,
-        info_type,
-        ctypes.cast(buf, ctypes.c_void_p),
-        512,
-        ctypes.byref(length),
-    )
-    if ret not in (SQL_SUCCESS, SQL_SUCCESS_WITH_INFO):
-        return None
-    return "".join(chr(c) for c in buf[: max(length.value, 0) // 2])
 
 
 RET_NAMES = {
