@@ -642,15 +642,36 @@ def main():
             except pyodbc.Error as e:
                 elapsed = time.monotonic() - start
                 state = e.args[0]
-                assert state == "HY008", (
-                    f"expected HY008, got {state}: {e}. HY010 after ~24s means "
-                    f"unixODBC serialised the cancelling thread -- check that "
-                    f"Threading = 2 is set in odbcinst.ini"
-                )
+                # What the cancel accomplished is decided by *when* the error
+                # arrives, so that is asserted first and for every SQLSTATE. An
+                # error only around the 24s mark means the query finished on its
+                # own and the cancelling thread was serialised behind it.
                 assert elapsed < 15, (
-                    f"HY008 after {elapsed:.1f}s: the query ran to completion "
-                    f"(~24s) before the cancel landed"
+                    f"{state} after {elapsed:.1f}s: the query ran to completion "
+                    f"(~24s) before the cancel landed -- check that Threading = 2 "
+                    f"is set in odbcinst.ini"
                 )
+                # unixODBC sometimes answers first, with its own Function
+                # sequence error: the cancelling thread's SQLCancel moves the
+                # Driver Manager's statement state while this thread is mid-loop,
+                # so this thread's next call is refused before it reaches the
+                # driver. HY010 is (DM)-marked, and measured on the direct and
+                # the spooled protocol alike, so it is not the driver's to
+                # report and not a defect. The cancel still interrupted the
+                # fetch, which is what this scenario claims; the driver's own
+                # HY008 path simply went unobserved, so that is noted.
+                if state == "HY010":
+                    R.note(
+                        "SQLCancel from another thread",
+                        f"unixODBC answered first with its own HY010 after "
+                        f"{elapsed:.1f}s, before the driver was reached: {e}",
+                    )
+                else:
+                    assert state == "HY008", (
+                        f"expected HY008, got {state} after {elapsed:.1f}s: {e}. "
+                        f"HY008 is the spec's code for a function interrupted by "
+                        f"SQLCancel from another thread"
+                    )
             else:
                 raise AssertionError(
                     "the fetch completed despite a cancel from another thread"
