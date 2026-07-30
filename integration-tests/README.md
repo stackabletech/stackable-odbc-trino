@@ -28,7 +28,7 @@ The unprofiled set is the core stack. Everything heavier is opt-in.
 | Profile | Services added | Buys |
 |---|---|---|
 | *(none)* | `postgres`, `trino` | The `tpcds` and `postgresql` catalogs, HTTPS, password and client-certificate auth |
-| `oauth` | `keycloak` | The OAuth 2.0 flow |
+| `oauth` | `keycloak` | The OAuth 2.0 flow, through `suites/test_oauth.py` |
 | `spooling` | `minio`, `minio-init` | Spooling |
 | `hive` | `minio`, `minio-init`, `hive-metastore` | A non-empty `SQLTablePrivileges` |
 
@@ -42,9 +42,10 @@ Changing profiles recreates the coordinator, because its configuration is
 assembled per profile rather than mounted from the checkout. A suite whose
 profile is not active is skipped and says which profile would enable it.
 
-`keycloak`, `minio`, `minio-init` and `hive-metastore` are placeholders at
-present: only `keycloak` carries its real image. The phases that configure them
-replace both image and command.
+`minio`, `minio-init` and `hive-metastore` are placeholders: configuring one
+means replacing both its image and its command. `keycloak` is configured, and its
+realm is imported from `stack/keycloak/realm-trino.json` by
+`scripts/gen-keycloak-config.sh`.
 
 ## Flags
 
@@ -82,8 +83,28 @@ export ODBCINI=$(pwd)/integration-tests/generated/odbc.ini
 isql -3 trino_https -v
 ```
 
-DSNs: `trino_https`, `trino_https_verify_false`, `trino_postgresql`.
+DSNs: `trino_https`, `trino_https_verify_false`, `trino_postgresql`,
+`trino_oauth`.
 
 ```bash
 docker compose -f integration-tests/stack/compose.yaml logs -f trino
 ```
+
+### An interactive OAuth 2.0 login
+
+Needs the `oauth` profile and the `trino_oauth` DSN:
+
+```bash
+./integration-tests/setup.sh --profile oauth
+isql -3 trino_oauth -v
+```
+
+`isql` connects through `SQLConnect`, which carries no *DriverCompletion*, so the
+driver is allowed to prompt and a real browser opens on Keycloak's login page. It
+will warn about the test CA, which is expected: `scripts/gen-certs.sh` generates
+that CA and no browser trusts it. The credentials are the `KEYCLOAK_USER` and
+`KEYCLOAK_PASSWORD` values in `generated/stack.env`.
+
+pyodbc cannot do this. It passes `SQL_DRIVER_NOPROMPT` unconditionally, so the
+driver refuses the connection; `suites/test_oauth.py` uses `ctypes` for that
+reason.

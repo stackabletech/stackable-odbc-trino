@@ -16,9 +16,12 @@ because `open` 5.4.0 runs `xdg-open` first and unconditionally and ignores
 `$BROWSER`. See that file for why it always exits 0.
 
 `OAUTH2_LOGINS` in `src/backend.rs` caches one login per
-`(secure, host, port, user)` for the life of the process, so a scenario that
-needs a login of its own picks a distinct `User`. That is deliberate rather than
-incidental: reusing a key is how the cache itself is asserted.
+`(secure, host, port, user)` for the life of the process. A scenario expecting a
+*failure* takes an entry of its own by naming a distinct `User`. One expecting a
+successful connect cannot: Trino refuses a `User` disagreeing with the token as
+an impersonation attempt, so those use the identity provider's own user or none
+at all and are served from the cache. Reusing a key is also how the cache itself
+is asserted.
 
 Usage:
     python3 integration-tests/suites/test_oauth.py [path/to/libstackable_odbc_trino.so]

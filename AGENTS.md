@@ -935,7 +935,7 @@ core stack.
 | Profile | Services | Buys |
 |---|---|---|
 | *(none)* | `postgres`, `trino` | tpcds and postgresql catalogs, HTTPS, PASSWORD and CERTIFICATE auth |
-| `oauth` | `keycloak` | The OAuth 2.0 flow |
+| `oauth` | `keycloak` | The OAuth 2.0 flow, through `suites/test_oauth.py` |
 | `spooling` | `minio`, `minio-init` | Spooling |
 | `hive` | `minio`, `minio-init`, `hive-metastore` | A non-empty `SQLTablePrivileges` |
 
@@ -1213,36 +1213,65 @@ ODBC-relevant column types).
 For interactive testing with `isql`, after `setup.sh`:
 
 ```bash
-export ODBCSYSINI=$(pwd)/test
+export ODBCSYSINI=$(pwd)/integration-tests/generated
 export ODBCINI=$(pwd)/integration-tests/generated/odbc.ini
 isql -3 trino_https -v
 
 # DSNs in integration-tests/generated/odbc.ini: trino_https,
-# trino_https_verify_false (TlsVerify=false), trino_postgresql
+# trino_https_verify_false (TlsVerify=false), trino_postgresql, and
+# trino_oauth (ExternalAuthentication, needs the oauth profile; opens a real
+# browser, which will warn about the test CA)
 
 docker compose -f integration-tests/stack/compose.yaml logs -f    # watch incoming requests
 ```
 
-### Blocked on an identity provider
+### The OAuth 2.0 flow, in `integration-tests/suites/test_oauth.py`
 
-The compose stack has no identity provider, so **nothing below is covered by
-any automated test** — not the unit suite, not `test_c_abi.py`, not the
-integration suite. The planned test rework brings Keycloak into the stack; each
-of these becomes a test then, and until it does the only evidence is a manual
-run against a coordinator configured with
-`http-server.authentication.type=OAUTH2`.
+The `oauth` profile brings up Keycloak, and `suites/test_oauth.py` drives the
+whole interactive flow against it. Do not replace any of it with a mock token
+endpoint: that would exercise the driver's own plumbing and none of the
+coordinator behaviour actually in doubt.
 
-Do not work around the absence — a mock token endpoint would exercise the
-driver's own plumbing and none of the coordinator behaviour that is actually in
-doubt.
+| What | Scenario |
+|------|----------|
+| The end-to-end flow: `401`, login URL, browser, poll, bearer token | `one_login_serves_many_connections` |
+| That three connections on one identity open exactly **one** browser | same scenario, counted from the browser's own launch record |
+| That omitting `X-Trino-User` works, and Trino resolves the user from the token | `the_token_supplies_the_user` |
+| That a matching `User` is honoured, and a *disagreeing* one is refused | `a_matching_user_is_honoured`, `a_disagreeing_user_is_refused` |
+| `28000` for a login the identity provider refuses, and for one nobody completes | `a_refused_login_reports_28000`, `an_abandoned_login_times_out` |
+| `ExternalAuthenticationTimeout` firing, measured against the elapsed time | `an_abandoned_login_times_out` |
+| Both sides of the *DriverCompletion* gate, including through unixODBC | `noprompt_is_refused`, `the_driver_manager_forwards_the_completion` |
 
-| What | Why it needs a real IdP |
-|------|------------------------|
-| The end-to-end `ExternalAuthentication` flow | `401` → login URL → browser → poll → bearer token. Only the seams are unit-tested: `resolve_auth`, and the `Prompter` → `RedirectHandler` adapter against a recording prompter |
-| Which SQLSTATE a *failed* login reports | Which `trino_rust_client::Error` a rejected or abandoned flow produces, and whether `map_trino_error` lands it on `28000` rather than degrading to `HY000`. Unknown, and it needs an IdP that can refuse |
-| That `OAUTH2_LOGINS` opens exactly one browser | The cache is unit-testable by key equality; that ten pooled connections produce one login is not |
-| `ExternalAuthenticationTimeout` firing | Needs a login nobody completes |
-| That omitting `X-Trino-User` really works | The header's absence is unit-tested in `trino-rust-client`; that Trino then resolves the user from the token, and that a *disagreeing* `User` is refused, needs a coordinator with an IdP behind it |
+**A `User` disagreeing with the token is refused, not ignored.** Trino's default
+system access control denies `checkCanImpersonateUser`, so the connection fails
+with `28000` and `Access Denied: User admin cannot impersonate user impostor`.
+That is the measured behaviour and it is why `User` is optional under
+`ExternalAuthentication` and the header is omitted entirely: an operator obliged
+to invent one would have the connection refused for their own account.
+
+It also constrains the suite. Every scenario expecting a *successful* connect has
+to use the identity provider's own user or none at all, so a fresh
+`OAUTH2_LOGINS` key cannot be obtained by naming a different `User`. Only
+scenarios expecting failure can, because they never reach the impersonation
+check.
+
+**The suite cannot use pyodbc.** pyodbc calls `SQLDriverConnectW` with
+`SQL_DRIVER_NOPROMPT` unconditionally, including for a `DSN=` string, and core
+reads that as forbidding a prompt, so every `ExternalAuthentication` connection
+made through pyodbc is refused. The suite loads the driver with `ctypes` and
+passes `SQL_DRIVER_COMPLETE` itself. `isql` is unaffected, because `SQLConnect`
+carries no *DriverCompletion* and core reads the absent argument as permitting a
+prompt; the `trino_oauth` DSN exists for exactly that manual path.
+
+**The browser is a `PATH`-shadowed `xdg-open`, not `$BROWSER`.** `open` 5.4.0
+ignores `$BROWSER` and runs `xdg-open` first and unconditionally, and `xdg-open`
+consults `$BROWSER` only in its `generic` desktop-environment branch: on a
+machine with a session it dispatches to `gio`, which opens a real browser.
+`suites/oauth_browser.py` therefore always **exits 0**, because a non-zero exit
+sends `open::that` on to `gio open`, and it reports its outcome through a JSONL
+record instead. That record is also how the suite counts browser launches, and
+what turns a broken login into a diagnosis rather than a suite that waits out the
+login budget with nothing to show.
 
 ### Windows VM tests
 

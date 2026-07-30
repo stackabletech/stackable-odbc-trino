@@ -48,6 +48,22 @@ Password = $TRINO_PASSWORD
 Protocol = https
 Catalog = postgresql
 Certificate = $SERVER_CERT
+
+[trino_oauth]
+# Needs the oauth profile. isql connects by DSN through SQLConnect, which carries
+# no DriverCompletion, and core reads the absent argument as permitting a prompt,
+# so this is the one interactive path a person can drive by hand. A real browser
+# will warn about the test CA.
+#
+# User is deliberately absent: the identity provider supplies it, and a User
+# disagreeing with the token is refused as an impersonation attempt.
+Driver = stackable_odbc_trino
+Host = $TRINO_HOST
+Port = $TRINO_HTTPS_PORT
+Protocol = https
+Catalog = $TRINO_CATALOG
+Certificate = $SERVER_CERT
+ExternalAuthentication = true
 EOF
 
 # One description of the running stack. Bash sources it; harness.Stack parses
