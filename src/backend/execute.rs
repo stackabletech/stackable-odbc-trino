@@ -23,28 +23,13 @@ use crate::type_conversion::{
     type_name_precision, type_name_scale,
 };
 
-/// Convert rows from a Trino response page into `Vec<Vec<ColumnValue>>`.
+/// Convert decoded Trino rows into `Vec<Vec<ColumnValue>>`.
 ///
-/// Takes ownership of the page data to avoid cloning every `Row`. The caller
-/// must extract `next_uri`, `stats`, `error`, etc. from the page before
-/// passing `page.data` here.
-///
-/// A page the coordinator spooled cannot be decoded from the page alone — its
-/// segments may live in object storage — so `into_vec` reports
-/// `Error::Protocol` for one. This driver never advertises a spooling encoding,
-/// so the coordinator has no reason to send one; the error is returned rather
-/// than swallowed because an empty batch would reach the application as an
-/// empty result set.
-fn convert_rows(
-    data: Option<trino_rust_client::models::QueryResultData<Row>>,
-    types: &[(String, TrinoTy)],
-) -> Result<Vec<Vec<ColumnValue>>, trino_rust_client::error::Error> {
-    let rows = match data {
-        Some(d) => d.into_vec()?,
-        None => return Ok(Vec::new()),
-    };
-    Ok(rows
-        .into_iter()
+/// Takes ownership to avoid cloning every `Row`. Transport decoding happens
+/// first, in [`decode_page_rows`], which is what resolves a spooled page's
+/// segments; this is the value-level step and cannot fail.
+fn convert_rows(rows: Vec<Row>, types: &[(String, TrinoTy)]) -> Vec<Vec<ColumnValue>> {
+    rows.into_iter()
         .map(|row| {
             row.into_json()
                 .into_iter()
@@ -52,7 +37,30 @@ fn convert_rows(
                 .map(|(val, (_, ty))| json_to_column_value(val, ty))
                 .collect()
         })
-        .collect())
+        .collect()
+}
+
+/// Decode one Trino response page into rows.
+///
+/// A page the coordinator spooled carries segment references rather than
+/// values, and the segments may live in object storage, so decoding needs the
+/// HTTP client and the query's column metadata. `Client::decode_page` owns both
+/// cases: a direct page's rows are returned as they arrived, a spooled page's
+/// segments are fetched, decoded against `raw_columns` and acknowledged.
+///
+/// `raw_columns` is passed for every page because Trino sends the metadata on
+/// one page only, while any later page may be spooled.
+fn decode_page_rows(
+    runtime: &tokio::runtime::Runtime,
+    client: &trino_rust_client::client::Client,
+    data: Option<trino_rust_client::models::QueryResultData<Row>>,
+    raw_columns: &[trino_rust_client::models::Column],
+) -> Result<Vec<Row>, trino_rust_client::error::Error> {
+    let Some(data) = data else {
+        return Ok(Vec::new());
+    };
+    let columns = (!raw_columns.is_empty()).then_some(raw_columns);
+    runtime.block_on(client.decode_page(data, columns))
 }
 
 /// Remove the statement terminator an application left on the end.
@@ -160,6 +168,10 @@ pub(super) fn exec_direct(
     // path (`SQLColumns`) uses. `TrinoTy` remains the fallback for a type
     // string the parser does not recognise (e.g. compound types).
     let raw_columns = page.columns.take().unwrap_or_default();
+    // Cloned because the loop below consumes each `Column` (`TrinoTy::from_column`
+    // takes it by value) and a spooled page fetched later still has to be decoded
+    // against the metadata.
+    let kept_columns = raw_columns.clone();
 
     let mut trino_types: Vec<(String, TrinoTy)> = Vec::with_capacity(raw_columns.len());
     let mut columns: Vec<ColumnDescriptor> = Vec::with_capacity(raw_columns.len());
@@ -224,7 +236,9 @@ pub(super) fn exec_direct(
     let convert_start = Instant::now();
     let batch = {
         let _span = tracing::info_span!("trino.convert_batch", page = page_count).entered();
-        convert_rows(page.data, &trino_types).map_err(|e| map_trino_error_on(&conn.liveness, e))?
+        let rows = decode_page_rows(&conn.runtime, &conn.client, page.data, &kept_columns)
+            .map_err(|e| map_trino_error_on(&conn.liveness, e))?;
+        convert_rows(rows, &trino_types)
     };
     let total_convert_time = convert_start.elapsed();
     let total_rows_fetched = batch.len() as u64;
@@ -240,6 +254,7 @@ pub(super) fn exec_direct(
         pending_sql: None,
         columns,
         trino_types,
+        raw_columns: kept_columns,
         batch,
         batch_cursor: 0,
         fetch_failed: false,
@@ -272,6 +287,7 @@ pub(super) fn prepare(
         pending_sql: Some(sql.to_string()),
         columns: Vec::new(),
         trino_types: Vec::new(),
+        raw_columns: Vec::new(),
         batch: Vec::new(),
         batch_cursor: 0,
         fetch_failed: false,
@@ -550,13 +566,13 @@ impl StatementBackend for TrinoStatement {
 
             // Phase: row conversion
             let convert_start = Instant::now();
-            let converted = {
+            let decoded = {
                 let _span =
                     tracing::info_span!("trino.convert_batch", page = self.page_count).entered();
-                convert_rows(page.data, &self.trino_types)
+                decode_page_rows(runtime, client, page.data, &self.raw_columns)
             };
-            self.batch = match converted {
-                Ok(batch) => batch,
+            self.batch = match decoded {
+                Ok(rows) => convert_rows(rows, &self.trino_types),
                 Err(e) => {
                     let mapped = self.map_client_error(e);
                     return Err(self.end_page_fetch(mapped));

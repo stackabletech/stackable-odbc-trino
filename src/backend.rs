@@ -726,6 +726,12 @@ pub struct TrinoStatement {
     pub(crate) columns: Vec<ColumnDescriptor>,
     /// Column types from Trino (needed for converting subsequent pages).
     trino_types: Vec<(String, trino_rust_client::TrinoTy)>,
+    /// Trino's own column metadata for the result set, kept because a spooled
+    /// segment is decoded against it and Trino sends it on one page only.
+    ///
+    /// Empty for a statement that reaches no network: the prepared-but-unexecuted
+    /// handle and the in-memory catalog results.
+    pub(crate) raw_columns: Vec<trino_rust_client::models::Column>,
     /// Current in-memory batch of converted rows.
     pub(crate) batch: Vec<Vec<ColumnValue>>,
     /// Position within the current batch (0 = before first row).
