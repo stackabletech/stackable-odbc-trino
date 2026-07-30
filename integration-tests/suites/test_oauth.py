@@ -37,6 +37,7 @@ from harness import Results, Stack  # noqa: E402
 from odbc_abi import (  # noqa: E402
     SQL_ATTR_ODBC_VERSION,
     SQL_DRIVER_COMPLETE,
+    SQL_DRIVER_NOPROMPT,
     SQL_ERROR,
     SQL_HANDLE_DBC,
     SQL_HANDLE_ENV,
@@ -434,6 +435,92 @@ def scenario_a_refused_login_reports_28000(lib, stack, shim):
         disconnect(lib, env, dbc)
 
 
+def scenario_the_driver_manager_forwards_the_completion(stack, shim):
+    """unixODBC passes a non-NOPROMPT *DriverCompletion* through to the driver.
+
+    Every other scenario here loads the driver directly, so nothing else would
+    notice a Driver Manager that flattened the argument. This one goes through
+    `libodbc.so.2`, which is the path `isql`, Power BI and Excel take. It takes
+    no driver path: the connection string carries `Driver`, and the Driver
+    Manager is what loads it.
+
+    **The connect succeeding is the whole proof, and no browser launch is
+    required for it.** `resolve_auth` refuses `ExternalAuthentication` on the
+    prompting flag alone, before `oauth2_auth` is ever consulted, so a connection
+    the Driver Manager had marked `SQL_DRIVER_NOPROMPT` would fail here even with
+    a token already cached. Which is just as well: unixODBC loads the same `.so`
+    this process already has open, so `OAUTH2_LOGINS` is shared with every
+    scenario above and a login this identity has performed is served from cache.
+    Naming a fresh `User` to force a login is not the way out, because a `User`
+    disagreeing with the token is refused as an impersonation attempt.
+    """
+    try:
+        dm = load("libodbc.so.2")
+    except OSError as e:
+        R.skip(
+            "unixODBC forwards the DriverCompletion", f"libodbc.so.2 not loadable: {e}"
+        )
+        return
+
+    shim.reset("login")
+    ret, env, dbc = odbc_connect(dm, oauth_conn(stack))
+    try:
+        if not check_connected(
+            dm, dbc, ret, "unixODBC forwards a non-NOPROMPT DriverCompletion"
+        ):
+            return
+        user = scalar(dm, dbc, "SELECT current_user")
+        R.check(
+            "the Driver Manager path resolves the same session user",
+            user == stack.get("TRINO_USER"),
+            f"current_user is {user!r}",
+        )
+    finally:
+        disconnect(dm, env, dbc)
+
+
+def scenario_noprompt_is_refused(lib, stack, shim):
+    """`SQL_DRIVER_NOPROMPT` forbids the prompt an interactive login needs, so
+    the connection is refused before any network I/O.
+
+    Needs no identity provider, and belongs beside its opposite: the two
+    together are what say the *DriverCompletion* gate is the thing deciding.
+    This is also the reason the suite cannot use pyodbc, which passes this value
+    unconditionally.
+    """
+    shim.reset("login")
+    ret, env, dbc = odbc_connect(
+        lib, oauth_conn(stack, User="noprompt"), completion=SQL_DRIVER_NOPROMPT
+    )
+    try:
+        state = sqlstate(lib, SQL_HANDLE_DBC, dbc)
+        message = diag_message(lib, SQL_HANDLE_DBC, dbc)
+        refused = ret == SQL_ERROR
+        R.check(
+            "ExternalAuthentication under SQL_DRIVER_NOPROMPT is refused",
+            refused,
+            "" if refused else f"returned {ret}",
+        )
+        R.check(
+            "the refusal reports 28000",
+            state == INVALID_AUTH_SPEC,
+            f"state is {state!r}: {message}",
+        )
+        R.check(
+            "the diagnostic names SQL_DRIVER_NOPROMPT",
+            "NOPROMPT" in message,
+            f"message is {message!r}",
+        )
+        no_browser = shim.launches() == []
+        R.check(
+            "no browser was launched",
+            no_browser,
+            "" if no_browser else f"records: {shim.launches()}",
+        )
+    finally:
+        disconnect(lib, env, dbc)
+
+
 def main():
     stack = Stack.load()
     driver = sys.argv[1] if len(sys.argv) > 1 else stack.get("DRIVER_PATH")
@@ -460,6 +547,10 @@ def main():
     print("\n--- a login that does not succeed ---")
     scenario_an_abandoned_login_times_out(lib, stack, shim)
     scenario_a_refused_login_reports_28000(lib, stack, shim)
+
+    print("\n--- who is allowed to prompt ---")
+    scenario_noprompt_is_refused(lib, stack, shim)
+    scenario_the_driver_manager_forwards_the_completion(stack, shim)
 
     return R.summary()
 
