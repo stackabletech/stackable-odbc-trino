@@ -1214,6 +1214,13 @@ impl Backend for TrinoBackend {
         if let Some(attempts) = p.max_attempts() {
             builder = builder.max_attempt(attempts);
         }
+        if let Some(encoding) = p.spooling_encoding() {
+            // Spooled pages are decoded by `Client::decode_page` in
+            // `execute.rs`; the catalog paths go through `get_all`, which
+            // resolves them itself.
+            tracing::debug!(encoding = %encoding, "advertising Trino's spooled protocol");
+            builder = builder.spooling_encoding(encoding);
+        }
 
         if p.secure() {
             match p.tls_verification() {

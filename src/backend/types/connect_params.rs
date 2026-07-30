@@ -9,6 +9,7 @@ use stackable_odbc_core::types::{ConnectParams, Redacted};
 use trino_rust_client::TlsVerification;
 use trino_rust_client::Tz;
 use trino_rust_client::selected_role::{RoleType, SelectedRole};
+use trino_rust_client::spooling::SpoolingEncoding;
 
 use super::super::TrinoError;
 
@@ -130,6 +131,17 @@ pub(crate) const PARAM_LOCALE: &str = "locale";
 pub(crate) const PARAM_DISABLE_COMPRESSION: &str = "disablecompression";
 /// How many times a request is attempted before it fails.
 pub(crate) const PARAM_MAX_ATTEMPTS: &str = "maxattempts";
+/// Advertise Trino's spooled protocol with this query-data encoding: `"json"`,
+/// `"json+zstd"` or `"json+lz4"`. JDBC spells it `encoding`.
+///
+/// Unset sends no `X-Trino-Query-Data-Encoding` header, so the coordinator
+/// returns every row inline. Off by default because
+/// `protocol.spooling.retrieval-mode=storage` has the *client* fetch segments
+/// straight from object storage, and a workstation that cannot reach the bucket
+/// would fail queries that succeed without the key. A coordinator that does not
+/// support the requested encoding ignores the header and answers inline, so
+/// setting it can never fail a connection.
+pub(crate) const PARAM_ENCODING: &str = "encoding";
 /// Authenticate with Trino's interactive OAuth 2.0 external-authentication
 /// flow: `"true"` or `"false"` (default). JDBC's `externalAuthentication`.
 ///
@@ -414,6 +426,7 @@ pub(crate) struct TrinoConnectParams {
     external_auth_timeout: Duration,
     compression_disabled: bool,
     max_attempts: Option<usize>,
+    spooling_encoding: Option<SpoolingEncoding>,
 }
 
 impl TrinoConnectParams {
@@ -561,6 +574,12 @@ impl TrinoConnectParams {
         self.max_attempts
     }
 
+    /// `None` sends no encoding header, which is the coordinator's inline
+    /// protocol.
+    pub fn spooling_encoding(&self) -> Option<SpoolingEncoding> {
+        self.spooling_encoding
+    }
+
     pub fn schema(&self) -> Option<&str> {
         self.schema.as_deref()
     }
@@ -697,6 +716,23 @@ impl TryFrom<&ConnectParams> for TrinoConnectParams {
             Some(v) => parse_bool(PARAM_DISABLE_COMPRESSION, v)?,
         };
 
+        // Lower-cased before matching, like every other value this parser
+        // accepts: core matches the key case-insensitively, and a DSN written
+        // `Encoding=JSON+ZSTD` means the same thing.
+        let spooling_encoding = match params.get(PARAM_ENCODING) {
+            None => None,
+            Some(raw) => Some(
+                SpoolingEncoding::try_from(raw.to_ascii_lowercase().as_str()).map_err(|_| {
+                    TrinoError::General {
+                        message: format!(
+                            "invalid value for {PARAM_ENCODING}: {raw:?}, expected \
+                             \"json\", \"json+zstd\" or \"json+lz4\""
+                        ),
+                    }
+                })?,
+            ),
+        };
+
         // Rejected rather than defaulted, like `MaxAttempts` below: a login
         // budget quietly reverting to 300s is invisible until someone is sitting
         // in front of a browser wondering why the connection gave up early --
@@ -815,6 +851,7 @@ impl TryFrom<&ConnectParams> for TrinoConnectParams {
             external_auth_timeout: Duration::from_secs(external_auth_timeout),
             compression_disabled,
             max_attempts,
+            spooling_encoding,
         })
     }
 }
@@ -1247,6 +1284,49 @@ mod tests {
             parse_err("Host=localhost;Port=8080;User=admin;DisableCompression=yes")
                 .to_string()
                 .contains("disablecompression")
+        );
+    }
+
+    #[test]
+    fn encoding_is_unset_by_default() {
+        // Unset means no `X-Trino-Query-Data-Encoding` header, so the
+        // coordinator returns rows inline. Spooling is opt-in because
+        // `retrieval-mode=storage` has the client fetch segments from object
+        // storage directly, which a workstation may not be able to reach.
+        assert!(
+            parse("Host=localhost;Port=8080;User=admin")
+                .spooling_encoding()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn encoding_accepts_the_three_json_forms() {
+        for (value, expected) in [
+            ("json", SpoolingEncoding::Json),
+            ("json+zstd", SpoolingEncoding::JsonZstd),
+            ("JSON+LZ4", SpoolingEncoding::JsonLz4),
+        ] {
+            let params = parse(&format!(
+                "Host=localhost;Port=8080;User=admin;Encoding={value}"
+            ));
+            assert_eq!(
+                params.spooling_encoding(),
+                Some(expected),
+                "Encoding={value} must parse"
+            );
+        }
+    }
+
+    #[test]
+    fn encoding_rejects_an_unknown_value() {
+        // Failing the connection rather than dropping the key: a silently
+        // ignored encoding leaves an application believing it asked for
+        // spooling, with nothing to show that it did not get it.
+        assert!(
+            parse_err("Host=localhost;Port=8080;User=admin;Encoding=json+snappy")
+                .to_string()
+                .contains("encoding")
         );
     }
 
