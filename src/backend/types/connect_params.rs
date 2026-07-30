@@ -50,6 +50,19 @@ pub(crate) const PARAM_PATH: &str = "path";
 pub(crate) const PARAM_CLIENT_INFO: &str = "clientinfo";
 /// Correlation token Trino records against the query.
 pub(crate) const PARAM_TRACE_TOKEN: &str = "tracetoken";
+/// HTTP or HTTPS proxy every request is routed through, as a URL.
+///
+/// `socks5://` is rejected: routing through SOCKS needs a `reqwest` feature
+/// `trino-rust-client` does not enable, and the client says so when the
+/// connection is built rather than failing later at connect time.
+///
+/// Credentials belong in [`PARAM_PROXY_USER`] and [`PARAM_PROXY_PASSWORD`], not
+/// in the URL's userinfo — see [`proxy_url`].
+pub(crate) const PARAM_PROXY: &str = "proxy";
+/// Username for a proxy that demands HTTP Basic authentication.
+pub(crate) const PARAM_PROXY_USER: &str = "proxyuser";
+/// Password for [`PARAM_PROXY_USER`]. **Secret.**
+pub(crate) const PARAM_PROXY_PASSWORD: &str = "proxypassword";
 /// Extra HTTP headers on every request, in the same `name:value;name2:value2`
 /// form as the other key-value keys.
 ///
@@ -189,6 +202,40 @@ fn parse_key_value_pairs(key: &str, raw: &str) -> Result<HashMap<String, String>
     Ok(map)
 }
 
+/// Validate a proxy URL, rejecting credentials written into its userinfo.
+///
+/// `http://user:pass@proxy:3128` is a natural thing to write and would put a
+/// password somewhere the driver cannot redact: the whole value is one
+/// connection-string key, and `SQLDriverConnect` echoes back every key it was
+/// not told is sensitive. Splitting the credentials into their own keys is what
+/// lets [`PARAM_PROXY_PASSWORD`] be declared and the URL stay readable in a
+/// diagnostic — so userinfo is an error naming the two keys, rather than a
+/// silent leak.
+///
+/// The scheme is left to `Proxy::all`, which rejects anything but http and
+/// https and phrases it better than a second check here would.
+fn proxy_url(raw: &str) -> Result<String, TrinoError> {
+    // Only the authority can carry userinfo, and it ends at the first `/`,
+    // `?` or `#` after the scheme -- so a path or query containing `@` is not
+    // mistaken for one.
+    let after_scheme = raw.split_once("://").map_or(raw, |(_, rest)| rest);
+    let authority = after_scheme
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or(after_scheme);
+    if authority.contains('@') {
+        return Err(TrinoError::General {
+            message: format!(
+                "invalid value for {PARAM_PROXY}: credentials in the URL are not \
+                 accepted, because the whole value is echoed back by \
+                 SQLDriverConnect. Use {PARAM_PROXY_USER} and \
+                 {PARAM_PROXY_PASSWORD} instead"
+            ),
+        });
+    }
+    Ok(raw.to_string())
+}
+
 /// A connection-string role value as `X-Trino-Role` spells it.
 ///
 /// `ALL` and `NONE` are Trino's two keywords and are matched case-insensitively,
@@ -256,6 +303,9 @@ pub(crate) struct TrinoConnectParams {
     /// is a plausible place for an API key, and `Debug` reaches the log.
     extra_headers: Redacted<HashMap<String, String>>,
     client_capabilities: HashSet<String>,
+    proxy: Option<String>,
+    proxy_user: Option<String>,
+    proxy_password: Redacted<Option<String>>,
     compression_disabled: bool,
     max_attempts: Option<usize>,
 }
@@ -357,6 +407,20 @@ impl TrinoConnectParams {
         &self.extra_headers.0
     }
 
+    /// `None` routes directly, which is `reqwest`'s own default — this driver
+    /// does not read the `HTTP_PROXY` environment.
+    pub fn proxy(&self) -> Option<&str> {
+        self.proxy.as_deref()
+    }
+
+    /// The proxy's Basic credentials, both or neither.
+    pub fn proxy_credentials(&self) -> Option<(&str, &str)> {
+        match (self.proxy_user.as_deref(), self.proxy_password.0.as_deref()) {
+            (Some(user), Some(password)) => Some((user, password)),
+            _ => None,
+        }
+    }
+
     /// Capabilities on top of the two the client always sends.
     pub fn client_capabilities(&self) -> &HashSet<String> {
         &self.client_capabilities
@@ -437,6 +501,28 @@ impl TryFrom<&ConnectParams> for TrinoConnectParams {
         let session_properties = pairs(PARAM_SESSION_PROPERTIES)?;
         let extra_credentials = pairs(PARAM_EXTRA_CREDENTIALS)?;
         let extra_headers = pairs(PARAM_EXTRA_HEADERS)?;
+
+        let proxy = match params.get(PARAM_PROXY) {
+            None => None,
+            Some(raw) => Some(proxy_url(raw)?),
+        };
+        let proxy_user = params.get(PARAM_PROXY_USER).map(str::to_string);
+        let proxy_password = params.get(PARAM_PROXY_PASSWORD).map(str::to_string);
+        // Half a credential authenticates to nothing. Rejected rather than
+        // dropped, because the connection would then fail at the proxy with a
+        // 407 that names neither key.
+        if proxy_user.is_some() != proxy_password.is_some() {
+            return Err(TrinoError::General {
+                message: format!(
+                    "{PARAM_PROXY_USER} and {PARAM_PROXY_PASSWORD} must be set together"
+                ),
+            });
+        }
+        if proxy.is_none() && proxy_user.is_some() {
+            return Err(TrinoError::General {
+                message: format!("{PARAM_PROXY_USER} was set without {PARAM_PROXY}"),
+            });
+        }
         let resource_estimates = pairs(PARAM_RESOURCE_ESTIMATES)?;
         let roles = pairs(PARAM_ROLES)?
             .into_iter()
@@ -539,6 +625,9 @@ impl TryFrom<&ConnectParams> for TrinoConnectParams {
             roles,
             time_zone,
             extra_headers: Redacted(extra_headers),
+            proxy,
+            proxy_user,
+            proxy_password: Redacted(proxy_password),
             // Split like `client_tags`, and for the same reasons: trimmed so a
             // written-out list does not send " FOO", and empty elements dropped
             // rather than sent as an empty capability.
@@ -768,6 +857,68 @@ mod tests {
         assert_eq!(p.roles()["iceberg"].to_string(), "ALL");
         // Matched case-insensitively, like every other connection-string value.
         assert_eq!(p.roles()["pg"].to_string(), "NONE");
+    }
+
+    #[test]
+    fn a_proxy_takes_a_url_and_optional_basic_credentials() {
+        let p = parse(
+            "Host=localhost;Port=8080;User=admin;\
+             Proxy=http://proxy.internal:3128;ProxyUser=bob;ProxyPassword=s3cret",
+        );
+        assert_eq!(p.proxy(), Some("http://proxy.internal:3128"));
+        assert_eq!(p.proxy_credentials(), Some(("bob", "s3cret")));
+    }
+
+    #[test]
+    fn a_proxy_without_credentials_has_none() {
+        let p = parse("Host=localhost;Port=8080;User=admin;Proxy=http://proxy.internal:3128");
+        assert_eq!(p.proxy_credentials(), None);
+        assert_eq!(parse("Host=localhost;Port=8080;User=admin").proxy(), None);
+    }
+
+    /// The whole `Proxy` value is echoed back by `SQLDriverConnect`, so a
+    /// password written into the URL is one the driver cannot redact.
+    #[test]
+    fn credentials_in_the_proxy_url_are_rejected() {
+        let err = parse_err(
+            "Host=localhost;Port=8080;User=admin;Proxy=http://bob:s3cret@proxy.internal:3128",
+        );
+        assert!(
+            err.to_string().contains(PARAM_PROXY_PASSWORD),
+            "the message must name the key to use instead: {err}"
+        );
+    }
+
+    /// An `@` in a path is not userinfo, and rejecting it would refuse a legal
+    /// URL.
+    #[test]
+    fn an_at_sign_outside_the_authority_is_not_credentials() {
+        let p = parse("Host=localhost;Port=8080;User=admin;Proxy=http://proxy.internal/a@b");
+        assert_eq!(p.proxy(), Some("http://proxy.internal/a@b"));
+    }
+
+    #[test]
+    fn half_a_proxy_credential_is_rejected() {
+        let err = parse_err(
+            "Host=localhost;Port=8080;User=admin;Proxy=http://proxy.internal:3128;ProxyUser=bob",
+        );
+        assert!(
+            err.to_string().contains("together"),
+            "a username with no password authenticates to nothing: {err}"
+        );
+    }
+
+    #[test]
+    fn the_proxy_password_is_redacted_in_debug() {
+        let p = parse(
+            "Host=localhost;Port=8080;User=admin;\
+             Proxy=http://proxy.internal:3128;ProxyUser=bob;ProxyPassword=hunter2",
+        );
+        let rendered = format!("{p:?}");
+        assert!(
+            !rendered.contains("hunter2"),
+            "the proxy password leaked into Debug output: {rendered}"
+        );
     }
 
     #[test]

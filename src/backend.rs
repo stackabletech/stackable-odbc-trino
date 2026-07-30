@@ -26,7 +26,9 @@ use stackable_odbc_core::{
         TableRow, TypeInfoRow, format_odbc_version, parse_dotted_version,
     },
 };
-use trino_rust_client::{Client, ClientBuilder, TlsVerification, Trino, auth::Auth, ssl::Ssl};
+use trino_rust_client::{
+    Client, ClientBuilder, TlsVerification, Trino, auth::Auth, proxy::Proxy, ssl::Ssl,
+};
 
 mod describe_param;
 mod execute;
@@ -1023,6 +1025,20 @@ impl Backend for TrinoBackend {
         if !p.client_capabilities().is_empty() {
             builder = builder.client_capabilities(p.client_capabilities().clone());
         }
+        if let Some(url) = p.proxy() {
+            // `Proxy::all` is where a `socks5://` URL is refused, and it
+            // phrases that better than a check here would.
+            let mut proxy = Proxy::all(url).map_err(|e| TrinoError::General {
+                message: format!(
+                    "invalid value for {}: {e}",
+                    types::connect_params::PARAM_PROXY
+                ),
+            })?;
+            if let Some((user, password)) = p.proxy_credentials() {
+                proxy = proxy.basic_auth(user, password);
+            }
+            builder = builder.proxy(proxy);
+        }
         if p.compression_disabled() {
             builder = builder.compression_disabled(true);
         }
@@ -1279,9 +1295,11 @@ impl Backend for TrinoBackend {
     /// `Password` is core's own spec-defined keyword, redacted there by name.
     fn sensitive_connect_keywords() -> Cow<'static, [Cow<'static, str>]> {
         use types::connect_params::{
-            PARAM_ACCESS_TOKEN, PARAM_EXTRA_CREDENTIALS, PARAM_EXTRA_HEADERS, PARAM_TOKEN,
+            PARAM_ACCESS_TOKEN, PARAM_EXTRA_CREDENTIALS, PARAM_EXTRA_HEADERS, PARAM_PROXY_PASSWORD,
+            PARAM_TOKEN,
         };
         Cow::Borrowed(&[
+            Cow::Borrowed(PARAM_PROXY_PASSWORD),
             Cow::Borrowed(PARAM_ACCESS_TOKEN),
             Cow::Borrowed(PARAM_TOKEN),
             // Whole values are credentials the connection forwards to a

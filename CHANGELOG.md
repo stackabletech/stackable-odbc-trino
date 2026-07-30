@@ -133,6 +133,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   into another.
 - **`Locale` connection-string key**, sent as `X-Trino-Language` for
   locale-dependent formatting.
+- **`Proxy`, `ProxyUser` and `ProxyPassword` connection-string keys**, routing
+  every request through an HTTP or HTTPS proxy, with optional Basic
+  credentials. A `socks5://` URL is refused when the connection is built rather
+  than failing later at connect time, because routing through SOCKS needs a
+  `reqwest` feature `trino-rust-client` does not enable.
+
+  Credentials written into the URL's userinfo (`http://bob:s3cret@proxy:3128`)
+  are rejected, naming the two keys to use instead. The whole `Proxy` value is
+  echoed back by `SQLDriverConnect`, so a password there is one the driver
+  cannot redact — `ProxyPassword` is its own key precisely so it can be
+  declared in `Backend::sensitive_connect_keywords`. An `@` outside the
+  authority, in a path or query, is left alone. Setting one of the two
+  credential keys without the other fails the connection instead of
+  authenticating to nothing and meeting a `407` that names neither.
 - **`ExtraHeaders` connection-string key**, arbitrary HTTP headers on every
   request in the same `name:value;name2:value2` form as the other key-value
   keys, for gateways and reverse proxies that require one. A name the client
