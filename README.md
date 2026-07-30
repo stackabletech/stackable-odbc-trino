@@ -62,6 +62,7 @@ Keys are case-insensitive. The authoritative list is
 | `Certificate` | No | Path to a PEM CA certificate for server verification |
 | `AccessToken` | No | JWT bearer token. Alias: `Token` |
 | `QueryTimeout` | No | Per-request HTTP timeout in seconds (default 30). Alias: `LoginTimeout` |
+| `Encoding` | No | Trino's spooled query-data encoding: `json`, `json+zstd` or `json+lz4`. Unset returns rows inline |
 
 ```text
 Driver=stackable_odbc_trino;Host=trino.example.com;Port=8443;User=admin;Password=secret;Protocol=https;Catalog=hive;Schema=default

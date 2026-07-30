@@ -276,6 +276,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Trino also cannot cast a `varchar` to either interval type, so no CAST target
   exists to name for those.
 
+- **`Encoding` connection-string key, selecting Trino's spooled query-data
+  encoding** (`json`, `json+zstd` or `json+lz4`), matching JDBC's `encoding`
+  property. With it set, result pages whose segments live in object storage are
+  fetched, decoded and acknowledged, where they previously could not be read at
+  all. Unset sends no encoding header, so the coordinator returns every row
+  inline exactly as before.
+
+  It is off by default because `protocol.spooling.retrieval-mode=storage` has
+  the *client* fetch segments straight from object storage, and a workstation
+  that cannot reach the bucket would fail queries that succeed without the key.
+  A coordinator that does not support the requested encoding ignores the header
+  and answers inline, so setting it can never fail a connection. An unknown
+  value fails the connection rather than being dropped, naming the three
+  accepted forms.
+
 ### Changed
 
 - **The driver binary no longer exports the deprecated ODBC 2.x entry points.**

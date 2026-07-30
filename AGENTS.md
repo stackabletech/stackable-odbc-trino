@@ -732,6 +732,7 @@ list — keep this table in sync with it. Keys are case-insensitive.
 | `Locale` | No | Locale for locale-dependent formatting, sent as `X-Trino-Language` |
 | `DisableCompression` | No | `true` or `false` (default) |
 | `MaxAttempts` | No | Request retry budget. Unset leaves `trino-rust-client`'s own |
+| `Encoding` | No | Trino's spooled query-data encoding: `json`, `json+zstd` or `json+lz4`. Unset returns every row inline. JDBC's `encoding` |
 
 The five `name:value;name2:value2` keys take **JDBC's format verbatim**, so a
 value copied out of a JDBC URL transfers unchanged. That format uses `;`, which
@@ -936,7 +937,7 @@ core stack.
 |---|---|---|
 | *(none)* | `postgres`, `trino` | tpcds and postgresql catalogs, HTTPS, PASSWORD and CERTIFICATE auth |
 | `oauth` | `keycloak` | The OAuth 2.0 flow, through `suites/test_oauth.py` |
-| `spooling` | `minio`, `minio-init` | The spooling protocol, server side |
+| `spooling` | `minio`, `minio-init` | The spooling protocol, through the `Encoding` key |
 | `hive` | `minio`, `minio-init`, `hive-metastore` | A non-empty `SQLTablePrivileges` |
 
 ```bash
@@ -1273,16 +1274,59 @@ record instead. That record is also how the suite counts browser launches, and
 what turns a broken login into a diagnosis rather than a suite that waits out the
 login budget with nothing to show.
 
-### The spooling stack, with no driver support behind it
+### The spooling protocol
 
 The `spooling` profile brings up MinIO and configures the coordinator to spool.
-**No suite drives it**, and that is not an oversight: `src/backend/execute.rs`
-pages with `client.get` and `client.get_next`, which cannot decode a spooled
-segment. A suite would either be vacuously green or permanently red, and neither
-is worth `0 failed` losing its meaning. Verified server side instead, by driving
-the REST API with an `X-Trino-Query-Data-Encoding: json+zstd` header: 20,000 rows
-of `tpcds.sf1.customer` yield 2 inline and 25 spooled segments, and 25 objects
-appear in the bucket.
+The driver reads a spooled result when the `Encoding` connection-string key
+advertises an encoding, and returns every row inline when it does not.
+
+Off by default because `protocol.spooling.retrieval-mode=storage` has the
+*client* fetch segments straight from object storage: a workstation that cannot
+reach the bucket would fail queries that succeed without the key, and the driver
+cannot know that in advance. Trino's JDBC driver leaves its `encoding` property
+unset for the same reason. A coordinator that does not support the requested
+encoding **ignores the header and answers inline** — measured against the live
+coordinator with `bogus` and with `json+snappy,json`, and end to end through the
+driver by running `suites/test_spooling.py` against a stack with no spooling
+manager — so setting the key can never fail a connection.
+
+`Client::decode_page` is the decoder, at both page-decode sites in
+`src/backend/execute.rs`: a direct page's rows arrive as they are, a spooled
+page's segments are fetched, decoded and acknowledged. The catalog and metadata
+functions need nothing, because `query_all_rows` goes through `Client::get_all`,
+which pages on `QueryPager` and resolves segments itself.
+
+`TrinoStatement::raw_columns` keeps Trino's own `Column` metadata for the result
+set. A spooled segment carries values without names or types and is decoded
+against that metadata, while Trino sends it on one page only, so the statement
+holds it for every later page.
+
+**What spools is bytes, not rows**, which is the trap for anyone extending
+`suites/test_spooling.py`. Measured on this stack under `Encoding=json+zstd`:
+
+| Query | Segments |
+|---|---|
+| `SELECT 1`, and 900 rows of `customer` | 1 inline, 0 spooled |
+| 20,000 rows of `customer`, **all** columns | 2 inline, 25 spooled |
+| the same 20,000 rows, four columns | inline only, 0 spooled |
+
+A narrow projection never reaches object storage, so the suite's queries are
+`SELECT *` deliberately. Rows that arrive spooled are byte-identical to rows that
+arrive inline, so a row count proves nothing either: each scenario reads the
+driver's log for `Successfully fetched remote spooled segment`, which the client
+emits once per *remote* segment and never for an inline one. That log is opened
+once per process — core pins its subscriber on the first connection — so the
+suite sets `ODBC_LOG_FILE` once and reads the file in deltas.
+
+The suite has **no required profile**. With `spooling` active it drives the
+protocol; without it, it asserts the fallback above. Each stack state skips the
+other's scenarios by name, so neither is a blind spot.
+
+Abandoning a spooled result set leaves its remaining segments unacknowledged, so
+they live until the coordinator's `fs.segment.ttl`, 12 hours by default.
+`close_cursor` drains the remaining pages to keep the pooled socket clean and
+discards their data; fetching those segments in order to acknowledge them would
+download exactly the data the application abandoned.
 
 Four settings in `stack/trino/spooling/` are load-bearing:
 
