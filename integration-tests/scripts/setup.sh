@@ -50,6 +50,9 @@ echo "=== Generating secrets ==="
 echo "=== Generating TLS material ==="
 "$SCRIPT_DIR/gen-certs.sh"
 
+echo "=== Assembling Trino config ==="
+"$SCRIPT_DIR/gen-trino-config.sh"
+
 echo "=== Starting the stack ==="
 compose up -d
 

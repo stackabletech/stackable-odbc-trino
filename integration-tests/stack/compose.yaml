@@ -20,11 +20,14 @@ services:
     ports:
       - "8443:8443"
     volumes:
-      - ./trino/base:/etc/trino
+      # Assembled by scripts/gen-trino-config.sh from stack/trino/ fragments,
+      # per active profile. Never mount stack/trino/base directly: compose
+      # profiles select services, not file contents.
+      - ../generated/trino:/etc/trino:ro
       # Secrets mount at /etc/trino-secrets, NOT inside /etc/trino. Nesting a
       # bind mount inside another one makes Docker create the mount point on
-      # the *host*, inside the checked-in config directory and owned by root --
-      # which is where the stray password.db and tls/ entries came from.
+      # the *host*, inside the mounted directory and owned by root, which is
+      # where the stray password.db and tls/ entries came from.
       - ../generated/certs:/etc/trino-secrets/tls:ro
       - ../generated/password.db:/etc/trino-secrets/password.db:ro
     depends_on:
@@ -39,3 +42,34 @@ services:
       timeout: 5s
       retries: 20
       start_period: 30s
+
+  # --- profiled services ---
+  # These exist so `parse_profiles`' known list and compose agree, and so
+  # phases 5 to 7 have an obvious place to fill in. The three inert ones run
+  # `true` on alpine and exit at once: this task proves profiles *select*
+  # correctly without also owning three service configurations, and without
+  # pulling a gigabyte of MinIO and Hive images to run a no-op. Each phase
+  # replaces both the image and the command, pinned to an explicit tag.
+
+  keycloak:
+    profiles: [oauth]
+    # Carries its real image: the oauth profile has to start something for
+    # Task 11's verification to mean anything.
+    image: quay.io/keycloak/keycloak:26.0
+    command: ["start-dev"]
+
+  minio:
+    # Listed under both, so it starts once for either.
+    profiles: [spooling, hive]
+    image: alpine:3
+    command: ["true"]
+
+  minio-init:
+    profiles: [spooling, hive]
+    image: alpine:3
+    command: ["true"]
+
+  hive-metastore:
+    profiles: [hive]
+    image: alpine:3
+    command: ["true"]
