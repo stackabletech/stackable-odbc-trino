@@ -41,6 +41,23 @@ KEYCLOAK_PASSWORD="$TRINO_PASSWORD"
 OAUTH_CLIENT_ID="trino"
 OAUTH_CLIENT_SECRET="trino-test-client-secret"
 
+# MinIO and the spooling protocol, for the `spooling` and `hive` profiles.
+# MinIO's port is deliberately not published: under
+# protocol.spooling.retrieval-mode=coordinator_proxy the client never reaches
+# object storage, only the coordinator does, over the compose network.
+#
+# Exported, because compose.yaml interpolates these three rather than repeating
+# them: Trino gets them substituted into spooling-manager.properties and MinIO
+# gets them from its environment, and a mismatch would surface only when a query
+# tried to spool. The defaults in compose.yaml exist so `docker compose logs`
+# still parses the file outside the harness.
+export MINIO_ACCESS_KEY="minioadmin"
+export MINIO_SECRET_KEY="minioadmin"
+export SPOOLING_BUCKET="spooling"
+# A 256-bit base64 key, fixed rather than generated per setup: the stack is
+# reproducible and nothing here is a real secret.
+SPOOLING_SECRET="W0PUdc6us24Z5Ki2Oi92/iaLd8Oksfxge59U2EHmKwo="
+
 # Every profile this stack knows about. `--profile all` expands to this.
 ALL_PROFILES="oauth spooling hive"
 
@@ -111,4 +128,40 @@ wait_for() {
         echo "  Waiting for $what... (${waited}s)"
     done
     echo "$what is ready."
+}
+
+# wait_for_init <service> <seconds>
+#
+# The counterpart of wait_for for a one-shot container, whose success *is*
+# exiting. `docker compose wait` cannot serve here: it considers only running
+# containers and answers "no containers for project" once the container has
+# finished, which for an init container is the usual case by the time anything
+# asks.
+wait_for_init() {
+    local service="$1" limit="$2" waited=0 id state
+    while true; do
+        id="$(compose ps -aq "$service" 2>/dev/null || true)"
+        if [[ -n "$id" ]]; then
+            state="$(docker inspect -f '{{.State.Status}}:{{.State.ExitCode}}' "$id" 2>/dev/null || true)"
+            case "$state" in
+                exited:0)
+                    echo "$service completed."
+                    return 0
+                    ;;
+                exited:*)
+                    echo "ERROR: $service exited with code ${state#exited:}. Its log:" >&2
+                    compose logs --tail 40 "$service" >&2
+                    return 1
+                    ;;
+            esac
+        fi
+        if (( waited >= limit )); then
+            echo "ERROR: $service did not complete in ${limit}s. Its log:" >&2
+            compose logs --tail 40 "$service" >&2
+            return 1
+        fi
+        sleep 2
+        waited=$(( waited + 2 ))
+        echo "  Waiting for $service... (${waited}s)"
+    done
 }

@@ -936,7 +936,7 @@ core stack.
 |---|---|---|
 | *(none)* | `postgres`, `trino` | tpcds and postgresql catalogs, HTTPS, PASSWORD and CERTIFICATE auth |
 | `oauth` | `keycloak` | The OAuth 2.0 flow, through `suites/test_oauth.py` |
-| `spooling` | `minio`, `minio-init` | Spooling |
+| `spooling` | `minio`, `minio-init` | The spooling protocol, server side |
 | `hive` | `minio`, `minio-init`, `hive-metastore` | A non-empty `SQLTablePrivileges` |
 
 ```bash
@@ -1272,6 +1272,41 @@ sends `open::that` on to `gio open`, and it reports its outcome through a JSONL
 record instead. That record is also how the suite counts browser launches, and
 what turns a broken login into a diagnosis rather than a suite that waits out the
 login budget with nothing to show.
+
+### The spooling stack, with no driver support behind it
+
+The `spooling` profile brings up MinIO and configures the coordinator to spool.
+**No suite drives it**, and that is not an oversight: `src/backend/execute.rs`
+pages with `client.get` and `client.get_next`, which cannot decode a spooled
+segment. A suite would either be vacuously green or permanently red, and neither
+is worth `0 failed` losing its meaning. Verified server side instead, by driving
+the REST API with an `X-Trino-Query-Data-Encoding: json+zstd` header: 20,000 rows
+of `tpcds.sf1.customer` yield 2 inline and 25 spooled segments, and 25 objects
+appear in the bucket.
+
+Four settings in `stack/trino/spooling/` are load-bearing:
+
+- **`retrieval-mode=coordinator_proxy`**, where the default is `storage`. It is
+  the only mode that does not require the *client* to reach object storage, and
+  the driver runs on the host, where `minio` does not resolve. Confirmed by the
+  segment URIs, which name the coordinator's `/v1/spooled/download/...` rather
+  than a pre-signed MinIO URI. Covering `storage` means publishing MinIO's port
+  *and* adding `127.0.0.1 minio` to the host's `/etc/hosts`, so it belongs in an
+  opt-in variant that skips with a reason rather than passing silently.
+- **`fs.segment.encryption=false`**, where the default is `true` and means SSE-C.
+  MinIO here serves plain HTTP with no key material, so a segment cannot be
+  written at all with it on.
+- **`initial-segment-size=16kB` and `max-segment-size=64kB`**, against defaults of
+  8MB and 16MB. Without them a result would need tens of megabytes before a
+  second segment appeared, and the retrieval loop is what needs exercising.
+- **`protocol.spooling.inlining` is left at its default of enabled**, because
+  that is what a real deployment does. The consequence is the test's to carry: the
+  first 1000 rows, up to 128kB, arrive inline, so a query has to exceed that
+  before anything is spooled.
+
+A client is expected to acknowledge each segment, which deletes it. Segments from
+a client that does not are left to `fs.segment.ttl`, 12 hours by default, so a
+long-lived stack accumulates them.
 
 ### Windows VM tests
 

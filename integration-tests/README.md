@@ -29,7 +29,7 @@ The unprofiled set is the core stack. Everything heavier is opt-in.
 |---|---|---|
 | *(none)* | `postgres`, `trino` | The `tpcds` and `postgresql` catalogs, HTTPS, password and client-certificate auth |
 | `oauth` | `keycloak` | The OAuth 2.0 flow, through `suites/test_oauth.py` |
-| `spooling` | `minio`, `minio-init` | Spooling |
+| `spooling` | `minio`, `minio-init` | The spooling protocol, server side |
 | `hive` | `minio`, `minio-init`, `hive-metastore` | A non-empty `SQLTablePrivileges` |
 
 ```bash
@@ -42,10 +42,16 @@ Changing profiles recreates the coordinator, because its configuration is
 assembled per profile rather than mounted from the checkout. A suite whose
 profile is not active is skipped and says which profile would enable it.
 
-`minio`, `minio-init` and `hive-metastore` are placeholders: configuring one
-means replacing both its image and its command. `keycloak` is configured, and its
-realm is imported from `stack/keycloak/realm-trino.json` by
-`scripts/gen-keycloak-config.sh`.
+`hive-metastore` is a placeholder: configuring it means replacing both its image
+and its command. `keycloak` is configured, and its realm is imported from
+`stack/keycloak/realm-trino.json` by `scripts/gen-keycloak-config.sh`. `minio` and
+`minio-init` are configured, and the coordinator spools to the bucket the init
+container creates.
+
+**No suite drives spooling.** The coordinator produces spooled segments, and the
+driver cannot yet read them: `src/backend/execute.rs` pages with `client.get` and
+`client.get_next`, which cannot decode a spooled segment. The profile exists so
+that work has something to be written against.
 
 ## Flags
 

@@ -87,13 +87,37 @@ services:
   minio:
     # Listed under both, so it starts once for either.
     profiles: [spooling, hive]
-    image: alpine:3
-    command: ["true"]
+    image: quay.io/minio/minio:RELEASE.2025-04-22T22-12-26Z
+    command: ["server", "/data"]
+    environment:
+      # Interpolated from scripts/lib.sh, which is the single source; the
+      # defaults keep this file parseable outside the harness.
+      MINIO_ROOT_USER: ${MINIO_ACCESS_KEY:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_SECRET_KEY:-minioadmin}
+    # No published port. Under retrieval-mode=coordinator_proxy the client never
+    # reaches object storage, only the coordinator does, over this network, so
+    # publishing would buy nothing and could collide. The realistic `storage`
+    # mode would need both a published port and `127.0.0.1 minio` in the host's
+    # own /etc/hosts, because the pre-signed URI names this service.
 
   minio-init:
     profiles: [spooling, hive]
-    image: alpine:3
-    command: ["true"]
+    image: quay.io/minio/mc:RELEASE.2025-04-16T18-13-26Z
+    depends_on:
+      minio:
+        condition: service_started
+    # A retry loop rather than a healthcheck on minio: the server image is not
+    # guaranteed to carry a probe binary, and `mc alias set` succeeding is the
+    # condition that actually matters. Trino does not create the bucket.
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        until mc alias set spool http://minio:9000 \
+            "${MINIO_ACCESS_KEY:-minioadmin}" "${MINIO_SECRET_KEY:-minioadmin}"; do
+          echo "waiting for minio..."; sleep 1
+        done
+        mc mb --ignore-existing "spool/${SPOOLING_BUCKET:-spooling}"
+        mc ls spool/
 
   hive-metastore:
     profiles: [hive]

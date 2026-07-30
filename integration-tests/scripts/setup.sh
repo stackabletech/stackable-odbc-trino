@@ -71,6 +71,13 @@ printf '%s' "$PROFILES" > "$PROFILE_STAMP"
 
 compose up -d "${RECREATE[@]+"${RECREATE[@]}"}"
 
+if [[ ",$PROFILES," == *",spooling,"* || ",$PROFILES," == *",hive,"* ]]; then
+    echo "=== Waiting for the MinIO bucket ==="
+    # Trino does not create the bucket, and a query only discovers the absence
+    # when it tries to spool, so the failure would land far from its cause.
+    wait_for_init minio-init 120
+fi
+
 # Readiness probes are shell functions, not `bash -c` strings: wait_for runs
 # "$@" in this shell, so a function works directly and the nested quoting a
 # curl-plus-grep pipeline inside a -c argument would need goes away entirely.

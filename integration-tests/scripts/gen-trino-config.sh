@@ -55,19 +55,30 @@ if [[ ",$PROFILES," == *",oauth,"* ]]; then
     AUTH_TYPES="$AUTH_TYPES,OAUTH2"
 fi
 
-sed -i "s|@AUTH_TYPES@|$AUTH_TYPES|g" "$OUT/config.properties"
+# Every substitution is applied to every assembled file, rather than to
+# config.properties alone: a profile may contribute a whole *.properties of its
+# own (spooling-manager.properties does), and one left unsubstituted would reach
+# Trino as a literal @NAME@ credential.
+shopt -s nullglob
+TARGETS=("$OUT"/*.properties "$OUT"/catalog/*.properties)
+shopt -u nullglob
 
-# Stated in lib.sh and used by both the Trino config and the Keycloak realm.
-sed -i -e "s|@OAUTH_CLIENT_ID@|$OAUTH_CLIENT_ID|g" \
-       -e "s|@OAUTH_CLIENT_SECRET@|$OAUTH_CLIENT_SECRET|g" \
-       "$OUT/config.properties"
+sed -i \
+    -e "s|@AUTH_TYPES@|$AUTH_TYPES|g" \
+    -e "s|@OAUTH_CLIENT_ID@|$OAUTH_CLIENT_ID|g" \
+    -e "s|@OAUTH_CLIENT_SECRET@|$OAUTH_CLIENT_SECRET|g" \
+    -e "s|@SPOOLING_SECRET@|$SPOOLING_SECRET|g" \
+    -e "s|@SPOOLING_BUCKET@|$SPOOLING_BUCKET|g" \
+    -e "s|@MINIO_ACCESS_KEY@|$MINIO_ACCESS_KEY|g" \
+    -e "s|@MINIO_SECRET_KEY@|$MINIO_SECRET_KEY|g" \
+    "${TARGETS[@]}"
 
 # An unresolved placeholder reaches Trino as a literal, which is why these are
 # @NAME@ rather than an empty default: a fragment added later that introduces
 # one without teaching this script about it fails here instead.
-if grep -qE '@[A-Z_]+@' "$OUT"/*.properties; then
+if grep -qE '@[A-Z_]+@' "${TARGETS[@]}"; then
     echo "ERROR: unresolved placeholder in the assembled config:" >&2
-    grep -nE '@[A-Z_]+@' "$OUT"/*.properties >&2
+    grep -nE '@[A-Z_]+@' "${TARGETS[@]}" >&2
     exit 2
 fi
 
