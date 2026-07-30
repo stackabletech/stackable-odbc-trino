@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 # One CA, and every leaf signed from it.
 #
-# The coordinator's SAN deliberately omits IP:127.0.0.1 while carrying
-# DNS:localhost. That single omission is what makes TlsVerify=ca testable
-# against one certificate and one listener: connecting as Host=localhost
-# verifies fully, connecting as Host=127.0.0.1 fails hostname verification
-# under `full` and succeeds under `ca`, which verifies the chain but not the
-# name. Do not add 127.0.0.1 -- test_tls.py asserts its absence.
+# The coordinator's SAN carries the names a client connects by, and Jetty
+# selects the certificate on SNI. Anything it cannot match gets the self-signed
+# certificate Trino generates for internal communication instead, so a name
+# missing from this list does not yield a hostname mismatch against this
+# certificate; it yields a different certificate. suites/test_tls.py documents
+# what that rules out.
 set -euo pipefail
 # shellcheck source-path=SCRIPTDIR source=lib.sh
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib.sh"
@@ -60,14 +60,14 @@ openssl pkcs12 -export \
     -out "$CERT_DIR/keystore.p12" -passout "pass:${KEYSTORE_PASSWORD}"
 
 echo "--- truststore (the CA alone) ---"
-# Serves two jobs: Trino's client-certificate truststore, and -- because Trino
-# derives its internal http clients' truststore from the same setting -- the
+# Serves two jobs: Trino's client-certificate truststore, and (because Trino
+# derives its internal http clients' truststore from the same setting) the
 # trust anchor for the HTTPS-only internal discovery loop.
 #
 # keytool, not `openssl pkcs12 -export -nokeys`. openssl writes the certificate
 # into a certBag with no Oracle trusted-certificate attribute, and Java then
-# reports "Your keystore contains 0 entries" -- an empty truststore that fails
-# silently: the coordinator still starts, but it validates no client
+# reports "Your keystore contains 0 entries". That is an empty truststore
+# failing silently: the coordinator still starts, but it validates no client
 # certificate and logs 503s fetching its own memory info over TLS.
 rm -f "$CERT_DIR/truststore.p12"
 keytool -importcert -noprompt -trustcacerts \
@@ -80,7 +80,7 @@ keytool -importcert -noprompt -trustcacerts \
 entries="$(keytool -list -keystore "$CERT_DIR/truststore.p12" -storetype PKCS12 \
     -storepass "$KEYSTORE_PASSWORD" 2>/dev/null | grep -c 'trustedCertEntry' || true)"
 if [[ "$entries" -lt 1 ]]; then
-    echo "ERROR: truststore.p12 holds no trustedCertEntry -- Java would read it as empty" >&2
+    echo "ERROR: truststore.p12 holds no trustedCertEntry; Java would read it as empty" >&2
     exit 1
 fi
 echo "truststore holds $entries trusted certificate(s)."

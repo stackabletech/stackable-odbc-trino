@@ -58,7 +58,7 @@ fi
 # --- Linux: pyodbc integration tests (4 configs, matching Windows) ---
 # Built from stack.env rather than written out here, so a port, a credential
 # or a certificate path is stated in exactly one place. The four configurations
-# are DSN and DSN-less crossed with verified and unverified TLS -- the
+# are DSN and DSN-less crossed with verified and unverified TLS. The
 # HTTP/HTTPS axis went with the plaintext listener.
 stack_conn() {
     python3 - "$@" <<'PYEOF'
@@ -104,11 +104,18 @@ uv run --with pyodbc python3 "$TEST_DIR/suites/test_sql_surface.py" "$CONN_HTTPS
 echo "=== Running folding contract test ==="
 uv run --with pyodbc python3 "$TEST_DIR/suites/test_folding_contract.py" "$CONN_HTTPS"
 
+# --- Linux: TLS verification modes and mutual TLS ---
+# The three TlsVerify modes, the SSLVerification alias, the combinations
+# refused at parse time, and client-certificate authentication. Builds every
+# connection string it needs from stack.env, so it takes no argument.
+echo "=== Running TLS verification tests ==="
+uv run --with pyodbc python3 "$TEST_DIR/suites/test_tls.py"
+
 # --- Linux: raw C ABI pen test (no Driver Manager) ---
 # Calls the driver's exported entry points directly with ctypes. unixODBC
 # answers a large part of the ODBC state machine itself, so the driver's own
 # handling of out-of-order and malformed calls is invisible to every suite
-# above this one. Standard library only -- no uv, no pyodbc.
+# above this one. Standard library only, with no uv and no pyodbc.
 echo "=== Running raw C ABI pen test ==="
 python3 "$TEST_DIR/suites/test_c_abi.py" "$DRIVER_PATH" "$CONN_HTTPS"
 

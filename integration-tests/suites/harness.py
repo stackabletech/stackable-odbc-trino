@@ -62,7 +62,7 @@ class Results:
             self.failed += 1
 
     def note(self, label, text):
-        """An observation the driver is entitled to make either way -- not a
+        """An observation the driver is entitled to make either way. Not a
         gap, and never counted as a pass."""
         self.notes += 1
         print(f"NOTE  {label}: {text}")

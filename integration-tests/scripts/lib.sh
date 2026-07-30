@@ -35,7 +35,7 @@ compose() {
     (cd "$STACK_DIR" && COMPOSE_PROFILES="${PROFILES:-}" docker compose -f "$COMPOSE_FILE" "$@")
 }
 
-# parse_profiles <arg> -- normalises a comma or space separated list, expands
+# parse_profiles <arg>. Normalises a comma or space separated list, expands
 # `all`, and rejects an unknown name rather than starting a stack that silently
 # lacks what was asked for.
 parse_profiles() {
