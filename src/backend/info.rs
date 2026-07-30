@@ -988,62 +988,32 @@ const TRINO_ADVERTISED_FUNCTIONS: &[FunctionId] = &[
 /// The functions core exports an entry point for that this driver deliberately
 /// does not advertise, each with the reason.
 ///
-/// Reporting one of these supported is not merely optimistic: `SQLGetFunctions`
-/// is what the Windows Driver Manager builds its dispatch table from, and an
-/// application that reads the bitmap will call what it finds there.
+/// Empty, because every entry point core exports is one this driver implements.
+/// The deprecated ODBC 2.x functions belong to the Driver Manager's mapping
+/// rather than to a 3.x driver, and core withholds them itself: they are in its
+/// `CORE_UNEXPORTED_FUNCTIONS`, with the reason recorded there, so there is no
+/// exported entry point left here to decline.
 ///
-/// The reasons live here rather than in the test that checks the partition,
-/// because the decision is the part worth reading.
+/// The list stays because it is the place a decision goes. Reporting a function
+/// supported is not merely optimistic: `SQLGetFunctions` is what the Windows
+/// Driver Manager builds its dispatch table from, and an application that reads
+/// the bitmap will call what it finds there. A function core starts exporting
+/// has to be advertised or refused explicitly, and this is where the refusal
+/// and its reason live.
 ///
-/// Nothing reads this at runtime, and that is the point: `get_functions`
-/// returns [`TRINO_ADVERTISED_FUNCTIONS`] directly rather than subtracting this
-/// from `CORE_EXPORTED_FUNCTIONS`, so that a function core adds later is
-/// advertised only once someone says it works. What consumes this is
-/// `every_core_exported_function_is_advertised_or_withheld`, which is what
-/// turns "someone says so" into a build failure. `#[cfg(test)]` would compile
-/// it out of the driver, but it would also file the reasoning under test
-/// scaffolding, which is the opposite of why it is written down.
+/// Nothing reads it at runtime, and that is the point: `get_functions` returns
+/// [`TRINO_ADVERTISED_FUNCTIONS`] directly rather than subtracting this from
+/// `CORE_EXPORTED_FUNCTIONS`, so a function core adds is advertised only once
+/// someone says it works. What consumes it is
+/// `every_core_exported_function_is_advertised_or_withheld`, which turns
+/// "someone says so" into a build failure. `#[cfg(test)]` would compile it out
+/// of the driver, but it would also file the reasoning under test scaffolding,
+/// which is the opposite of why it is written down.
 // `allow` rather than `expect`: the lib is compiled both as a library, where
 // this is dead, and as a test target, where the partition test reads it -- so
 // an expectation would go unfulfilled in one of the two and fail the build.
 #[allow(dead_code)]
-const TRINO_WITHHELD_FUNCTIONS: &[(FunctionId, &str)] = &[
-    (
-        FunctionId::AllocConnect,
-        "ODBC 2.x, superseded by SQLAllocHandle",
-    ),
-    (
-        FunctionId::AllocEnv,
-        "ODBC 2.x, superseded by SQLAllocHandle",
-    ),
-    (
-        FunctionId::AllocStmt,
-        "ODBC 2.x, superseded by SQLAllocHandle",
-    ),
-    (FunctionId::Error, "ODBC 2.x, superseded by SQLGetDiagRec"),
-    (
-        FunctionId::FreeConnect,
-        "ODBC 2.x, superseded by SQLFreeHandle",
-    ),
-    (FunctionId::FreeEnv, "ODBC 2.x, superseded by SQLFreeHandle"),
-    (
-        FunctionId::GetConnectOption,
-        "ODBC 2.x, superseded by SQLGetConnectAttr",
-    ),
-    (
-        FunctionId::GetStmtOption,
-        "ODBC 2.x, superseded by SQLGetStmtAttr",
-    ),
-    (
-        FunctionId::SetConnectOption,
-        "ODBC 2.x, superseded by SQLSetConnectAttr",
-    ),
-    (
-        FunctionId::SetStmtOption,
-        "ODBC 2.x, superseded by SQLSetStmtAttr",
-    ),
-    (FunctionId::Transact, "ODBC 2.x, superseded by SQLEndTran"),
-];
+const TRINO_WITHHELD_FUNCTIONS: &[(FunctionId, &str)] = &[];
 
 pub(super) fn get_functions() -> &'static [FunctionId] {
     TRINO_ADVERTISED_FUNCTIONS

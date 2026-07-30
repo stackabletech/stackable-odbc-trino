@@ -6,7 +6,7 @@ This crate is an ODBC driver for [Trino](https://trino.io). It contains **only**
 Trino-specific code: the `Backend` and `StatementBackend` implementations,
 connection-string parsing, Trino-to-ODBC type conversion, ODBC escape-sequence
 translation, and the catalog and metadata functions. Everything generic — handle
-management, UTF-16 marshalling, diagnostics, panic safety, and the 73 C ABI
+management, UTF-16 marshalling, diagnostics, panic safety, and the exported C ABI
 entry points — lives in
 [`stackable-odbc-core`](https://github.com/stackabletech/stackable-odbc-core).
 
@@ -52,7 +52,7 @@ and cannot be published. Both clear when the path dep becomes a version dep.
 |---------|-------|
 | Handle allocation, tag validation, `panic_safe` | core |
 | UTF-16 marshalling, diagnostics, `SQLGetDiagRec` | core |
-| The 73 exported C ABI entry points (`forward_ffi!`) | core |
+| The exported C ABI entry points (`forward_ffi!`) | core |
 | Generic `SQLGetInfo` defaults, cursor-state tracking | core |
 | `Backend` / `StatementBackend` trait definitions | core |
 | Connecting to Trino, executing, fetching, cancelling | this crate |

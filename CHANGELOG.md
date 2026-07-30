@@ -278,6 +278,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **The driver binary no longer exports the deprecated ODBC 2.x entry points.**
+  `SQLAllocConnect`, `SQLAllocEnv`, `SQLAllocStmt`, `SQLFreeConnect`,
+  `SQLFreeEnv`, `SQLError`, `SQLTransact`, `SQLGetConnectOption(W)`,
+  `SQLSetConnectOption(W)`, `SQLGetStmtOption` and `SQLSetStmtOption` are gone
+  from the `.so` and the `.dll`, following `stackable-odbc-core`. Appendix G is
+  explicit that a 3.x driver need not implement them and that the Driver
+  Manager's mapping fires precisely when the driver does not export one, so an
+  export removes a capability rather than adding one, and the Driver Manager is
+  the better-informed of the two. An ODBC 2.x application is unaffected: it
+  reaches `SQLGetDiagRec`, `SQLSetConnectAttr` and the rest through that
+  mapping, and `SQLGetFunctions`' ODBC 2.x array still reports every one of them
+  supported, because a 2.x application can indeed call them. Nothing changes in
+  the 3.x bitmap, which never claimed them.
+
+- **`SQLSetCursorName` enforces the spec's cursor-name rules.** This driver
+  advertises the function, so an application sees the three diagnostics core
+  now raises: `24000` for a name set after the statement has executed (the spec
+  allows it only in an allocated or prepared state), `34000` for a name that is
+  empty, longer than `SQL_MAX_CURSOR_NAME_LEN` (128, what
+  `SQLGetInfo(SQL_MAX_CURSOR_NAME_LEN)` reports), or begins with the reserved
+  `SQLCUR` / `SQL_CUR`, and `3C000` for a name another statement on the same
+  connection already holds. An empty name moves from `HY090` to `34000`;
+  `HY090` is `(DM)`-marked and describes a negative `NameLength`, a different
+  condition.
+
 - **`SQLGetFunctions` now reports `SQL_TRUE` for `SQL_API_SQLEXTENDEDFETCH`.**
   `stackable-odbc-core` exports the function and fetches through the same body as
   `SQLFetch`, so reporting `SQL_FALSE` denied a function the driver performs, and
