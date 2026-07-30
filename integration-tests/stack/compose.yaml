@@ -44,11 +44,8 @@ services:
       start_period: 30s
 
   # --- profiled services ---
-  # These exist so `parse_profiles`' known list and compose agree. The three
-  # inert ones run `true` on alpine and exit at once, which proves profiles
-  # *select* correctly without also owning three service configurations, and
-  # without pulling a gigabyte of MinIO and Hive images to run a no-op.
-  # Configuring one means replacing both its image and its command, pinned to an
+  # These exist so `parse_profiles`' known list and compose agree. Configuring
+  # a new one means replacing both its image and its command, pinned to an
   # explicit tag.
 
   keycloak:
@@ -85,8 +82,7 @@ services:
     # is what the stack actually depends on.
 
   minio:
-    # Listed under both, so it starts once for either.
-    profiles: [spooling, hive]
+    profiles: [spooling]
     image: quay.io/minio/minio:RELEASE.2025-04-22T22-12-26Z
     command: ["server", "/data"]
     environment:
@@ -101,7 +97,7 @@ services:
     # own /etc/hosts, because the pre-signed URI names this service.
 
   minio-init:
-    profiles: [spooling, hive]
+    profiles: [spooling]
     image: quay.io/minio/mc:RELEASE.2025-04-16T18-13-26Z
     depends_on:
       minio:
@@ -118,8 +114,3 @@ services:
         done
         mc mb --ignore-existing "spool/${SPOOLING_BUCKET:-spooling}"
         mc ls spool/
-
-  hive-metastore:
-    profiles: [hive]
-    image: alpine:3
-    command: ["true"]

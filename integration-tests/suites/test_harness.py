@@ -100,7 +100,7 @@ TRINO_PASSWORD=admin
 TRINO_CATALOG=tpcds
 CA_CERT=/tmp/certs/ca.crt
 CLIENT_PEM="/tmp/certs/client.pem"
-PROFILES=oauth,hive
+PROFILES=oauth,spooling
 """
 
 
@@ -123,9 +123,9 @@ class TestStack(unittest.TestCase):
         self.assertEqual(self.stack.get("NOPE", "fallback"), "fallback")
 
     def test_profiles_split_on_comma(self):
-        self.assertEqual(self.stack.profiles, ["oauth", "hive"])
-        self.assertTrue(self.stack.has_profile("hive"))
-        self.assertFalse(self.stack.has_profile("spooling"))
+        self.assertEqual(self.stack.profiles, ["oauth", "spooling"])
+        self.assertTrue(self.stack.has_profile("spooling"))
+        self.assertFalse(self.stack.has_profile("nosuchprofile"))
 
     def test_empty_profiles_is_an_empty_list_not_a_list_containing_empty(self):
         with open(self.path, "a") as f:

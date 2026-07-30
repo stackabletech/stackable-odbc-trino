@@ -30,7 +30,7 @@ pre-commit run --all-files                   # the gate; run before every commit
 
 ./integration-tests/setup.sh                 # start the stack (Docker), write ODBC config
 ./integration-tests/run-tests.sh             # run the integration suite
-./integration-tests/setup.sh --profile all   # plus keycloak, minio and hive
+./integration-tests/setup.sh --profile all   # plus keycloak and minio
 ./integration-tests/run-tests.sh --suite tls # one suite by name
 ./integration-tests/scripts/teardown.sh      # stop the stack
 ```
@@ -939,13 +939,12 @@ core stack.
 
 | Profile | Services | Buys |
 |---|---|---|
-| *(none)* | `postgres`, `trino` | tpcds and postgresql catalogs, HTTPS, PASSWORD and CERTIFICATE auth |
+| *(none)* | `postgres`, `trino` | tpcds, postgresql and hive catalogs, HTTPS, PASSWORD and CERTIFICATE auth, transactional writes, a non-empty `SQLTablePrivileges` |
 | `oauth` | `keycloak` | The OAuth 2.0 flow, through `suites/test_oauth.py` |
 | `spooling` | `minio`, `minio-init` | The spooling protocol, through the `Encoding` key |
-| `hive` | `minio`, `minio-init`, `hive-metastore` | A non-empty `SQLTablePrivileges` |
 
 ```bash
-./integration-tests/setup.sh --profile oauth,hive   # or PROFILES=all
+./integration-tests/setup.sh --profile oauth,spooling   # or PROFILES=all
 ```
 
 Compose profiles select *services*; they cannot vary a mounted file's
@@ -960,6 +959,51 @@ Trino as a literal.
 A profile change recreates the coordinator. Without that, compose would start
 the new service and leave `trino` on its previously assembled config, so
 enabling a profile would appear to do nothing.
+
+### The hive catalog, and why it is not behind a profile
+
+The `hive` catalog is in the base stack because it costs no container: a file
+metastore on a path the coordinator can write needs neither a metastore service
+nor object storage. It is what makes two things testable at all.
+
+**It is the only connector that accepts a write outside autocommit.** Trino's
+coordinator refuses the rest with `AUTOCOMMIT_WRITE_CONFLICT: Catalog only
+supports writes using autocommit`, raised by
+`InMemoryTransactionManager$TransactionMetadata` and gated on the SPI's
+`Connector.isSingleStatementWritesOnly()`, whose default body is `iconst_1;
+ireturn`:
+
+| Plugin | Overrides it |
+|---|---|
+| `trino-hive` | yes, from `HiveConfig` (`hive.single-statement-writes`) |
+| `trino-base-jdbc`, so postgresql | no, inherits `true` |
+| `trino-iceberg` | no, inherits `true` |
+| `trino-delta-lake` | no, inherits `true` |
+| `trino-memory` | no, inherits `true` |
+
+So a rollback cannot be demonstrated against `postgresql`, and **Iceberg is not
+an alternative** — read from the shipped bytecode of Trino 483, not from
+documentation. PostgreSQL's own transactionality is irrelevant, because the
+coordinator refuses the write before any SQL reaches PostgreSQL.
+
+**`hive.security=sql-standard` is what fills
+`information_schema.table_privileges`**, which gives `SQLTablePrivileges` rows
+to convert and exercises `metadata::table_privilege_row` end to end.
+
+Two consequences that look like defects when met cold:
+
+- **The warehouse is not a named volume.** Docker mounts one root-owned, and
+  the coordinator runs as `trino`, so it could not write it at all. The
+  warehouse therefore lives in the container's own writable layer under
+  `/tmp/hive-warehouse`, which Trino creates on first use, and recreating the
+  container starts from an empty metastore.
+- **`CREATE SCHEMA` needs the `admin` role**, so an ordinary connection meets
+  `Access Denied: Cannot create schema`. `scripts/seed-hive.sh` creates the
+  schema with `X-Trino-Role: hive=ROLE{admin}` on every `setup.sh`, and that is
+  the only statement that needs it: once the schema exists and `admin` owns it,
+  an ordinary connection creates tables, writes, reads and grants without a
+  role. The seed is idempotent, and it drains the statement's `nextUri` because
+  Trino runs a statement as the client pages it.
 
 A suite that needs an inactive profile is **skipped, naming the profile that
 would enable it**. An unrun suite must never be printable as a passing one.

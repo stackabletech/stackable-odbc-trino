@@ -22,6 +22,9 @@ TRINO_HTTPS_PORT=8443
 TRINO_USER="admin"
 TRINO_PASSWORD="admin"
 TRINO_CATALOG="tpcds"
+# The schema scripts/seed-hive.sh creates in the hive catalog, and the one every
+# suite that needs a writable, transactional table works in.
+HIVE_SCHEMA="tx"
 KEYSTORE_PASSWORD="changeit"
 
 # Keycloak, for the `oauth` profile. 8444 on the host because Trino holds 8443;
@@ -41,7 +44,7 @@ KEYCLOAK_PASSWORD="$TRINO_PASSWORD"
 OAUTH_CLIENT_ID="trino"
 OAUTH_CLIENT_SECRET="trino-test-client-secret"
 
-# MinIO and the spooling protocol, for the `spooling` and `hive` profiles.
+# MinIO and the spooling protocol, for the `spooling` profile.
 # MinIO's port is deliberately not published: under
 # protocol.spooling.retrieval-mode=coordinator_proxy the client never reaches
 # object storage, only the coordinator does, over the compose network.
@@ -59,7 +62,7 @@ export SPOOLING_BUCKET="spooling"
 SPOOLING_SECRET="W0PUdc6us24Z5Ki2Oi92/iaLd8Oksfxge59U2EHmKwo="
 
 # Every profile this stack knows about. `--profile all` expands to this.
-ALL_PROFILES="oauth spooling hive"
+ALL_PROFILES="oauth spooling"
 
 mkdir -p "$GENERATED"
 

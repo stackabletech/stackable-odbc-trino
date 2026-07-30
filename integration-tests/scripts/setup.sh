@@ -7,7 +7,7 @@
 #
 # Usage:
 #   ./integration-tests/setup.sh
-#   ./integration-tests/setup.sh --profile oauth,hive
+#   ./integration-tests/setup.sh --profile oauth,spooling
 #   PROFILES=all ./integration-tests/setup.sh
 set -euo pipefail
 # shellcheck source-path=SCRIPTDIR source=lib.sh
@@ -71,7 +71,7 @@ printf '%s' "$PROFILES" > "$PROFILE_STAMP"
 
 compose up -d "${RECREATE[@]+"${RECREATE[@]}"}"
 
-if [[ ",$PROFILES," == *",spooling,"* || ",$PROFILES," == *",hive,"* ]]; then
+if [[ ",$PROFILES," == *",spooling,"* ]]; then
     echo "=== Waiting for the MinIO bucket ==="
     # Trino does not create the bucket, and a query only discovers the absence
     # when it tries to spool, so the failure would land far from its cause.
@@ -106,6 +106,9 @@ wait_for trino "Trino" 600 trino_ready
 
 echo "=== Waiting for the postgresql catalog ==="
 wait_for trino "postgresql catalog" 60 postgresql_catalog_ready
+
+echo "=== Seeding the hive catalog ==="
+"$SCRIPT_DIR/seed-hive.sh"
 
 if [[ ",$PROFILES," == *",oauth,"* ]]; then
     keycloak_ready() {

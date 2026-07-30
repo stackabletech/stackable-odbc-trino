@@ -27,14 +27,13 @@ The unprofiled set is the core stack. Everything heavier is opt-in.
 
 | Profile | Services added | Buys |
 |---|---|---|
-| *(none)* | `postgres`, `trino` | The `tpcds` and `postgresql` catalogs, HTTPS, password and client-certificate auth |
+| *(none)* | `postgres`, `trino` | The `tpcds`, `postgresql` and `hive` catalogs, HTTPS, password and client-certificate auth, transactions, a non-empty `SQLTablePrivileges` |
 | `oauth` | `keycloak` | The OAuth 2.0 flow, through `suites/test_oauth.py` |
 | `spooling` | `minio`, `minio-init` | The spooling protocol, server side |
-| `hive` | `minio`, `minio-init`, `hive-metastore` | A non-empty `SQLTablePrivileges` |
 
 ```bash
 ./integration-tests/setup.sh --profile oauth
-./integration-tests/setup.sh --profile oauth,hive
+./integration-tests/setup.sh --profile oauth,spooling
 PROFILES=all ./integration-tests/setup.sh
 ```
 
@@ -42,8 +41,14 @@ Changing profiles recreates the coordinator, because its configuration is
 assembled per profile rather than mounted from the checkout. A suite whose
 profile is not active is skipped and says which profile would enable it.
 
-`hive-metastore` is a placeholder: configuring it means replacing both its image
-and its command. `keycloak` is configured, and its realm is imported from
+The `hive` catalog is in the base stack rather than behind a profile because it
+costs no container: a file metastore on a named volume needs neither a metastore
+service nor object storage. It is the only connector Trino ships that accepts
+writes outside autocommit, which is what makes a transaction rollback
+observable, and `hive.security=sql-standard` is what fills
+`information_schema.table_privileges`.
+
+`keycloak` is configured, and its realm is imported from
 `stack/keycloak/realm-trino.json` by `scripts/gen-keycloak-config.sh`. `minio` and
 `minio-init` are configured, and the coordinator spools to the bucket the init
 container creates.
