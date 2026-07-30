@@ -13,23 +13,16 @@ Usage:
 Requires: pip install pyodbc
 """
 
+import os
 import sys
+
 import pyodbc
 
-passed = 0
-failed = 0
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+from harness import Results, Stack  # noqa: E402
 
-def run(label, fn):
-    """Run a test function, print PASS/FAIL, track counts."""
-    global passed, failed
-    try:
-        fn()
-        print(f"PASS  {label}")
-        passed += 1
-    except Exception as e:
-        print(f"FAIL  {label}: {e}")
-        failed += 1
+R = Results("integration")
 
 
 def conn_str_catalog(conn_str):
@@ -42,11 +35,11 @@ def conn_str_catalog(conn_str):
 
 
 def main():
-    if len(sys.argv) != 2:
-        print(f"Usage: {sys.argv[0]} <connection-string>")
-        sys.exit(2)
-
-    conn_str = sys.argv[1]
+    # A connection string may be passed positionally -- run-tests.sh does, to
+    # drive this suite against several configurations, and windows_test.py does
+    # because the VM's stack is not this one. With no argument, the local stack
+    # describes itself.
+    conn_str = sys.argv[1] if len(sys.argv) > 1 else Stack.load().conn_str()
     conn = pyodbc.connect(conn_str, autocommit=True)
     cur = conn.cursor()
 
@@ -59,7 +52,7 @@ def main():
         assert row is not None
         assert row[0] == 1, f"expected 1, got {row[0]!r}"
 
-    run("SELECT 1", test_select_1)
+    R.run("SELECT 1", test_select_1)
 
     # ------------------------------------------------------------------
     # Metadata queries
@@ -69,14 +62,14 @@ def main():
         catalogs = [r[0].strip() for r in cur.fetchall()]
         assert "tpcds" in catalogs, f"tpcds not in catalogs: {catalogs}"
 
-    run("SHOW CATALOGS", test_show_catalogs)
+    R.run("SHOW CATALOGS", test_show_catalogs)
 
     def test_show_schemas():
         cur.execute("SHOW SCHEMAS FROM tpcds")
         schemas = [r[0].strip() for r in cur.fetchall()]
         assert "sf1" in schemas, f"sf1 not in schemas: {schemas}"
 
-    run("SHOW SCHEMAS FROM tpcds", test_show_schemas)
+    R.run("SHOW SCHEMAS FROM tpcds", test_show_schemas)
 
     def test_show_tables():
         cur.execute("SHOW TABLES FROM tpcds.sf1")
@@ -84,7 +77,7 @@ def main():
         assert "customer" in tables, f"customer not in tables: {tables}"
         assert "item" in tables, f"item not in tables: {tables}"
 
-    run("SHOW TABLES FROM tpcds.sf1", test_show_tables)
+    R.run("SHOW TABLES FROM tpcds.sf1", test_show_tables)
 
     # ------------------------------------------------------------------
     # SELECT queries
@@ -95,7 +88,7 @@ def main():
         assert len(rows) == 5, f"expected 5 rows, got {len(rows)}"
         assert rows[0][0] is not None, "c_customer_sk should not be NULL"
 
-    run("SELECT with LIMIT", test_select_with_limit)
+    R.run("SELECT with LIMIT", test_select_with_limit)
 
     def test_select_with_where():
         cur.execute("SELECT c_first_name, c_last_name FROM tpcds.sf1.customer WHERE c_customer_sk = 1")
@@ -103,14 +96,14 @@ def main():
         assert row is not None, "expected a row for c_customer_sk=1"
         assert row[0].strip() == "Javier", f"expected Javier, got {row[0]!r}"
 
-    run("SELECT with WHERE", test_select_with_where)
+    R.run("SELECT with WHERE", test_select_with_where)
 
     def test_empty_result():
         cur.execute("SELECT c_customer_sk FROM tpcds.sf1.customer WHERE 1 = 0")
         rows = cur.fetchall()
         assert len(rows) == 0, f"expected 0 rows, got {len(rows)}"
 
-    run("Empty result set (WHERE 1=0)", test_empty_result)
+    R.run("Empty result set (WHERE 1=0)", test_empty_result)
 
     def test_column_metadata():
         cur.execute("SELECT c_customer_sk, c_first_name, c_birth_year FROM tpcds.sf1.customer LIMIT 1")
@@ -119,7 +112,7 @@ def main():
         assert len(col_names) == 3, f"expected 3 columns, got {len(col_names)}"
         cur.fetchall()
 
-    run("Column metadata", test_column_metadata)
+    R.run("Column metadata", test_column_metadata)
 
     # ------------------------------------------------------------------
     # Aggregation
@@ -131,7 +124,7 @@ def main():
         count = row[0]
         assert count > 0, f"expected count > 0, got {count}"
 
-    run("COUNT(*)", test_count)
+    R.run("COUNT(*)", test_count)
 
     def test_group_by():
         cur.execute("""
@@ -145,7 +138,7 @@ def main():
         assert len(rows) == 12, f"expected 12 months, got {len(rows)}"
         assert rows[0][0] == 1, f"first month should be 1, got {rows[0][0]}"
 
-    run("GROUP BY + ORDER BY", test_group_by)
+    R.run("GROUP BY + ORDER BY", test_group_by)
 
     def test_aggregation_functions():
         cur.execute("""
@@ -159,7 +152,7 @@ def main():
         assert min_year < max_year, f"min {min_year} should be < max {max_year}"
         assert distinct_years > 1, f"expected multiple distinct years, got {distinct_years}"
 
-    run("MIN + MAX + COUNT(DISTINCT)", test_aggregation_functions)
+    R.run("MIN + MAX + COUNT(DISTINCT)", test_aggregation_functions)
 
     # ------------------------------------------------------------------
     # Multiple WHERE conditions (exercises query variety without
@@ -171,14 +164,14 @@ def main():
         assert row is not None, "expected a row for c_customer_sk=1"
         assert row[0].strip() == "Javier", f"expected Javier, got {row[0]!r}"
 
-    run("WHERE integer equality", test_where_integer)
+    R.run("WHERE integer equality", test_where_integer)
 
     def test_where_range():
         cur.execute("SELECT COUNT(*) FROM tpcds.sf1.customer WHERE c_customer_sk BETWEEN 1 AND 10")
         row = cur.fetchone()
         assert row[0] == 10, f"expected 10, got {row[0]}"
 
-    run("WHERE BETWEEN range", test_where_range)
+    R.run("WHERE BETWEEN range", test_where_range)
 
     def test_reexecute_different_queries():
         for sk, expected_name in [(1, "Javier"), (2, "Amy"), (3, "Latisha")]:
@@ -187,7 +180,7 @@ def main():
             assert row is not None, f"no row for c_customer_sk={sk}"
             assert row[0].strip() == expected_name, f"expected {expected_name!r}, got {row[0]!r}"
 
-    run("Re-execute with different queries", test_reexecute_different_queries)
+    R.run("Re-execute with different queries", test_reexecute_different_queries)
 
     # ------------------------------------------------------------------
     # Multiple sequential queries
@@ -200,7 +193,7 @@ def main():
         cur.execute("SELECT COUNT(*) FROM tpcds.sf1.customer")
         assert cur.fetchone()[0] > 0
 
-    run("Sequential queries on same cursor", test_sequential_queries)
+    R.run("Sequential queries on same cursor", test_sequential_queries)
 
     # ------------------------------------------------------------------
     # Unicode roundtrip
@@ -218,7 +211,7 @@ def main():
             assert row is not None, f"no row for {label}"
             assert row[0] == val, f"{label}: expected {val!r}, got {row[0]!r}"
 
-    run("Unicode roundtrip (Japanese, emoji, accents)", test_unicode_roundtrip)
+    R.run("Unicode roundtrip (Japanese, emoji, accents)", test_unicode_roundtrip)
 
     # ------------------------------------------------------------------
     # SQLGetData type coercion
@@ -247,7 +240,7 @@ def main():
         finally:
             conn.clear_output_converters()
 
-    run("SQLGetData type coercion: INTEGER via add_output_converter", test_getdata_integer_as_char)
+    R.run("SQLGetData type coercion: INTEGER via add_output_converter", test_getdata_integer_as_char)
 
     # ------------------------------------------------------------------
     # VARBINARY
@@ -280,7 +273,7 @@ def main():
             f"expected None, got {row[0]!r}"
         )
 
-    run("VARBINARY returns raw bytes (not base64 text)", test_varbinary_returns_raw_bytes)
+    R.run("VARBINARY returns raw bytes (not base64 text)", test_varbinary_returns_raw_bytes)
 
     # ------------------------------------------------------------------
     # Catalog functions (SQLPrimaryKeys, SQLForeignKeys, SQLStatistics)
@@ -293,7 +286,7 @@ def main():
         rows = list(cur.primaryKeys("customer", catalog="tpcds", schema="sf1"))
         assert len(rows) == 0, f"expected 0 PK rows for tpcds, got {len(rows)}"
 
-    run("SQLPrimaryKeys empty (tpcds)", test_primary_keys_empty)
+    R.run("SQLPrimaryKeys empty (tpcds)", test_primary_keys_empty)
 
     def test_foreign_keys_empty():
         """tpcds tables have no FK constraints — should return empty, not error."""
@@ -304,7 +297,7 @@ def main():
                                      foreignSchema="sf1"))
         assert len(rows) == 0, f"expected 0 FK rows for tpcds, got {len(rows)}"
 
-    run("SQLForeignKeys empty (tpcds)", test_foreign_keys_empty)
+    R.run("SQLForeignKeys empty (tpcds)", test_foreign_keys_empty)
 
     def test_statistics():
         cur.execute("SELECT 1")
@@ -313,7 +306,7 @@ def main():
         # We return empty result sets for statistics — just verify no error
         assert isinstance(rows, list), "statistics should return a list"
 
-    run("SQLStatistics (no error)", test_statistics)
+    R.run("SQLStatistics (no error)", test_statistics)
 
     # ------------------------------------------------------------------
     # Catalog functions against PostgreSQL catalog
@@ -330,7 +323,7 @@ def main():
         # Trino doesn't expose constraint metadata — expect empty, not error
         assert isinstance(rows, list), "primaryKeys should return a list"
 
-    run("SQLPrimaryKeys postgresql (succeeds, empty)", test_primary_keys_postgresql_succeeds)
+    R.run("SQLPrimaryKeys postgresql (succeeds, empty)", test_primary_keys_postgresql_succeeds)
 
     def test_foreign_keys_postgresql_succeeds():
         cur.execute("SELECT 1")
@@ -341,7 +334,7 @@ def main():
         # Trino doesn't expose constraint metadata — expect empty, not error
         assert isinstance(rows, list), "foreignKeys should return a list"
 
-    run("SQLForeignKeys postgresql (succeeds, empty)", test_foreign_keys_postgresql_succeeds)
+    R.run("SQLForeignKeys postgresql (succeeds, empty)", test_foreign_keys_postgresql_succeeds)
 
     # ------------------------------------------------------------------
     # Timestamp with timezone → UTC conversion
@@ -362,7 +355,7 @@ def main():
         assert val.minute == 21, f"minute: expected 21, got {val.minute}"
         assert val.second == 22, f"second: expected 22, got {val.second}"
 
-    run("TIMESTAMP WITH TZ to UTC", test_timestamp_with_tz_utc_conversion)
+    R.run("TIMESTAMP WITH TZ to UTC", test_timestamp_with_tz_utc_conversion)
 
     def test_timestamp_with_utc_tz():
         cur.execute("SELECT TIMESTAMP '2020-05-05 22:00:00.000 UTC' AS v")
@@ -377,7 +370,7 @@ def main():
         assert val.hour == 22, f"hour: expected 22, got {val.hour}"
         assert val.minute == 0, f"minute: expected 0, got {val.minute}"
 
-    run("TIMESTAMP WITH UTC TZ", test_timestamp_with_utc_tz)
+    R.run("TIMESTAMP WITH UTC TZ", test_timestamp_with_utc_tz)
 
     # ------------------------------------------------------------------
     # Connection attributes, through the Driver Manager
@@ -411,7 +404,7 @@ def main():
         # The value the driver already uses is accepted.
         conn.set_attr(SQL_ATTR_ASYNC_ENABLE, SQL_ASYNC_ENABLE_OFF)
 
-    run("connection attribute state and support rules", test_connection_attribute_rules)
+    R.run("connection attribute state and support rules", test_connection_attribute_rules)
 
     # ------------------------------------------------------------------
     # SQL_DATABASE_NAME names the connected catalog
@@ -440,7 +433,7 @@ def main():
                 f"SQL_DATABASE_NAME is {got!r}, but the connection string named {wanted!r}"
             )
 
-    run("SQL_DATABASE_NAME is the connected catalog", test_database_name_is_the_connected_catalog)
+    R.run("SQL_DATABASE_NAME is the connected catalog", test_database_name_is_the_connected_catalog)
 
     # ------------------------------------------------------------------
     # SQL_ATTR_METADATA_ID changes what the catalog functions match
@@ -489,7 +482,7 @@ def main():
         finally:
             probe_conn.close()
 
-    run(
+    R.run(
         "SQL_ATTR_METADATA_ID changes catalog argument semantics",
         test_metadata_id_changes_catalog_argument_semantics,
     )
@@ -549,7 +542,7 @@ def main():
                 f"{label} is not ##.##.#### with an optional suffix: {got!r}"
             )
 
-    run("Backend-declared SQLGetInfo values", test_backend_declared_info_values)
+    R.run("Backend-declared SQLGetInfo values", test_backend_declared_info_values)
 
     def test_query_timeout_fires_through_the_driver_manager():
         # The only place the query timeout is exercised through a Driver
@@ -607,7 +600,7 @@ def main():
         finally:
             timed.close()
 
-    run(
+    R.run(
         "SQL_ATTR_QUERY_TIMEOUT fires during fetch",
         test_query_timeout_fires_through_the_driver_manager,
     )
@@ -667,7 +660,7 @@ def main():
         finally:
             c.close()
 
-    run(
+    R.run(
         "SQLCancel from another thread interrupts a fetch (needs Threading=2)",
         test_cross_thread_cancel_interrupts_a_running_fetch,
     )
@@ -676,8 +669,7 @@ def main():
     conn.close()
 
     # === Summary ===
-    print(f"\n{passed} passed, {failed} failed")
-    sys.exit(1 if failed else 0)
+    sys.exit(R.summary())
 
 
 if __name__ == "__main__":

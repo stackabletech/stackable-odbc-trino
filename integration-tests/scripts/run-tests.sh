@@ -55,6 +55,8 @@ fi
 export ODBCSYSINI="$GENERATED"
 export ODBCINI="$GENERATED/odbc.ini"
 
+CONN_HTTP="Driver=$DRIVER_PATH;Host=localhost;Port=8080;User=admin;Password=admin;Protocol=http;Catalog=tpcds"
+
 echo "=== Running Linux pyodbc integration tests (DSN-less, HTTP) ==="
 uv run --with pyodbc python3 "$TEST_DIR/suites/test_integration.py" \
     "Driver=$DRIVER_PATH;Host=localhost;Port=8080;User=admin;Password=admin;Protocol=http;Catalog=tpcds"
@@ -92,7 +94,7 @@ uv run --with pyodbc python3 "$TEST_DIR/suites/test_folding_contract.py" \
 # handling of out-of-order and malformed calls is invisible to every suite
 # above this one. Standard library only -- no uv, no pyodbc.
 echo "=== Running raw C ABI pen test ==="
-python3 "$TEST_DIR/suites/test_c_abi.py" "$DRIVER_PATH"
+python3 "$TEST_DIR/suites/test_c_abi.py" "$DRIVER_PATH" "$CONN_HTTP"
 
 # --- Linux: type-transform fuzz (no Driver Manager) ---
 # Every (Trino value, C data type) pair through SQLGetData, checked against
@@ -100,7 +102,7 @@ python3 "$TEST_DIR/suites/test_c_abi.py" "$DRIVER_PATH"
 # boundary values, the IEEE specials, NULL per target type, and the statement
 # terminator forms. Standard library only.
 echo "=== Running type-transform fuzz ==="
-python3 "$TEST_DIR/suites/test_type_matrix.py" "$DRIVER_PATH"
+python3 "$TEST_DIR/suites/test_type_matrix.py" "$DRIVER_PATH" "$CONN_HTTP"
 
 # --- Linux: Rust FFI integration tests ---
 # Only FFI tests are run here. The backend::tests integration tests use a

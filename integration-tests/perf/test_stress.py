@@ -13,45 +13,24 @@ Usage:
 Requires: pip install pyodbc
 """
 
+import os
 import sys
+
 import pyodbc
 
-passed = 0
-failed = 0
-skipped = 0
+sys.path.insert(
+    0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "suites")
+)
 
+from harness import Results, Stack  # noqa: E402
 
-def run(label, fn):
-    """Run a test function, print PASS/FAIL with elapsed time, track counts."""
-    global passed, failed
-    import time
-    t0 = time.monotonic()
-    try:
-        fn()
-        elapsed = time.monotonic() - t0
-        print(f"PASS  {label}  ({elapsed:.1f}s)")
-        passed += 1
-    except Exception as e:
-        elapsed = time.monotonic() - t0
-        print(f"FAIL  {label}  ({elapsed:.1f}s): {e}")
-        failed += 1
-
-
-def skip(label, reason):
-    """Mark a test as skipped with a reason."""
-    global skipped
-    print(f"SKIP  {label}: {reason}")
-    skipped += 1
+R = Results("stress")
 
 
 def main():
-    if len(sys.argv) != 2:
-        print(f"Usage: {sys.argv[0]} <connection-string>")
-        sys.exit(2)
-
-    global passed, failed, skipped
-
-    conn_str = sys.argv[1]
+    # A connection string may be passed positionally; with no argument the
+    # local stack describes itself.
+    conn_str = sys.argv[1] if len(sys.argv) > 1 else Stack.load().conn_str()
     conn = pyodbc.connect(conn_str, autocommit=True)
     cur = conn.cursor()
 
@@ -73,7 +52,7 @@ def main():
         for row in rows:
             assert row[2] is not None and row[2] > 0, f"total_spend should be > 0, got {row[2]!r}"
 
-    run("Two-table INNER JOIN with aggregation", test_two_table_join)
+    R.run("Two-table INNER JOIN with aggregation", test_two_table_join)
 
     def test_three_table_star_join():
         cur.execute("""
@@ -92,7 +71,7 @@ def main():
         for row in rows:
             assert row[2] is not None, "total_qty should not be NULL"
 
-    run("Three-table star-schema JOIN", test_three_table_star_join)
+    R.run("Three-table star-schema JOIN", test_three_table_star_join)
 
     def test_left_join_nulls():
         cur.execute("""
@@ -107,7 +86,7 @@ def main():
         has_null = any(row[2] is None for row in rows)
         assert has_null, "expected at least one NULL ws_order_number from LEFT JOIN"
 
-    run("LEFT JOIN producing NULLs", test_left_join_nulls)
+    R.run("LEFT JOIN producing NULLs", test_left_join_nulls)
 
     # ------------------------------------------------------------------
     # 2. Subqueries and CTEs
@@ -129,7 +108,7 @@ def main():
         for row in rows:
             assert row[0] > 0, f"c_customer_sk should be > 0, got {row[0]}"
 
-    run("Correlated subquery", test_correlated_subquery)
+    R.run("Correlated subquery", test_correlated_subquery)
 
     def test_cte():
         cur.execute("""
@@ -149,7 +128,7 @@ def main():
         for row in rows:
             assert row[1] is not None and row[1] > 0, f"total_qty should be > 0, got {row[1]!r}"
 
-    run("CTE / WITH clause", test_cte)
+    R.run("CTE / WITH clause", test_cte)
 
     # ------------------------------------------------------------------
     # 3. UNION
@@ -171,7 +150,7 @@ def main():
         assert "store" in channels, f"expected 'store' channel, got {channels}"
         assert "web" in channels, f"expected 'web' channel, got {channels}"
 
-    run("UNION ALL across sales channels", test_union_all)
+    R.run("UNION ALL across sales channels", test_union_all)
 
     def test_union_dedup():
         cur.execute("""
@@ -186,7 +165,7 @@ def main():
         for row in rows:
             assert 1 <= row[0] <= 10, f"customer_sk {row[0]} out of range [1, 10]"
 
-    run("UNION with dedup", test_union_dedup)
+    R.run("UNION with dedup", test_union_dedup)
 
     # ------------------------------------------------------------------
     # 4. Large result sets
@@ -201,7 +180,7 @@ def main():
         rows = cur.fetchall()
         assert len(rows) >= 10000, f"expected >= 10000 rows, got {len(rows)}"
 
-    run("Fetch 10,000+ rows", test_large_result_set)
+    R.run("Fetch 10,000+ rows", test_large_result_set)
 
     def test_wide_result_set():
         cur.execute("""
@@ -220,7 +199,7 @@ def main():
         col_names = [d[0] for d in cur.description]
         assert len(col_names) == 11, f"expected 11 columns, got {len(col_names)}"
 
-    run("Wide result set (11 columns)", test_wide_result_set)
+    R.run("Wide result set (11 columns)", test_wide_result_set)
 
     # ------------------------------------------------------------------
     # 5. NULL and edge cases
@@ -240,14 +219,14 @@ def main():
         )
         assert has_none, "expected at least one NULL in nullable columns"
 
-    run("NULLs in various column positions", test_nulls_in_various_positions)
+    R.run("NULLs in various column positions", test_nulls_in_various_positions)
 
     def test_empty_result_set():
         cur.execute("SELECT c_customer_sk FROM tpcds.sf1.customer WHERE 1 = 0")
         rows = cur.fetchall()
         assert len(rows) == 0, f"expected 0 rows, got {len(rows)}"
 
-    run("Empty result set", test_empty_result_set)
+    R.run("Empty result set", test_empty_result_set)
 
     # ------------------------------------------------------------------
     # 6. Complex aggregation
@@ -269,7 +248,7 @@ def main():
             assert row[1] > 100, f"purchase_count should be > 100, got {row[1]}"
             assert row[2] is not None and row[2] > 0, f"total should be > 0, got {row[2]!r}"
 
-    run("GROUP BY + HAVING on a JOIN", test_group_by_having_on_join)
+    R.run("GROUP BY + HAVING on a JOIN", test_group_by_having_on_join)
 
     def test_window_function():
         cur.execute("""
@@ -283,17 +262,13 @@ def main():
         for row in rows:
             assert row[3] is not None and row[3] > 0, f"rn should be a positive integer, got {row[3]!r}"
 
-    run("Window function (ROW_NUMBER OVER PARTITION BY)", test_window_function)
+    R.run("Window function (ROW_NUMBER OVER PARTITION BY)", test_window_function)
 
     # === Cleanup ===
     conn.close()
 
     # === Summary ===
-    parts = [f"{passed} passed", f"{failed} failed"]
-    if skipped:
-        parts.append(f"{skipped} skipped")
-    print(f"\n{', '.join(parts)}")
-    sys.exit(1 if failed else 0)
+    sys.exit(R.summary())
 
 
 if __name__ == "__main__":

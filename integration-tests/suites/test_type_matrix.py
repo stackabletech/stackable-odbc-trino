@@ -34,8 +34,8 @@ import os
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from harness import Results, Stack  # noqa: E402
 from test_c_abi import (  # noqa: E402
-    DEFAULT_CONN_STR,
     SQL_ATTR_ODBC_VERSION,
     SQL_DRIVER_NOPROMPT,
     SQL_ERROR,
@@ -173,20 +173,20 @@ TERMINATORS = [
     ("semicolon inside a block comment", "SELECT 1 AS n /* ; */"),
 ]
 
-passed = 0
-failed = 0
+R = Results("type matrix")
 violations = []
 
 
+# These write R's counters directly rather than going through ok()/bad():
+# the suite prints per *violation*, not per check. 37 values against 13 C
+# types is 481 PASS lines nobody reads.
 def fail(kind, detail):
-    global failed
-    failed += 1
+    R.failed += 1
     violations.append(f"{kind}: {detail}")
 
 
 def ok():
-    global passed
-    passed += 1
+    R.passed += 1
 
 
 class Driver:
@@ -262,13 +262,11 @@ def as_text(raw, c_type):
 
 
 def main():
-    global passed, failed
-
     here = os.path.dirname(os.path.abspath(__file__))
     so = sys.argv[1] if len(sys.argv) > 1 else os.path.join(
         here, "..", "..", "target", "debug", "libstackable_odbc_trino.so"
     )
-    conn_str = sys.argv[2] if len(sys.argv) > 2 else DEFAULT_CONN_STR
+    conn_str = sys.argv[2] if len(sys.argv) > 2 else Stack.load().conn_str()
     if not os.path.exists(so):
         print(f"driver not found: {so}\nrun: cargo build")
         return 2
@@ -443,7 +441,6 @@ def main():
 
     d.close()
 
-    print(f"\n{passed} passed, {failed} failed")
     if violations:
         print("\nviolations:")
         seen = set()
@@ -451,7 +448,7 @@ def main():
             if v not in seen:
                 seen.add(v)
                 print(f"  {v}")
-    return 1 if failed else 0
+    return R.summary()
 
 
 if __name__ == "__main__":

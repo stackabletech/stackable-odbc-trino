@@ -22,39 +22,28 @@ Usage:
 Requires: pip install pyodbc (run through `uv run --with pyodbc`).
 """
 
+import os
 import sys
 import time
 
 import pyodbc
 
-passed = 0
-failed = 0
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from harness import Results, Stack  # noqa: E402
+
+R = Results("sql surface")
 
 # A query that hangs is worse than one that errors: it takes the whole suite
 # with it and gives no diagnosis. Nothing here should come close.
 QUERY_TIMEOUT_SECONDS = 60
 
 
-def run(label, fn):
-    global passed, failed
-    t0 = time.monotonic()
-    try:
-        fn()
-        print(f"PASS  {label}  ({time.monotonic() - t0:.1f}s)")
-        passed += 1
-    except Exception as e:
-        print(f"FAIL  {label}  ({time.monotonic() - t0:.1f}s): {e}")
-        failed += 1
-
-
 def main():
-    global passed, failed
-
-    if len(sys.argv) != 2:
-        print(f"Usage: {sys.argv[0]} <connection-string>")
-        return 2
-
-    conn = pyodbc.connect(sys.argv[1], autocommit=True)
+    # A connection string may be passed positionally; with no argument the
+    # local stack describes itself.
+    conn_str = sys.argv[1] if len(sys.argv) > 1 else Stack.load().conn_str()
+    conn = pyodbc.connect(conn_str, autocommit=True)
     conn.timeout = QUERY_TIMEOUT_SECONDS
     cur = conn.cursor()
 
@@ -81,113 +70,113 @@ def main():
 
     # ------------------------------------------------------------------
     print("--- joins ---")
-    run("inner join", lambda: scalar(
+    R.run("inner join", lambda: scalar(
         "SELECT count(*) FROM (VALUES 1,2,3) a(x) JOIN (VALUES 2,3,4) b(y) ON a.x = b.y", 2))
-    run("left outer join", lambda: scalar(
+    R.run("left outer join", lambda: scalar(
         "SELECT count(*) FROM (VALUES 1,2,3) a(x) LEFT JOIN (VALUES 2) b(y) ON a.x = b.y", 3))
-    run("right outer join", lambda: scalar(
+    R.run("right outer join", lambda: scalar(
         "SELECT count(*) FROM (VALUES 1) a(x) RIGHT JOIN (VALUES 1,2,3) b(y) ON a.x = b.y", 3))
-    run("full outer join", lambda: scalar(
+    R.run("full outer join", lambda: scalar(
         "SELECT count(*) FROM (VALUES 1,2) a(x) FULL JOIN (VALUES 2,3) b(y) ON a.x = b.y", 3))
-    run("cross join", lambda: scalar(
+    R.run("cross join", lambda: scalar(
         "SELECT count(*) FROM (VALUES 1,2,3) a(x) CROSS JOIN (VALUES 1,2) b(y)", 6))
-    run("non-equi join", lambda: scalar(
+    R.run("non-equi join", lambda: scalar(
         "SELECT count(*) FROM (VALUES 1,2,3) a(x) JOIN (VALUES 1,2,3) b(y) ON a.x < b.y", 3))
-    run("self join", lambda: scalar(
+    R.run("self join", lambda: scalar(
         "SELECT count(*) FROM (VALUES 1,2,3) a(x) JOIN (VALUES 1,2,3) b(x) ON a.x = b.x", 3))
-    run("three-way join", lambda: scalar(
+    R.run("three-way join", lambda: scalar(
         "SELECT count(*) FROM (VALUES 1,2) a(x) JOIN (VALUES 1,2) b(y) ON a.x=b.y "
         "JOIN (VALUES 1,2) c(z) ON b.y=c.z", 2))
     # The {oj} escape, which SQL_OUTER_JOIN_CAPABILITIES advertises.
-    run("ODBC {oj} escape", lambda: scalar(
+    R.run("ODBC {oj} escape", lambda: scalar(
         "SELECT count(*) FROM {oj (VALUES 1,2,3) a(x) LEFT OUTER JOIN (VALUES 2) b(y) "
         "ON a.x = b.y}", 3))
 
     # ------------------------------------------------------------------
     print("\n--- aggregates and GROUP BY ---")
-    run("count/sum/avg/min/max", lambda: scalar(
+    R.run("count/sum/avg/min/max", lambda: scalar(
         "SELECT count(*) + sum(x) + min(x) + max(x) FROM (VALUES 1,2,3) t(x)", 3 + 6 + 1 + 3))
-    run("count(DISTINCT)", lambda: scalar(
+    R.run("count(DISTINCT)", lambda: scalar(
         "SELECT count(DISTINCT x) FROM (VALUES 1,1,2) t(x)", 2))
-    run("GROUP BY", lambda: rows(
+    R.run("GROUP BY", lambda: rows(
         "SELECT x, count(*) FROM (VALUES 1,1,2) t(x) GROUP BY x", want_count=2))
-    run("HAVING", lambda: rows(
+    R.run("HAVING", lambda: rows(
         "SELECT x FROM (VALUES 1,1,2) t(x) GROUP BY x HAVING count(*) > 1", want_count=1))
-    run("GROUPING SETS", lambda: rows(
+    R.run("GROUPING SETS", lambda: rows(
         "SELECT x, y, count(*) FROM (VALUES (1,1),(1,2)) t(x,y) "
         "GROUP BY GROUPING SETS ((x),(y))", min_count=2))
-    run("ROLLUP", lambda: rows(
+    R.run("ROLLUP", lambda: rows(
         "SELECT x, count(*) FROM (VALUES 1,2) t(x) GROUP BY ROLLUP (x)", min_count=2))
-    run("CUBE", lambda: rows(
+    R.run("CUBE", lambda: rows(
         "SELECT x, y, count(*) FROM (VALUES (1,1),(2,2)) t(x,y) GROUP BY CUBE (x,y)",
         min_count=3))
 
     # ------------------------------------------------------------------
     print("\n--- window functions ---")
-    run("row_number", lambda: scalar(
+    R.run("row_number", lambda: scalar(
         "SELECT max(rn) FROM (SELECT row_number() OVER (ORDER BY x) rn "
         "FROM (VALUES 1,2,3) t(x)) s", 3))
-    run("rank with PARTITION BY", lambda: rows(
+    R.run("rank with PARTITION BY", lambda: rows(
         "SELECT rank() OVER (PARTITION BY x ORDER BY y) FROM (VALUES (1,1),(1,2)) t(x,y)",
         want_count=2))
-    run("lag/lead", lambda: rows(
+    R.run("lag/lead", lambda: rows(
         "SELECT lag(x) OVER (ORDER BY x), lead(x) OVER (ORDER BY x) "
         "FROM (VALUES 1,2,3) t(x)", want_count=3))
-    run("running sum frame", lambda: scalar(
+    R.run("running sum frame", lambda: scalar(
         "SELECT max(s) FROM (SELECT sum(x) OVER (ORDER BY x ROWS BETWEEN UNBOUNDED "
         "PRECEDING AND CURRENT ROW) s FROM (VALUES 1,2,3) t(x)) q", 6))
 
     # ------------------------------------------------------------------
     print("\n--- subqueries and CTEs ---")
-    run("scalar subquery", lambda: scalar("SELECT (SELECT max(x) FROM (VALUES 1,2,3) t(x))", 3))
-    run("IN subquery", lambda: scalar(
+    R.run("scalar subquery", lambda: scalar("SELECT (SELECT max(x) FROM (VALUES 1,2,3) t(x))", 3))
+    R.run("IN subquery", lambda: scalar(
         "SELECT count(*) FROM (VALUES 1,2,3) a(x) WHERE a.x IN (SELECT y FROM (VALUES 1,2) b(y))",
         2))
-    run("EXISTS subquery", lambda: scalar(
+    R.run("EXISTS subquery", lambda: scalar(
         "SELECT count(*) FROM (VALUES 1,2) a(x) WHERE EXISTS "
         "(SELECT 1 FROM (VALUES 1) b(y) WHERE b.y = a.x)", 1))
-    run("correlated subquery", lambda: scalar(
+    R.run("correlated subquery", lambda: scalar(
         "SELECT count(*) FROM (VALUES 1,2) a(x) WHERE a.x = "
         "(SELECT max(y) FROM (VALUES 1) b(y))", 1))
-    run("quantified comparison (ANY/ALL)", lambda: scalar(
+    R.run("quantified comparison (ANY/ALL)", lambda: scalar(
         "SELECT count(*) FROM (VALUES 1,2,3) a(x) WHERE a.x > ALL (SELECT y FROM (VALUES 1) b(y))",
         2))
-    run("CTE", lambda: scalar("WITH c AS (SELECT 1 AS x) SELECT x FROM c", 1))
-    run("multiple CTEs", lambda: scalar(
+    R.run("CTE", lambda: scalar("WITH c AS (SELECT 1 AS x) SELECT x FROM c", 1))
+    R.run("multiple CTEs", lambda: scalar(
         "WITH a AS (SELECT 1 x), b AS (SELECT 2 y) SELECT a.x + b.y FROM a, b", 3))
-    run("derived table", lambda: scalar(
+    R.run("derived table", lambda: scalar(
         "SELECT count(*) FROM (SELECT x FROM (VALUES 1,2,3) t(x)) s", 3))
 
     # ------------------------------------------------------------------
     print("\n--- set operations ---")
-    run("UNION", lambda: scalar(
+    R.run("UNION", lambda: scalar(
         "SELECT count(*) FROM (SELECT 1 UNION SELECT 1 UNION SELECT 2) t", 2))
-    run("UNION ALL", lambda: scalar(
+    R.run("UNION ALL", lambda: scalar(
         "SELECT count(*) FROM (SELECT 1 UNION ALL SELECT 1) t", 2))
-    run("INTERSECT", lambda: scalar(
+    R.run("INTERSECT", lambda: scalar(
         "SELECT count(*) FROM (SELECT 1 INTERSECT SELECT 1) t", 1))
-    run("EXCEPT", lambda: scalar(
+    R.run("EXCEPT", lambda: scalar(
         "SELECT count(*) FROM (SELECT 1 EXCEPT SELECT 2) t", 1))
 
     # ------------------------------------------------------------------
     print("\n--- parameters in every clause that takes one ---")
-    run("parameter in SELECT", lambda: scalar("SELECT CAST(? AS INTEGER)", 7, params=[7]))
-    run("parameter in WHERE", lambda: scalar(
+    R.run("parameter in SELECT", lambda: scalar("SELECT CAST(? AS INTEGER)", 7, params=[7]))
+    R.run("parameter in WHERE", lambda: scalar(
         "SELECT count(*) FROM (VALUES 1,2,3) t(x) WHERE x > ?", 2, params=[1]))
-    run("parameter in HAVING", lambda: rows(
+    R.run("parameter in HAVING", lambda: rows(
         "SELECT x FROM (VALUES 1,1,2) t(x) GROUP BY x HAVING count(*) > ?",
         want_count=1, params=[1]))
-    run("parameter in IN list", lambda: scalar(
+    R.run("parameter in IN list", lambda: scalar(
         "SELECT count(*) FROM (VALUES 1,2,3) t(x) WHERE x IN (?, ?)", 2, params=[1, 2]))
-    run("two parameters, order preserved", lambda: scalar(
+    R.run("two parameters, order preserved", lambda: scalar(
         "SELECT CAST(? AS VARCHAR) || CAST(? AS VARCHAR)", "ab", params=["a", "b"]))
-    run("parameter in a join condition", lambda: scalar(
+    R.run("parameter in a join condition", lambda: scalar(
         "SELECT count(*) FROM (VALUES 1,2) a(x) JOIN (VALUES 1,2) b(y) ON a.x = b.y "
         "AND a.x > ?", 1, params=[1]))
-    run("NULL parameter", lambda: scalar("SELECT CAST(? AS INTEGER) IS NULL", True, params=[None]))
+    R.run("NULL parameter", lambda: scalar("SELECT CAST(? AS INTEGER) IS NULL", True, params=[None]))
     # LIMIT is worth its own probe: Trino does not accept a parameter there, so
     # the driver rendering the value as a literal is what makes it work at all.
-    run("parameter in LIMIT", lambda: rows(
+    R.run("parameter in LIMIT", lambda: rows(
         "SELECT x FROM (VALUES 1,2,3) t(x) LIMIT ?", want_count=2, params=[2]))
 
     # ------------------------------------------------------------------
@@ -196,33 +185,33 @@ def main():
     # because that is the property under test: the driver has to describe a
     # column whose size it cannot know, and an application sizes its buffers
     # from what it says.
-    run("DESCRIBE", lambda: shape("DESCRIBE tpcds.sf1.customer", min_cols=2, min_rows=1))
-    run("SHOW TABLES", lambda: shape("SHOW TABLES FROM tpcds.sf1", min_rows=1))
-    run("SHOW SCHEMAS", lambda: shape("SHOW SCHEMAS FROM tpcds", min_rows=1))
-    run("SHOW COLUMNS", lambda: shape("SHOW COLUMNS FROM tpcds.sf1.customer", min_rows=1))
-    run("EXPLAIN", lambda: shape("EXPLAIN SELECT 1", min_rows=1))
-    run("EXPLAIN (TYPE LOGICAL)", lambda: shape("EXPLAIN (TYPE LOGICAL) SELECT 1", min_rows=1))
-    run("EXPLAIN ANALYZE", lambda: shape("EXPLAIN ANALYZE SELECT 1", min_rows=1))
-    run("SHOW FUNCTIONS", lambda: shape("SHOW FUNCTIONS", min_rows=1))
+    R.run("DESCRIBE", lambda: shape("DESCRIBE tpcds.sf1.customer", min_cols=2, min_rows=1))
+    R.run("SHOW TABLES", lambda: shape("SHOW TABLES FROM tpcds.sf1", min_rows=1))
+    R.run("SHOW SCHEMAS", lambda: shape("SHOW SCHEMAS FROM tpcds", min_rows=1))
+    R.run("SHOW COLUMNS", lambda: shape("SHOW COLUMNS FROM tpcds.sf1.customer", min_rows=1))
+    R.run("EXPLAIN", lambda: shape("EXPLAIN SELECT 1", min_rows=1))
+    R.run("EXPLAIN (TYPE LOGICAL)", lambda: shape("EXPLAIN (TYPE LOGICAL) SELECT 1", min_rows=1))
+    R.run("EXPLAIN ANALYZE", lambda: shape("EXPLAIN ANALYZE SELECT 1", min_rows=1))
+    R.run("SHOW FUNCTIONS", lambda: shape("SHOW FUNCTIONS", min_rows=1))
 
     # ------------------------------------------------------------------
     print("\n--- ODBC catalog functions ---")
-    run("SQLTables", lambda: (
+    R.run("SQLTables", lambda: (
         cur.tables(catalog="tpcds", schema="sf1").fetchall() or
         (_ for _ in ()).throw(AssertionError("no tables"))))
-    run("SQLTables catalog enumeration", lambda: (
+    R.run("SQLTables catalog enumeration", lambda: (
         cur.tables(catalog="%", schema="", table="").fetchall() or
         (_ for _ in ()).throw(AssertionError("no catalogs"))))
-    run("SQLTables schema enumeration", lambda: (
+    R.run("SQLTables schema enumeration", lambda: (
         cur.tables(catalog="", schema="%", table="").fetchall() or
         (_ for _ in ()).throw(AssertionError("no schemas"))))
-    run("SQLTables table-type enumeration", lambda: (
+    R.run("SQLTables table-type enumeration", lambda: (
         cur.tables(catalog="", schema="", table="", tableType="%").fetchall() or
         (_ for _ in ()).throw(AssertionError("no table types"))))
-    run("SQLColumns", lambda: (
+    R.run("SQLColumns", lambda: (
         cur.columns(catalog="tpcds", schema="sf1", table="customer").fetchall() or
         (_ for _ in ()).throw(AssertionError("no columns"))))
-    run("SQLGetTypeInfo", lambda: (
+    R.run("SQLGetTypeInfo", lambda: (
         cur.getTypeInfo().fetchall() or
         (_ for _ in ()).throw(AssertionError("no type info"))))
 
@@ -260,7 +249,7 @@ def main():
                 assert sub is not None, f"{r[3]}: SQL_DATETIME with no subcode"
         assert seen >= 3, f"expected date, time and timestamp columns, saw {seen}"
 
-    run("SQLColumns datetime verbose type agrees with SQLGetTypeInfo",
+    R.run("SQLColumns datetime verbose type agrees with SQLGetTypeInfo",
         datetime_columns_report_the_verbose_type)
 
     def catalog_functions_reach_an_unconnected_catalog():
@@ -282,43 +271,42 @@ def main():
         assert cur.tables(catalog="no_such_catalog").fetchall() == [], \
             "a missing catalog must be empty, not an error"
 
-    run("catalog functions reach an unconnected catalog",
+    R.run("catalog functions reach an unconnected catalog",
         catalog_functions_reach_an_unconnected_catalog)
     # Trino exposes no key or index metadata, so an empty result set is the
     # correct answer and the assertion is that the call succeeds and describes
     # its columns rather than erroring.
-    run("SQLPrimaryKeys (empty is correct)",
+    R.run("SQLPrimaryKeys (empty is correct)",
         lambda: cur.primaryKeys(catalog="tpcds", schema="sf1", table="customer").fetchall())
-    run("SQLStatistics (empty is correct)",
+    R.run("SQLStatistics (empty is correct)",
         lambda: cur.statistics(catalog="tpcds", schema="sf1", table="customer").fetchall())
     # Trino has callable procedures (CALL system.runtime.kill_query(...))
     # but publishes no metadata naming them, so an empty result set is the
     # honest answer here too. pyodbc exposes no tablePrivileges() or
     # columnPrivileges(), so those two are covered in test_c_abi.py instead.
-    run("SQLProcedures (empty is correct)",
+    R.run("SQLProcedures (empty is correct)",
         lambda: cur.procedures(catalog="system", schema="runtime").fetchall())
-    run("SQLProcedureColumns (empty is correct)",
+    R.run("SQLProcedureColumns (empty is correct)",
         lambda: cur.procedureColumns(catalog="system", schema="runtime").fetchall())
 
     # ------------------------------------------------------------------
     print("\n--- ordering, distinct, and null handling ---")
-    run("ORDER BY on an unselected column", lambda: rows(
+    R.run("ORDER BY on an unselected column", lambda: rows(
         "SELECT y FROM (VALUES (1,'b'),(2,'a')) t(x,y) ORDER BY x", want_count=2))
-    run("ORDER BY an expression", lambda: rows(
+    R.run("ORDER BY an expression", lambda: rows(
         "SELECT x FROM (VALUES 1,2) t(x) ORDER BY -x", want_count=2))
-    run("NULLS sort last by default", lambda: scalar(
+    R.run("NULLS sort last by default", lambda: scalar(
         "SELECT x FROM (VALUES 1, NULL) t(x) ORDER BY x LIMIT 1", 1))
-    run("DISTINCT", lambda: scalar(
+    R.run("DISTINCT", lambda: scalar(
         "SELECT count(*) FROM (SELECT DISTINCT x FROM (VALUES 1,1,2) t(x)) s", 2))
-    run("CASE expression", lambda: scalar(
+    R.run("CASE expression", lambda: scalar(
         "SELECT CASE WHEN 1 = 1 THEN 'y' ELSE 'n' END", "y"))
-    run("COALESCE over NULL", lambda: scalar("SELECT coalesce(CAST(NULL AS INTEGER), 5)", 5))
+    R.run("COALESCE over NULL", lambda: scalar("SELECT coalesce(CAST(NULL AS INTEGER), 5)", 5))
 
     cur.close()
     conn.close()
 
-    print(f"\n{passed} passed, {failed} failed")
-    return 1 if failed else 0
+    return R.summary()
 
 
 if __name__ == "__main__":

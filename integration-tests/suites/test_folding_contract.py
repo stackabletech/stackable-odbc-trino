@@ -35,9 +35,11 @@ import sys
 
 import pyodbc
 
-passed = 0
-failed = 0
-notes = 0
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from harness import Results, Stack  # noqa: E402
+
+R = Results("folding contract")
 
 CONNECTOR = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "..", "..", "connector", "StackableTrinoODBC.pq"
@@ -62,19 +64,11 @@ DM_COMPAT_ONLY = {"SQL_CHAR", "SQL_VARCHAR"}
 
 
 def check(label, ok, detail=""):
-    global passed, failed
-    if ok:
-        print(f"PASS  {label}{detail}")
-        passed += 1
-    else:
-        print(f"FAIL  {label}{detail}")
-        failed += 1
+    R.check(f"{label}{detail}", ok)
 
 
 def note(label, text):
-    global notes
-    print(f"NOTE  {label}: {text}")
-    notes += 1
+    R.note(label, text)
 
 
 def parse_constant_visitor(source):
@@ -123,11 +117,9 @@ def parse_limit_clause(source):
 
 
 def main():
-    global failed
-
-    if len(sys.argv) != 2:
-        print(f"Usage: {sys.argv[0]} <connection-string>")
-        return 2
+    # A connection string may be passed positionally; with no argument the
+    # local stack describes itself.
+    conn_str = sys.argv[1] if len(sys.argv) > 1 else Stack.load().conn_str()
 
     with open(CONNECTOR, encoding="utf-8") as f:
         source = f.read()
@@ -137,7 +129,7 @@ def main():
         print("FAIL  could not parse the Constant visitor out of the connector")
         return 1
 
-    conn = pyodbc.connect(sys.argv[1], autocommit=True)
+    conn = pyodbc.connect(conn_str, autocommit=True)
     cur = conn.cursor()
     type_names = {r[0] for r in cur.getTypeInfo().fetchall()}
 
@@ -241,8 +233,7 @@ def main():
     cur.close()
     conn.close()
 
-    print(f"\n{passed} passed, {failed} failed, {notes} notes")
-    return 1 if failed else 0
+    return R.summary()
 
 
 if __name__ == "__main__":

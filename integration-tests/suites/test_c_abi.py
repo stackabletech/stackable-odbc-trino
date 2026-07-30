@@ -119,13 +119,11 @@ SQL_BIGINT = -5
 SQL_PARAM_INPUT = 1
 SQL_NUMERIC = 2
 
-DEFAULT_CONN_STR = (
-    "Host=localhost;Port=8080;User=admin;Password=admin;Protocol=http;Catalog=tpcds"
-)
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-passed = 0
-failed = 0
-notes = 0
+from harness import Results, Stack  # noqa: E402
+
+R = Results("raw C ABI")
 
 
 def w(s):
@@ -237,8 +235,11 @@ def rname(r):
 
 
 def check(label, got, want, state=None, got_state=None):
-    """Assert a return code, and optionally the SQLSTATE that came with it."""
-    global passed, failed
+    """Assert a return code, and optionally the SQLSTATE that came with it.
+
+    Kept here rather than in the harness: it speaks in ODBC return codes and
+    SQLSTATEs, which is this suite's vocabulary, not generic machinery.
+    """
     want_list = want if isinstance(want, (list, tuple)) else [want]
     ok = got in want_list
     detail = ""
@@ -248,30 +249,24 @@ def check(label, got, want, state=None, got_state=None):
     elif got_state:
         detail = f" (SQLSTATE {got_state})"
     if ok:
-        print(f"PASS  {label}: {rname(got)}{detail}")
-        passed += 1
+        R.ok(f"{label}: {rname(got)}{detail}")
     else:
         expect = "/".join(rname(x) for x in want_list)
-        print(f"FAIL  {label}: got {rname(got)}{detail}, expected {expect}")
-        failed += 1
+        R.bad(f"{label}: got {rname(got)}{detail}, expected {expect}")
 
 
 def note(label, text):
     """An observation the driver is entitled to make either way."""
-    global notes
-    print(f"NOTE  {label}: {text}")
-    notes += 1
+    R.note(label, text)
 
 
 def main():
-    global passed, failed
-
     here = os.path.dirname(os.path.abspath(__file__))
     default_so = os.path.join(
         here, "..", "..", "target", "debug", "libstackable_odbc_trino.so"
     )
     so = sys.argv[1] if len(sys.argv) > 1 else default_so
-    conn_str = sys.argv[2] if len(sys.argv) > 2 else DEFAULT_CONN_STR
+    conn_str = sys.argv[2] if len(sys.argv) > 2 else Stack.load().conn_str()
 
     if not os.path.exists(so):
         print(f"driver not found: {so}\nrun: cargo build")
@@ -1168,8 +1163,7 @@ def main():
     r = lib.SQLFreeHandle(SQL_HANDLE_ENV, env)
     check("free the same env twice", r, SQL_INVALID_HANDLE)
 
-    print(f"\n{passed} passed, {failed} failed, {notes} notes")
-    return 1 if failed else 0
+    return R.summary()
 
 
 if __name__ == "__main__":
