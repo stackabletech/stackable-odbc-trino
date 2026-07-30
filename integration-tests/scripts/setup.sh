@@ -1,171 +1,95 @@
 #!/usr/bin/env bash
-# Sets up the Trino test environment: generates TLS cert and password.db,
-# starts Trino via Docker Compose, waits for it to be healthy, builds the
-# driver, and writes the ODBC config files.
+# Brings up the test stack: generates certificates, secrets and ODBC config,
+# starts Docker Compose, waits for readiness, and builds the driver.
 #
-# Trino keeps running after this script exits. Use run-tests.sh to execute
-# tests and tear down, or manage the compose stack manually:
-#   docker compose -f integration-tests/stack/compose.yaml down
+# The stack keeps running after this exits. Use run-tests.sh to run the suites,
+# or scripts/teardown.sh to stop.
+#
+# Usage:
+#   ./integration-tests/setup.sh
+#   ./integration-tests/setup.sh --profile oauth,hive
+#   PROFILES=all ./integration-tests/setup.sh
 set -euo pipefail
+# shellcheck source=lib.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib.sh"
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-TEST_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
-PROJECT_DIR="$(cd "$TEST_DIR/.." && pwd)"
-
-COMPOSE_FILE="$TEST_DIR/stack/compose.yaml"
-PASSFILE="$TEST_DIR/stack/trino/base/password.db"
-GENERATED="$TEST_DIR/generated"
-
-mkdir -p "$GENERATED"
+PROFILES_ARG="${PROFILES:-}"
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --profile) PROFILES_ARG="$2"; shift 2 ;;
+        --profile=*) PROFILES_ARG="${1#*=}"; shift ;;
+        *) echo "unknown argument: $1" >&2; exit 2 ;;
+    esac
+done
+PROFILES="$(parse_profiles "$PROFILES_ARG")"
+export PROFILES
 
 # --- Dependency checks (fail fast) ---
 missing=()
-if ! docker compose version &>/dev/null; then
-    missing+=("'docker compose' v2 plugin — sudo apt install docker-compose-plugin  OR  https://docs.docker.com/compose/install/")
-fi
-if ! command -v cargo &>/dev/null; then
-    missing+=("'cargo' — https://rustup.rs")
-fi
-if ! command -v curl &>/dev/null; then
-    missing+=("'curl' — sudo apt install curl")
-fi
-if [[ ! -f "$PASSFILE" ]] && ! command -v htpasswd &>/dev/null && ! python3 -c "import bcrypt" 2>/dev/null; then
+docker compose version &>/dev/null || missing+=("'docker compose' v2 plugin — sudo apt install docker-compose-plugin  OR  https://docs.docker.com/compose/install/")
+command -v cargo &>/dev/null || missing+=("'cargo' — https://rustup.rs")
+command -v curl &>/dev/null || missing+=("'curl' — sudo apt install curl")
+command -v openssl &>/dev/null || missing+=("'openssl' — sudo apt install openssl")
+if [[ ! -f "$GENERATED/password.db" ]] && ! command -v htpasswd &>/dev/null && ! python3 -c "import bcrypt" 2>/dev/null; then
     missing+=("'htpasswd' or 'python3-bcrypt' — sudo apt install apache2-utils  OR  pip install bcrypt")
 fi
 if [[ ${#missing[@]} -gt 0 ]]; then
     echo "ERROR: Missing required dependencies:" >&2
-    for dep in "${missing[@]}"; do
-        printf "  - %s\n" "$dep" >&2
-    done
+    printf '  - %s\n' "${missing[@]}" >&2
     exit 1
 fi
 
-echo "=== Generating TLS certificate ==="
-bash "$TEST_DIR/stack/tls-legacy/generate-cert.sh"
+echo "=== Profiles: ${PROFILES:-<core only>} ==="
 
-echo "=== Generating password.db (admin/admin) ==="
-if [[ ! -f "$PASSFILE" ]]; then
-    if command -v htpasswd &>/dev/null; then
-        # Trino requires bcrypt cost >= 8; htpasswd defaults to cost 5 with -B, use -C 10
-        htpasswd -c -B -C 10 -b "$PASSFILE" admin admin
-    else
-        python3 -c "
-import bcrypt
-h = bcrypt.hashpw(b'admin', bcrypt.gensalt(rounds=10)).decode()
-print(f'admin:{h}')
-" > "$PASSFILE"
-    fi
-    echo "password.db created."
-else
-    echo "password.db already exists, skipping."
-fi
+echo "=== Generating secrets ==="
+"$SCRIPT_DIR/gen-secrets.sh"
 
-echo "=== Starting Trino via Docker Compose ==="
-cd "$TEST_DIR/stack"
-docker compose up -d
+echo "=== Generating TLS material ==="
+bash "$STACK_DIR/tls-legacy/generate-cert.sh"
 
-echo "=== Waiting for Trino to be healthy (up to 600s) ==="
-for i in $(seq 1 120); do
-    # Wait for "starting":false — this means the coordinator has completed its
-    # startup sequence and worker nodes are ready to run queries. Checking only
-    # for HTTP 200 is insufficient: /v1/info responds early while the node is
-    # still initialising, causing NO_NODES_AVAILABLE on data queries.
-    if curl -sf http://localhost:8080/v1/info 2>/dev/null | grep -q '"starting":false'; then
-        echo "Trino is ready."
-        break
-    fi
-    if [[ $i -eq 120 ]]; then
-        echo "ERROR: Trino did not become healthy in 600 seconds." >&2
-        echo "Run: docker compose logs trino" >&2
-        exit 1
-    fi
-    echo "  Waiting... ($((i * 5))s)"
-    sleep 5
-done
+echo "=== Starting the stack ==="
+compose up -d
 
-echo "=== Waiting for PostgreSQL catalog in Trino (up to 60s) ==="
-for i in $(seq 1 12); do
-    if curl -sf -X POST http://localhost:8080/v1/statement \
-        -H "X-Trino-User: admin" \
+# Readiness probes are shell functions, not `bash -c` strings: wait_for runs
+# "$@" in this shell, so a function works directly and the nested quoting a
+# curl-plus-grep pipeline inside a -c argument would need goes away entirely.
+trino_ready() {
+    # "starting":false means the coordinator finished its startup sequence and
+    # can schedule work. HTTP 200 alone is not enough: /v1/info answers while
+    # the node is still initialising, which surfaces later as
+    # NO_NODES_AVAILABLE on a data query.
+    curl -sf "http://$TRINO_HOST:$TRINO_HTTP_PORT/v1/info" | grep -q '"starting":false'
+}
+
+postgresql_catalog_ready() {
+    curl -sf -X POST "http://$TRINO_HOST:$TRINO_HTTP_PORT/v1/statement" \
+        -H "X-Trino-User: $TRINO_USER" \
         -H "X-Trino-Catalog: postgresql" \
         -H "X-Trino-Schema: public" \
-        -d "SELECT 1 FROM postgresql.public.customers LIMIT 1" 2>/dev/null | grep -q '"stats"'; then
-        echo "PostgreSQL catalog is ready."
-        break
-    fi
-    if [[ $i -eq 12 ]]; then
-        echo "WARNING: PostgreSQL catalog not yet available — PK/FK tests may fail." >&2
-    fi
-    echo "  Waiting... ($((i * 5))s)"
-    sleep 5
-done
+        -d "SELECT 1 FROM postgresql.public.customers LIMIT 1" | grep -q '"stats"'
+}
 
-echo "=== Building stackable-odbc-trino ==="
-cd "$PROJECT_DIR"
-cargo build
+echo "=== Waiting for Trino ==="
+wait_for "Trino" 600 trino_ready
 
-DRIVER_PATH="$PROJECT_DIR/target/debug/libstackable_odbc_trino.so"
+echo "=== Waiting for the postgresql catalog ==="
+wait_for "postgresql catalog" 60 postgresql_catalog_ready
 
-echo "=== Writing ODBC install config ==="
-# Threading = 2 must match packaging/linux/install.sh -- see the comment there.
-# Without it the suites run against a Driver Manager that serialises a
-# cross-thread SQLCancel against the executing call, which is a configuration no
-# user has. test_integration.py's cross-thread cancel test is what notices.
-cat > "$GENERATED/odbcinst.ini" << EOF
-[stackable_odbc_trino]
-Driver = $DRIVER_PATH
-Threading = 2
+echo "=== Building the driver ==="
+(cd "$PROJECT_DIR" && cargo build)
+
+echo "=== Writing ODBC config ==="
+"$SCRIPT_DIR/gen-odbc-config.sh"
+
+cat <<EOF
+
+=== Setup complete ===
+
+Run tests:    ./integration-tests/run-tests.sh [--windows]
+Tear down:    ./integration-tests/scripts/teardown.sh
+
+Interactive:
+  export ODBCSYSINI=$GENERATED
+  export ODBCINI=$GENERATED/odbc.ini
+  isql -3 trino_https -v
 EOF
-
-echo "=== Writing ODBC driver config ==="
-cat > "$GENERATED/odbc.ini" << EOF
-[trino_https]
-Driver = stackable_odbc_trino
-Host = localhost
-Port = 8443
-User = admin
-Password = admin
-Protocol = https
-Catalog = tpcds
-Certificate = $TEST_DIR/stack/tls-legacy/server.crt
-
-[trino_https_verify_false]
-Driver = stackable_odbc_trino
-Host = localhost
-Port = 8443
-User = admin
-Password = admin
-Protocol = https
-Catalog = tpcds
-TlsVerify = false
-
-[trino_http]
-Driver = stackable_odbc_trino
-Host = localhost
-Port = 8080
-User = admin
-Password = admin
-Protocol = http
-Catalog = tpcds
-
-[trino_postgresql]
-Driver = stackable_odbc_trino
-Host = localhost
-Port = 8080
-User = admin
-Protocol = http
-Catalog = postgresql
-EOF
-
-echo ""
-echo "=== Setup complete — Trino is running ==="
-echo ""
-echo "Run tests:    ./integration-tests/run-tests.sh [--windows]"
-echo "Tear down:    docker compose -f $COMPOSE_FILE down"
-echo ""
-echo "To test interactively:"
-echo "  export ODBCSYSINI=$GENERATED"
-echo "  export ODBCINI=$GENERATED/odbc.ini"
-echo "  isql -3 trino_https -v"
-echo "  isql -3 trino_https_verify_false -v"
-echo "  isql -3 trino_http -v"

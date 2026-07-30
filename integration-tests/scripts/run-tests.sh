@@ -4,19 +4,13 @@
 # Tears down the Docker Compose stack on exit (unless --skip-delete is passed).
 #
 # Usage:
-#   ./integration-tests/run-tests.sh                         # Linux tests only
-#   ./test/run-tests.sh --windows               # Linux + Windows VM tests
-#   ./test/run-tests.sh --skip-build            # skip the cargo build (also passed to windows_test.py)
-#   ./test/run-tests.sh --skip-delete           # keep Trino running after tests
+#   ./integration-tests/run-tests.sh                # Linux tests only
+#   ./integration-tests/run-tests.sh --windows      # Linux + Windows VM tests
+#   ./integration-tests/run-tests.sh --skip-build   # skip the cargo build (also passed to windows_test.py)
+#   ./integration-tests/run-tests.sh --skip-delete  # keep the stack running afterwards
 set -euo pipefail
-
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-TEST_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
-PROJECT_DIR="$(cd "$TEST_DIR/.." && pwd)"
-
-COMPOSE_FILE="$TEST_DIR/stack/compose.yaml"
-GENERATED="$TEST_DIR/generated"
-DRIVER_PATH="$PROJECT_DIR/target/debug/libstackable_odbc_trino.so"
+# shellcheck source=lib.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib.sh"
 
 RUN_WINDOWS=false
 SKIP_DELETE=false
@@ -33,14 +27,24 @@ for arg in "$@"; do
 done
 
 if [[ "$SKIP_DELETE" == false ]]; then
-    trap 'echo "=== Tearing down Trino ===" && docker compose -f "$COMPOSE_FILE" down' EXIT
+    trap 'echo "=== Tearing down the stack ===" && "$SCRIPT_DIR/teardown.sh"' EXIT
 fi
 
-# --- Start Trino if not already running ---
-if ! docker compose -f "$COMPOSE_FILE" ps --status running 2>/dev/null | grep -q trino; then
-    echo "=== Trino not running — calling setup.sh ==="
+# --- Set the stack up if it has not been ---
+# stack.env rather than `compose ps`: a running container is not the same as a
+# configured stack, and the suites read stack.env, not docker.
+if [[ ! -f "$STACK_ENV" ]]; then
+    echo "=== Stack not set up — calling setup.sh ==="
     "$SCRIPT_DIR/setup.sh"
 fi
+
+# One description of the stack, shared with the suites. Carries ODBCSYSINI and
+# ODBCINI, so the Driver Manager and the suites cannot disagree about which
+# config they are reading.
+set -a
+# shellcheck source=/dev/null
+source "$STACK_ENV"
+set +a
 
 # --- Rebuild the driver ---
 # setup.sh also builds, but it is skipped when Trino is already running. Without
@@ -52,9 +56,6 @@ if [[ "$SKIP_BUILD" == false ]]; then
 fi
 
 # --- Linux: pyodbc integration tests (4 configs, matching Windows) ---
-export ODBCSYSINI="$GENERATED"
-export ODBCINI="$GENERATED/odbc.ini"
-
 CONN_HTTP="Driver=$DRIVER_PATH;Host=localhost;Port=8080;User=admin;Password=admin;Protocol=http;Catalog=tpcds"
 
 echo "=== Running Linux pyodbc integration tests (DSN-less, HTTP) ==="
