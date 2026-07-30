@@ -54,7 +54,19 @@ echo "=== Assembling Trino config ==="
 "$SCRIPT_DIR/gen-trino-config.sh"
 
 echo "=== Starting the stack ==="
-compose up -d
+# A profile change must recreate the coordinator. Compose would start the new
+# service and leave trino running on its previously assembled config, so
+# enabling a profile would appear to do nothing at all.
+PROFILE_STAMP="$GENERATED/.profiles"
+RECREATE=()
+if [[ -f "$PROFILE_STAMP" && "$(cat "$PROFILE_STAMP")" != "$PROFILES" ]]; then
+    was="$(cat "$PROFILE_STAMP")"
+    echo "Profiles changed (${was:-<core only>} -> ${PROFILES:-<core only>}); recreating Trino"
+    RECREATE=(--force-recreate)
+fi
+printf '%s' "$PROFILES" > "$PROFILE_STAMP"
+
+compose up -d "${RECREATE[@]+"${RECREATE[@]}"}"
 
 # Readiness probes are shell functions, not `bash -c` strings: wait_for runs
 # "$@" in this shell, so a function works directly and the nested quoting a
