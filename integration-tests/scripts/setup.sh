@@ -50,6 +50,9 @@ echo "=== Generating secrets ==="
 echo "=== Generating TLS material ==="
 "$SCRIPT_DIR/gen-certs.sh"
 
+echo "=== Assembling the Keycloak realm ==="
+"$SCRIPT_DIR/gen-keycloak-config.sh"
+
 echo "=== Assembling Trino config ==="
 "$SCRIPT_DIR/gen-trino-config.sh"
 
@@ -92,10 +95,23 @@ postgresql_catalog_ready() {
 }
 
 echo "=== Waiting for Trino ==="
-wait_for "Trino" 600 trino_ready
+wait_for trino "Trino" 600 trino_ready
 
 echo "=== Waiting for the postgresql catalog ==="
-wait_for "postgresql catalog" 60 postgresql_catalog_ready
+wait_for trino "postgresql catalog" 60 postgresql_catalog_ready
+
+if [[ ",$PROFILES," == *",oauth,"* ]]; then
+    keycloak_ready() {
+        # The discovery document rather than /health/ready: this is the endpoint
+        # whose absence actually breaks the flow, and it proves the realm import
+        # finished, which a health probe does not.
+        curl -sf --cacert "$CERT_DIR/ca.crt" \
+            "$KEYCLOAK_ISSUER/.well-known/openid-configuration" |
+            grep -q '"token_endpoint"'
+    }
+    echo "=== Waiting for Keycloak ==="
+    wait_for keycloak "Keycloak" 180 keycloak_ready
+fi
 
 echo "=== Building the driver ==="
 (cd "$PROJECT_DIR" && cargo build)

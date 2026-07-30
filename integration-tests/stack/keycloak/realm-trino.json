@@ -1,0 +1,56 @@
+{
+  "realm": "@KEYCLOAK_REALM@",
+  "enabled": true,
+  "sslRequired": "all",
+  "registrationAllowed": false,
+  "clients": [
+    {
+      "clientId": "@OAUTH_CLIENT_ID@",
+      "enabled": true,
+      "protocol": "openid-connect",
+      "publicClient": false,
+      "bearerOnly": false,
+      "standardFlowEnabled": true,
+      "implicitFlowEnabled": false,
+      "directAccessGrantsEnabled": true,
+      "serviceAccountsEnabled": false,
+      "consentRequired": false,
+      "fullScopeAllowed": true,
+      "secret": "@OAUTH_CLIENT_SECRET@",
+      "redirectUris": [
+        "https://localhost:@TRINO_HTTPS_PORT@/oauth2/callback",
+        "https://trino:@TRINO_HTTPS_PORT@/oauth2/callback"
+      ],
+      "webOrigins": [],
+      "defaultClientScopes": ["basic", "profile", "email", "roles", "acr", "web-origins"],
+      "optionalClientScopes": [],
+      "protocolMappers": [
+        {
+          "name": "trino-audience",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-audience-mapper",
+          "consentRequired": false,
+          "config": {
+            "included.client.audience": "@OAUTH_CLIENT_ID@",
+            "access.token.claim": "true",
+            "id.token.claim": "false"
+          }
+        }
+      ]
+    }
+  ],
+  "users": [
+    {
+      "username": "@KEYCLOAK_USER@",
+      "enabled": true,
+      "emailVerified": true,
+      "firstName": "Test",
+      "lastName": "User",
+      "email": "@KEYCLOAK_USER@@example.invalid",
+      "requiredActions": [],
+      "credentials": [
+        { "type": "password", "value": "@KEYCLOAK_PASSWORD@", "temporary": false }
+      ]
+    }
+  ]
+}

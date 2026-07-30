@@ -50,7 +50,7 @@ echo "--- client certificate (mutual TLS) ---"
 # subject to a principal, and the user-mapping pattern extracts this CN.
 gen_leaf client "/CN=${TRINO_USER}" "DNS:${TRINO_USER}" clientAuth
 
-echo "--- keycloak certificate (phase 5) ---"
+echo "--- keycloak certificate ---"
 gen_leaf keycloak "/CN=keycloak" "DNS:keycloak,DNS:localhost" serverAuth
 
 echo "--- coordinator keystore ---"

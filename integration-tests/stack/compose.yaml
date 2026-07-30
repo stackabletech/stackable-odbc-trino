@@ -44,19 +44,45 @@ services:
       start_period: 30s
 
   # --- profiled services ---
-  # These exist so `parse_profiles`' known list and compose agree, and so
-  # phases 5 to 7 have an obvious place to fill in. The three inert ones run
-  # `true` on alpine and exit at once: this task proves profiles *select*
-  # correctly without also owning three service configurations, and without
-  # pulling a gigabyte of MinIO and Hive images to run a no-op. Each phase
-  # replaces both the image and the command, pinned to an explicit tag.
+  # These exist so `parse_profiles`' known list and compose agree. The three
+  # inert ones run `true` on alpine and exit at once, which proves profiles
+  # *select* correctly without also owning three service configurations, and
+  # without pulling a gigabyte of MinIO and Hive images to run a no-op.
+  # Configuring one means replacing both its image and its command, pinned to an
+  # explicit tag.
 
   keycloak:
     profiles: [oauth]
-    # Carries its real image: the oauth profile has to start something for
-    # Task 11's verification to mean anything.
     image: quay.io/keycloak/keycloak:26.0
-    command: ["start-dev"]
+    command: ["start-dev", "--import-realm"]
+    ports:
+      # 8444 on the host; Trino holds 8443. Inside the container Keycloak
+      # listens on its own default 8443, which is the backchannel URL Trino
+      # reaches it by.
+      - "8444:8443"
+    environment:
+      # Not `admin`: that is the realm user's name, and the two are easy to
+      # confuse when reading a log.
+      KC_BOOTSTRAP_ADMIN_USERNAME: kcadmin
+      KC_BOOTSTRAP_ADMIN_PASSWORD: kcadmin
+      # Every generated URL, including the `iss` claim, derives from this. It is
+      # the browser-facing form, because the browser runs on the host and the
+      # coordinator is given explicit backchannel URLs instead.
+      #
+      # KC_HOSTNAME_BACKCHANNEL_DYNAMIC is deliberately unset. It would derive
+      # the issuer from each request's own host, so a token minted through
+      # keycloak:8443 would carry a different `iss` from the one Trino is
+      # configured with.
+      KC_HOSTNAME: https://localhost:8444
+      KC_HTTP_ENABLED: "false"
+      KC_HTTPS_CERTIFICATE_FILE: /etc/keycloak-certs/keycloak.crt
+      KC_HTTPS_CERTIFICATE_KEY_FILE: /etc/keycloak-certs/keycloak.key
+    volumes:
+      - ../generated/certs:/etc/keycloak-certs:ro
+      - ../generated/keycloak:/opt/keycloak/data/import:ro
+    # No healthcheck: the image carries neither curl nor a shell to build a
+    # probe with. setup.sh waits from the host for the discovery document, which
+    # is what the stack actually depends on.
 
   minio:
     # Listed under both, so it starts once for either.

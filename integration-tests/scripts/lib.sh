@@ -24,6 +24,23 @@ TRINO_PASSWORD="admin"
 TRINO_CATALOG="tpcds"
 KEYSTORE_PASSWORD="changeit"
 
+# Keycloak, for the `oauth` profile. 8444 on the host because Trino holds 8443;
+# inside its own container Keycloak listens on 8443.
+KEYCLOAK_HOST="localhost"
+KEYCLOAK_HTTPS_PORT=8444
+KEYCLOAK_REALM="trino"
+# The browser-facing base URL. This is also the `iss` claim Keycloak stamps into
+# its tokens, because every generated URL derives from KC_HOSTNAME, so it is
+# what Trino's `issuer` property has to be set to.
+KEYCLOAK_ISSUER="https://$KEYCLOAK_HOST:$KEYCLOAK_HTTPS_PORT/realms/$KEYCLOAK_REALM"
+# The same principal password.db and the client certificate resolve to, so the
+# Trino session user is `admin` however the connection authenticated and
+# `current_user` is comparable across all three.
+KEYCLOAK_USER="$TRINO_USER"
+KEYCLOAK_PASSWORD="$TRINO_PASSWORD"
+OAUTH_CLIENT_ID="trino"
+OAUTH_CLIENT_SECRET="trino-test-client-secret"
+
 # Every profile this stack knows about. `--profile all` expands to this.
 ALL_PROFILES="oauth spooling hive"
 
@@ -57,16 +74,36 @@ parse_profiles() {
     echo "${out[*]:-}"
 }
 
-# wait_for <description> <seconds> <command...>
+# service_running <service> — true while its container exists and is running.
+service_running() {
+    local id
+    id="$(compose ps -q "$1" 2>/dev/null)" || return 1
+    [[ -n "$id" ]] || return 1
+    [[ "$(docker inspect -f '{{.State.Running}}' "$id" 2>/dev/null)" == "true" ]]
+}
+
+# wait_for <service> <description> <seconds> <command...>
 #
 # The command is run in this shell, so a shell function works and the nested
 # quoting a `bash -c "curl ... | grep ..."` would need does not arise.
+#
+# The wait gives up the moment <service>'s container stops running, and prints
+# its log either way. A coordinator that rejects its own configuration exits
+# within seconds and stays exited, so spending the whole budget on it wastes
+# minutes and then reports a timeout, while the log says exactly which property
+# is wrong.
 wait_for() {
-    local what="$1" limit="$2"; shift 2
+    local service="$1" what="$2" limit="$3"; shift 3
     local waited=0
     while ! "$@" &>/dev/null; do
+        if ! service_running "$service"; then
+            echo "ERROR: the $service container is not running. Its last log lines:" >&2
+            compose logs --tail 40 "$service" >&2
+            return 1
+        fi
         if (( waited >= limit )); then
-            echo "ERROR: $what did not become ready in ${limit}s" >&2
+            echo "ERROR: $what did not become ready in ${limit}s. Last log lines:" >&2
+            compose logs --tail 40 "$service" >&2
             return 1
         fi
         sleep 5

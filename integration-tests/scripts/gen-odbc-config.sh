@@ -63,6 +63,13 @@ TRINO_PASSWORD=$TRINO_PASSWORD
 TRINO_CATALOG=$TRINO_CATALOG
 CA_CERT=$SERVER_CERT
 CLIENT_PEM=$CERT_DIR/client.pem
+# Keycloak, for suites/test_oauth.py. The client secret is deliberately absent:
+# nothing on the Python side needs it, and the coordinator gets it from the
+# assembled config.
+KEYCLOAK_ISSUER=$KEYCLOAK_ISSUER
+KEYCLOAK_USER=$KEYCLOAK_USER
+KEYCLOAK_PASSWORD=$KEYCLOAK_PASSWORD
+OAUTH_CLIENT_ID=$OAUTH_CLIENT_ID
 ODBCSYSINI=$GENERATED
 ODBCINI=$GENERATED/odbc.ini
 PROFILES=${PROFILES:-}
