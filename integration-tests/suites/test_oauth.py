@@ -342,6 +342,98 @@ def scenario_a_disagreeing_user_is_refused(lib, stack, shim):
         disconnect(lib, env, dbc)
 
 
+def scenario_an_abandoned_login_times_out(lib, stack, shim):
+    """A login nobody completes ends at `ExternalAuthenticationTimeout`, with
+    `28000`.
+
+    The elapsed time is asserted as well as the SQLSTATE: a failure arriving
+    after some other budget expired would be the timeout not working, reported
+    as though it were.
+    """
+    shim.reset("noop")
+    t0 = time.monotonic()
+    ret, env, dbc = odbc_connect(
+        lib,
+        oauth_conn(
+            stack,
+            User="abandoned",
+            ExternalAuthenticationTimeout=str(ABANDON_BUDGET_SECONDS),
+        ),
+    )
+    elapsed = time.monotonic() - t0
+    try:
+        state = sqlstate(lib, SQL_HANDLE_DBC, dbc)
+        failed = ret == SQL_ERROR
+        R.check(
+            f"an abandoned login fails the connection  ({elapsed:.1f}s)",
+            failed,
+            "" if failed else f"returned {ret} with state {state!r}",
+        )
+        R.check(
+            "an abandoned login reports 28000",
+            state == INVALID_AUTH_SPEC,
+            f"state is {state!r}: {diag_message(lib, SQL_HANDLE_DBC, dbc)}",
+        )
+        R.check(
+            "the login budget is what ended the wait",
+            ABANDON_BUDGET_SECONDS - 1 <= elapsed <= ABANDON_BUDGET_SECONDS + 15,
+            f"{elapsed:.1f}s against a {ABANDON_BUDGET_SECONDS}s budget",
+        )
+        presented = shim.outcomes() == ["presented"]
+        R.check(
+            "the browser was launched and presented the URL",
+            presented,
+            "" if presented else f"records: {shim.launches()}",
+        )
+    finally:
+        disconnect(lib, env, dbc)
+
+
+def scenario_a_refused_login_reports_28000(lib, stack, shim):
+    """A login the identity provider refuses fails at once, not at the budget.
+
+    Elapsed time is what separates the two failures: a refusal the coordinator
+    ignored would still end the connection, just at
+    `ExternalAuthenticationTimeout`, and the SQLSTATE alone cannot tell them
+    apart.
+    """
+    shim.reset("deny")
+    t0 = time.monotonic()
+    ret, env, dbc = odbc_connect(lib, oauth_conn(stack, User="refused"))
+    elapsed = time.monotonic() - t0
+    try:
+        denied = shim.outcomes() == ["denied"]
+        if not R.check(
+            "the browser delivered a refusal",
+            denied,
+            "" if denied else f"records: {shim.launches()}",
+        ):
+            return
+        state = sqlstate(lib, SQL_HANDLE_DBC, dbc)
+        failed = ret == SQL_ERROR
+        R.check(
+            f"a refused login fails the connection  ({elapsed:.1f}s)",
+            failed,
+            "" if failed else f"returned {ret} with state {state!r}",
+        )
+        R.check(
+            "a refused login reports 28000",
+            state == INVALID_AUTH_SPEC,
+            f"state is {state!r}: {diag_message(lib, SQL_HANDLE_DBC, dbc)}",
+        )
+        prompt = elapsed < LOGIN_BUDGET_SECONDS - 5
+        R.check(
+            "the refusal ended the login rather than the budget",
+            prompt,
+            ""
+            if prompt
+            else f"{elapsed:.1f}s against a {LOGIN_BUDGET_SECONDS}s budget, so the "
+            "coordinator waited the flow out instead of failing it",
+        )
+    finally:
+        disconnect(lib, env, dbc)
+
+
 def main():
     stack = Stack.load()
     driver = sys.argv[1] if len(sys.argv) > 1 else stack.get("DRIVER_PATH")
@@ -364,6 +456,10 @@ def main():
     print("\n--- the X-Trino-User trap ---")
     scenario_a_matching_user_is_honoured(lib, stack, shim)
     scenario_a_disagreeing_user_is_refused(lib, stack, shim)
+
+    print("\n--- a login that does not succeed ---")
+    scenario_an_abandoned_login_times_out(lib, stack, shim)
+    scenario_a_refused_login_reports_28000(lib, stack, shim)
 
     return R.summary()
 
