@@ -17,15 +17,17 @@ use stackable_odbc_core::{
     errors::OdbcError,
     prompt::Prompter,
     types::{
-        ColumnDescriptor, ColumnPrivilegeRow, ColumnRow, ColumnValue, ConnectParams,
-        CursorBehavior, ExecuteOutcome, ForeignKeyRow, IdentifierType, InfoValue, Nullable,
-        ParamDescriptor, PrimaryKeyRow, ProcedureColumnRow, ProcedureRow, SQL_CB_NULL, SQL_CN_ANY,
-        SQL_FN_CVT_CAST, SQL_FN_TSI_DAY, SQL_FN_TSI_HOUR, SQL_FN_TSI_MINUTE, SQL_FN_TSI_MONTH,
-        SQL_FN_TSI_QUARTER, SQL_FN_TSI_SECOND, SQL_FN_TSI_WEEK, SQL_FN_TSI_YEAR,
+        ColumnDescriptor, ColumnPrivilegeRow, ColumnPrivilegesQuery, ColumnRow, ColumnValue,
+        ColumnsQuery, ConnectParams, CursorBehavior, ExecuteOutcome, ForeignKeyRow,
+        ForeignKeysQuery, InfoValue, ParamDescriptor, PrimaryKeyRow, PrimaryKeysQuery,
+        ProcedureColumnRow, ProcedureColumnsQuery, ProcedureRow, ProceduresQuery, SQL_CB_NULL,
+        SQL_CN_ANY, SQL_FN_CVT_CAST, SQL_FN_TSI_DAY, SQL_FN_TSI_HOUR, SQL_FN_TSI_MINUTE,
+        SQL_FN_TSI_MONTH, SQL_FN_TSI_QUARTER, SQL_FN_TSI_SECOND, SQL_FN_TSI_WEEK, SQL_FN_TSI_YEAR,
         SQL_GB_GROUP_BY_CONTAINS_SELECT, SQL_IC_LOWER, SQL_NC_END, SQL_NNC_NON_NULL,
         SQL_SQ_COMPARISON, SQL_SQ_CORRELATED_SUBQUERIES, SQL_SQ_EXISTS, SQL_SQ_IN,
         SQL_SQ_QUANTIFIED, SQL_TC_DML, SQL_TXN_READ_UNCOMMITTED, SQL_U_UNION, SQL_U_UNION_ALL,
-        Scope, SpecialColumnRow, SqlState, StatisticsRow, TablePrivilegeRow, TableRow, TypeInfoRow,
+        SpecialColumnRow, SpecialColumnsQuery, SqlState, StatisticsQuery, StatisticsRow,
+        TablePrivilegeRow, TablePrivilegesQuery, TableRow, TablesQuery, TypeInfoRow,
         format_odbc_version, parse_dotted_version,
     },
 };
@@ -2302,12 +2304,9 @@ impl Backend for TrinoBackend {
     fn tables(
         conn: &TrinoConnection,
         _cancel: &TrinoCancelToken,
-        catalog: Option<&str>,
-        schema: Option<&str>,
-        table: Option<&str>,
-        table_types: &[String],
+        query: &TablesQuery<'_>,
     ) -> Result<Vec<TableRow>, TrinoError> {
-        metadata::tables(conn, catalog, schema, table, table_types)
+        metadata::tables(conn, query)
     }
 
     /// The two `information_schema.tables.table_type` values `metadata::tables`
@@ -2339,71 +2338,41 @@ impl Backend for TrinoBackend {
     fn columns(
         conn: &TrinoConnection,
         _cancel: &TrinoCancelToken,
-        catalog: Option<&str>,
-        schema: Option<&str>,
-        table: Option<&str>,
-        column: Option<&str>,
+        query: &ColumnsQuery<'_>,
     ) -> Result<Vec<ColumnRow>, TrinoError> {
-        metadata::columns(conn, catalog, schema, table, column)
+        metadata::columns(conn, query)
     }
 
     fn primary_keys(
         conn: &TrinoConnection,
         _cancel: &TrinoCancelToken,
-        catalog: Option<&str>,
-        schema: Option<&str>,
-        table: Option<&str>,
+        query: &PrimaryKeysQuery<'_>,
     ) -> Result<Vec<PrimaryKeyRow>, TrinoError> {
-        metadata::primary_keys(conn, catalog, schema, table)
+        metadata::primary_keys(conn, query)
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn foreign_keys(
         conn: &TrinoConnection,
         _cancel: &TrinoCancelToken,
-        pk_catalog: Option<&str>,
-        pk_schema: Option<&str>,
-        pk_table: Option<&str>,
-        fk_catalog: Option<&str>,
-        fk_schema: Option<&str>,
-        fk_table: Option<&str>,
+        query: &ForeignKeysQuery<'_>,
     ) -> Result<Vec<ForeignKeyRow>, TrinoError> {
-        metadata::foreign_keys(
-            conn, pk_catalog, pk_schema, pk_table, fk_catalog, fk_schema, fk_table,
-        )
+        metadata::foreign_keys(conn, query)
     }
 
     fn statistics(
         conn: &TrinoConnection,
         _cancel: &TrinoCancelToken,
-        catalog: Option<&str>,
-        schema: Option<&str>,
-        table: Option<&str>,
-        unique_only: bool,
+        query: &StatisticsQuery<'_>,
     ) -> Result<Vec<StatisticsRow>, TrinoError> {
-        metadata::statistics(conn, catalog, schema, table, unique_only)
+        metadata::statistics(conn, query)
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn special_columns(
         conn: &TrinoConnection,
         _cancel: &TrinoCancelToken,
-        identifier_type: IdentifierType,
-        catalog: Option<&str>,
-        schema: Option<&str>,
-        table: Option<&str>,
-        scope: Scope,
-        nullable: Nullable,
+        query: &SpecialColumnsQuery<'_>,
     ) -> Result<Vec<SpecialColumnRow>, TrinoError> {
-        metadata::special_columns(
-            conn,
-            identifier_type,
-            catalog,
-            schema,
-            table,
-            scope,
-            nullable,
-        )
+        metadata::special_columns(conn, query)
     }
 
     /// Answered from Trino's `DESCRIBE INPUT`, so a client sizing its buffers
@@ -2427,43 +2396,33 @@ impl Backend for TrinoBackend {
     fn table_privileges(
         conn: &TrinoConnection,
         _cancel: &TrinoCancelToken,
-        catalog: Option<&str>,
-        schema: Option<&str>,
-        table: Option<&str>,
+        query: &TablePrivilegesQuery<'_>,
     ) -> Result<Vec<TablePrivilegeRow>, TrinoError> {
-        metadata::table_privileges(conn, catalog, schema, table)
+        metadata::table_privileges(conn, query)
     }
 
     fn column_privileges(
         conn: &TrinoConnection,
         _cancel: &TrinoCancelToken,
-        catalog: Option<&str>,
-        schema: Option<&str>,
-        table: Option<&str>,
-        column: Option<&str>,
+        query: &ColumnPrivilegesQuery<'_>,
     ) -> Result<Vec<ColumnPrivilegeRow>, TrinoError> {
-        metadata::column_privileges(conn, catalog, schema, table, column)
+        metadata::column_privileges(conn, query)
     }
 
     fn procedures(
         conn: &TrinoConnection,
         _cancel: &TrinoCancelToken,
-        catalog: Option<&str>,
-        schema: Option<&str>,
-        proc_name: Option<&str>,
+        query: &ProceduresQuery<'_>,
     ) -> Result<Vec<ProcedureRow>, TrinoError> {
-        metadata::procedures(conn, catalog, schema, proc_name)
+        metadata::procedures(conn, query)
     }
 
     fn procedure_columns(
         conn: &TrinoConnection,
         _cancel: &TrinoCancelToken,
-        catalog: Option<&str>,
-        schema: Option<&str>,
-        proc_name: Option<&str>,
-        column: Option<&str>,
+        query: &ProcedureColumnsQuery<'_>,
     ) -> Result<Vec<ProcedureColumnRow>, TrinoError> {
-        metadata::procedure_columns(conn, catalog, schema, proc_name, column)
+        metadata::procedure_columns(conn, query)
     }
 
     /// Trino's `{fn}`/`{d}`/`{t}`/`{ts}` escape-translation dialect. See

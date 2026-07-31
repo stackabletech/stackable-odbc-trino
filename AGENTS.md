@@ -329,9 +329,10 @@ DSN-less configuration.
 
 The ten catalog methods — `tables`, `columns`, `primary_keys`, `foreign_keys`,
 `statistics`, `special_columns`, `table_privileges`, `column_privileges`,
-`procedures`, `procedure_columns` — each return a `Vec` of core's typed row
-structs (`TableRow`, `ColumnRow`, …, in `stackable_odbc_core::types`). Core
-converts them to `ColumnValue`s in spec column order, sorts them, and serves
+`procedures`, `procedure_columns` — each take one of core's sealed query types
+(`TablesQuery`, `ColumnsQuery`, …) and return a `Vec` of its typed row structs
+(`TableRow`, `ColumnRow`, …), both in `stackable_odbc_core::types`. Core
+converts the rows to `ColumnValue`s in spec column order, sorts them, and serves
 the result set, so this crate never builds a `TrinoStatement` for a catalog
 call and never names a result-set descriptor. Four consequences, each of which
 is easy to undo by accident:
@@ -348,8 +349,16 @@ is easy to undo by accident:
   enumerations on the raw arguments and answers them from `catalogs`,
   `schemas` and `table_types` instead; `tables` is not called at all.
 - **No `TableType` value-list parsing.** Core splits and unquotes it;
-  `tables` receives `table_types: &[String]`, where an empty slice means no
+  `TablesQuery::table_types` is a `&[String]`, where an empty slice means no
   filter.
+
+**The query object is passed on to `src/backend/metadata.rs`, not unpacked in
+the `Backend` impl.** Each type is `#[non_exhaustive]` with crate-private
+fields and an accessor per argument, so a filter core adds later reaches this
+crate without changing a signature anywhere. Destructuring at the trait impl
+and handing `metadata` a positional list would spend that: the argument run it
+removes — six `Option<&str>` on `foreign_keys`, where a crossed pk/fk pair
+compiles silently — would simply move one call down.
 
 `table_types` is required and returns `["TABLE", "VIEW"]` — the two
 `information_schema.tables.table_type` values `metadata::tables` maps, upper

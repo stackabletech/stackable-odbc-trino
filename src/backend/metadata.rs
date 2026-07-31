@@ -17,9 +17,11 @@
 use std::borrow::Cow;
 
 use stackable_odbc_core::types::{
-    ColumnPrivilegeRow, ColumnRow, ForeignKeyRow, IdentifierType, Nullable, PrimaryKeyRow,
-    ProcedureColumnRow, ProcedureRow, SQL_CODE_DATE, SQL_CODE_TIME, SQL_CODE_TIMESTAMP, Scope,
-    SpecialColumnRow, SqlDataType, StatisticsRow, TablePrivilegeRow, TableRow,
+    ColumnPrivilegeRow, ColumnPrivilegesQuery, ColumnRow, ColumnsQuery, ForeignKeyRow,
+    ForeignKeysQuery, Nullable, PrimaryKeyRow, PrimaryKeysQuery, ProcedureColumnRow,
+    ProcedureColumnsQuery, ProcedureRow, ProceduresQuery, SQL_CODE_DATE, SQL_CODE_TIME,
+    SQL_CODE_TIMESTAMP, SpecialColumnRow, SpecialColumnsQuery, SqlDataType, StatisticsQuery,
+    StatisticsRow, TablePrivilegeRow, TablePrivilegesQuery, TableRow, TablesQuery,
 };
 
 use super::{TrinoConnection, TrinoError, info::trino_bare_type_name, query_all_rows};
@@ -319,11 +321,10 @@ const TABLE_TYPE_VIEW: &str = "VIEW";
 
 pub(super) fn tables(
     conn: &TrinoConnection,
-    catalog: Option<&str>,
-    schema: Option<&str>,
-    table: Option<&str>,
-    table_types: &[String],
+    query: &TablesQuery<'_>,
 ) -> Result<Vec<TableRow>, TrinoError> {
+    let (catalog, schema, table) = (query.catalog(), query.schema(), query.table());
+    let table_types = query.table_types();
     tracing::debug!(catalog, schema, table, ?table_types, "TrinoBackend::tables");
 
     // No ORDER BY: core sorts the result set into the spec's order. The three
@@ -382,11 +383,14 @@ pub(super) fn tables(
 
 pub(super) fn columns(
     conn: &TrinoConnection,
-    catalog: Option<&str>,
-    schema: Option<&str>,
-    table: Option<&str>,
-    column: Option<&str>,
+    query: &ColumnsQuery<'_>,
 ) -> Result<Vec<ColumnRow>, TrinoError> {
+    let (catalog, schema, table, column) = (
+        query.catalog(),
+        query.schema(),
+        query.table(),
+        query.column(),
+    );
     tracing::debug!(catalog, schema, table, column, "TrinoBackend::columns");
 
     // 0-based column positions in the SELECT list below.
@@ -631,10 +635,9 @@ fn table_privilege_row(vals: &[serde_json::Value]) -> Option<TablePrivilegeRow> 
 /// implements no permission management. Verified against the test stack.
 pub(super) fn table_privileges(
     conn: &TrinoConnection,
-    catalog: Option<&str>,
-    schema: Option<&str>,
-    table: Option<&str>,
+    query: &TablePrivilegesQuery<'_>,
 ) -> Result<Vec<TablePrivilegeRow>, TrinoError> {
+    let (catalog, schema, table) = (query.catalog(), query.schema(), query.table());
     tracing::debug!(catalog, schema, table, "TrinoBackend::table_privileges");
 
     // No ORDER BY: core sorts by TABLE_CAT, TABLE_SCHEM, TABLE_NAME,
@@ -673,16 +676,13 @@ pub(super) fn table_privileges(
 /// recorded and the call is logged like every other backend method.
 pub(super) fn column_privileges(
     _conn: &TrinoConnection,
-    catalog: Option<&str>,
-    schema: Option<&str>,
-    table: Option<&str>,
-    column: Option<&str>,
+    query: &ColumnPrivilegesQuery<'_>,
 ) -> Result<Vec<ColumnPrivilegeRow>, TrinoError> {
     tracing::debug!(
-        catalog,
-        schema,
-        table,
-        column,
+        catalog = query.catalog(),
+        schema = query.schema(),
+        table = query.table(),
+        column = query.column(),
         "TrinoBackend::column_privileges (empty — Trino grants on tables, not columns)"
     );
     Ok(Vec::new())
@@ -701,14 +701,12 @@ pub(super) fn column_privileges(
 /// already reports from `info`.
 pub(super) fn procedures(
     _conn: &TrinoConnection,
-    catalog: Option<&str>,
-    schema: Option<&str>,
-    proc_name: Option<&str>,
+    query: &ProceduresQuery<'_>,
 ) -> Result<Vec<ProcedureRow>, TrinoError> {
     tracing::debug!(
-        catalog,
-        schema,
-        proc_name,
+        catalog = query.catalog(),
+        schema = query.schema(),
+        proc_name = query.proc_name(),
         "TrinoBackend::procedures (empty — Trino publishes no procedure metadata)"
     );
     Ok(Vec::new())
@@ -721,16 +719,13 @@ pub(super) fn procedures(
 /// cannot name a procedure cannot describe its parameters either.
 pub(super) fn procedure_columns(
     _conn: &TrinoConnection,
-    catalog: Option<&str>,
-    schema: Option<&str>,
-    proc_name: Option<&str>,
-    column: Option<&str>,
+    query: &ProcedureColumnsQuery<'_>,
 ) -> Result<Vec<ProcedureColumnRow>, TrinoError> {
     tracing::debug!(
-        catalog,
-        schema,
-        proc_name,
-        column,
+        catalog = query.catalog(),
+        schema = query.schema(),
+        proc_name = query.proc_name(),
+        column = query.column(),
         "TrinoBackend::procedure_columns (empty — Trino publishes no procedure metadata)"
     );
     Ok(Vec::new())
@@ -750,14 +745,12 @@ pub(super) fn procedure_columns(
 /// Ref: <https://github.com/trinodb/trino/issues/22408>
 pub(super) fn primary_keys(
     _conn: &TrinoConnection,
-    catalog: Option<&str>,
-    schema: Option<&str>,
-    table: Option<&str>,
+    query: &PrimaryKeysQuery<'_>,
 ) -> Result<Vec<PrimaryKeyRow>, TrinoError> {
     tracing::debug!(
-        catalog,
-        schema,
-        table,
+        catalog = query.catalog(),
+        schema = query.schema(),
+        table = query.table(),
         "TrinoBackend::primary_keys (empty — Trino has no PK metadata)"
     );
     Ok(Vec::new())
@@ -771,20 +764,15 @@ pub(super) fn primary_keys(
 /// Ref: <https://github.com/trinodb/trino/issues/22408>
 pub(super) fn foreign_keys(
     _conn: &TrinoConnection,
-    pk_catalog: Option<&str>,
-    pk_schema: Option<&str>,
-    pk_table: Option<&str>,
-    fk_catalog: Option<&str>,
-    fk_schema: Option<&str>,
-    fk_table: Option<&str>,
+    query: &ForeignKeysQuery<'_>,
 ) -> Result<Vec<ForeignKeyRow>, TrinoError> {
     tracing::debug!(
-        pk_catalog,
-        pk_schema,
-        pk_table,
-        fk_catalog,
-        fk_schema,
-        fk_table,
+        pk_catalog = query.pk_catalog(),
+        pk_schema = query.pk_schema(),
+        pk_table = query.pk_table(),
+        fk_catalog = query.fk_catalog(),
+        fk_schema = query.fk_schema(),
+        fk_table = query.fk_table(),
         "TrinoBackend::foreign_keys (empty — Trino has no FK metadata)"
     );
     Ok(Vec::new())
@@ -799,15 +787,12 @@ pub(super) fn foreign_keys(
 /// and `foreign_keys`.
 pub(super) fn statistics(
     _conn: &TrinoConnection,
-    catalog: Option<&str>,
-    schema: Option<&str>,
-    table: Option<&str>,
-    _unique_only: bool,
+    query: &StatisticsQuery<'_>,
 ) -> Result<Vec<StatisticsRow>, TrinoError> {
     tracing::debug!(
-        catalog,
-        schema,
-        table,
+        catalog = query.catalog(),
+        schema = query.schema(),
+        table = query.table(),
         "TrinoBackend::statistics (empty — Trino exposes no index metadata)"
     );
     Ok(Vec::new())
@@ -819,20 +804,14 @@ pub(super) fn statistics(
 /// metadata to derive an optimal identifier from, so there is nothing to report.
 /// Like `statistics`, this returns the deliberate empty result explicitly rather
 /// than via the trait default.
-#[allow(clippy::too_many_arguments)]
 pub(super) fn special_columns(
     _conn: &TrinoConnection,
-    _identifier_type: IdentifierType,
-    catalog: Option<&str>,
-    schema: Option<&str>,
-    table: Option<&str>,
-    _scope: Scope,
-    _nullable: Nullable,
+    query: &SpecialColumnsQuery<'_>,
 ) -> Result<Vec<SpecialColumnRow>, TrinoError> {
     tracing::debug!(
-        catalog,
-        schema,
-        table,
+        catalog = query.catalog(),
+        schema = query.schema(),
+        table = query.table(),
         "TrinoBackend::special_columns (empty — Trino has no rowid/row-version metadata)"
     );
     Ok(Vec::new())
