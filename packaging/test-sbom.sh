@@ -89,6 +89,34 @@ check "the only non-root path component is core" \
              | select(.name != "stackable-odbc-trino") | .name] | join(",")' "$SBOM")" \
   "stackable-odbc-core"
 
+# --- --check-native --------------------------------------------------------
+
+check "--check-native passes on the current fragment" \
+  "$("$REPO_ROOT/packaging/sbom.sh" --check-native "$SO" >/dev/null 2>&1 && echo ok || echo failed)" "ok"
+
+# Drift must be detected, not tolerated. Feed it a fragment with the entry
+# removed and require a non-zero exit.
+jq 'del(.linux[0])' "$REPO_ROOT/packaging/sbom-native.json" > "$WORK/drifted.json"
+check "--check-native detects a missing entry" \
+  "$(SBOM_NATIVE="$WORK/drifted.json" "$REPO_ROOT/packaging/sbom.sh" --check-native "$SO" >/dev/null 2>&1 && echo ok || echo failed)" "failed"
+
+# The wrong soname must be caught too, which is the mistake of naming libodbc
+# where the artifact links libodbcinst.
+jq '.linux[0].properties |= map(if .name == "stackable:soname" then .value = "libodbc.so.2" else . end)' \
+  "$REPO_ROOT/packaging/sbom-native.json" > "$WORK/wrong-soname.json"
+check "--check-native detects a wrong soname" \
+  "$(SBOM_NATIVE="$WORK/wrong-soname.json" "$REPO_ROOT/packaging/sbom.sh" --check-native "$SO" >/dev/null 2>&1 && echo ok || echo failed)" "failed"
+
+# The Windows branch asserts a different invariant: the mingw runtime must stay
+# statically linked, because the archive ships no runtime DLL alongside it.
+DLL="$REPO_ROOT/target/x86_64-pc-windows-gnu/release/stackable_odbc_trino.dll"
+if [ -f "$DLL" ]; then
+  check "--check-native passes on the Windows DLL" \
+    "$("$REPO_ROOT/packaging/sbom.sh" --check-native "$DLL" >/dev/null 2>&1 && echo ok || echo failed)" "ok"
+else
+  echo "SKIP  --check-native on the Windows DLL: not built (cargo build --release --target x86_64-pc-windows-gnu)"
+fi
+
 echo
 if [ "$FAILURES" -eq 0 ]; then
   echo "All checks passed."

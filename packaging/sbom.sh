@@ -16,9 +16,82 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SBOM_NATIVE="${SBOM_NATIVE:-$REPO_ROOT/packaging/sbom-native.json}"
 
 usage() {
-  echo "usage: $0 <artifact> <outdir>" >&2
+  cat >&2 <<'EOF'
+usage: sbom.sh <artifact> <outdir>
+           write <outdir>/<basename>.cdx.json
+
+       sbom.sh --check-native <artifact>
+           verify sbom-native.json against what the artifact actually links
+EOF
   exit 2
 }
+
+# Libraries supplied by the toolchain and libc are the platform, not components,
+# so they are excluded the same way the Windows branch excludes the operating
+# system's own DLLs. Everything else the ELF object needs at load time must be
+# declared in the fragment.
+IGNORED_SONAMES='^(libc\.so\.|libm\.so\.|libpthread\.so\.|libdl\.so\.|librt\.so\.|libgcc_s\.so\.|ld-linux)'
+
+# The Windows artifact declares no load-time component at all, because it
+# imports only the operating system's libraries. What must hold instead is that
+# the toolchain runtime stays *statically* linked: the release archive ships no
+# runtime DLL, so an artifact importing one would fail to load on a machine
+# without mingw installed.
+FORBIDDEN_WINDOWS_IMPORTS='^(libgcc_s_seh-1|libgcc_s_dw2-1|libwinpthread-1|libstdc\+\+-6)\.dll$'
+
+check_native_elf() {
+  local artifact="$1" needed declared
+  needed="$(readelf -d "$artifact" \
+    | sed -n 's/.*(NEEDED).*\[\(.*\)\]/\1/p' \
+    | grep -Ev "$IGNORED_SONAMES" \
+    | sort)"
+  declared="$(jq -r '.linux[].properties[]? | select(.name == "stackable:soname") | .value' \
+    "$SBOM_NATIVE" | sort)"
+
+  if [ "$needed" = "$declared" ]; then
+    echo "PASS: sbom-native.json matches the artifact's DT_NEEDED set"
+    return 0
+  fi
+
+  echo "FAIL: sbom-native.json has drifted from $artifact" >&2
+  echo "  linked but undeclared:" >&2
+  comm -23 <(echo "$needed") <(echo "$declared") | sed 's/^/    /' >&2
+  echo "  declared but not linked:" >&2
+  comm -13 <(echo "$needed") <(echo "$declared") | sed 's/^/    /' >&2
+  return 1
+}
+
+check_native_pe() {
+  local artifact="$1" dynamic
+  dynamic="$(objdump -p "$artifact" \
+    | sed -n 's/^\tDLL Name: //p' \
+    | tr '[:upper:]' '[:lower:]' \
+    | sort -u \
+    | grep -E "$FORBIDDEN_WINDOWS_IMPORTS" || true)"
+
+  if [ -z "$dynamic" ]; then
+    echo "PASS: the toolchain runtime is statically linked into the artifact"
+    return 0
+  fi
+
+  echo "FAIL: $artifact imports the toolchain runtime dynamically" >&2
+  echo "$dynamic" | sed 's/^/    /' >&2
+  echo "  The release archive ships no runtime DLL, so this artifact would fail" >&2
+  echo "  to load on a machine without mingw installed. Either restore static" >&2
+  echo "  linking or ship the runtime and declare it in sbom-native.json." >&2
+  return 1
+}
+
+if [ "${1:-}" = "--check-native" ]; then
+  [ "$#" -eq 2 ] || usage
+  [ -f "$2" ] || { echo "ERROR: artifact not found: $2" >&2; exit 1; }
+  case "$2" in
+    *.so) check_native_elf "$2" ;;
+    *.dll) check_native_pe "$2" ;;
+    *) echo "ERROR: cannot check native links of $2" >&2; exit 1 ;;
+  esac
+  exit $?
+fi
 
 [ "$#" -eq 2 ] || usage
 
