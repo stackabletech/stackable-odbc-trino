@@ -9,25 +9,51 @@ To produce the release archives yourself, run the following from the
 **repository root**:
 
 ```bash
-# One-time: add the Windows cross-compilation target
+# One-time: add the Windows cross-compilation target and the SBOM tooling
 rustup target add x86_64-pc-windows-gnu
+cargo install cargo-auditable
+# syft: see https://github.com/anchore/syft for install options
 
 # Build the Linux and Windows binaries
-cargo build --release
-cargo build --release --target x86_64-pc-windows-gnu
+cargo auditable build --release
+cargo auditable build --release --target x86_64-pc-windows-gnu
 
 # Package into release archives (replace the version as appropriate)
 VERSION=0.0.1 ./packaging/build-archives.sh
 ```
 
-This produces three files in `packaging/dist/`:
+`cargo auditable` embeds the dependency list into each binary, and the SBOM is
+generated from it. A binary built with plain `cargo build` is refused rather
+than turned into an SBOM that lists a handful of components.
+
+This produces the following in `packaging/dist/`:
 
 - `stackable-odbc-trino-<version>-linux-x64.tar.gz` — the `.so` plus
-  `install.sh` and `uninstall.sh`
+  `install.sh`, `uninstall.sh` and the SBOM describing it
 - `stackable-odbc-trino-<version>-windows-x64.zip` — the `.dll`,
-  `StackableTrinoODBC.mez`, `install.bat`, `uninstall.bat` and
-  `configure-dsn.ps1`
+  `StackableTrinoODBC.mez`, `install.bat`, `uninstall.bat`,
+  `configure-dsn.ps1` and an SBOM for each of the two artefacts
 - `StackableTrinoODBC-<version>.mez` (standalone, for Power BI)
+- a CycloneDX (`.cdx.json`) and an SPDX (`.spdx.json`) SBOM per artefact
+- `sha256sums.txt` over everything above
+
+Verify a download with `sha256sum -c sha256sums.txt` from the directory you
+downloaded into.
+
+### The SBOM
+
+Every archive carries the CycloneDX SBOM for what is inside it, so an offline
+install has it without going back to the release page, and the SBOM records the
+sha256 of the very binary shipped beside it. SPDX is published alongside the
+release for tooling that asks for that format by name.
+
+The SBOM is generated from the binary rather than from `Cargo.toml`, so it lists
+what actually linked: 167 components, with development dependencies excluded by
+construction. It also covers what cargo cannot see, which differs by platform.
+The Linux build links unixODBC (`libodbcinst.so.2`, LGPL-2.1-or-later) at load
+time. The Windows build imports only Windows' own libraries and instead carries
+the mingw-w64 runtime and libgcc statically, the latter under
+`GPL-3.0-or-later WITH GCC-exception-3.1`.
 
 To install on Linux, extract and run the install script:
 

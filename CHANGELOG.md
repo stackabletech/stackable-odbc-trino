@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Every release archive carries a software bill of materials, and every
+  release publishes checksums.** The `.tar.gz` and the `.zip` each contain a
+  CycloneDX SBOM for what is inside them, so an offline install has it without
+  going back to the release page, and each SBOM records the sha256 of the very
+  binary shipped beside it. A CycloneDX and an SPDX document are published per
+  artefact, alongside a `sha256sums.txt` covering all of them; verify a download
+  with `sha256sum -c sha256sums.txt`.
+
+  The SBOM is generated from the binary rather than from `Cargo.toml`, so it
+  lists what actually linked and excludes development dependencies by
+  construction. It also records what cargo cannot see: the Linux build links
+  unixODBC at load time, while the Windows build carries the mingw-w64 runtime
+  and libgcc statically.
+
 - **A DSN configuration dialog for Windows.** `configure-dsn.ps1` ships in the
   Windows archive and is installed alongside the driver. It presents the whole
   connection-string surface across six tabs, tests a configuration before
