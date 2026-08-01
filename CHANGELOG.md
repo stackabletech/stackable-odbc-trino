@@ -335,6 +335,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **The Power Query connector carries the Stackable mark, where it carried a
+  generic database cylinder.** All eight icon sizes are rendered from the brand
+  asset, so the entry in Power BI's Get Data list is identifiable rather than
+  looking like an unfinished extension. The Trino Software Foundation's logo is
+  deliberately not used: naming the connector "Stackable Trino" is nominative
+  use of the trademark, while shipping their logo as this product's tile would
+  imply an endorsement.
+
 - **`SQL_TXN_CAPABLE` reports `SQL_TC_DML`, where it reported `SQL_TC_NONE`.**
   An application that branches on it now finds transactions available.
   `SQL_TXN_ISOLATION_OPTION` and `SQL_DEFAULT_TXN_ISOLATION` move with it, from
