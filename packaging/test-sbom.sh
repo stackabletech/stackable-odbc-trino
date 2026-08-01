@@ -30,7 +30,7 @@ fi
 SBOM="$WORK/libstackable_odbc_trino.so.cdx.json"
 
 check "SBOM file is written" "$([ -f "$SBOM" ] && echo yes || echo no)" "yes"
-check "component count" "$(jq '.components | length' "$SBOM")" "167"
+check "component count" "$(jq '.components | length' "$SBOM")" "168"
 
 # Expects 1, not 0. The one unlicensed component is syft's type:"file" entry for
 # the artifact itself, which is not a cargo package and so is not in the lookup.
@@ -52,6 +52,17 @@ check "syft cpe23 noise is stripped" \
 
 check "dev-dependencies are absent" \
   "$(jq '[.components[] | select(.name | test("^(criterion|proptest|serial_test)$"))] | length' "$SBOM")" "0"
+
+check "the native component is merged in" \
+  "$(jq '[.components[] | select(.name == "unixodbc")] | length' "$SBOM")" "1"
+
+check "the native component keeps its soname" \
+  "$(jq -r '.components[] | select(.name == "unixodbc")
+            | .properties[] | select(.name == "stackable:soname") | .value' "$SBOM")" \
+  "libodbcinst.so.2"
+
+check "the Windows runtime is not merged into a Linux SBOM" \
+  "$(jq '[.components[] | select(.name == "libgcc" or .name == "mingw-w64-runtime")] | length' "$SBOM")" "0"
 
 echo
 if [ "$FAILURES" -eq 0 ]; then

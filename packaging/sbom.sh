@@ -12,6 +12,9 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
+# Overridable so the tests can feed a deliberately drifted fragment.
+SBOM_NATIVE="${SBOM_NATIVE:-$REPO_ROOT/packaging/sbom-native.json}"
+
 usage() {
   echo "usage: $0 <artifact> <outdir>" >&2
   exit 2
@@ -30,6 +33,7 @@ OUT="$OUTDIR/$BASENAME.cdx.json"
 
 RAW="$OUTDIR/.$BASENAME.raw.json"
 LOOKUP="$OUTDIR/.$BASENAME.lookup.json"
+ENRICHED="$OUTDIR/.$BASENAME.enriched.json"
 
 # --- extract ---------------------------------------------------------------
 syft "$ARTIFACT" -o cyclonedx-json="$RAW" --quiet
@@ -79,8 +83,27 @@ jq --slurpfile lut "$LOOKUP" '
               + (if $m.kind == "path"
                  then [ { name: "stackable:cargo-source", value: "path" } ]
                  else [] end))
-        end)' "$RAW" > "$OUT"
+        end)' "$RAW" > "$ENRICHED"
 
-rm -f "$RAW" "$LOOKUP"
+# --- augment ---------------------------------------------------------------
+# Components the toolchain contributes are invisible to cargo, and the two
+# platforms contribute different ones: the ELF object links unixODBC at load
+# time, while the Windows DLL imports only the operating system's own libraries
+# and instead carries the mingw runtime statically.
+case "$BASENAME" in
+  *.so) NATIVE_KEY="linux" ;;
+  *.dll) NATIVE_KEY="windows" ;;
+  *) NATIVE_KEY="" ;;
+esac
+
+if [ -n "$NATIVE_KEY" ]; then
+  jq --slurpfile native "$SBOM_NATIVE" \
+     --arg key "$NATIVE_KEY" \
+     '.components += ($native[0][$key] // [])' "$ENRICHED" > "$OUT"
+else
+  cp "$ENRICHED" "$OUT"
+fi
+
+rm -f "$RAW" "$LOOKUP" "$ENRICHED"
 
 echo "Wrote $OUT"
