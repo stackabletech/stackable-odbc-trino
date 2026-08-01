@@ -256,35 +256,34 @@ StackableTrinoODBCImpl = (
 
         SqlCapabilities = defaultConfig[SqlCapabilities] & [
             FractionalSecondsScale = 3,
-            // GroupByCapabilities is not a documented SqlCapabilities field --
-            // the GROUP BY relationship is expressed through SQL_GROUP_BY in
-            // the SQLGetInfo record, which the driver now answers with
-            // SQL_GB_GROUP_BY_CONTAINS_SELECT (the value that used to be here,
-            // in the wrong record). Its old comment, "Trino supports GROUP BY
-            // without restrictions", was wrong either way: Trino rejects a
-            // non-aggregated select column that is absent from GROUP BY with
-            // EXPRESSION_NOT_AGGREGATE.
+            // GroupByCapabilities has no entry here, because it is not a
+            // documented SqlCapabilities field. The GROUP BY relationship
+            // belongs in the SQLGetInfo record instead, under SQL_GROUP_BY,
+            // which the driver answers with SQL_GB_GROUP_BY_CONTAINS_SELECT.
+            // That value is also the accurate one: Trino rejects a
+            // non-aggregated select column absent from GROUP BY with
+            // EXPRESSION_NOT_AGGREGATE, so it does not support GROUP BY
+            // without restrictions.
             SupportsDerivedTable = true,
             SupportsTop = false
         ],
 
-        // Overrides are for what the driver gets wrong. Anything the driver
-        // reports correctly is deliberately absent, because an override here
-        // silently wins over SQLGetInfoW and cannot be corrected by fixing the
-        // driver. SQL_SQL92_PREDICATES, SQL_AGGREGATE_FUNCTIONS,
+        // Nothing is overridden. An override here silently wins over
+        // SQLGetInfoW and cannot be corrected by fixing the driver, so the
+        // record is reserved for what the driver gets wrong, and this group it
+        // answers honestly: SQL_SQL92_PREDICATES, SQL_AGGREGATE_FUNCTIONS,
         // SQL_SQL92_RELATIONAL_JOIN_OPERATORS, SQL_SQL92_VALUE_EXPRESSIONS and
-        // SQL_IDENTIFIER_QUOTE_CHAR were all overridden here and are all now
-        // answered honestly by the driver.
+        // SQL_IDENTIFIER_QUOTE_CHAR.
         //
-        // Two of them were actively harmful. The driver gates
-        // SQL_SQL92_PREDICATES and SQL_SQL92_RELATIONAL_JOIN_OPERATORS on the
-        // coordinator's version, because MATCH and UNIQUE arrived in Trino
-        // 482, OVERLAPS in 483 and CORRESPONDING in 475. The flat 0x3FFF and
-        // 0x3FF here re-asserted all of them on every server, and 0x3FF also
-        // claimed NATURAL JOIN -- which a live 467 rejects with
-        // "NOT_SUPPORTED: Natural join not supported" -- and UNION JOIN, which
-        // has no production in Trino's grammar at any version. Folding any of
-        // those produces SQL the coordinator refuses.
+        // Two of them must never be overridden with a flat value. The driver
+        // gates SQL_SQL92_PREDICATES and SQL_SQL92_RELATIONAL_JOIN_OPERATORS on
+        // the coordinator's version, because MATCH and UNIQUE arrived in Trino
+        // 482, OVERLAPS in 483 and CORRESPONDING in 475. A flat 0x3FFF or 0x3FF
+        // asserts all of them on every server, and 0x3FF also claims NATURAL
+        // JOIN, which a live 467 rejects with "NOT_SUPPORTED: Natural join not
+        // supported", and UNION JOIN, which has no production in Trino's
+        // grammar at any version. Folding any of those produces SQL the
+        // coordinator refuses.
         //
         // Nothing Power Query actually generates is lost: comparison, IN,
         // LIKE, BETWEEN, IS NULL, EXISTS and the four join types are all in
@@ -298,10 +297,10 @@ StackableTrinoODBCImpl = (
         // it, folding fails even though LimitClauseKind.LimitOffset is set in
         // SqlCapabilities.
         //
-        // Trino's grammar is `OFFSET count LIMIT count`, in that order --
+        // Trino's grammar is `OFFSET count LIMIT count`, in that order.
         // `LIMIT 2 OFFSET 2` is rejected outright with "mismatched input
         // 'OFFSET'". Only a fold carrying both a skip and a take emits the
-        // pair, which is why take-only folding worked regardless.
+        // pair, so take-only folding never exposes the ordering.
         // `test_folding_contract.py` runs whatever this builds.
         AstVisitor = [
             LimitClause = (skip, take) =>
@@ -339,7 +338,7 @@ StackableTrinoODBCImpl = (
                     // out, each measured against a live coordinator:
                     //
                     //   CHAR      `CAST('abc' AS CHAR)` is char(1), not
-                    //             char(3) -- it truncates to 'a', and
+                    //             char(3): it truncates to 'a', and
                     //             `CAST('abc' AS CHAR) = CAST('abc' AS
                     //             CHAR(3))` is false. A CHAR entry would fold
                     //             an equality filter into one matching no
@@ -358,8 +357,9 @@ StackableTrinoODBCImpl = (
                     //             Each has a valid Trino cast, but the
                     //             rendering turns on whether Power Query
                     //             hands a text-valued constant to the visitor
-                    //             already quoted -- unresolved, and the same
-                    //             question the VARCHAR entry below rests on.
+                    //             already quoted. That is unresolved, and is
+                    //             the same question the VARCHAR entry below
+                    //             rests on.
                     //             Settle that first, in Power BI Desktop, and
                     //             all five can be added together.
                     //
