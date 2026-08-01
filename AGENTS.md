@@ -1733,10 +1733,22 @@ Publishing to crates.io is disabled (`publish = false`) and blocked anyway while
 
 ### The SBOM
 
-`packaging/sbom.sh <artifact> <outdir>` writes a CycloneDX SBOM for one release
-artifact, in four stages: syft extracts the component list, `cargo metadata`
-enriches it, `packaging/sbom-native.json` supplies what cargo cannot see, and a
-finalize pass makes the artifact the document's subject.
+`packaging/sbom.sh <artifact> <outdir>` writes `<basename>.cdx.json` and
+`<basename>.spdx.json` for one release artifact, in four stages: syft extracts
+the component list, `cargo metadata` enriches it, `packaging/sbom-native.json`
+supplies what cargo cannot see, and a finalize pass makes the artifact the
+document's subject.
+
+**SPDX is converted from the finished CycloneDX, never generated afresh**, so
+the enrichment and the native fragment reach both formats from one
+implementation and cannot drift apart. CycloneDX is what ships inside the
+archive; SPDX exists for procurement processes that ask for it by name.
+
+`build-archives.sh` generates all three artifacts' SBOMs, puts the CycloneDX one
+into each staging directory so it travels inside the archive, publishes both
+formats per artifact as release assets under versioned names, and writes
+`sha256sums.txt` over everything. The SBOM inside an archive records the sha256
+of the binary shipped beside it.
 
 **The artifact must be built with `cargo auditable`.** Syft reads the `.dep-v0`
 section that embeds, so the SBOM describes what actually linked rather than what
@@ -1764,6 +1776,16 @@ of the release. The entries are selected by **having no purl**, not by type: the
 ELF artifact yields one of type `file`, while the PE artifact yields that plus a
 second of type `application`. Every real component has a purl, the crates from
 enrichment and the native ones from the fragment alike.
+
+#### The `.mez` takes a different path
+
+The Power Query connector is M source in a zip. Syft finds nothing in it and
+there is no cargo graph to enrich, so `sbom.sh` recognises the extension and
+builds the document directly: the connector is the subject, its version read
+from the `[Version = "..."]` in `StackableTrinoODBC.pq`, and the component list
+is **empty**. That is the honest answer rather than a gap, because the connector
+has no third-party dependencies. Running it through the pipeline instead fails,
+since syft reports `components: null` for an archive it cannot catalogue.
 
 #### The native fragment, and why the two platforms differ
 
