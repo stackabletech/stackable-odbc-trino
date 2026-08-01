@@ -103,6 +103,7 @@ mkdir -p "$OUTDIR"
 
 BASENAME="$(basename "$ARTIFACT")"
 OUT="$OUTDIR/$BASENAME.cdx.json"
+OUT_SPDX="$OUTDIR/$BASENAME.spdx.json"
 
 # An artifact built with plain `cargo build` carries no .dep-v0 section, and
 # syft then reports a handful of components rather than the whole graph. That
@@ -231,6 +232,14 @@ jq --arg name "$BASENAME" \
        { name: "stackable:rustc-version", value: $rustc }
      ])' "$AUGMENTED" > "$OUT"
 
+# --- convert ---------------------------------------------------------------
+# SPDX is converted from the finished CycloneDX rather than generated afresh, so
+# the enrichment and the native fragment reach both formats from one
+# implementation and cannot drift apart. Some procurement processes ask for SPDX
+# by name; CycloneDX is what ships inside the archive.
+syft convert "$OUT" -o spdx-json="$OUT_SPDX" --quiet
+
 rm -f "$RAW" "$LOOKUP" "$ENRICHED" "$AUGMENTED"
 
 echo "Wrote $OUT"
+echo "Wrote $OUT_SPDX"

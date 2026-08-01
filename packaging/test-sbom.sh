@@ -29,7 +29,10 @@ fi
 "$REPO_ROOT/packaging/sbom.sh" "$SO" "$WORK"
 SBOM="$WORK/libstackable_odbc_trino.so.cdx.json"
 
+SPDX="$WORK/libstackable_odbc_trino.so.spdx.json"
+
 check "SBOM file is written" "$([ -f "$SBOM" ] && echo yes || echo no)" "yes"
+check "SPDX file is written" "$([ -f "$SPDX" ] && echo yes || echo no)" "yes"
 check "component count" "$(jq '.components | length' "$SBOM")" "167"
 
 check "every component is licensed" \
@@ -88,6 +91,24 @@ check "the only non-root path component is core" \
              | select(.properties[]? | select(.name == "stackable:cargo-source" and .value == "path"))
              | select(.name != "stackable-odbc-trino") | .name] | join(",")' "$SBOM")" \
   "stackable-odbc-core"
+
+# --- SPDX ------------------------------------------------------------------
+# SPDX is converted from the enriched CycloneDX rather than generated afresh, so
+# the enrichment reaches both formats from one implementation. These assert the
+# conversion actually carries it across.
+
+check "SPDX carries the enriched licenses" \
+  "$(jq '[.packages[] | select((.licenseDeclared // "NOASSERTION") == "NOASSERTION")] | length' "$SPDX")" "2"
+
+check "SPDX carries the fork's vcs_url purl" \
+  "$(jq -r '[.packages[] | select(.name == "trino-rust-client") | .externalRefs[]? | select(.referenceType == "purl") | .referenceLocator] | first' "$SPDX")" \
+  "pkg:cargo/trino-rust-client@0.11.0?vcs_url=git+https://github.com/stackabletech/trino-rust-client.git@4a835ccfe4d8332b495cbd74ee1ba48971cbc024"
+
+check "SPDX carries the native component" \
+  "$(jq '[.packages[] | select(.name == "unixodbc")] | length' "$SPDX")" "1"
+
+check "SPDX leaks no build path" \
+  "$(jq '[.. | strings | select(startswith("/home/") or startswith("/build/"))] | length' "$SPDX")" "0"
 
 # --- --check-native --------------------------------------------------------
 
