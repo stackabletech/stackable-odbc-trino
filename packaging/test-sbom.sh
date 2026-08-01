@@ -113,9 +113,43 @@ DLL="$REPO_ROOT/target/x86_64-pc-windows-gnu/release/stackable_odbc_trino.dll"
 if [ -f "$DLL" ]; then
   check "--check-native passes on the Windows DLL" \
     "$("$REPO_ROOT/packaging/sbom.sh" --check-native "$DLL" >/dev/null 2>&1 && echo ok || echo failed)" "ok"
+
+  # --- the Windows SBOM ----------------------------------------------------
+  # Generated as well as checked, because the two artifact formats take
+  # different branches through augment and finalize. Syft emits a second
+  # self-entry of type "application" for the PE artifact, which the Linux run
+  # never exercises.
+  "$REPO_ROOT/packaging/sbom.sh" "$DLL" "$WORK" >/dev/null
+  WSBOM="$WORK/stackable_odbc_trino.dll.cdx.json"
+
+  check "Windows: every component is licensed" \
+    "$(jq '[.components[] | select((.licenses // []) | length == 0)] | length' "$WSBOM")" "0"
+
+  check "Windows: no self-entry survives" \
+    "$(jq '[.components[] | select((.purl // "") == "")] | length' "$WSBOM")" "0"
+
+  check "Windows: the toolchain runtime is declared" \
+    "$(jq -r '[.components[] | select(.name == "mingw-w64-runtime" or .name == "libgcc") | .name] | sort | join(",")' "$WSBOM")" \
+    "libgcc,mingw-w64-runtime"
+
+  check "Windows: unixODBC is not merged in" \
+    "$(jq '[.components[] | select(.name == "unixodbc")] | length' "$WSBOM")" "0"
+
+  check "Windows: no absolute build path leaks" \
+    "$(jq '[.. | strings | select(startswith("/home/") or startswith("/build/"))] | length' "$WSBOM")" "0"
+
+  check "Windows: the artifact is the SBOM subject" \
+    "$(jq -r '.metadata.component.name' "$WSBOM")" "stackable_odbc_trino.dll"
 else
-  echo "SKIP  --check-native on the Windows DLL: not built (cargo build --release --target x86_64-pc-windows-gnu)"
+  echo "SKIP  Windows checks: DLL not built (cargo auditable build --release --target x86_64-pc-windows-gnu)"
 fi
+
+# An artifact built without cargo auditable must be refused, not silently turned
+# into a near-empty SBOM. Strip the section to prove the guard fires.
+cp "$SO" "$WORK/no-audit.so"
+objcopy --remove-section=.dep-v0 "$WORK/no-audit.so" 2>/dev/null || true
+check "an artifact without .dep-v0 is refused" \
+  "$("$REPO_ROOT/packaging/sbom.sh" "$WORK/no-audit.so" "$WORK/refused" >/dev/null 2>&1 && echo ok || echo refused)" "refused"
 
 echo
 if [ "$FAILURES" -eq 0 ]; then

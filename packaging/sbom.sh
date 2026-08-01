@@ -104,6 +104,32 @@ mkdir -p "$OUTDIR"
 BASENAME="$(basename "$ARTIFACT")"
 OUT="$OUTDIR/$BASENAME.cdx.json"
 
+# An artifact built with plain `cargo build` carries no .dep-v0 section, and
+# syft then reports a handful of components rather than the whole graph. That
+# failure is silent and the result looks like a valid SBOM, so refuse it here
+# rather than shipping a document that understates what is in the binary.
+require_audit_section() {
+  local artifact="$1" found=0
+  case "$artifact" in
+    *.so) found="$(readelf -S -W "$artifact" 2>/dev/null | grep -c '\.dep-v0' || true)" ;;
+    *.dll) found="$(objdump -h "$artifact" 2>/dev/null | grep -c '\.dep-v0' || true)" ;;
+    *) return 0 ;;
+  esac
+
+  if [ "${found:-0}" -eq 0 ]; then
+    echo "ERROR: $artifact carries no .dep-v0 section." >&2
+    echo "  It was built with plain cargo, so the dependency graph is not in it" >&2
+    echo "  and the SBOM would list only a few components. Rebuild with:" >&2
+    case "$artifact" in
+      *.dll) echo "    cargo auditable build --release --target x86_64-pc-windows-gnu" >&2 ;;
+      *)     echo "    cargo auditable build --release" >&2 ;;
+    esac
+    exit 1
+  fi
+}
+
+require_audit_section "$ARTIFACT"
+
 RAW="$OUTDIR/.$BASENAME.raw.json"
 LOOKUP="$OUTDIR/.$BASENAME.lookup.json"
 ENRICHED="$OUTDIR/.$BASENAME.enriched.json"
@@ -179,10 +205,15 @@ else
 fi
 
 # --- finalize --------------------------------------------------------------
-# Syft reports the scanned artifact as an ordinary component of type "file",
-# named by its absolute path on the build host. It is the *subject* of this
-# document rather than one of its dependencies, so it moves to
-# metadata.component, and the build path stops travelling with the release.
+# Syft reports the scanned artifact as an ordinary component: type "file" named
+# by its absolute path on the build host, and for the PE artifact a second
+# type "application" entry as well. Both are the *subject* of this document
+# rather than dependencies, so they move to metadata.component, and the build
+# path stops travelling with the release.
+#
+# They are selected by having no purl rather than by type, because the types
+# differ between the two artifact formats. Every real component has one: the
+# cargo crates from the enrich stage, the native ones from the fragment.
 ARTIFACT_SHA="$(sha256sum "$ARTIFACT" | cut -d' ' -f1)"
 RUSTC_VERSION="$(rustc --version)"
 
@@ -190,7 +221,7 @@ jq --arg name "$BASENAME" \
    --arg sha "$ARTIFACT_SHA" \
    --arg rustc "$RUSTC_VERSION" \
    '
-   .components |= map(select(.type != "file"))
+   .components |= map(select((.purl // "") != ""))
    | .metadata.component = {
        type: "library",
        name: $name,
