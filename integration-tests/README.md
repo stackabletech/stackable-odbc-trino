@@ -29,7 +29,7 @@ The unprofiled set is the core stack. Everything heavier is opt-in.
 |---|---|---|
 | *(none)* | `postgres`, `trino` | The `tpcds`, `postgresql` and `hive` catalogs, HTTPS, password and client-certificate auth, transactions, a non-empty `SQLTablePrivileges` |
 | `oauth` | `keycloak` | The OAuth 2.0 flow, through `suites/test_oauth.py` |
-| `spooling` | `minio`, `minio-init` | The spooling protocol, server side |
+| `spooling` | `minio`, `minio-init` | The spooling protocol end to end, through `suites/test_spooling.py` |
 
 ```bash
 ./integration-tests/setup.sh --profile oauth
@@ -42,31 +42,42 @@ assembled per profile rather than mounted from the checkout. A suite whose
 profile is not active is skipped and says which profile would enable it.
 
 The `hive` catalog is in the base stack rather than behind a profile because it
-costs no container: a file metastore on a named volume needs neither a metastore
-service nor object storage. It is the only connector Trino ships that accepts
-writes outside autocommit, which is what makes a transaction rollback
-observable, and `hive.security=sql-standard` is what fills
+costs no container: a file metastore on a path the coordinator can write needs
+neither a metastore service nor object storage. It is the only connector Trino
+ships that accepts writes outside autocommit, which is what makes a transaction
+rollback observable, and `hive.security=sql-standard` is what fills
 `information_schema.table_privileges`.
+
+The warehouse is **not** a named volume: Docker mounts one root-owned and the
+coordinator runs as `trino`, so it lives in the container's own writable layer
+under `/tmp/hive-warehouse`. Recreating the container starts from an empty
+metastore. `scripts/seed-hive.sh` recreates the schema on every `setup.sh`,
+because `CREATE SCHEMA` needs the `admin` role that an ordinary connection does
+not hold.
 
 `keycloak` is configured, and its realm is imported from
 `stack/keycloak/realm-trino.json` by `scripts/gen-keycloak-config.sh`. `minio` and
 `minio-init` are configured, and the coordinator spools to the bucket the init
 container creates.
 
-**No suite drives spooling.** The coordinator produces spooled segments, and the
-driver cannot yet read them: `src/backend/execute.rs` pages with `client.get` and
-`client.get_next`, which cannot decode a spooled segment. The profile exists so
-that work has something to be written against.
+`suites/test_spooling.py` has **no required profile**. With `spooling` active it
+drives the protocol and reads the driver's log for
+`Successfully fetched remote spooled segment`, which the client emits once per
+remote segment; without it, the same suite asserts the fallback, that a
+coordinator with no spooling manager ignores the `Encoding` key and answers
+inline. Each stack state skips the other's scenarios by name, so neither is a
+blind spot.
 
 ## Flags
 
-| Flag | Effect |
-|---|---|
-| `--profile <list>` | `setup.sh`: comma or space separated, or `all` |
-| `--suite <substring>` | `run-tests.sh`: run only matching suites |
-| `--skip-build` | Skip the cargo build |
-| `--skip-delete` | Leave the stack running afterwards |
-| `--windows` | Also run the Windows VM suite |
+| Flag | Script | Effect |
+|---|---|---|
+| `--profile <list>` | `setup.sh` | Comma or space separated, or `all` |
+| `--force-recreate` | `setup.sh` | Recreate the containers even if the profile set has not changed |
+| `--suite <substring>` | `run-tests.sh` | Run only matching suites |
+| `--skip-build` | `run-tests.sh` | Skip the cargo build |
+| `--skip-delete` | `run-tests.sh` | Leave the stack running afterwards |
+| `--windows` | `run-tests.sh` | Also run the Windows VM suite |
 
 ## The stack is HTTPS only
 

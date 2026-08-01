@@ -11,8 +11,11 @@ virsh --connect qemu:///system start stackable-odbc-test
 ```
 
 Then run from the Linux host (`pywinrm` is installed automatically by `uv`).
-The suite runs once per config, across four configs — DSN-less HTTP/HTTPS and
-DSN HTTP/HTTPS — and requires Trino running on the host via `./integration-tests/setup.sh`:
+The suite runs once per config, across four configs: DSN and DSN-less crossed
+with verified and unverified TLS. Every one of them is HTTPS on port 8443,
+because the stack serves nothing else. Each config records its result rather
+than aborting the run, so one failure no longer hides the other three. Trino
+must be running on the host via `./integration-tests/setup.sh`:
 
 ```bash
 uv run --with pywinrm python3 integration-tests/windows/windows_test.py
@@ -22,6 +25,7 @@ Common options:
 
 ```bash
 # Skip the cargo build (use an already-built DLL)
+# Do not use this while diagnosing a failure — see the warning below.
 uv run --with pywinrm python3 integration-tests/windows/windows_test.py --skip-build
 
 # Target a specific VM IP (skip DHCP lease discovery)
@@ -34,6 +38,12 @@ export ODBC_TEST_HOST_GATEWAY=10.0.0.1
 # Full usage
 uv run --with pywinrm python3 integration-tests/windows/windows_test.py --help
 ```
+
+**Do not diagnose a Windows failure without rebuilding the DLL first.**
+`--skip-build` reuses whatever sits in `target/x86_64-pc-windows-gnu/release/`,
+which can predate the feature under test by days. A stale DLL once produced four
+consecutive `SQL_ATTR_QUERY_TIMEOUT` failures that looked exactly like a Windows
+Driver Manager defect.
 
 ### Using a different hypervisor (VirtualBox, Hyper-V, etc.)
 
@@ -180,27 +190,50 @@ ODBC API functions and the `ConfigDSNW` setup entry point.
 
 ### Creating a DSN
 
-The driver's `ConfigDSNW` is headless (no GUI dialog), so DSNs must be created
-programmatically rather than through the ODBC Data Source Administrator's "Add"
-button:
+Three ways, in descending order of convenience.
 
-```cmd
-odbcconf.exe /A {CONFIGDSN "stackable_odbc_trino" "DSN=MyTrino|Host=trino.example.com|Port=8080|User=admin|Password=secret|Catalog=hive|Schema=default|"}
+**The dialog.** `packaging/windows/configure-dsn.ps1` is a WinForms dialog
+covering the whole connection-string surface. It writes through
+`SQLConfigDataSourceW`, so the driver's own `ConfigDSN` stays in the loop:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File configure-dsn.ps1
 ```
 
+**`odbcconf`**, which is what the test harness uses:
+
+```cmd
+odbcconf.exe /A {CONFIGDSN "stackable_odbc_trino" "DSN=MyTrino|Host=trino.example.com|Port=8443|User=admin|Password=secret|Catalog=hive|Schema=default|"}
+```
+
+**The ODBC Data Source Administrator's "Add" button does not work yet.** That
+button loads the driver's setup DLL and asks it for a dialog; this driver
+answers headlessly, so `odbcad32` reports `ODBC_ERROR_INVALID_KEYWORD_VALUE`.
+Wiring it up needs core's `ffi/setup.rs` `config_dsn_w` to become generic over
+the backend.
+
+Note that a DSN stores the five `name:value;name2:value2` keys **bare**. Braces
+belong to connection-string syntax, where `;` separates parameters; a braced
+value in a DSN fails the connection with `08001`. `configure-dsn.ps1` handles
+that for you.
+
 ### Connection string parameters
+
+The keys used most often on Windows. The full list of 34 is in the
+[root README](../../README.md#connecting), and the authoritative one is
+`src/backend/types/connect_params.rs`.
 
 | Parameter    | Required | Description |
 |--------------|----------|-------------|
 | Host         | Yes      | Trino coordinator hostname |
 | Port         | Yes      | Coordinator port |
-| User         | Yes      | Username (Basic Auth) |
+| User         | Yes¹     | Username (Basic Auth). ¹Optional under `ExternalAuthentication` |
 | Password     | No       | Password (Basic Auth) |
 | Catalog      | No       | Default catalog |
 | Schema       | No       | Default schema |
-| Protocol     | No       | `http` (default) or `https` |
-| TlsVerify    | No       | `true` (default) or `false` — skip server certificate verification |
-| Certificate  | No       | Path to a PEM CA certificate file for server verification |
+| Protocol     | No       | `https` (default) or `http` |
+| TlsVerify    | No       | `true`/`full` (default) verifies the chain and the hostname, `ca` the chain only, `false`/`none` nothing. Alias: `SSLVerification` |
+| Certificate  | No       | Path to a PEM CA certificate file for server verification. Required by `ca` |
 | AccessToken  | No       | JWT bearer token, sent as `Authorization: Bearer <token>`. Alias: `Token` |
 | QueryTimeout | No       | Per-request HTTP timeout in seconds (default 30). ODBC alias: `LoginTimeout` |
 
@@ -210,7 +243,9 @@ Open `%SystemRoot%\System32\odbcad32.exe` (64-bit) and confirm:
 
 - **Drivers tab**: `stackable_odbc_trino` is listed
 - **User DSN tab**: `MyTrino` (or whatever DSN name you chose) is listed
-- Selecting the driver under "Add" should produce no error (but also no dialog — this is expected for a headless driver)
+- Selecting the driver under "Add" reports `ODBC_ERROR_INVALID_KEYWORD_VALUE`.
+  That is the current expected behaviour, not a broken registration; see
+  [Creating a DSN](#creating-a-dsn)
 
 ### Unregistering
 
@@ -238,8 +273,13 @@ table and no writable catalog (Trino's DDL support depends on which connector
 backs the catalog). The driver must be registered first (done automatically by
 the test script), and Trino must be reachable at the given host.
 
+The compose stack serves HTTPS on 8443 and nothing else, and its certificate
+comes from a CA no machine trusts by default, so `TlsVerify=false` is what makes
+a hand-typed connection work against it. Point at a coordinator with a real
+certificate and it can come off.
+
 ```powershell
-$conn = New-Object System.Data.Odbc.OdbcConnection("Driver=stackable_odbc_trino;Host=<trino-host>;Port=8080;User=admin;Protocol=http")
+$conn = New-Object System.Data.Odbc.OdbcConnection("Driver=stackable_odbc_trino;Host=<trino-host>;Port=8443;User=admin;Password=admin;Protocol=https;TlsVerify=false")
 $conn.Open()
 Write-Host "Connected: $($conn.State)"
 
@@ -270,7 +310,7 @@ The automated test script registers a DSN named `test_trino`. To create one
 yourself (in `cmd.exe`, not PowerShell):
 
 ```cmd
-odbcconf.exe /A {CONFIGDSN "stackable_odbc_trino" "DSN=MyTrino|Host=<trino-host>|Port=8080|User=admin|Protocol=http|"}
+odbcconf.exe /A {CONFIGDSN "stackable_odbc_trino" "DSN=MyTrino|Host=<trino-host>|Port=8443|User=admin|Password=admin|Protocol=https|TlsVerify=false|"}
 ```
 
 Then in PowerShell:
@@ -285,5 +325,5 @@ If you need to run the tests without the wrapper script (e.g. from a
 PowerShell session on the VM):
 
 ```powershell
-& "C:\Program Files\Python312\python.exe" C:\odbc_test\test_integration.py "Driver=stackable_odbc_trino;Host=<trino-host>;Port=8080;User=admin;Protocol=http;Catalog=tpcds"
+& "C:\Program Files\Python312\python.exe" C:\odbc_test\test_integration.py "Driver=stackable_odbc_trino;Host=<trino-host>;Port=8443;User=admin;Password=admin;Protocol=https;TlsVerify=false;Catalog=tpcds"
 ```

@@ -22,9 +22,12 @@ VERSION=0.0.1 ./packaging/build-archives.sh
 
 This produces three files in `packaging/dist/`:
 
-- `stackable-odbc-trino-<version>-linux-x64.tar.gz`
-- `stackable-odbc-trino-<version>-windows-x64.zip` (includes `StackableTrinoODBC.mez`)
-- `StackableTrinoODBC-<version>.mez` (standalone)
+- `stackable-odbc-trino-<version>-linux-x64.tar.gz` — the `.so` plus
+  `install.sh` and `uninstall.sh`
+- `stackable-odbc-trino-<version>-windows-x64.zip` — the `.dll`,
+  `StackableTrinoODBC.mez`, `install.bat`, `uninstall.bat` and
+  `configure-dsn.ps1`
+- `StackableTrinoODBC-<version>.mez` (standalone, for Power BI)
 
 To install on Linux, extract and run the install script:
 
@@ -116,47 +119,77 @@ A DSN stores connection parameters so that users don't need the full
 connection string each time. This step is optional — DSN-less connection
 strings (shown below) work without it.
 
-On Windows (`cmd.exe`):
+### Windows: the dialog
+
+`configure-dsn.ps1` ships in the archive and covers every connection-string
+option in one window:
 
 ```cmd
-odbcconf.exe /A {CONFIGDSN "stackable_odbc_trino" "DSN=Trino|Host=trino.example.com|Port=8080|User=admin|Catalog=hive|Schema=default|Protocol=http|"}
+powershell -ExecutionPolicy Bypass -File configure-dsn.ps1
+```
+
+Secrets are written only when their **Save** box is ticked, which is off by
+default. A saved secret is stored unencrypted, and a System data source puts it
+in `HKLM`, where every local user can read it.
+
+> The ODBC Data Source Administrator's own **Add** button does not work with
+> this driver yet: it asks the driver's setup DLL for a dialog, gets a headless
+> answer, and reports `ODBC_ERROR_INVALID_KEYWORD_VALUE`. Use the script above,
+> or `odbcconf` below. Both register a DSN the Administrator then lists and
+> edits normally.
+
+### Windows: scripted
+
+```cmd
+odbcconf.exe /A {CONFIGDSN "stackable_odbc_trino" "DSN=Trino|Host=trino.example.com|Port=8443|User=admin|Password=secret|Catalog=hive|Schema=default|"}
 ```
 
 > **PowerShell users:** `odbcconf.exe` commands with `{...}` use `cmd.exe`
 > syntax. In PowerShell, wrap the argument in single quotes:
 > `odbcconf.exe /A '{CONFIGDSN ...}'`.
 
-The DSN will appear under the **User DSN** tab in ODBC Data Source
-Administrator. Note: the driver has no GUI dialog, so DSNs must be
-created via `odbcconf` or the registry, not the "Add" button.
+The DSN appears under the **User DSN** tab in ODBC Data Source Administrator.
 
-On Linux, add a section to `/etc/odbc.ini` (or `~/.odbc.ini` for a
-per-user DSN):
+### Linux
+
+Add a section to `/etc/odbc.ini` (or `~/.odbc.ini` for a per-user DSN):
 
 ```ini
 [Trino]
 Driver = stackable_odbc_trino
 Host = trino.example.com
-Port = 8080
+Port = 8443
 User = admin
+Password = secret
 Catalog = hive
 Schema = default
-Protocol = http
 ```
+
+### One gotcha in a DSN
+
+`SessionProperties`, `ResourceEstimates`, `ExtraCredentials`, `Roles` and
+`ExtraHeaders` take a `name:value;name2:value2` list. In a *connection string*
+those values need `{braces}`, because `;` also separates one parameter from the
+next. In a *DSN* they are stored **bare**; a braced value there fails the
+connection with `08001`. `configure-dsn.ps1` handles the difference for you.
 
 ## Connection string
 
-DSN-less, HTTP:
+DSN-less, HTTPS with username and password. `Protocol` defaults to `https`, so
+it can be left out:
 
-```
-Driver=stackable_odbc_trino;Host=trino.example.com;Port=8080;User=admin;Protocol=http;Catalog=hive;Schema=default
+```text
+Driver=stackable_odbc_trino;Host=trino.example.com;Port=8443;User=admin;Password=secret;Catalog=hive;Schema=default
 ```
 
-DSN-less, HTTPS with username/password:
+DSN-less, plaintext HTTP:
 
+```text
+Driver=stackable_odbc_trino;Host=trino.example.com;Port=8080;Protocol=http;User=admin;Catalog=hive;Schema=default
 ```
-Driver=stackable_odbc_trino;Host=trino.example.com;Port=8443;User=admin;Password=secret;Protocol=https;Catalog=hive;Schema=default
-```
+
+The full list of 34 connection options is in the
+[project README](https://github.com/stackabletech/stackable-odbc-trino#connecting).
 
 ## Support
 

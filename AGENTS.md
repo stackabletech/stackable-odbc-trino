@@ -1015,7 +1015,6 @@ applications set login timeouts assuming a machine round trip, and a tool
 defaulting to 15s would abort every login while the user was still typing.
 `ExternalAuthenticationTimeout` bounds it instead.
 
-`User` stays **required**. The client sends `X-Trino-User` on every request from
 **`User` is optional under `ExternalAuthentication`, and `X-Trino-User` is then
 left off entirely.**
 
