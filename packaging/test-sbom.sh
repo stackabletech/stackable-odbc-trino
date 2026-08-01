@@ -30,13 +30,10 @@ fi
 SBOM="$WORK/libstackable_odbc_trino.so.cdx.json"
 
 check "SBOM file is written" "$([ -f "$SBOM" ] && echo yes || echo no)" "yes"
-check "component count" "$(jq '.components | length' "$SBOM")" "168"
+check "component count" "$(jq '.components | length' "$SBOM")" "167"
 
-# Expects 1, not 0. The one unlicensed component is syft's type:"file" entry for
-# the artifact itself, which is not a cargo package and so is not in the lookup.
-# The finalize stage removes it and this tightens to 0.
-check "every cargo component is licensed" \
-  "$(jq '[.components[] | select((.licenses // []) | length == 0)] | length' "$SBOM")" "1"
+check "every component is licensed" \
+  "$(jq '[.components[] | select((.licenses // []) | length == 0)] | length' "$SBOM")" "0"
 
 check "no bare pkg:cargo purl on a git or path dep" \
   "$(jq '[.components[] | select(.purl != null)
@@ -63,6 +60,34 @@ check "the native component keeps its soname" \
 
 check "the Windows runtime is not merged into a Linux SBOM" \
   "$(jq '[.components[] | select(.name == "libgcc" or .name == "mingw-w64-runtime")] | length' "$SBOM")" "0"
+
+check "the artifact is the SBOM subject" \
+  "$(jq -r '.metadata.component.name' "$SBOM")" "libstackable_odbc_trino.so"
+
+check "the subject carries a sha256" \
+  "$(jq -r '.metadata.component.hashes[]? | select(.alg == "SHA-256") | .content' "$SBOM" | tr -d '\n' | wc -c)" "64"
+
+check "no absolute build path leaks" \
+  "$(jq -r '[.. | strings | select(startswith("/home/") or startswith("/build/"))] | length' "$SBOM")" "0"
+
+check "the rust toolchain is recorded" \
+  "$(jq '[.metadata.properties[]? | select(.name == "stackable:rustc-version")] | length' "$SBOM")" "1"
+
+# Measured: 2. stackable-odbc-core, which is a path dependency for now, and
+# stackable-odbc-trino, which is the root package and is path-local permanently.
+# When core becomes a git tag dependency this drops to 1.
+#
+# The eventual release gate is therefore NOT "zero path components". It is that
+# the only path-sourced component is the root package, which is what catches a
+# developer's local override shipping.
+check "path-sourced components" \
+  "$(jq '[.components[].properties[]? | select(.name == "stackable:cargo-source" and .value == "path")] | length' "$SBOM")" "2"
+
+check "the only non-root path component is core" \
+  "$(jq -r '[.components[]
+             | select(.properties[]? | select(.name == "stackable:cargo-source" and .value == "path"))
+             | select(.name != "stackable-odbc-trino") | .name] | join(",")' "$SBOM")" \
+  "stackable-odbc-core"
 
 echo
 if [ "$FAILURES" -eq 0 ]; then

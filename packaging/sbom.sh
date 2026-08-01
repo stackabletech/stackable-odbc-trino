@@ -34,6 +34,7 @@ OUT="$OUTDIR/$BASENAME.cdx.json"
 RAW="$OUTDIR/.$BASENAME.raw.json"
 LOOKUP="$OUTDIR/.$BASENAME.lookup.json"
 ENRICHED="$OUTDIR/.$BASENAME.enriched.json"
+AUGMENTED="$OUTDIR/.$BASENAME.augmented.json"
 
 # --- extract ---------------------------------------------------------------
 syft "$ARTIFACT" -o cyclonedx-json="$RAW" --quiet
@@ -99,11 +100,33 @@ esac
 if [ -n "$NATIVE_KEY" ]; then
   jq --slurpfile native "$SBOM_NATIVE" \
      --arg key "$NATIVE_KEY" \
-     '.components += ($native[0][$key] // [])' "$ENRICHED" > "$OUT"
+     '.components += ($native[0][$key] // [])' "$ENRICHED" > "$AUGMENTED"
 else
-  cp "$ENRICHED" "$OUT"
+  cp "$ENRICHED" "$AUGMENTED"
 fi
 
-rm -f "$RAW" "$LOOKUP" "$ENRICHED"
+# --- finalize --------------------------------------------------------------
+# Syft reports the scanned artifact as an ordinary component of type "file",
+# named by its absolute path on the build host. It is the *subject* of this
+# document rather than one of its dependencies, so it moves to
+# metadata.component, and the build path stops travelling with the release.
+ARTIFACT_SHA="$(sha256sum "$ARTIFACT" | cut -d' ' -f1)"
+RUSTC_VERSION="$(rustc --version)"
+
+jq --arg name "$BASENAME" \
+   --arg sha "$ARTIFACT_SHA" \
+   --arg rustc "$RUSTC_VERSION" \
+   '
+   .components |= map(select(.type != "file"))
+   | .metadata.component = {
+       type: "library",
+       name: $name,
+       hashes: [ { alg: "SHA-256", content: $sha } ]
+     }
+   | .metadata.properties = ((.metadata.properties // []) + [
+       { name: "stackable:rustc-version", value: $rustc }
+     ])' "$AUGMENTED" > "$OUT"
+
+rm -f "$RAW" "$LOOKUP" "$ENRICHED" "$AUGMENTED"
 
 echo "Wrote $OUT"
