@@ -2,7 +2,7 @@
 //!
 //! Trino's OAuth 2.0 external authentication answers the first request with a
 //! login URL a human has to visit, and then issues the token once they have.
-//! Core decides *whether* this connect may prompt at all — that is
+//! Core decides *whether* this connect may prompt at all: that is
 //! `SQLDriverConnect`'s *DriverCompletion*, and core hands back a
 //! [`Prompter`] only when the answer is yes. This module is the *how*, and the
 //! only place the `open` dependency is used.
@@ -24,7 +24,7 @@ impl Prompter for BrowserPrompter {
     /// make the URL reachable at all under `isql`, Power BI or Excel.
     ///
     /// A failed browser launch is **not** an error. There may be no display, no
-    /// browser, or no permission to start one — and the flow can still be
+    /// browser, or no permission to start one, and the flow can still be
     /// completed by opening the logged URL by hand, because the client polls
     /// for the token rather than waiting on this call. Reporting `IM008` here
     /// would fail a connect that was still perfectly able to succeed.
@@ -45,7 +45,7 @@ impl Prompter for BrowserPrompter {
 /// The client owns the OAuth 2.0 flow and calls its handler once per login;
 /// core owns the decision that a login may be shown at all. This is the seam
 /// between them, and it exists so the `Prompter` core handed back is the object
-/// actually used — not an equivalent this driver rebuilt for itself.
+/// actually used, not an equivalent this driver rebuilt for itself.
 pub(crate) struct ClientRedirect(Arc<dyn Prompter>);
 
 impl ClientRedirect {
@@ -116,7 +116,7 @@ mod tests {
     }
 
     /// A prompter that cannot show anything must reach the client as an OAuth2
-    /// failure, not be swallowed -- the client is what turns it into a failed
+    /// failure, not be swallowed: the client is what turns it into a failed
     /// login rather than an indefinite poll.
     #[test]
     fn a_prompter_failure_becomes_a_client_oauth2_error() {

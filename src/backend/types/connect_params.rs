@@ -1,6 +1,17 @@
-//! `TrinoConnectParams`: the Trino connection settings (host, port, user,
-//! password, protocol, catalog, schema, TLS and JWT options) parsed from the
+//! `TrinoConnectParams`: every Trino connection setting, parsed from the
 //! generic `stackable-odbc-core` connection-string key/value map.
+//!
+//! The `PARAM_*` constants are the authoritative key list, and cover the
+//! coordinator address and credentials, all four authentication methods, the
+//! three TLS verification modes and both certificate paths, the session
+//! controls Trino carries in headers (catalog, schema, path, time zone,
+//! locale, roles, session properties, resource estimates, client tags),
+//! spooling, proxying, retries and the auditing fields. `README.md` and
+//! `AGENTS.md` carry the same list for people who install the driver rather
+//! than work on it, so a new key means three edits.
+//!
+//! Secrets are wrapped in `Redacted`, and the keys carrying them are declared
+//! to core in `Backend::sensitive_connect_keywords`.
 
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
@@ -29,7 +40,7 @@ pub(crate) const PARAM_PROTOCOL: &str = "protocol";
 /// values, so a value copied out of a JDBC URL transfers.
 pub(crate) const PARAM_TLS_VERIFY: &str = "tlsverify";
 /// JDBC's name for [`PARAM_TLS_VERIFY`]. Setting both is an error unless they
-/// agree — see [`parse_tls_verification`].
+/// agree; see [`parse_tls_verification`].
 pub(crate) const PARAM_SSL_VERIFICATION: &str = "sslverification";
 /// Path to a PEM certificate file for TLS verification.
 pub(crate) const PARAM_CERTIFICATE: &str = "certificate";
@@ -37,7 +48,7 @@ pub(crate) const PARAM_CERTIFICATE: &str = "certificate";
 /// private key, for mutual TLS.
 ///
 /// One file, and PEM only: `trino-rust-client` builds `reqwest` on rustls,
-/// which accepts neither PKCS#12 nor JKS — so JDBC's `SSLKeyStorePath` and
+/// which accepts neither PKCS#12 nor JKS, so JDBC's `SSLKeyStorePath` and
 /// `SSLKeyStoreType` have no equivalent here and the key is named for what it
 /// actually takes.
 pub(crate) const PARAM_CLIENT_CERTIFICATE: &str = "clientcertificate";
@@ -75,7 +86,7 @@ pub(crate) const PARAM_TRACE_TOKEN: &str = "tracetoken";
 /// connection is built rather than failing later at connect time.
 ///
 /// Credentials belong in [`PARAM_PROXY_USER`] and [`PARAM_PROXY_PASSWORD`], not
-/// in the URL's userinfo — see [`proxy_url`].
+/// in the URL's userinfo; see [`proxy_url`].
 pub(crate) const PARAM_PROXY: &str = "proxy";
 /// Username for a proxy that demands HTTP Basic authentication.
 pub(crate) const PARAM_PROXY_USER: &str = "proxyuser";
@@ -96,17 +107,17 @@ pub(crate) const PARAM_EXTRA_HEADERS: &str = "extraheaders";
 /// always sends.
 ///
 /// `PARAMETRIC_DATETIME` and `PATH` are sent unconditionally and cannot be
-/// dropped — the client's own type decoder depends on both.
+/// dropped: the client's own type decoder depends on both.
 pub(crate) const PARAM_CLIENT_CAPABILITIES: &str = "clientcapabilities";
 /// IANA time zone the session runs in, sent as `X-Trino-Time-Zone`.
 ///
 /// Trino resolves `current_timestamp`, `TIMESTAMP WITH TIME ZONE` literals and
 /// every `AT TIME ZONE` against the session zone, so leaving it unset means
-/// those follow whatever zone the coordinator's JVM happens to be in — which is
+/// those follow whatever zone the coordinator's JVM happens to be in, which is
 /// a property of the server, not of the query.
 pub(crate) const PARAM_TIME_ZONE: &str = "timezone";
 /// Authorisation role per catalog, in the same `name:value;name2:value2` form
-/// as the other key-value keys — `Roles={hive:admin;iceberg:ALL}`.
+/// as the other key-value keys: `Roles={hive:admin;iceberg:ALL}`.
 ///
 /// The value is a role name, or the keyword `ALL` or `NONE`, which is the shape
 /// JDBC's `roles` property takes. Trino's own `X-Trino-Role` spelling wraps a
@@ -117,7 +128,8 @@ pub(crate) const PARAM_TIME_ZONE: &str = "timezone";
 /// Roles are what Hive and Iceberg under `sql-standard` security check, and
 /// therefore what decides whether `SQLTablePrivileges` returns a row.
 pub(crate) const PARAM_ROLES: &str = "roles";
-/// User the statements run as, while authentication stays with [`PARAM_USER`].
+/// User the statements run as, while authentication stays with the `User`
+/// connection-string keyword, which core defines and `ConnectParams` carries.
 ///
 /// JDBC spells it `sessionUser`. Trino sends it as `X-Trino-User`, so the
 /// coordinator applies the impersonated user's permissions and records it
@@ -146,8 +158,8 @@ pub(crate) const PARAM_ENCODING: &str = "encoding";
 /// flow: `"true"` or `"false"` (default). JDBC's `externalAuthentication`.
 ///
 /// Needs `Protocol=https`, and cannot be combined with `Password` or
-/// [`PARAM_ACCESS_TOKEN`]. Interactive by nature — a person has to visit the
-/// login URL the driver presents — so it is refused on a connection made with
+/// [`PARAM_ACCESS_TOKEN`]. Interactive by nature, since a person has to visit
+/// the login URL the driver presents, so it is refused on a connection made with
 /// `SQL_DRIVER_NOPROMPT`. Unattended callers use [`PARAM_ACCESS_TOKEN`].
 ///
 /// `User` remains required: the client sends `X-Trino-User` on every request
@@ -166,7 +178,7 @@ pub(crate) const PARAM_EXTERNAL_AUTH_TIMEOUT: &str = "externalauthenticationtime
 
 /// Separator between the pairs of a key-value connection-string parameter.
 ///
-/// `;` is JDBC's, and it is also the ODBC connection-string separator — so a
+/// `;` is JDBC's, and it is also the ODBC connection-string separator, so a
 /// value using it has to be `{}`-wrapped, which core's parser supports and
 /// [`parse_key_value_pairs`] documents. Matching JDBC is worth that: the value
 /// an operator already has in a JDBC URL transfers unchanged.
@@ -175,7 +187,7 @@ const PAIR_SEPARATOR: char = ';';
 /// Separator between a key and its value, JDBC's again.
 ///
 /// `:` rather than `=`, which means a value may contain `=` without escaping.
-/// Only the *first* occurrence splits, so a value may contain `:` too — which
+/// Only the *first* occurrence splits, so a value may contain `:` too, which
 /// matters, because a session property value is routinely a URL or a duration.
 const KEY_VALUE_SEPARATOR: char = ':';
 
@@ -221,7 +233,7 @@ pub(crate) const DEFAULT_SOURCE: &str = concat!("stackable-odbc-trino/", env!("C
 /// ```
 ///
 /// Without the braces core's parser ends the value at the first `;` and treats
-/// the rest as another parameter, which it then discards as unrecognised —
+/// the rest as another parameter, which it then discards as unrecognised,
 /// silently dropping every property but the first.
 ///
 /// A malformed pair is an error rather than a skip. A dropped session property
@@ -267,14 +279,14 @@ fn parse_key_value_pairs(key: &str, raw: &str) -> Result<HashMap<String, String>
 /// connection-string key, and `SQLDriverConnect` echoes back every key it was
 /// not told is sensitive. Splitting the credentials into their own keys is what
 /// lets [`PARAM_PROXY_PASSWORD`] be declared and the URL stay readable in a
-/// diagnostic — so userinfo is an error naming the two keys, rather than a
+/// diagnostic, so userinfo is an error naming the two keys, rather than a
 /// silent leak.
 ///
 /// The scheme is left to `Proxy::all`, which rejects anything but http and
 /// https and phrases it better than a second check here would.
 fn proxy_url(raw: &str) -> Result<String, TrinoError> {
     // Only the authority can carry userinfo, and it ends at the first `/`,
-    // `?` or `#` after the scheme -- so a path or query containing `@` is not
+    // `?` or `#` after the scheme, so a path or query containing `@` is not
     // mistaken for one.
     let after_scheme = raw.split_once("://").map_or(raw, |(_, rest)| rest);
     let authority = after_scheme
@@ -298,7 +310,7 @@ fn proxy_url(raw: &str) -> Result<String, TrinoError> {
 ///
 /// `ALL` and `NONE` are Trino's two keywords and are matched case-insensitively,
 /// the way every other connection-string value is. Anything else is a role
-/// name, which the wire format wraps as `ROLE{name}` — done here rather than
+/// name, which the wire format wraps as `ROLE{name}`, done here rather than
 /// asked of the operator, because the braces would have to be escaped past
 /// core's connection-string parser to survive.
 fn selected_role(value: &str) -> SelectedRole {
@@ -317,13 +329,13 @@ fn selected_role(value: &str) -> SelectedRole {
 /// Resolve `TlsVerify` and its JDBC alias `SSLVerification` into one value.
 ///
 /// Both spellings accept both vocabularies, so `TlsVerify=CA` and
-/// `SSLVerification=false` are as valid as the pairings you would expect —
+/// `SSLVerification=false` are as valid as the pairings you would expect,
 /// there is no sense in which one key owns one set of words, and rejecting a
 /// mixed pairing would only surprise.
 ///
 /// Setting both keys is an error unless they resolve to the same thing. They
 /// are one setting under two names, and silently preferring either would leave
-/// the other looking honoured when it was not — for a value whose failure mode
+/// the other looking honoured when it was not, for a value whose failure mode
 /// is an unauthenticated connection.
 fn parse_tls_verification(
     tls_verify: Option<&str>,
@@ -439,7 +451,7 @@ impl TrinoConnectParams {
     }
 
     /// `None` leaves `X-Trino-User` off, which only `ExternalAuthentication`
-    /// permits — see the field.
+    /// permits; see the field.
     pub fn user(&self) -> Option<&str> {
         self.user.as_deref()
     }
@@ -534,7 +546,7 @@ impl TrinoConnectParams {
         &self.extra_headers.0
     }
 
-    /// `None` routes directly, which is `reqwest`'s own default — this driver
+    /// `None` routes directly, which is `reqwest`'s own default: this driver
     /// does not read the `HTTP_PROXY` environment.
     pub fn proxy(&self) -> Option<&str> {
         self.proxy.as_deref()
@@ -609,7 +621,7 @@ impl TryFrom<&ConnectParams> for TrinoConnectParams {
         // Required, except when the identity provider decides who you are.
         // Trino takes the user from the authenticated identity when
         // `X-Trino-User` is absent, and reads one that *disagrees* with that
-        // identity as an impersonation request — so under
+        // identity as an impersonation request, so under
         // `ExternalAuthentication` a name we asked the operator to invent would
         // be refused for their own account. `SessionUser` remains how
         // deliberate impersonation is expressed.
@@ -649,7 +661,7 @@ impl TryFrom<&ConnectParams> for TrinoConnectParams {
         let client_certificate = params.get(PARAM_CLIENT_CERTIFICATE).map(str::to_string);
         // rustls only permits skipping hostname verification when the trust
         // store is supplied explicitly, which excludes the platform's own
-        // roots -- so `CaOnly` without a root certificate would trust nothing
+        // roots, so `CaOnly` without a root certificate would trust nothing
         // at all. The client reports this at build time; catching it here names
         // the two connection-string keys instead of the builder methods.
         if tls_verification == TlsVerification::CaOnly && certificate.is_none() {
@@ -735,7 +747,7 @@ impl TryFrom<&ConnectParams> for TrinoConnectParams {
 
         // Rejected rather than defaulted, like `MaxAttempts` below: a login
         // budget quietly reverting to 300s is invisible until someone is sitting
-        // in front of a browser wondering why the connection gave up early --
+        // in front of a browser wondering why the connection gave up early,
         // or did not give up at all.
         let external_auth_timeout = match params.get(PARAM_EXTERNAL_AUTH_TIMEOUT) {
             None => DEFAULT_EXTERNAL_AUTH_TIMEOUT_SECS,
@@ -876,7 +888,7 @@ mod tests {
 
     /// Trino takes the user from the authenticated identity when the header is
     /// absent, and reads one that *disagrees* with that identity as an
-    /// impersonation request -- so under `ExternalAuthentication` the operator
+    /// impersonation request, so under `ExternalAuthentication` the operator
     /// must not have to invent a name that would then be refused.
     #[test]
     fn user_may_be_omitted_under_external_authentication() {
@@ -886,7 +898,7 @@ mod tests {
     }
 
     /// The interactive flow does not stop an operator naming a user, and one
-    /// that matches the provider's mapping is harmless -- so it is still read.
+    /// that matches the provider's mapping is harmless, so it is still read.
     #[test]
     fn user_is_kept_when_given_alongside_external_authentication() {
         let p =
@@ -929,7 +941,7 @@ mod tests {
     #[test]
     fn source_defaults_to_the_driver_name_and_version() {
         // Trino's query history shows this. Left unset, every query from this
-        // driver is indistinguishable from any other client's -- and without
+        // driver is indistinguishable from any other client's, and without
         // the version, one driver build is indistinguishable from another,
         // which is what an operator needs when a regression appears in the
         // query log after a rollout.
@@ -997,11 +1009,11 @@ mod tests {
             p.session_properties().len(),
             1,
             "core's parser ends the value at the first ';', so the rest is a \
-             separate (unrecognised) parameter -- this is why braces are required"
+             separate (unrecognised) parameter: this is why braces are required"
         );
     }
 
-    /// Only the *first* separator splits, so a value may contain `:` — which
+    /// Only the *first* separator splits, so a value may contain `:`, which
     /// is not a corner case: `http://…` and `10:00` are ordinary property
     /// values.
     #[test]

@@ -41,7 +41,7 @@ fn env_or<T: std::str::FromStr>(name: &str, default: T) -> T {
         .unwrap_or(default)
 }
 
-/// Returns `None` if `TRINO_BENCH_URL` is unset — caller should print a skip
+/// Returns `None` if `TRINO_BENCH_URL` is unset, so the caller should print a skip
 /// message and return early.
 fn bench_config() -> Option<BenchConfig> {
     let url = std::env::var("TRINO_BENCH_URL").ok()?;
@@ -243,7 +243,7 @@ unsafe fn drain_repeat_get_data(stmt: *mut c_void, n_cols: u16, repeats: usize) 
 
 fn bench_trino(c: &mut Criterion) {
     let Some(cfg) = bench_config() else {
-        eprintln!("[fetch_trino] TRINO_BENCH_URL unset — skipping Trino benches.");
+        eprintln!("[fetch_trino] TRINO_BENCH_URL unset, skipping Trino benches.");
         return;
     };
 
@@ -304,7 +304,7 @@ fn bench_trino(c: &mut Criterion) {
 
     let repeat_id = BenchmarkId::new(format!("repeat_get_data_x{}", cfg.repeat_get_data), &label);
     group.bench_function(repeat_id, |b| {
-        // Unbind columns from the bound_columns bench — its buffers are freed
+        // Unbind columns from the bound_columns bench: its buffers are freed
         // when that closure exits, so fetching with stale bindings is UB.
         let _ = unsafe {
             ffi::handle::sql_free_stmt::<TrinoBackend>(stmt, FreeStmtOption::Unbind as u16)

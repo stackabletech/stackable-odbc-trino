@@ -1,9 +1,8 @@
 //! `SQLDescribeParam` support, answered from Trino's `DESCRIBE INPUT`.
 //!
 //! Trino describes a prepared statement's parameters, so this driver does not
-//! have to fall back to core's generic `VARCHAR(SQL_DEFAULT_PARAM_SIZE)` —
-//! the answer that makes a client send a number as text and get a type error
-//! back.
+//! have to fall back to core's generic `VARCHAR(SQL_DEFAULT_PARAM_SIZE)`, the
+//! answer that makes a client send a number as text and get a type error back.
 //!
 //! Reaching it takes three statements, because `DESCRIBE INPUT` names a
 //! prepared statement rather than taking SQL:
@@ -17,7 +16,7 @@
 //! The `PREPARE` must go through the client directly, **never** through the
 //! bound-parameter path. Its `?` markers belong to the statement being
 //! described, not to this call, and there are no values to substitute for
-//! them: `params::interpolate` would consume them, and core now rejects the
+//! them: `params::interpolate` would consume them, and core rejects the
 //! shortfall with `07002` before it even gets that far. Either way the
 //! statement has to reach Trino verbatim, or `DESCRIBE INPUT` describes
 //! something with no parameters in it.
@@ -51,8 +50,8 @@ const DESCRIBE_PARAM_STATEMENT: &str = "stackable_odbc_describe_input";
 
 /// Build one descriptor from a Trino type signature.
 ///
-/// Precision and scale come from the signature itself — `char(20)`,
-/// `decimal(10,2)` — through the same two helpers `SQLColumns` uses, so a
+/// Precision and scale come from the signature itself (`char(20)`,
+/// `decimal(10,2)`) through the same two helpers `SQLColumns` uses, so a
 /// parameter and a column of the same Trino type never disagree. A type
 /// carrying neither keeps `ParamDescriptor::new`'s zeroes, which is what the
 /// spec has a driver report when the value is not applicable.
@@ -91,7 +90,7 @@ fn describe_input_rows_to_params(rows: &[Vec<serde_json::Value>]) -> Vec<ParamDe
 
 /// Describe parameter `parameter_number` (1-based) of `sql`.
 ///
-/// `Ok(None)` for anything that cannot be answered — a statement Trino
+/// `Ok(None)` for anything that cannot be answered: a statement Trino
 /// declines to prepare, a parameter past the end, a failed round trip. Core
 /// then reports its documented uniform guess, which is a better outcome than
 /// failing `SQLDescribeParam` outright or inventing a specific type.

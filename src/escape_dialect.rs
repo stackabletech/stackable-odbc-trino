@@ -11,7 +11,7 @@
 //! There are two hooks because there are two kinds of difference:
 //!
 //! - [`remap_scalar_fn`] swaps the identifier in front of the parentheses and
-//!   never sees the arguments. That is all a pure spelling difference needs —
+//!   never sees the arguments. That is all a pure spelling difference needs:
 //!   `UCASE` → `upper`, `LOG` → `ln`.
 //! - [`rewrite_scalar_fn`] receives the whole call and returns its
 //!   replacement, for the functions where ODBC and Trino agree on the
@@ -66,7 +66,7 @@ pub(crate) fn remap_scalar_fn(name: &str) -> Option<&'static str> {
 /// and Trino's finest unit is `millisecond`, which would silently be a
 /// million times coarser. That is why `SQL_FN_TSI_FRAC_SECOND` is left out of
 /// [`Backend::timedate_add_intervals`](stackable_odbc_core::backend::Backend::timedate_add_intervals)
-/// too — the two must agree.
+/// too, and the two must agree.
 fn trino_interval_unit(keyword: &str) -> Option<&'static str> {
     match keyword.trim().to_ascii_uppercase().as_str() {
         "SQL_TSI_SECOND" => Some("second"),
@@ -93,7 +93,7 @@ fn trino_interval_unit(keyword: &str) -> Option<&'static str> {
 /// coordinator rather than read off the documentation:
 ///
 /// - `SQL_CHAR` maps to `VARCHAR`, not to Trino's `CHAR`. A bare `CHAR` in
-///   Trino is `CHAR(1)`, so `CAST('hello world' AS CHAR)` returns `"h"` — the
+///   Trino is `CHAR(1)`, so `CAST('hello world' AS CHAR)` returns `"h"`, and the
 ///   escape would silently truncate every conversion to one character. ODBC's
 ///   `{fn CONVERT}` carries no length to give `CHAR(n)` instead.
 /// - `SQL_FLOAT` maps to `DOUBLE`. ODBC's `SQL_FLOAT` is double precision;
@@ -130,7 +130,7 @@ fn trino_convert_target(keyword: &str) -> Option<&'static str> {
 /// Core hands the argument text over whole, deliberately: only the dialect
 /// knows each function's arity, and a naive split would corrupt
 /// `{fn LOCATE(',', x)}`. So this walks the text with the same awareness core
-/// applies to the statement — a comma inside a string literal, a quoted
+/// applies to the statement: a comma inside a string literal, a quoted
 /// identifier, a comment or a nested parenthesis is not a separator.
 fn split_args(args: &str) -> Vec<&str> {
     let bytes: Vec<char> = args.chars().collect();
@@ -195,7 +195,7 @@ fn split_args(args: &str) -> Vec<&str> {
 /// This is for the functions a rename alone cannot reach: ODBC and Trino
 /// agree on the capability but not on the argument syntax, the parentheses,
 /// or the numbering. Every one of them is advertised in the `SQL_*_FUNCTIONS`
-/// bitmaps in `backend/info.rs`, and the two must stay in step — a bit there
+/// bitmaps in `backend/info.rs`, and the two must stay in step: a bit there
 /// without an arm here is a claim an application cannot use.
 ///
 /// Returning `None` falls back to [`remap_scalar_fn`] plus verbatim
@@ -216,8 +216,8 @@ pub(crate) fn rewrite_scalar_fn(name: &str, args: &str) -> Option<String> {
         "LOCATE" if parts.len() == 2 => Some(format!("position({} IN {})", parts[0], parts[1])),
 
         // SQL_FN_TD_CURDATE / CURTIME and the three ODBC 3.x CURRENT_* forms.
-        // Trino takes these as bare SQL-92 keywords, so the whole escape --
-        // trailing `()` included -- has to go. This is what `remap_scalar_fn`
+        // Trino takes these as bare SQL-92 keywords, so the whole escape,
+        // trailing `()` included, has to go. This is what `remap_scalar_fn`
         // could not express.
         "CURDATE" | "CURRENT_DATE" if empty => Some("current_date".into()),
         "CURTIME" | "CURRENT_TIME" if empty => Some("current_time".into()),
@@ -298,7 +298,7 @@ mod tests {
     /// deliberately declined to: core hands the argument text over whole
     /// because only the dialect knows each function's arity, and warns that
     /// splitting naively would corrupt `{fn LOCATE(',', x)}`. So the comma
-    /// cases below are the point of the function, not edge cases around it —
+    /// cases below are the point of the function, not edge cases around it:
     /// a separator that is really a character inside a literal, an
     /// identifier, a comment or a nested call.
     #[test]
@@ -507,8 +507,8 @@ mod tests {
 
     /// `SQL_TIMEDATE_ADD_INTERVALS` / `SQL_TIMEDATE_DIFF_INTERVALS` name the
     /// units `TIMESTAMPADD`/`TIMESTAMPDIFF` accept, so every bit advertised
-    /// there must be a unit [`trino_interval_unit`] can actually rewrite --
-    /// otherwise the driver names an interval whose escape then falls through
+    /// there must be a unit [`trino_interval_unit`] can actually rewrite.
+    /// Otherwise the driver names an interval whose escape then falls through
     /// untranslated.
     ///
     /// `FRAC_SECOND` is the one that must stay out: ODBC defines it as
@@ -549,7 +549,7 @@ mod tests {
     }
 
     /// A comma inside a literal must survive the whole rewrite, not just
-    /// `split_args` in isolation -- this is core's stated worst case.
+    /// `split_args` in isolation: this is core's stated worst case.
     #[test]
     fn rewrite_preserves_a_comma_inside_a_literal() {
         assert_eq!(

@@ -95,14 +95,14 @@ const TRINO_CATALOG_NOT_FOUND: i32 = 44;
 ///
 /// Trino resolves a bare `information_schema` through the **session** catalog,
 /// and each catalog's copy describes only itself. So filtering on
-/// `table_catalog` alone cannot reach another catalog — `SQLColumns` for a
+/// `table_catalog` alone cannot reach another catalog: `SQLColumns` for a
 /// catalog other than the connected one matched nothing whatever the WHERE
 /// clause said, which left an application enumerating catalogs and finding
 /// every one but its own empty.
 ///
 /// The catalog is a *identifier* here, not a literal, so it is delimited and
 /// its embedded quotes doubled. A pattern cannot appear in a FROM clause, so
-/// anything wildcarded — and the absent and `%` cases — keeps the session
+/// anything wildcarded (and the absent and `%` cases) keeps the session
 /// catalog, which is the previous behaviour.
 fn information_schema_ref(catalog: Option<&str>, table: &str) -> String {
     match catalog.filter(|c| !c.is_empty() && *c != "%" && !has_odbc_wildcards(c)) {
@@ -211,7 +211,7 @@ const NUM_PREC_RADIX_DECIMAL: i16 = 10;
 /// A column's `SQL_DATA_TYPE` and `SQL_DATETIME_SUB` from its concise type.
 ///
 /// Spec (`SQLColumns`): `SQL_DATA_TYPE` is the *verbose* type, which differs
-/// from `DATA_TYPE` only for datetimes and intervals — "For datetime and
+/// from `DATA_TYPE` only for datetimes and intervals: "For datetime and
 /// interval data types, this column returns `SQL_DATETIME` or `SQL_INTERVAL`,
 /// and the `SQL_DATETIME_SUB` field returns the subcode. For other data types,
 /// this column returns a NULL."
@@ -222,8 +222,8 @@ const NUM_PREC_RADIX_DECIMAL: i16 = 10;
 /// `SQLColumns` against `9` plus subcode `1` from `SQLGetTypeInfo`.
 ///
 /// Trino's two interval types are deliberately absent. They map to
-/// `SQL_WVARCHAR`, not to an ODBC interval type — see
-/// `type_conversion::trino_ty_to_sql_type` — so `SQL_INTERVAL` would be a
+/// `SQL_WVARCHAR`, not to an ODBC interval type (see
+/// `type_conversion::trino_ty_to_sql_type`), so `SQL_INTERVAL` would be a
 /// claim this driver's own type mapping does not make.
 fn verbose_type(concise: SqlDataType) -> (i16, Option<i16>) {
     match concise {
@@ -270,7 +270,7 @@ fn char_octet_length(sql_type: SqlDataType, ty_precision: Option<i32>) -> Option
 
 /// The catalog names, for `SQLTables`' `SQL_ALL_CATALOGS` enumeration.
 ///
-/// Uses `system.jdbc.catalogs`, which works without a default session catalog —
+/// Uses `system.jdbc.catalogs`, which works without a default session catalog,
 /// `information_schema` does not, and this is exactly the call an application
 /// makes before it has picked one.
 pub(super) fn catalogs(conn: &TrinoConnection) -> Result<Vec<String>, TrinoError> {
@@ -328,7 +328,7 @@ pub(super) fn tables(
     tracing::debug!(catalog, schema, table, ?table_types, "TrinoBackend::tables");
 
     // No ORDER BY: core sorts the result set into the spec's order. The three
-    // `SQL_ALL_*` enumerations never reach here either — core serves them from
+    // `SQL_ALL_*` enumerations never reach here either: core serves them from
     // `catalogs`, `schemas` and `table_types` above.
     let sql = format!(
         "SELECT table_catalog, table_schema, table_name, table_type \
@@ -620,7 +620,7 @@ fn table_privilege_row(vals: &[serde_json::Value]) -> Option<TablePrivilegeRow> 
 /// table for `DatabaseMetaData.getTablePrivileges()`.
 ///
 /// It is populated from the connector's permission management, so it is
-/// non-empty only for connectors that implement it — Hive and Iceberg under
+/// non-empty only for connectors that implement it: Hive and Iceberg under
 /// `sql-standard` security, say. A connector without it answers with zero rows
 /// rather than an error, which is why this queries unconditionally instead of
 /// gating on the catalog. Both catalogs in this project's test stack are in
@@ -641,7 +641,7 @@ pub(super) fn table_privileges(
     tracing::debug!(catalog, schema, table, "TrinoBackend::table_privileges");
 
     // No ORDER BY: core sorts by TABLE_CAT, TABLE_SCHEM, TABLE_NAME,
-    // PRIVILEGE, GRANTEE — note that PRIVILEGE outranks GRANTEE here.
+    // PRIVILEGE, GRANTEE. Note that PRIVILEGE outranks GRANTEE here.
     let sql = format!(
         "SELECT table_catalog, table_schema, table_name, grantor, grantee, \
                 privilege_type, is_grantable \
@@ -683,15 +683,15 @@ pub(super) fn column_privileges(
         schema = query.schema(),
         table = query.table(),
         column = query.column(),
-        "TrinoBackend::column_privileges (empty — Trino grants on tables, not columns)"
+        "TrinoBackend::column_privileges (empty: Trino grants on tables, not columns)"
     );
     Ok(Vec::new())
 }
 
 /// Return the stored procedures matching the given filters.
 ///
-/// Trino has procedures — `CALL system.runtime.kill_query(...)` is one, and
-/// calling an unregistered name answers `PROCEDURE_NOT_FOUND` — but it
+/// Trino has procedures (`CALL system.runtime.kill_query(...)` is one, and
+/// calling an unregistered name answers `PROCEDURE_NOT_FOUND`), but it
 /// publishes no metadata describing them. `system.jdbc.procedures` exists for
 /// JDBC compatibility and is hardwired empty (verified against a live
 /// coordinator: `system.runtime.kill_query` is callable while that table
@@ -707,7 +707,7 @@ pub(super) fn procedures(
         catalog = query.catalog(),
         schema = query.schema(),
         proc_name = query.proc_name(),
-        "TrinoBackend::procedures (empty — Trino publishes no procedure metadata)"
+        "TrinoBackend::procedures (empty: Trino publishes no procedure metadata)"
     );
     Ok(Vec::new())
 }
@@ -726,7 +726,7 @@ pub(super) fn procedure_columns(
         schema = query.schema(),
         proc_name = query.proc_name(),
         column = query.column(),
-        "TrinoBackend::procedure_columns (empty — Trino publishes no procedure metadata)"
+        "TrinoBackend::procedure_columns (empty: Trino publishes no procedure metadata)"
     );
     Ok(Vec::new())
 }
@@ -751,7 +751,7 @@ pub(super) fn primary_keys(
         catalog = query.catalog(),
         schema = query.schema(),
         table = query.table(),
-        "TrinoBackend::primary_keys (empty — Trino has no PK metadata)"
+        "TrinoBackend::primary_keys (empty: Trino has no PK metadata)"
     );
     Ok(Vec::new())
 }
@@ -773,7 +773,7 @@ pub(super) fn foreign_keys(
         fk_catalog = query.fk_catalog(),
         fk_schema = query.fk_schema(),
         fk_table = query.fk_table(),
-        "TrinoBackend::foreign_keys (empty — Trino has no FK metadata)"
+        "TrinoBackend::foreign_keys (empty: Trino has no FK metadata)"
     );
     Ok(Vec::new())
 }
@@ -793,7 +793,7 @@ pub(super) fn statistics(
         catalog = query.catalog(),
         schema = query.schema(),
         table = query.table(),
-        "TrinoBackend::statistics (empty — Trino exposes no index metadata)"
+        "TrinoBackend::statistics (empty: Trino exposes no index metadata)"
     );
     Ok(Vec::new())
 }
@@ -812,7 +812,7 @@ pub(super) fn special_columns(
         catalog = query.catalog(),
         schema = query.schema(),
         table = query.table(),
-        "TrinoBackend::special_columns (empty — Trino has no rowid/row-version metadata)"
+        "TrinoBackend::special_columns (empty: Trino has no rowid/row-version metadata)"
     );
     Ok(Vec::new())
 }
@@ -869,7 +869,7 @@ mod tests {
     /// The row a coordinator with `sql-standard` security returns. Neither
     /// catalog in this project's test stack implements permission management,
     /// so this shape cannot be obtained from the live server the integration
-    /// tests run against — it is transcribed from
+    /// tests run against: it is transcribed from
     /// `information_schema.table_privileges`' column list, which was read off
     /// the running coordinator.
     fn privilege_json(grantor: serde_json::Value) -> Vec<serde_json::Value> {

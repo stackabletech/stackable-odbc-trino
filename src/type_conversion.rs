@@ -32,7 +32,7 @@ pub(crate) const MAX_FRACTIONAL_SECONDS_PRECISION: i16 = 12;
 /// 0)"; the same is true for TIMESTAMP). A single shared constant is used
 /// for both TIME and TIMESTAMP: TIME's fraction survives via text
 /// conversions the same way TIMESTAMP's does, so there is no reason for the
-/// two to differ — do not split this into per-type constants. This remains a
+/// two to differ. Do not split this into per-type constants. This remains a
 /// simplification: parsing the *actual* declared scale per column, rather
 /// than assuming a default, is future work.
 const DEFAULT_TEMPORAL_SCALE_WITHOUT_TYPE_NAME: i16 = 3;
@@ -643,7 +643,7 @@ fn parse_fraction_nanos(frac: &str) -> u32 {
     // ASCII digits from Trino's own wire format, but if malformed input ever
     // contains a multi-byte character, byte index 9 may not land on a UTF-8
     // char boundary, and indexing (unlike `get`) panics rather than
-    // returning `None` -- the workspace denies `panic` outside tests, so
+    // returning `None`: the workspace denies `panic` outside tests, so
     // this must not be able to. Falling back to 0 matches what an
     // unparseable numeric fragment already does below.
     padded.get(..9).and_then(|s| s.parse().ok()).unwrap_or(0)
@@ -979,7 +979,7 @@ fn parse_numeric_offset(sign: i32, hhmm: &str) -> Option<chrono::TimeDelta> {
 /// JSON has no literal for the IEEE specials, so Trino sends them as strings:
 /// a `DOUBLE` or `REAL` column carrying one arrives as `"NaN"`, `"Infinity"` or
 /// `"-Infinity"` rather than as a number. Read off the wire, not from the
-/// documentation — see `ieee_specials_are_read_as_floats_not_strings`.
+/// documentation. See `ieee_specials_are_read_as_floats_not_strings`.
 ///
 /// The spellings are matched exactly rather than case-insensitively: these are
 /// the three Trino emits, and accepting looser forms would mean silently
@@ -1431,8 +1431,8 @@ mod tests {
         assert_eq!(val, ColumnValue::String("1e+300".to_string()));
     }
 
-    /// Trino encodes the three IEEE specials as JSON *strings*, not numbers —
-    /// `["NaN", "Infinity", "-Infinity"]`, confirmed off the wire — because
+    /// Trino encodes the three IEEE specials as JSON *strings*, not numbers
+    /// (`["NaN", "Infinity", "-Infinity"]`, confirmed off the wire), because
     /// JSON has no literal for them. Without an arm for a string-valued float
     /// column they fell through to `ColumnValue::String`, and core then refused
     /// `String -> Double` with `22018`, making the values unreadable.
@@ -1481,12 +1481,13 @@ mod tests {
     }
 
     /// A string Trino sends for a float column that is *not* one of the three
-    /// specials still falls back to text — but as the text itself, not as its
-    /// JSON encoding.
+    /// specials falls back to text, as the text itself rather than as its JSON
+    /// encoding.
     ///
-    /// `Value::to_string()` on a `Value::String` re-adds the quote characters,
-    /// so the fallback used to yield `"\"abc\""`: an application reading the
-    /// column as text got two literal quote marks it never sent.
+    /// The fallback goes through `json_as_text` for that reason.
+    /// `Value::to_string()` on a `Value::String` re-adds the quote characters
+    /// and would yield `"\"abc\""`, giving an application reading the column as
+    /// text two literal quote marks it never sent.
     #[test]
     fn unparseable_float_string_falls_back_without_json_quotes() {
         let val = json_to_column_value(
@@ -2561,7 +2562,7 @@ mod proptests {
 
     proptest! {
         // The type-name parsers must never panic on any input, however
-        // malformed — a panic would cross the FFI boundary.
+        // malformed: a panic would cross the FFI boundary.
         #[test]
         fn type_name_parsers_never_panic(s in ".*") {
             let _ = type_name_precision(&s);

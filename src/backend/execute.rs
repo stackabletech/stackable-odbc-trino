@@ -68,15 +68,15 @@ fn decode_page_rows(
 /// Trino's REST API takes one statement per request and its grammar has no
 /// terminator, so a trailing `;` is a syntax error rather than a no-op:
 /// `SELECT 1;` fails with `SYNTAX_ERROR` at the semicolon's own column. ODBC
-/// applications and query tools routinely send one — `isql` submits the line as
-/// typed, and SQL editors commonly append it — so a driver that passes it
+/// applications and query tools routinely send one (`isql` submits the line as
+/// typed, and SQL editors commonly append it), so a driver that passes it
 /// through rejects statements every other client accepts.
 ///
 /// Only the *trailing* run is removed, after trailing whitespace. That is
 /// enough to be safe without parsing: a statement whose last token is a string
 /// literal or quoted identifier ends with the closing quote, so a semicolon
 /// inside one is never the final character and never seen here. An embedded
-/// semicolon is left alone, and Trino rejects it — correctly, since it does not
+/// semicolon is left alone, and Trino rejects it, correctly, since it does not
 /// accept multiple statements per request.
 ///
 /// A comment *after* the terminator (`SELECT 1; -- done`) is not handled: the
@@ -96,8 +96,8 @@ pub(super) fn exec_direct(
     cancel: &TrinoCancelToken,
     sql: &str,
 ) -> Result<TrinoStatement, TrinoError> {
-    // Every path carrying application SQL funnels through here -- `execute`
-    // calls this after interpolating parameters -- so this is the one place the
+    // Every path carrying application SQL funnels through here (`execute`
+    // calls this after interpolating parameters), so this is the one place the
     // terminator has to be dropped.
     let stripped = strip_trailing_semicolons(sql);
     if stripped.len() != sql.len() {
@@ -211,7 +211,7 @@ pub(super) fn exec_direct(
         // Nullability is left at `ColumnDescriptor::new`'s
         // `SQL_NULLABLE_UNKNOWN`. Trino's REST protocol describes a result
         // column with a name and a type and nothing else, so this driver cannot
-        // determine whether a column accepts NULL -- and the ODBC spec defines
+        // determine whether a column accepts NULL, and the ODBC spec defines
         // the third value for exactly that case. Claiming `SQL_NULLABLE`
         // instead would be a guess that happens to be safe for a projection of
         // a nullable base column and wrong for a `COUNT(*)`; claiming
@@ -364,7 +364,7 @@ pub(super) fn cancel(token: &TrinoCancelToken) -> Result<(), TrinoError> {
         // A poisoned lock is an internal invariant violation rather than a
         // client failure, so it is hand-built rather than routed through
         // `map_trino_error` (see AGENTS.md), and built as an `OdbcError` so its
-        // SQLSTATE and message reach `SQLGetDiagRec` unchanged -- a
+        // SQLSTATE and message reach `SQLGetDiagRec` unchanged: a
         // `TrinoError::Odbc` is unwrapped, not re-mapped.
         Err(_) => {
             return Err(TrinoError::from(OdbcError::general(
@@ -408,14 +408,14 @@ impl TrinoStatement {
     ///
     /// Trino answers `GENERIC_INTERNAL_ERROR: Already finished` for a page
     /// request on a result set whose transaction has ended, so the drain that
-    /// normally keeps the pooled socket clean would fail instead — the same
+    /// normally keeps the pooled socket clean would fail instead: the same
     /// shape of problem a server-side cancel creates, and solved the same way.
     ///
     /// The connection bumps its epoch before it sends the `COMMIT`, so a
     /// statement whose recorded epoch has fallen behind is one whose rows the
     /// coordinator is already discarding.
     ///
-    /// `false` for a statement built without an epoch — the in-memory catalog
+    /// `false` for a statement built without an epoch: the in-memory catalog
     /// results, which hold no `next_uri` and so have nothing to drain.
     fn result_set_died_with_a_transaction(&self) -> bool {
         self.txn
@@ -426,7 +426,7 @@ impl TrinoStatement {
     /// Whether a `SQLCancel` on another thread has already stopped this
     /// statement's query server-side.
     ///
-    /// `false` for a statement built without a cancel state — the in-memory
+    /// `false` for a statement built without a cancel state: the in-memory
     /// catalog results, which hold no `next_uri` and so have nothing to stop.
     fn is_cancelled(&self) -> bool {
         self.cancel_state
@@ -439,7 +439,7 @@ impl TrinoStatement {
     ///
     /// A page fetch is the most likely place a connection failure is first
     /// seen, and `SQL_ATTR_CONNECTION_DEAD` is a fact about the connection
-    /// rather than about the statement — so the observation has to travel back.
+    /// rather than about the statement, so the observation has to travel back.
     /// Falls back to the bare mapper for a statement built without a liveness
     /// handle, which is the in-memory catalog results that reach no network.
     fn map_client_error(&self, e: trino_rust_client::error::Error) -> TrinoError {
@@ -479,11 +479,17 @@ impl TrinoStatement {
     ///
     /// Both discard the buffered rows, but they leave the statement in
     /// different states. A failure marks it `fetch_failed`, so a further fetch
-    /// reports `24000` rather than a spurious `NoData` — the cursor position is
-    /// genuinely undefined. A cancellation is not a failure: the application
-    /// asked for it, the rows are simply over, and a subsequent fetch should
-    /// see the same clean `NoData` it would get had the cancel landed between
-    /// fetches rather than during one.
+    /// reports `24000`, the cursor position being genuinely undefined. A
+    /// cancellation is not an abandonment: the application asked for it, so the
+    /// statement is kept off `abandon_result_set` and its cursor counts as
+    /// finished rather than undefined.
+    ///
+    /// Finished is not the same as exhausted. The cancellation is still an
+    /// error, and every later fetch reports `HY008` too, from the
+    /// `is_cancelled` check at the top of [`TrinoStatement::fetch`]. `NoData`
+    /// would say "your result set ended", which is false when rows were
+    /// discarded, and would let a query timeout enforced by cancelling reach
+    /// the application as an empty result set with no diagnostic.
     ///
     /// Either way the drain is suppressed by `next_uri = None`: paging a
     /// cancelled query fails and leaves the pooled socket dirty.
@@ -527,7 +533,7 @@ impl StatementBackend for TrinoStatement {
             // cancelling, has already stopped this query server-side. Discard
             // what is left rather than serving rows from a result set the
             // application asked to abandon, and above all do not poll
-            // `next_uri` -- see `cancel` for why that dirties the socket.
+            // `next_uri`; see `cancel` for why that dirties the socket.
             //
             // Reported as an error, not `NoData`. `NoData` is "your result set
             // ended", which is false here: rows were discarded, and an
@@ -667,8 +673,8 @@ impl StatementBackend for TrinoStatement {
     fn column_count(&self) -> i16 {
         // `SQLNumResultCols` writes through a `SQLSMALLINT *`, so the count is
         // narrowed here rather than in core: this is where the real number is
-        // known. Saturating is the only option the ABI leaves -- there is no
-        // `SQL_NO_TOTAL` for a column count -- and a Trino result set with more
+        // known. Saturating is the only option the ABI leaves, there being no
+        // `SQL_NO_TOTAL` for a column count, and a Trino result set with more
         // than 32767 columns is beyond anything the coordinator will plan.
         i16::try_from(self.columns.len()).unwrap_or_else(|_| {
             tracing::warn!(
@@ -730,7 +736,7 @@ impl StatementBackend for TrinoStatement {
                         // surfaces later as an unrelated query failing. Core
                         // records what this returns on the statement's own
                         // diagnostic queue, so it reaches the application
-                        // rather than only the log -- but the teardown below
+                        // rather than only the log, but the teardown below
                         // still runs first, so one dirty socket does not also
                         // strand the statement.
                         tracing::warn!(

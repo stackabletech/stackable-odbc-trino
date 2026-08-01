@@ -378,13 +378,13 @@ fn trino_get_info(
     match info_type {
         // A schema-qualified name (`schema.table`) is usable in DML, in a
         // `CALL schema.procedure()` invocation, in `CREATE`/`ALTER`/`DROP
-        // TABLE`, and in `GRANT`/`REVOKE` -- all confirmed against the Trino
+        // TABLE`, and in `GRANT`/`REVOKE`, all confirmed against the Trino
         // SQL statement reference. `SQL_SU_INDEX_DEFINITION` is deliberately
         // absent: Trino's grammar has no `CREATE INDEX`/`DROP INDEX`
         // statement at all, so no schema-qualified name is ever usable
         // there. Do not claim `SQL_SU_INDEX_DEFINITION` in place of
         // `SQL_SU_PRIVILEGE_DEFINITION` (both being bit `0x08`/`0x10` of the
-        // same nibble makes the swap easy to miss) -- that would overclaim a
+        // same nibble makes the swap easy to miss): that would overclaim a
         // statement Trino cannot execute and underclaim one it can.
         InfoType::SchemaUsage => {
             return Ok(InfoValue::U32(
@@ -406,11 +406,11 @@ fn trino_get_info(
                     | SQL_CU_PRIVILEGE_DEFINITION,
             ));
         }
-        // Trino's qualified names read catalog.schema.table -- catalog first.
+        // Trino's qualified names read catalog.schema.table, catalog first.
         InfoType::CatalogLocation => return Ok(InfoValue::U16(SQL_CL_START)),
         // SQL_GD_BLOCK is deliberately not claimed: it means SQLGetData can
         // be called for a row in a block cursor after a bulk fetch, but no
-        // driver in this workspace has block cursors -- `SQLSetStmtAttrW`
+        // driver in this workspace has block cursors: `SQLSetStmtAttrW`
         // (`stackable-odbc-core/src/ffi/stmt_attr.rs`) rejects any
         // SQL_ATTR_ROW_ARRAY_SIZE other than 1, substituting 1 back with
         // 01S02, so an application can never obtain a multi-row rowset from
@@ -479,7 +479,7 @@ fn trino_get_info(
         // `default_txn_isolation`,
         // `txn_isolation_options`), and an arm here would shadow the hook for
         // `SQLGetInfo` while the hook still drove `SQLGetConnectAttr` and the
-        // `HY024` validation in `sql_set_connect_attr` -- the two answers
+        // `HY024` validation in `sql_set_connect_attr`, so the two answers
         // could then disagree for the same connection. See the hook
         // implementations in `crate::backend`.
         //
@@ -614,8 +614,8 @@ pub(crate) const TRINO_NUMERIC_FUNCTIONS: u32 = SQL_FN_NUM_ABS
 /// Transcribed from <https://trino.io/docs/current/language/reserved.html>
 /// rather than read out of the server, because there is nothing to read.
 /// Trino has no equivalent of SQLite's `sqlite3_keyword_name`: `system.jdbc`
-/// -- the schema backing the JDBC driver's `DatabaseMetaData`, and so the one
-/// place such a list would live -- has no keywords table, nor does
+/// (the schema backing the JDBC driver's `DatabaseMetaData`, and so the one
+/// place such a list would live) has no keywords table, nor does
 /// `system.metadata`, and this driver speaks HTTP so there is no library to
 /// ask. Trino's own JDBC driver hardcodes `getSQLKeywords()` for the same
 /// reason.
@@ -625,7 +625,7 @@ pub(crate) const TRINO_NUMERIC_FUNCTIONS: u32 = SQL_FN_NUM_ABS
 /// reporting a keyword only makes an application quote an identifier it need
 /// not have, while under-reporting leaves a genuinely reserved word unquoted
 /// and the statement fails to parse. So this tracks the newest list rather
-/// than the connected server's. The drift is small and additive -- of the
+/// than the connected server's. The drift is small and additive: of the
 /// twelve sampled against a live 467, eleven were already reserved and only
 /// `AUTO` was newer.
 pub(crate) const TRINO_RESERVED_KEYWORDS: &[&str] = &[
@@ -714,7 +714,8 @@ pub(crate) const TRINO_RESERVED_KEYWORDS: &[&str] = &[
     "WITH",
 ];
 
-/// [`TRINO_RESERVED_KEYWORDS`] in the `Cow` form [`Backend::keywords`] returns.
+/// [`TRINO_RESERVED_KEYWORDS`] in the `Cow` form
+/// [`stackable_odbc_core::backend::Backend::keywords`] returns.
 ///
 /// The const above stays a plain `&[&str]` so the list itself remains readable;
 /// wrapping each of the 83 entries in `Cow::Borrowed` at the literal would
@@ -803,7 +804,7 @@ pub(crate) const TRINO_SYSTEM_FUNCTIONS: u32 =
 /// trusts the ODBC convention can be off by one.
 ///
 /// Deliberately absent: `DAYNAME` and `MONTHNAME`, which Trino has no
-/// function for -- only `format_datetime()` with a pattern.
+/// function for, only `format_datetime()` with a pattern.
 /// <https://trino.io/docs/current/functions/datetime.html>
 pub(crate) const TRINO_TIMEDATE_FUNCTIONS: u32 = SQL_FN_TD_NOW
     | SQL_FN_TD_CURDATE
@@ -828,7 +829,7 @@ pub(crate) const TRINO_TIMEDATE_FUNCTIONS: u32 = SQL_FN_TD_NOW
 /// `SQL_SQL92_PREDICATES` for a coordinator of major version `server_major`.
 ///
 /// `MATCH` and `UNIQUE` arrived in Trino 482 and `OVERLAPS` in 483, so a
-/// server older than that must not claim them -- a BI tool that folds an
+/// server older than that must not claim them: a BI tool that folds an
 /// unsupported predicate gets a parse error, which is worse than not folding.
 /// `server_major` is `0` when the version probe failed, which gates all three
 /// off.
@@ -864,7 +865,7 @@ fn sql92_predicates(server_major: u32) -> u32 {
 /// no production in Trino's grammar at any version, so it is never claimed.
 ///
 /// `NATURAL JOIN` is deliberately *not* claimed, despite being grammatically
-/// present (`SqlBase.g4` accepts it) -- a live Trino 467 coordinator rejects
+/// present (`SqlBase.g4` accepts it), because a live Trino 467 coordinator rejects
 /// it at analysis time with `NOT_SUPPORTED: Natural join not supported`, so
 /// grammar acceptance alone overstates capability. Confirmed against a live
 /// coordinator.
@@ -901,13 +902,13 @@ pub(super) fn get_info_raw(
     // ODBC escape-sequence support in the naive sense: `SQLExecDirectW` /
     // `SQLPrepareW` / `SQLNativeSqlW` do translate `{fn NAME(...)}` escapes
     // (`stackable_odbc_core::escape::translate_escapes`, driven by
-    // `TrinoBackend::escape_dialect()` -- see `crate::escape_dialect`), so
+    // `TrinoBackend::escape_dialect()`; see `crate::escape_dialect`), so
     // `{fn ABS(x)}` becomes `ABS(x)` and succeeds, and names Trino spells
     // differently are remapped (`UCASE`->`upper`, `LOG`->`ln`,
     // `IFNULL`->`coalesce`, ...). A handful of advertised functions need an
-    // argument-syntax change that a bare name substitution cannot make --
-    // `LOCATE`, `CURDATE`/`CURTIME`, `TIMESTAMPADD`/`TIMESTAMPDIFF`,
-    // `USERNAME`/`DBNAME`, `DAYOFWEEK` -- and are deliberately left
+    // argument-syntax change that a bare name substitution cannot make
+    // (`LOCATE`, `CURDATE`/`CURTIME`, `TIMESTAMPADD`/`TIMESTAMPDIFF`,
+    // `USERNAME`/`DBNAME`, `DAYOFWEEK`), and are deliberately left
     // untranslated; see the `crate::escape_dialect` module doc comment for
     // why each one can't be fixed by renaming alone.
     match info_type {
@@ -926,7 +927,7 @@ pub(super) fn get_info_raw(
         SQL_OUTER_JOINS => Some(Ok(InfoValue::String("Y".into()))),
         // SQL_DATABASE_NAME is deliberately absent. The spec makes it and
         // `SQLGetConnectAttr(SQL_ATTR_CURRENT_CATALOG)` one value under two
-        // names, and core reads both from `TrinoBackend::current_catalog` --
+        // names, and core reads both from `TrinoBackend::current_catalog`,
         // what the application set, else what the session is using, in that
         // order for both. An arm here would answer only the info type and let
         // the two disagree, which is the state this driver was in until core
@@ -1050,7 +1051,7 @@ const TRINO_ADVERTISED_FUNCTIONS: &[FunctionId] = &[
 /// of the driver, but it would also file the reasoning under test scaffolding,
 /// which is the opposite of why it is written down.
 // `allow` rather than `expect`: the lib is compiled both as a library, where
-// this is dead, and as a test target, where the partition test reads it -- so
+// this is dead, and as a test target, where the partition test reads it, so
 // an expectation would go unfulfilled in one of the two and fail the build.
 #[allow(dead_code)]
 const TRINO_WITHHELD_FUNCTIONS: &[(FunctionId, &str)] = &[];
@@ -1164,7 +1165,7 @@ mod tests {
                 expected,
                 "{} (DATA_TYPE {:?}): COLUMN_SIZE is {} but the \
                  backend-independent appendix formula for that DATA_TYPE \
-                 gives {} — the row is built from a different SqlDataType \
+                 gives {}: the row is built from a different SqlDataType \
                  than it reports",
                 row.type_name(),
                 row.data_type(),
@@ -1216,7 +1217,7 @@ mod tests {
         (InfoType::UserName,                      Expected::Str("test")),
         (InfoType::DataSourceReadOnly,            Expected::Str("N")),
         // "N": Trino can filter information_schema by privilege, but only
-        // when the deployment configures access control -- see
+        // when the deployment configures access control; see
         // TrinoBackend::accessible_tables.
         (InfoType::AccessibleTables,              Expected::Str("N")),
         (InfoType::AccessibleProcedures,          Expected::Str("N")),
@@ -1292,7 +1293,7 @@ mod tests {
         // inside a transaction is an error on every JDBC-backed catalog.
         (InfoType::TransactionCapable,            Expected::U16(SQL_TC_DML as u16)),
         // --- U32 values ---
-        // CursorSensitivity is SQLUINTEGER per spec, not SQLUSMALLINT -- see
+        // CursorSensitivity is SQLUINTEGER per spec, not SQLUSMALLINT; see
         // the matching comment in stackable-odbc-core's default_get_info.
         // `SQL_UNSPECIFIED`, not `SQL_INSENSITIVE`: core's fetch streams rows
         // from this backend as the application asks for them, so it makes no
@@ -1391,7 +1392,7 @@ mod tests {
     /// Asserted on the *connected* path. Several of these answers come from
     /// capability declarations that now take a `&TrinoConnection`, so
     /// `default_get_info` declines them without one and core substitutes its
-    /// benign pre-connect default — which is what
+    /// benign pre-connect default, which is what
     /// `get_info_every_named_info_type_has_the_declared_shape_pre_connect`
     /// covers. This table is about the values the driver reports to a connected
     /// application.
@@ -1639,7 +1640,7 @@ mod tests {
                 produced,
                 row.type_name(),
                 "trino_type_info() row {:?} (DATA_TYPE={:?}) is not reachable via \
-                 trino_bare_type_name (got {produced:?} instead) — no real column can \
+                 trino_bare_type_name (got {produced:?} instead): no real column can \
                  ever be reported under this TYPE_NAME",
                 row.type_name(),
                 row.data_type()
@@ -1816,7 +1817,7 @@ mod tests {
     ///
     /// NATURAL JOIN is also never claimed, at any version: it is accepted by
     /// Trino's grammar but rejected at analysis time (live-verified against
-    /// Trino 467: `NOT_SUPPORTED: Natural join not supported`) -- see
+    /// Trino 467: `NOT_SUPPORTED: Natural join not supported`); see
     /// `sql92_join_operators`'s doc comment.
     #[test]
     fn sql92_join_operators_track_the_server_version() {
@@ -1840,7 +1841,7 @@ mod tests {
     }
 
     /// Only defined SQL_FN_NUM_* flags may be set (no bit outside the range,
-    /// such as bit 24), and COT must not be claimed — Trino has no cot().
+    /// such as bit 24), and COT must not be claimed: Trino has no cot().
     #[test]
     fn numeric_functions_claim_only_defined_flags_trino_has() {
         let all_defined = SQL_FN_NUM_ABS
@@ -1938,7 +1939,7 @@ mod tests {
     /// SQL that runs.
     ///
     /// Every name below needs an argument-syntax change that
-    /// `EscapeDialect::remap_scalar_fn` cannot make -- it only swaps the
+    /// `EscapeDialect::remap_scalar_fn` cannot make: it only swaps the
     /// identifier in front of the parentheses. Each was advertised without a
     /// translation once, and a client that read the bitmap and emitted the
     /// escape got `FUNCTION_NOT_FOUND: \'curdate\'`,
@@ -1947,7 +1948,7 @@ mod tests {
     /// asserts both halves together: the bit is set *and* the rewrite exists.
     ///
     /// `DAYOFWEEK` is the one where the rewrite matters most. Trino has
-    /// `day_of_week()`, so a rename would have succeeded -- and returned a
+    /// `day_of_week()`, so a rename would have succeeded, and returned a
     /// silently wrong, ISO-numbered day.
     #[test]
     fn every_advertised_rewrite_has_a_translation() {
@@ -2015,7 +2016,7 @@ mod tests {
     /// correct: ODBC spells it `POSITION(exp IN exp)`, which is already
     /// Trino\'s syntax, so the escape passes through untouched.
     ///
-    /// `SQL_FN_STR_LOCATE` -- the *three*-argument form -- must stay
+    /// `SQL_FN_STR_LOCATE`, the *three*-argument form, must stay
     /// unadvertised. ODBC\'s third argument is a start offset and the third
     /// argument of Trino\'s `strpos()` is an occurrence index, so the rewrite
     /// declines it; advertising the bit would promise a call that then falls
@@ -2026,7 +2027,7 @@ mod tests {
         assert_eq!(
             crate::escape_dialect::rewrite_scalar_fn("POSITION", "\'b\' IN \'ab\'"),
             None,
-            "POSITION needs no rewrite -- ODBC already spells it Trino\'s way"
+            "POSITION needs no rewrite: ODBC already spells it Trino\'s way"
         );
 
         assert_eq!(TRINO_STRING_FUNCTIONS & SQL_FN_STR_LOCATE, 0);
@@ -2101,7 +2102,7 @@ mod tests {
 
     /// `SQL_KEYWORDS` is Trino's reserved words *minus* the ones ODBC already
     /// reserves, so this asserts the value an application receives rather than
-    /// the raw list the hook returns -- the subtraction is core's, and getting
+    /// the raw list the hook returns: the subtraction is core's, and getting
     /// it wrong in either direction is what the info type exists to prevent.
     ///
     /// The expected string is written out rather than recomputed from
@@ -2196,7 +2197,7 @@ mod tests {
     /// The two lists together are this driver's answer to "do you support this
     /// function?" for every entry point core exports. A function in neither has
     /// no answer, and that is exactly what a newly exported core function looks
-    /// like -- so this failing is the point at which someone decides whether
+    /// like, so this failing is the point at which someone decides whether
     /// the driver implements it, rather than it going unadvertised unnoticed.
     ///
     /// Mirrors core's own `every_function_id_is_declared_exported_or_not`, one
