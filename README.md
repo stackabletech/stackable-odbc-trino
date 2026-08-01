@@ -10,7 +10,7 @@
 
 [![Build and Test](https://github.com/stackabletech/stackable-odbc-trino/actions/workflows/build.yaml/badge.svg)](https://github.com/stackabletech/stackable-odbc-trino/actions/workflows/build.yaml)
 [![Security Audit](https://github.com/stackabletech/stackable-odbc-trino/actions/workflows/security_audit.yaml/badge.svg)](https://github.com/stackabletech/stackable-odbc-trino/actions/workflows/security_audit.yaml)
-[![PRs Welcome](https://img.shields.io/badge/PRs-welcome-green.svg)](https://docs.stackable.tech/home/stable/contributor/index.html)
+[![OpenSSF Scorecard](https://api.securityscorecards.dev/projects/github.com/stackabletech/stackable-odbc-trino/badge)](https://scorecard.dev/viewer/?uri=github.com/stackabletech/stackable-odbc-trino)
 [![Apache License 2.0](https://img.shields.io/badge/license-Apache--2.0-green)](./LICENSE)
 [![ODBC 3.80](https://img.shields.io/badge/ODBC-3.80-blue)](#what-it-deliberately-does-not-do)
 [![Platforms](https://img.shields.io/badge/platforms-Linux%20%7C%20Windows-blue)](#quick-start)
