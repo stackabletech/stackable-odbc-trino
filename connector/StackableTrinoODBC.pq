@@ -15,6 +15,29 @@ section StackableTrinoODBC;
 // The ODBC driver name as registered in odbcinst.ini / the Windows registry.
 Config_DriverName = "stackable_odbc_trino";
 
+// Connection-string keys reachable through the `options` record.
+//
+// Every name is a key that src/backend/types/connect_params.rs accepts;
+// `connector_options_are_connection_string_keys` in src/lib.rs fails the build
+// if one is not, because an option the driver does not recognise is discarded
+// at connect and reads as the setting having no effect.
+//
+// The four keys the driver declares sensitive through
+// `Backend::sensitive_connect_keywords` are absent deliberately: an option set
+// here is stored in the query text inside the .pbix, which is a file people
+// mail to each other. AccessToken, ExtraCredentials, ExtraHeaders and
+// ProxyPassword therefore stay on the connection string or the data source,
+// where a credential store can hold them.
+Config_AdvancedOptions = {
+    "Source", "ClientTags", "Path", "TimeZone", "Locale", "ClientInfo",
+    "TraceToken", "SessionUser", "Roles",
+    "TlsVerify", "Certificate", "ClientCertificate",
+    "SessionProperties", "ResourceEstimates", "ClientCapabilities", "Encoding",
+    "Proxy", "ProxyUser",
+    "QueryTimeout", "DisableCompression", "MaxAttempts",
+    "ExternalAuthentication", "ExternalAuthenticationTimeout"
+};
+
 // SQL conformance override.
 //
 // The driver reports SQL_SC_SQL92_FULL here and 0 through SQLGetInfo, and
@@ -66,14 +89,111 @@ Config_EnableDirectQuery = true;
 // Data source function
 // ---------------------------------------------------------------------------
 
+// The published function is the implementation re-typed, so the Get Data
+// dialog renders a caption per parameter and an "Advanced options" section
+// rather than asking for a bare record.
 [DataSource.Kind = "StackableTrinoODBC", Publish = "StackableTrinoODBC.Publish"]
-shared StackableTrinoODBC.Contents = (
+shared StackableTrinoODBC.Contents =
+    Value.ReplaceType(StackableTrinoODBCImpl, StackableTrinoODBC.ContentsType);
+
+StackableTrinoODBC.ContentsType = type function (
+    server as (type text meta [
+        Documentation.FieldCaption = "Server",
+        Documentation.SampleValues = {"trino.example.com"}
+    ]),
+    port as (type number meta [
+        Documentation.FieldCaption = "Port",
+        Documentation.SampleValues = {8443}
+    ]),
+    catalog as (type text meta [
+        Documentation.FieldCaption = "Catalog",
+        Documentation.SampleValues = {"hive"}
+    ]),
+    optional schema as (type text meta [
+        Documentation.FieldCaption = "Schema"
+    ]),
+    optional user as (type text meta [
+        Documentation.FieldCaption = "User",
+        Documentation.FieldDescription =
+            "Left empty under external authentication, where the identity provider supplies it."
+    ]),
+    optional protocol as (type text meta [
+        Documentation.FieldCaption = "Protocol",
+        Documentation.AllowedValues = {"https", "http"}
+    ]),
+    optional options as (type StackableTrinoODBC.OptionsType meta [
+        Documentation.FieldCaption = "Advanced options"
+    ])
+) as table meta [
+    Documentation.Name = "Stackable Trino"
+];
+
+// Keep in step with Config_AdvancedOptions. That list is what the connection
+// string is built from and what the build checks against the driver's parser;
+// this type is only what the dialog renders.
+StackableTrinoODBC.OptionsType = type [
+    optional Source = (type text meta [Documentation.FieldCaption = "Source"]),
+    optional ClientTags = (type text meta [Documentation.FieldCaption = "Client tags"]),
+    optional Path = (type text meta [Documentation.FieldCaption = "SQL path"]),
+    optional TimeZone = (type text meta [
+        Documentation.FieldCaption = "Time zone",
+        Documentation.SampleValues = {"Europe/Berlin"}
+    ]),
+    optional Locale = (type text meta [Documentation.FieldCaption = "Locale"]),
+    optional ClientInfo = (type text meta [Documentation.FieldCaption = "Client info"]),
+    optional TraceToken = (type text meta [Documentation.FieldCaption = "Trace token"]),
+    optional SessionUser = (type text meta [Documentation.FieldCaption = "Session user"]),
+    optional Roles = (type text meta [
+        Documentation.FieldCaption = "Roles",
+        Documentation.SampleValues = {"hive:ROLE{admin}"}
+    ]),
+    optional TlsVerify = (type text meta [
+        Documentation.FieldCaption = "TLS verification",
+        Documentation.AllowedValues = {"full", "ca", "none"}
+    ]),
+    optional Certificate = (type text meta [Documentation.FieldCaption = "CA certificate"]),
+    optional ClientCertificate = (type text meta [
+        Documentation.FieldCaption = "Client certificate"
+    ]),
+    optional SessionProperties = (type text meta [
+        Documentation.FieldCaption = "Session properties",
+        Documentation.SampleValues = {"query_max_run_time:10m"}
+    ]),
+    optional ResourceEstimates = (type text meta [
+        Documentation.FieldCaption = "Resource estimates"
+    ]),
+    optional ClientCapabilities = (type text meta [
+        Documentation.FieldCaption = "Client capabilities"
+    ]),
+    optional Encoding = (type text meta [
+        Documentation.FieldCaption = "Spooling encoding",
+        Documentation.AllowedValues = {"json", "json+zstd", "json+lz4"}
+    ]),
+    optional Proxy = (type text meta [Documentation.FieldCaption = "Proxy URL"]),
+    optional ProxyUser = (type text meta [Documentation.FieldCaption = "Proxy user"]),
+    optional QueryTimeout = (type number meta [
+        Documentation.FieldCaption = "Query timeout (s)"
+    ]),
+    optional DisableCompression = (type logical meta [
+        Documentation.FieldCaption = "Disable compression"
+    ]),
+    optional MaxAttempts = (type number meta [Documentation.FieldCaption = "Max attempts"]),
+    optional ExternalAuthentication = (type logical meta [
+        Documentation.FieldCaption = "External authentication"
+    ]),
+    optional ExternalAuthenticationTimeout = (type number meta [
+        Documentation.FieldCaption = "External auth timeout (s)"
+    ])
+];
+
+StackableTrinoODBCImpl = (
     server as text,
     port as number,
     catalog as text,
     optional schema as text,
     optional user as text,
-    optional protocol as text
+    optional protocol as text,
+    optional options as record
 ) as table =>
     let
         // Matches the driver's own default. An unencrypted connection should
@@ -97,6 +217,30 @@ shared StackableTrinoODBC.Contents = (
                 ConnectionString & [Schema = schema]
             else
                 ConnectionString,
+
+        // An unrecognised option is an error rather than a value quietly
+        // dropped: a misspelled key would otherwise change nothing, and a
+        // report whose TimeZone silently did not apply still renders.
+        suppliedOptions = if options <> null then options else [],
+        unknownOptions =
+            List.Difference(Record.FieldNames(suppliedOptions), Config_AdvancedOptions),
+        checkedOptions =
+            if List.Count(unknownOptions) > 0 then
+                error "Unknown option: " & Text.Combine(unknownOptions, ", ")
+            else
+                suppliedOptions,
+
+        // A connection string carries text. Numbers and logicals reach the
+        // driver as "30" and "TRUE", both of which its parser accepts.
+        optionsAsText = Record.FromList(
+            List.Transform(
+                Record.FieldValues(checkedOptions),
+                each if _ is text then _ else Text.From(_)
+            ),
+            Record.FieldNames(checkedOptions)
+        ),
+
+        ConnectionStringWithOptions = ConnectionStringWithSchema & optionsAsText,
 
         // Credentials: PowerBI supplies username/password via the
         // credential system. Map them to the ODBC connection string.
@@ -247,7 +391,7 @@ shared StackableTrinoODBC.Contents = (
         SQLGetTypeInfo = (types) => types,
 
         OdbcDatasource = Odbc.DataSource(
-            ConnectionStringWithSchema,
+            ConnectionStringWithOptions,
             [
                 HierarchicalNavigation = true,
                 SoftNumbers = true,

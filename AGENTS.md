@@ -1641,8 +1641,66 @@ undefined-behaviour risk lives and where both are run.
 `packaging/dist/`, given `$VERSION` and both release binaries:
 
 - `stackable-odbc-trino-<version>-linux-x64.tar.gz` — `.so` + install scripts
-- `stackable-odbc-trino-<version>-windows-x64.zip` — `.dll` + `.mez` + `.bat` scripts
+- `stackable-odbc-trino-<version>-windows-x64.zip` — `.dll`, `.mez`, the `.bat`
+  scripts and `configure-dsn.ps1`
 - `StackableTrinoODBC-<version>.mez` — standalone Power BI asset
+
+### The Windows DSN dialog
+
+`packaging/windows/configure-dsn.ps1` is a WinForms dialog covering the whole
+connection-string surface. It is **not** the ODBC Data Source Administrator's
+"Add…" button: that button loads the driver's setup DLL and asks it for a
+dialog, and this driver answers headlessly, so odbcad32 reports
+`ODBC_ERROR_INVALID_KEYWORD_VALUE` and the message core posts. Giving that
+button a dialog needs `ffi/setup.rs`'s `config_dsn_w` to become generic over
+the backend, which is a core change.
+
+Layout, the read path, the write path and validation are generated from one
+`$Fields` table, and `dsn_keys_match_the_connection_string_parser` in
+`src/lib.rs` fails `cargo test` if that table and the `PARAM_` constants ever
+disagree in either direction.
+
+The write goes through `SQLConfigDataSourceW`, so the driver's own `ConfigDSN`
+stays in the loop. Two things about it are measured rather than assumed:
+
+- **`SQLInstallerErrorW` returns a 16-bit `RETCODE`.** Declared as a 4-byte
+  `bool` it silently yields no error record at all, which makes a failed write
+  look like a write with no explanation.
+- **The five `name:value;name2:value2` keys are written bare.** Braces belong
+  to connection-string syntax, where `;` separates parameters. Measured against
+  the live driver: a bare DSN value applies both session properties, a braced
+  one fails the connection with `08001`.
+
+Secrets are written only when their **Save** box is ticked, which is off by
+default. A saved secret is stored unencrypted, and a System data source puts it
+in HKLM where every local user can read it.
+
+### The connector's advanced options
+
+`StackableTrinoODBC.Contents` takes `optional options as record`, and
+`Config_AdvancedOptions` is the list of keys it accepts.
+`connector_options_are_connection_string_keys` in `src/lib.rs` checks that list
+against the `PARAM_` constants, and against `StackableTrinoODBC.OptionsType` in
+both directions: the list is what the connection string is built from, the type
+is only what the Get Data dialog renders, and nothing in Power Query relates
+them.
+
+The four keys `Backend::sensitive_connect_keywords` declares are deliberately
+absent — `AccessToken`, `ExtraCredentials`, `ExtraHeaders`, `ProxyPassword`. An
+option set here is stored in the query text inside the `.pbix`, which is a file
+people mail to each other.
+
+**`SessionProperties`, `ResourceEstimates` and `Roles` are unverified through
+Power Query.** All three carry `;`, and whether `Odbc.DataSource` escapes a
+record value containing one is not established here: nothing in this repo
+executes the `.pq`, since `suites/test_folding_contract.py` parses it and Power
+BI is what runs it. They are passed unbraced, relying on Power Query's own
+escaping. **Before a release, set `SessionProperties` to two pairs in Power BI
+Desktop and confirm both apply**; if only the first does, brace those three in
+the connector the way `Build-ConnectionString` does in `configure-dsn.ps1`.
+`DirectQuery` needs no such check and no option of its own: it is a `Publish`
+capability (`SupportsDirectQuery`), and Power BI draws the Import/DirectQuery
+selector itself.
 
 `connector/` holds the Power Query custom connector source; `connector/build.sh`
 zips it into the `.mez`.

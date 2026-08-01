@@ -68,6 +68,7 @@ cp "$WINDOWS_DLL" "$WINDOWS_STAGING/"
 cp "$MEZ_SOURCE" "$WINDOWS_STAGING/StackableTrinoODBC.mez"
 cp "$PACKAGING_DIR/windows/install.bat" "$WINDOWS_STAGING/"
 cp "$PACKAGING_DIR/windows/uninstall.bat" "$WINDOWS_STAGING/"
+cp "$PACKAGING_DIR/windows/configure-dsn.ps1" "$WINDOWS_STAGING/"
 cp "$PACKAGING_DIR/README.md" "$WINDOWS_STAGING/"
 cp "$LICENSE_FILE" "$WINDOWS_STAGING/"
 

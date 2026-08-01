@@ -57,4 +57,172 @@ mod tests {
              release.toml's pre-release-replacement for the .pq is what keeps them together"
         );
     }
+
+    /// The DSN dialog's field table names exactly the parser's keywords.
+    ///
+    /// `packaging/windows/configure-dsn.ps1` generates its layout, its read
+    /// path and its write path from one field table, so a keyword missing from
+    /// that table is a keyword no Windows user can set through the dialog —
+    /// invisibly, because the dialog still opens and still writes a working
+    /// data source without it. The reverse is worse: a keyword the table names
+    /// and the parser does not is written into the registry and silently
+    /// ignored at connect, which reads as the setting having no effect.
+    ///
+    /// Both directions are checked against the `PARAM_` constants themselves
+    /// rather than a transcribed list, so adding a connection-string key fails
+    /// here until the dialog offers it.
+    /// Every connection-string keyword the parser accepts, from the `PARAM_`
+    /// constants themselves rather than a transcribed list.
+    fn connection_string_keys() -> Vec<&'static str> {
+        let parser = include_str!("backend/types/connect_params.rs");
+        // `pub(crate) const PARAM_HOST: &str = "host";`
+        let mut keys: Vec<&str> = parser
+            .lines()
+            .filter_map(|line| {
+                let rest = line.trim().strip_prefix("pub(crate) const PARAM_")?;
+                let rest = rest.split_once(": &str = \"")?.1;
+                rest.strip_suffix("\";")
+            })
+            .collect();
+        keys.sort_unstable();
+        keys
+    }
+
+    /// The text of a block, from `opener` to its closing delimiter.
+    fn block_after<'a>(source: &'a str, opener: &str, closer: &str) -> &'a str {
+        let Some(start) = source.find(opener) else {
+            panic!("{opener} must appear in the connector");
+        };
+        let rest = &source[start + opener.len()..];
+        let end = rest.find(closer).unwrap_or(rest.len());
+        &rest[..end]
+    }
+
+    /// The double-quoted strings in a block, in order.
+    fn quoted_names(block: &str) -> Vec<String> {
+        block
+            .split('"')
+            .skip(1)
+            .step_by(2)
+            .map(str::to_lowercase)
+            .collect()
+    }
+
+    /// The identifiers introduced by `needle` in a block.
+    fn prefixed_names(block: &str, needle: &str) -> Vec<String> {
+        block
+            .match_indices(needle)
+            .filter_map(|(i, _)| {
+                let after = &block[i + needle.len()..];
+                let cut = after.find(|c: char| !c.is_alphanumeric() && c != '_')?;
+                Some(after[..cut].to_lowercase())
+            })
+            .collect()
+    }
+
+    #[test]
+    fn dsn_keys_match_the_connection_string_parser() {
+        let dialog = include_str!("../packaging/windows/configure-dsn.ps1");
+        let parser_keys = connection_string_keys();
+        assert!(
+            parser_keys.len() > 30,
+            "expected the PARAM_ constants to parse; got {parser_keys:?}"
+        );
+
+        // `Key='host'` and `Alias='token'` in the field table.
+        let extract = |needle: &str| -> Vec<String> {
+            dialog
+                .match_indices(needle)
+                .filter_map(|(i, _)| {
+                    let rest = &dialog[i + needle.len()..];
+                    rest.split_once('\'').map(|(v, _)| v.to_string())
+                })
+                .collect()
+        };
+        let mut dialog_keys = extract("Key='");
+        dialog_keys.extend(extract("Alias='"));
+        dialog_keys.sort();
+
+        // `User` and `Password` are core's own spec-defined keywords, read
+        // through `ConnectParams` rather than a `PARAM_` constant, so the
+        // dialog names two keys the parser file cannot declare.
+        const CORE_KEYWORDS: [&str; 2] = ["user", "password"];
+
+        let missing: Vec<&&str> = parser_keys
+            .iter()
+            .filter(|k| !dialog_keys.iter().any(|d| d == *k))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "connect_params.rs accepts {missing:?}, which configure-dsn.ps1's \
+             field table does not offer; add an entry (or an Alias= on an \
+             existing one) so Windows users can set it"
+        );
+
+        let unknown: Vec<&String> = dialog_keys
+            .iter()
+            .filter(|d| {
+                !parser_keys.iter().any(|k| k == *d) && !CORE_KEYWORDS.contains(&d.as_str())
+            })
+            .collect();
+        assert!(
+            unknown.is_empty(),
+            "configure-dsn.ps1 offers {unknown:?}, which connect_params.rs does \
+             not accept; the driver would ignore it at connect"
+        );
+    }
+
+    /// The connector's advanced options are keys the driver accepts, and the
+    /// list and the rendered type name the same ones.
+    ///
+    /// `Config_AdvancedOptions` is what the connection string is built from,
+    /// and `StackableTrinoODBC.OptionsType` is only what the Get Data dialog
+    /// renders. Nothing in Power Query relates them, so an option in the type
+    /// and not the list is a box a user can fill in that is then rejected as
+    /// unknown, and one in the list and not the type is reachable only by
+    /// hand-editing M.
+    ///
+    /// The `.pq` is not executed anywhere in this repo, so a name that matches
+    /// no connection-string key would otherwise surface as a report whose
+    /// setting silently did nothing.
+    #[test]
+    fn connector_options_are_connection_string_keys() {
+        let connector = include_str!("../connector/StackableTrinoODBC.pq");
+        let parser_keys = connection_string_keys();
+
+        let listed = quoted_names(block_after(connector, "Config_AdvancedOptions = {", "};"));
+        assert!(
+            listed.len() > 15,
+            "expected Config_AdvancedOptions to parse; got {listed:?}"
+        );
+
+        let unknown: Vec<&String> = listed
+            .iter()
+            .filter(|o| !parser_keys.contains(&o.as_str()))
+            .collect();
+        assert!(
+            unknown.is_empty(),
+            "the connector offers {unknown:?}, which connect_params.rs does not \
+             accept; the driver would discard it at connect"
+        );
+
+        let rendered = prefixed_names(
+            block_after(connector, "StackableTrinoODBC.OptionsType = type [", "];"),
+            "optional ",
+        );
+
+        let in_type_only: Vec<&String> = rendered.iter().filter(|r| !listed.contains(r)).collect();
+        assert!(
+            in_type_only.is_empty(),
+            "OptionsType renders {in_type_only:?}, which Config_AdvancedOptions \
+             omits; the dialog would offer a field the connector then rejects"
+        );
+
+        let in_list_only: Vec<&String> = listed.iter().filter(|l| !rendered.contains(l)).collect();
+        assert!(
+            in_list_only.is_empty(),
+            "Config_AdvancedOptions carries {in_list_only:?}, which OptionsType \
+             does not render; it would be reachable only by hand-editing M"
+        );
+    }
 }

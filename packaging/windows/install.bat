@@ -25,9 +25,13 @@ if errorlevel 1 (
     exit /b 1
 )
 
+copy /Y "%~dp0configure-dsn.ps1" "%INSTALL_DIR%\" >nul 2>&1
+
 echo Stackable Trino ODBC driver installed to %INSTALL_DIR%.
 echo Verify with: ODBC Data Source Administrator (odbcad32.exe)
 echo.
-echo To create a DSN (optional), see README.md.
+echo To create a DSN (optional), run:
+echo   powershell -ExecutionPolicy Bypass -File "%INSTALL_DIR%\configure-dsn.ps1"
+echo See README.md for the odbcconf and registry alternatives.
 echo For Power BI users: see README.md for StackableTrinoODBC.mez installation steps.
 endlocal

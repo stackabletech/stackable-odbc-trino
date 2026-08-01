@@ -9,6 +9,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **A DSN configuration dialog for Windows.** `configure-dsn.ps1` ships in the
+  Windows archive and is installed alongside the driver. It presents the whole
+  connection-string surface across six tabs, tests a configuration before
+  writing it, and writes User or System data sources through the driver's own
+  `ConfigDSN` rather than the registry.
+
+  It is not the ODBC Data Source Administrator's "Add…" button. That button
+  asks the driver's setup DLL to display a dialog, which this driver does not
+  do, so it still reports an error there.
+
+  Secrets are written only when their **Save** box is ticked, which is off by
+  default: a data source keeps its values as plain registry values, and a
+  System data source puts them in HKLM where every local user can read them.
+
+- **The Power Query connector reaches the driver's wider option surface.**
+  `StackableTrinoODBC.Contents` takes an optional `options` record, rendered by
+  Power BI as an "Advanced options" section, carrying 23 further
+  connection-string keys — TLS verification and certificates, session
+  properties, resource estimates, roles, time zone, spooling encoding, proxy
+  and retry settings among them. A Power BI user on a coordinator behind a
+  private CA can now configure it from the Get Data dialog.
+
+  The keys the driver declares sensitive are deliberately excluded, because an
+  option set here is stored in the query text inside the `.pbix`.
+
 - **Transactions.** `SQL_ATTR_AUTOCOMMIT` selects manual-commit mode and
   `SQLEndTran` commits or rolls back, over Trino's own `START TRANSACTION` /
   `COMMIT` / `ROLLBACK`. The transaction opens at the first statement rather
