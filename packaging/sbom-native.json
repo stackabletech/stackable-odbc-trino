@@ -1,0 +1,70 @@
+{
+  "_comment": "Components linked at load time, which cargo cannot see. The version recorded here is the one built against on the build host; the version actually loaded is whatever the user's machine provides. Keyed by artifact platform. Verified against readelf -d by `sbom.sh --check-native`.",
+  "linux": [
+    {
+      "type": "library",
+      "name": "unixodbc",
+      "version": "2.3.12",
+      "purl": "pkg:generic/unixodbc@2.3.12",
+      "description": "unixODBC Driver Manager. libodbcinst.so.2 is linked at load time for driver and DSN registry access.",
+      "licenses": [
+        {
+          "license": {
+            "id": "LGPL-2.1-or-later"
+          }
+        }
+      ],
+      "properties": [
+        {
+          "name": "stackable:link-kind",
+          "value": "dynamic"
+        },
+        {
+          "name": "stackable:soname",
+          "value": "libodbcinst.so.2"
+        }
+      ]
+    }
+  ],
+  "_windows_comment": "The DLL imports only Windows' own libraries, odbccp32.dll included, and those are the platform rather than dependencies, so none is listed here for the same reason libc is not listed for Linux. What is listed is the toolchain runtime, which is linked statically and therefore redistributed inside the artifact: the DLL imports no libgcc_s_seh-1.dll, libwinpthread-1.dll or libstdc++-6.dll, while carrying mingw_*, __gcc_register_frame, _Unwind_* and pthread_* internally.",
+  "windows": [
+    {
+      "type": "library",
+      "name": "mingw-w64-runtime",
+      "version": "11.0.1",
+      "purl": "pkg:generic/mingw-w64-runtime@11.0.1",
+      "description": "mingw-w64 C runtime and winpthreads, statically linked into the DLL by the x86_64-pc-windows-gnu target.",
+      "licenses": [
+        {
+          "license": {
+            "name": "Permissive mix: BSD-2-Clause-NetBSD, BSD-3-Clause, ISC, Cygwin and David-Gay. No single SPDX identifier covers it; see the mingw-w64 COPYING."
+          }
+        }
+      ],
+      "properties": [
+        {
+          "name": "stackable:link-kind",
+          "value": "static"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "libgcc",
+      "version": "13.2.0",
+      "purl": "pkg:generic/libgcc@13.2.0",
+      "description": "GCC low-level runtime and unwinder, statically linked into the DLL by the x86_64-pc-windows-gnu target.",
+      "licenses": [
+        {
+          "expression": "GPL-3.0-or-later WITH GCC-exception-3.1"
+        }
+      ],
+      "properties": [
+        {
+          "name": "stackable:link-kind",
+          "value": "static"
+        }
+      ]
+    }
+  ]
+}
