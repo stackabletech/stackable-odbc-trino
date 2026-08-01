@@ -32,6 +32,27 @@ SBOM="$WORK/libstackable_odbc_trino.so.cdx.json"
 check "SBOM file is written" "$([ -f "$SBOM" ] && echo yes || echo no)" "yes"
 check "component count" "$(jq '.components | length' "$SBOM")" "167"
 
+# Expects 1, not 0. The one unlicensed component is syft's type:"file" entry for
+# the artifact itself, which is not a cargo package and so is not in the lookup.
+# The finalize stage removes it and this tightens to 0.
+check "every cargo component is licensed" \
+  "$(jq '[.components[] | select((.licenses // []) | length == 0)] | length' "$SBOM")" "1"
+
+check "no bare pkg:cargo purl on a git or path dep" \
+  "$(jq '[.components[] | select(.purl != null)
+         | select(.name == "trino-rust-client" or .name == "stackable-odbc-core")
+         | select(.purl | test("^pkg:cargo/[^?]*$"))] | length' "$SBOM")" "0"
+
+check "the fork purl names an immutable commit" \
+  "$(jq -r '.components[] | select(.name == "trino-rust-client") | .purl' "$SBOM")" \
+  "pkg:cargo/trino-rust-client@0.11.0?vcs_url=git+https://github.com/stackabletech/trino-rust-client.git@4a835ccfe4d8332b495cbd74ee1ba48971cbc024"
+
+check "syft cpe23 noise is stripped" \
+  "$(jq '[.components[].properties[]? | select(.name | startswith("syft:cpe23"))] | length' "$SBOM")" "0"
+
+check "dev-dependencies are absent" \
+  "$(jq '[.components[] | select(.name | test("^(criterion|proptest|serial_test)$"))] | length' "$SBOM")" "0"
+
 echo
 if [ "$FAILURES" -eq 0 ]; then
   echo "All checks passed."
