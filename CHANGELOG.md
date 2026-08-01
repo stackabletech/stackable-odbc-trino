@@ -667,6 +667,81 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **An out-of-range field in a bound `SQL_DATE_STRUCT` or
+  `SQL_TIMESTAMP_STRUCT` was sent to the coordinator.** Month 13, month 0, day
+  0, day 32, 30 February and hour 24 were all rendered into a literal, so the
+  application got `HY000 [INVALID_LITERAL]` quoting SQL it never wrote, for a
+  value that never had to leave the process. `SQLExecute`'s diagnostics list
+  `22007` for "the data sent for a parameter ... was an invalid date, time, or
+  timestamp value" with no `(DM)` marker, so the driver now reports it. The date
+  check is calendar-aware, because 30 February passes every per-field bound; the
+  seconds field still accepts 60 and 61, which `SQL_TIME_STRUCT` is documented
+  to carry because the spec permits leap seconds
+- **A `DATE` before 1 CE could not be read back.** Trino renders such a year
+  with a leading `-`, the same character that separates the fields, so the value
+  fell through to the string fallback and `SQLGetData(SQL_C_TYPE_DATE)` failed
+  with `22018` on a column the driver had itself described as `SQL_TYPE_DATE`.
+  Together with the negative-year rendering fix above, a bound year of -1 now
+  round-trips. A year beyond the struct's signed 16-bit field, which Trino
+  renders with a leading `+`, keeps the string fallback rather than being
+  truncated into a different year
+- **`SQLGetData` and `SQLDescribeCol` reported `HY000` for a column number past
+  the end of the result set.** Both functions' `07009` rows carry the clause
+  "the value specified for the argument *ColumnNumber* was greater than the
+  number of columns in the result set" with no `(DM)` marker, so it is the
+  driver's to return; an application walking columns until it runs out reads
+  `07009` as the end of the descriptor list, where `HY000` says only that
+  something went wrong. Column 0 already answered `07009` from core
+- **`QueryTimeout=0` meant "expire before the request is sent" while
+  `SQL_ATTR_CONNECTION_TIMEOUT=0` meant "no timeout".** The two set the same
+  thing, so the same `0` cannot mean opposite things: a connection string
+  carrying `QueryTimeout=0` failed every query on the connection with `HYT00`.
+  It now means what the attribute means
+- **A cancel whose `DELETE` failed left `SQL_ATTR_QUERY_TIMEOUT` and
+  `SQLCancel` unenforced, and `SQLFetch` running.** `CancelState::cancelled` was
+  set only once Trino's `DELETE /v1/query/{id}` had succeeded, on the reasoning
+  that a failed cancel leaves the query drainable. But that flag is also the
+  only thing that stops the fetch loop, and the caller's intent to stop does not
+  depend on a round trip, so a coordinator that was slow or unhealthy enough to
+  need a deadline was exactly the one that could not have it enforced. Measured
+  against a scripted coordinator that errors on the cancel endpoint and keeps
+  answering pages: a 3-second query timeout fired on schedule, `cancel` ran, the
+  `DELETE` failed, and `SQLFetch` then paged 86,287 times over 40 seconds
+  without returning; it now ends at 3.0s with `HYT00`. The flag is set before
+  the `DELETE` and unconditionally, which also closes a race against
+  `map_trino_error`'s `USER_CANCELED` arm, and the `DELETE`'s own failure is
+  still returned and logged
+- **A bound `TIMESTAMP`, `TIME` or `TIMESTAMP WITH TIME ZONE` parameter was
+  truncated to milliseconds.** `SQL_TIMESTAMP_STRUCT::fraction` is nanoseconds
+  and Trino accepts up to `timestamp(12)`, but the literal was rendered with
+  `fraction / 1_000_000` and a three-digit field, so six digits were discarded
+  with no `01S07` and no other sign. An `INSERT` stored a value the application
+  never bound, and `WHERE ts = ?` missed the row it was looking for. A fraction
+  of one whole second was worse: `1_000_000_000 / 1_000_000` is `1000`, a
+  four-digit "millisecond" field that Trino reads as `timestamp(4)`, turning one
+  second into a tenth of one. The field is now nine digits, and a fraction at or
+  above one second saturates rather than widening it. The existing test used
+  `500_000_000`, which is exactly representable in milliseconds, which is why
+  this stayed green
+- **A bound `DATE` with a negative year lost a digit.** `SQL_DATE_STRUCT::year`
+  is signed and `{year:04}` spends one of its four slots on the sign, so year -1
+  rendered as `DATE '-001-01-01'`. Trino accepted it, stored a different year,
+  and this driver's own read path then could not parse the value back
+- **Every connect-time failure reported the bare words "query failed", with no
+  cause and no native error.** `validate_connection` restated its failure as
+  `08001` through `TrinoError::ConnectionFailed { message: e.to_string() }`, and
+  half the errors reaching it are `TrinoError::Query`, whose own `Display` is
+  empty by design because core walks its `source` when it builds the diagnostic
+  record. Flattening it therefore produced a two-word message and discarded both
+  the causal chain and Trino's error code. `ConnectionFailed` now carries the
+  restated error as its source and lifts the native error out of it, so a
+  malformed session property, an undecodable page or a proxy's 500 reaches
+  `SQLGetDiagRec` with the reason. Measured against a live coordinator, a
+  connection string carrying a bad session property went from
+  `08001 / native 0 / "query failed"` to
+  `08001 / native 14 / "connection failed: query failed: query error [INVALID_SESSION_PROPERTY]: Session property 'x' does not exist"`.
+  `AuthFailure` and `QueryTimeout` keep their own more specific SQLSTATEs as
+  before
 - **`SQL_USER_NAME`, `SQL_SERVER_NAME` and `SQL_DATA_SOURCE_NAME` answered the
   empty string.** All three fell through to a shared default whose reason —
   that the value is carried in the connection string and not known to the

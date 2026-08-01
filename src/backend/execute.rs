@@ -355,6 +355,32 @@ pub(super) fn execute(
 /// connection while another thread executes on the same statement. Everything
 /// this needs is therefore reached through the token: the statement itself may
 /// be under `&mut` on the other thread and is not touchable from here.
+/// A column number past the end of the result set.
+///
+/// `SQLGetData` and `SQLDescribeCol` both list "the value specified for the
+/// argument *ColumnNumber* was greater than the number of columns in the result
+/// set" under `07009`, with no `(DM)` marker, so it is the driver's to return.
+/// An application walking columns until it runs out reads that as the end of
+/// the descriptor list; `HY000` tells it only that something went wrong.
+pub(super) fn column_out_of_range(col: u16, have: usize) -> TrinoError {
+    OdbcError::general(
+        format!("column {col} out of range (have {have} columns)"),
+        SqlState::invalid_descriptor_index(),
+    )
+    .into()
+}
+
+/// Column 0 reaching a backend at all. Core refuses the bookmark binding
+/// first, so this is defence in depth for a driver loaded without a Driver
+/// Manager, and `07009` is the same SQLSTATE core answers there.
+pub(super) fn column_index_must_be_positive() -> TrinoError {
+    OdbcError::general(
+        "column index must be >= 1",
+        SqlState::invalid_descriptor_index(),
+    )
+    .into()
+}
+
 pub(super) fn cancel(token: &TrinoCancelToken) -> Result<(), TrinoError> {
     // Taken, not read: a second SQLCancel for the same query has nothing left
     // to do, and Trino answers a DELETE for an already-cancelled query with an
@@ -381,24 +407,39 @@ pub(super) fn cancel(token: &TrinoCancelToken) -> Result<(), TrinoError> {
 
     tracing::debug!(query_id = %query_id, "cancelling Trino query");
 
+    // Publish the cancellation *before* the DELETE, and unconditionally.
+    //
+    // Two things read this flag, and only one of them is about the server.
+    // `fetch`, `close_cursor` and `Drop` stay off `next_uri` because after a
+    // server-side cancel `get_next` fails and leaves the pooled TCP socket
+    // carrying residual bytes, corrupting later queries that reuse it from the
+    // same reqwest pool. But `is_cancelled` is also what stops the fetch loop
+    // at all, and the caller's intent to stop does not depend on a round trip.
+    //
+    // Setting it only on success made `SQL_ATTR_QUERY_TIMEOUT` and `SQLCancel`
+    // unenforceable in exactly the conditions that produce them. Measured
+    // against a scripted coordinator that errors on the cancel endpoint and
+    // keeps answering pages: core's timer fired at 3s, this ran, the DELETE
+    // failed, the flag stayed clear, and `SQLFetch` paged 86,287 times over 40
+    // seconds without returning. The same server answering the DELETE with
+    // `204` ended the fetch at 3.0s with `HYT00`.
+    //
+    // Setting it early also closes a race the old ordering had against
+    // `map_trino_error`'s `USER_CANCELED` arm: the coordinator could fail the
+    // in-flight request before the cancelling thread had recorded anything.
+    //
+    // Nothing is stranded by doing this when the DELETE fails. A cancelled
+    // result set is abandoned either way, and the socket it leaves behind is
+    // the one the success path already accepts: reqwest evicts it on its idle
+    // timeout (90s).
+    token.state.cancelled.store(true, Ordering::SeqCst);
+
+    // The failure is still reported. Core logs it, and a caller that wanted the
+    // coordinator to stop deserves to know it may not have.
     token
         .runtime
         .block_on(token.client.cancel(&query_id))
         .map_err(|e| map_trino_error_on(&token.liveness, e))?;
-
-    // Publish the cancellation so `fetch`, `close_cursor` and `Drop` stay off
-    // `next_uri`: after a server-side cancel, `get_next` fails and leaves the
-    // pooled TCP socket carrying residual bytes, corrupting subsequent queries
-    // that reuse it from the same reqwest pool.
-    //
-    // The flag is set only once the DELETE has succeeded. A failed cancel means
-    // the query is still running server-side, so the result set is still
-    // legitimately drainable and suppressing the drain would strand it.
-    //
-    // The pooled connection may still carry unread response bytes for the
-    // request that was in flight when the cancel landed. reqwest evicts such a
-    // socket on its idle timeout (90s).
-    token.state.cancelled.store(true, Ordering::SeqCst);
 
     Ok(())
 }
@@ -653,21 +694,13 @@ impl StatementBackend for TrinoStatement {
             )
             .into());
         }
-        let col_idx = (col as usize).checked_sub(1).ok_or_else(|| {
-            TrinoError::from(OdbcError::general(
-                "column index must be >= 1",
-                SqlState::general_error(),
-            ))
-        })?;
+        let col_idx = (col as usize)
+            .checked_sub(1)
+            .ok_or_else(column_index_must_be_positive)?;
         let row = &self.batch[self.batch_cursor - 1];
         row.get(col_idx)
             .map(std::borrow::Cow::Borrowed)
-            .ok_or_else(|| {
-                TrinoError::from(OdbcError::general(
-                    format!("column {col} out of range (have {} columns)", row.len()),
-                    SqlState::general_error(),
-                ))
-            })
+            .ok_or_else(|| column_out_of_range(col, row.len()))
     }
 
     fn column_count(&self) -> i16 {
@@ -686,24 +719,16 @@ impl StatementBackend for TrinoStatement {
     }
 
     fn describe_col(&self, col: u16) -> Result<std::borrow::Cow<'_, ColumnDescriptor>, TrinoError> {
-        let idx = (col as usize).checked_sub(1).ok_or_else(|| {
-            TrinoError::from(OdbcError::general(
-                "column index must be >= 1",
-                SqlState::general_error(),
-            ))
-        })?;
+        let idx = (col as usize)
+            .checked_sub(1)
+            .ok_or_else(column_index_must_be_positive)?;
         // Borrowed, not cloned: `SQLColAttribute` calls this once per column
         // per attribute, and the descriptors live on the statement for as long
         // as the result set does.
         self.columns
             .get(idx)
             .map(std::borrow::Cow::Borrowed)
-            .ok_or_else(|| {
-                TrinoError::from(OdbcError::general(
-                    format!("column {col} out of range (have {})", self.columns.len()),
-                    SqlState::general_error(),
-                ))
-            })
+            .ok_or_else(|| column_out_of_range(col, self.columns.len()))
     }
 
     fn row_count(&self) -> Option<i64> {

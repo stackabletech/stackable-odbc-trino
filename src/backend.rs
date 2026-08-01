@@ -70,6 +70,12 @@ fn request_timeout(connection_timeout: Option<u32>, from_connection_string: Dura
     match connection_timeout {
         Some(0) => NO_TIMEOUT,
         Some(secs) => Duration::from_secs(u64::from(secs)),
+        // The key sets the same thing as the attribute, so its `0` means the
+        // same thing. Passed through as a zero `Duration` it reaches reqwest as
+        // a request that expires before it is sent, failing every query on the
+        // connection, which is not what an operator writing `QueryTimeout=0`
+        // can have meant.
+        None if from_connection_string.is_zero() => NO_TIMEOUT,
         None => from_connection_string,
     }
 }
@@ -531,9 +537,25 @@ fn validate_connection(
         }
         // Already correct for connect time, and more specific than 08001.
         Err(e @ (TrinoError::AuthFailure { .. } | TrinoError::QueryTimeout { .. })) => Err(e),
-        Err(e) => Err(TrinoError::ConnectionFailed {
-            message: e.to_string(),
-        }),
+        Err(e) => Err(connection_failed(e)),
+    }
+}
+
+/// Restate a validation failure as 08001, the SQLSTATE the spec reserves for
+/// the connection functions, keeping what caused it.
+///
+/// Trino's error code is lifted out of the restated error because
+/// `SQLGetDiagRec` reads the native error from the diagnostic record rather
+/// than from the causal chain, so a code left inside the source would not
+/// reach the application.
+fn connection_failed(e: TrinoError) -> TrinoError {
+    let native_error = match &e {
+        TrinoError::Query { native_error, .. } => *native_error,
+        _ => 0,
+    };
+    TrinoError::ConnectionFailed {
+        source: Box::new(e),
+        native_error,
     }
 }
 
@@ -1066,11 +1088,23 @@ pub enum TrinoError {
     NotImplemented { feature: String },
     /// A usable connection to Trino could not be established.
     ///
-    /// Produced only by [`validate_connection`], which is the only place that
-    /// runs before the ODBC connection exists and so the only place 08001 is
-    /// the correct SQLSTATE.
-    #[snafu(display("Connection failed: {message}"))]
-    ConnectionFailed { message: String },
+    /// Produced only by [`connection_failed`], called from
+    /// [`validate_connection`], which is the only place that runs before the
+    /// ODBC connection exists and so the only place 08001 is the correct
+    /// SQLSTATE.
+    ///
+    /// The failure it restates is kept whole, as the source, and never
+    /// flattened with `to_string()`. Half the errors reaching it are
+    /// [`TrinoError::Query`], whose own `Display` is empty by design because
+    /// core walks its `source` instead, so flattening yields the bare words
+    /// "query failed" and discards both the cause and Trino's error code.
+    /// `native_error` is lifted out of the restated error for the same reason:
+    /// `SQLGetDiagRec` reads it from the record, not from the chain.
+    #[snafu(display("connection failed"))]
+    ConnectionFailed {
+        source: Box<TrinoError>,
+        native_error: i32,
+    },
     /// The link to the Trino coordinator failed while a request was in flight.
     ///
     /// This is 08S01, not 08001: `TrinoBackend::connect` performs no network
@@ -1161,10 +1195,15 @@ impl From<TrinoError> for OdbcError {
             TrinoError::NotImplemented { ref feature } => OdbcError::NotImplemented {
                 feature: feature.clone(),
             },
-            TrinoError::ConnectionFailed { ref message } => OdbcError::general(
-                message.clone(),
+            TrinoError::ConnectionFailed {
+                source,
+                native_error,
+            } => OdbcError::general(
+                "connection failed",
                 SqlState::client_unable_to_establish_connection(),
-            ),
+            )
+            .with_native_error(native_error)
+            .with_source(source),
             TrinoError::CommunicationLinkFailure { ref message } => {
                 OdbcError::general(message.clone(), SqlState::communication_link_failure())
             }
@@ -2720,6 +2759,21 @@ mod tests {
         );
     }
 
+    /// The attribute and the key set the same thing, so `0` cannot mean
+    /// opposite things on the two paths. `SQL_ATTR_CONNECTION_TIMEOUT = 0` is
+    /// the spec's "there is no timeout"; `QueryTimeout=0` reaching reqwest as a
+    /// zero duration is a request that expires before it is sent, which fails
+    /// every query on the connection and is not something an operator can have
+    /// meant by "no timeout".
+    #[test]
+    fn a_zero_query_timeout_key_means_the_same_as_a_zero_attribute() {
+        assert_eq!(
+            request_timeout(None, Duration::ZERO),
+            NO_TIMEOUT,
+            "QueryTimeout=0 must mean what SQL_ATTR_CONNECTION_TIMEOUT=0 means"
+        );
+    }
+
     /// `SQL_ATTR_LOGIN_TIMEOUT` of `0` is "the timeout is disabled and a
     /// connection attempt will wait indefinitely", which is the same behaviour
     /// as setting none.
@@ -3033,9 +3087,9 @@ mod tests {
     #[test]
     fn error_mapping_connection_failed_produces_08001() {
         use stackable_odbc_core::{errors::OdbcError, types::sql_state};
-        let err = TrinoError::ConnectionFailed {
+        let err = connection_failed(TrinoError::CommunicationLinkFailure {
             message: "connection refused".into(),
-        };
+        });
         let odbc_err: OdbcError = err.into();
         assert_eq!(
             odbc_err.sqlstate().as_str(),
@@ -3127,6 +3181,155 @@ mod tests {
             cause.to_string().contains("SYNTAX_ERROR"),
             "the cause must name the Trino error, got: {cause}"
         );
+    }
+
+    /// `SQLGetData`'s and `SQLDescribeCol`'s `07009` rows both carry the clause
+    /// "the value specified for the argument *ColumnNumber* was greater than
+    /// the number of columns in the result set" with no `(DM)` marker, so it is
+    /// the driver's to return. `HY000` says only "something went wrong", where
+    /// an application walking columns until it runs out reads `07009` as the
+    /// end of the descriptor list.
+    ///
+    /// Column 0 already answers `07009` from core, which refuses the bookmark
+    /// binding before it reaches a backend.
+    #[test]
+    fn a_column_past_the_result_set_reports_07009() {
+        use stackable_odbc_core::{errors::OdbcError, types::sql_state};
+
+        for err in [
+            execute::column_out_of_range(2, 1),
+            execute::column_index_must_be_positive(),
+        ] {
+            assert_eq!(
+                OdbcError::from(err).sqlstate().as_str(),
+                sql_state::INVALID_DESCRIPTOR_INDEX
+            );
+        }
+    }
+
+    /// A token whose coordinator is not listening, so its `DELETE` fails fast
+    /// with a connection refusal rather than a timeout.
+    fn token_to_nowhere() -> TrinoCancelToken {
+        let client = ClientBuilder::new("test", "127.0.0.1")
+            .port(1)
+            .build()
+            .expect("ClientBuilder::build performs no I/O");
+        TrinoCancelToken {
+            client: Arc::new(client),
+            runtime: Arc::new(
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("Runtime::build performs no I/O"),
+            ),
+            state: Arc::new(CancelState::default()),
+            liveness: Liveness::default(),
+        }
+    }
+
+    /// `SQLCancel` and `SQL_ATTR_QUERY_TIMEOUT` both mean "stop this
+    /// statement", and this flag is what `fetch` reads to stop. Setting it only
+    /// once the `DELETE` has succeeded makes the deadline unenforceable in
+    /// exactly the conditions that produce one: measured against a scripted
+    /// coordinator whose cancel endpoint errors, a 3-second query timeout fired
+    /// on schedule, `cancel` ran, the `DELETE` failed, and `SQLFetch` then
+    /// paged 86,287 times over 40 seconds without returning. With the same
+    /// server answering the `DELETE` normally it ended at 3.0s with `HYT00`.
+    #[test]
+    fn a_cancel_whose_delete_fails_still_stops_the_statement() {
+        let token = token_to_nowhere();
+        token
+            .state
+            .begin_query("20260801_000000_00001_x".to_string());
+
+        let result = TrinoBackend::cancel(&token);
+
+        assert!(
+            result.is_err(),
+            "a DELETE that did not reach the coordinator must still be reported"
+        );
+        assert!(
+            TrinoBackend::is_cancelled(&token),
+            "the statement must be marked cancelled even so, or nothing stops \
+             the fetch loop"
+        );
+    }
+
+    /// `TrinoError::Query`'s own `Display` is deliberately empty, because core
+    /// walks its `source` when it builds the diagnostic. Reclassifying it to
+    /// 08001 by way of `to_string()` therefore yields the bare words "query
+    /// failed" and throws away both the cause and Trino's error code, which is
+    /// every connect-time failure that is not an auth or timeout error: a
+    /// malformed session property, an undecodable page, a 500 from a proxy.
+    #[test]
+    fn a_failed_connect_keeps_the_cause_that_explains_it() {
+        use stackable_odbc_core::errors::OdbcError;
+
+        let odbc_err = OdbcError::from(connection_failed(map_trino_error(
+            query_error(46, "MALFORMED_SESSION_PROPERTY").into(),
+        )));
+
+        let cause = odbc_err.cause().expect("the cause must survive 08001");
+        assert!(
+            chain_text(&odbc_err).contains("MALFORMED_SESSION_PROPERTY"),
+            "the diagnostic must name what failed, got: {cause}"
+        );
+    }
+
+    #[test]
+    fn a_failed_connect_keeps_trinos_error_code() {
+        use stackable_odbc_core::errors::OdbcError;
+
+        let odbc_err = OdbcError::from(connection_failed(map_trino_error(
+            query_error(46, "MALFORMED_SESSION_PROPERTY").into(),
+        )));
+
+        assert_eq!(odbc_err.native_error(), 46);
+    }
+
+    /// The reclassification is the whole point: 08001 is valid only from the
+    /// connection functions, and `validate_connection` is the one caller.
+    #[test]
+    fn a_failed_connect_still_reports_08001() {
+        use stackable_odbc_core::{errors::OdbcError, types::sql_state};
+
+        let odbc_err = OdbcError::from(connection_failed(map_trino_error(
+            query_error(46, "MALFORMED_SESSION_PROPERTY").into(),
+        )));
+
+        assert_eq!(
+            odbc_err.sqlstate().as_str(),
+            sql_state::CLIENT_UNABLE_TO_ESTABLISH_CONNECTION
+        );
+    }
+
+    /// A variant that already says something useful must not be buried.
+    #[test]
+    fn a_failed_connect_keeps_a_plain_messages_text() {
+        use stackable_odbc_core::errors::OdbcError;
+
+        let odbc_err = OdbcError::from(connection_failed(TrinoError::General {
+            message: "no runtime available".into(),
+        }));
+
+        assert!(
+            chain_text(&odbc_err).contains("no runtime available"),
+            "got: {}",
+            chain_text(&odbc_err)
+        );
+    }
+
+    /// The message an application reads, assembled the way
+    /// `Diagnostics::push` assembles it: the error, then every cause.
+    fn chain_text(err: &stackable_odbc_core::errors::OdbcError) -> String {
+        let mut text = err.to_string();
+        let mut cause: Option<&(dyn std::error::Error + 'static)> =
+            err.cause().map(|e| e as &(dyn std::error::Error + 'static));
+        while let Some(e) = cause {
+            text.push_str(&format!(": {e}"));
+            cause = e.source();
+        }
+        text
     }
 
     /// A failure that never came from the coordinator has no Trino code, and

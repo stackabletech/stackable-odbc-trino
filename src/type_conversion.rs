@@ -624,8 +624,23 @@ pub fn trino_type_name_to_sql_type(name: &str) -> SqlDataType {
 ///
 /// Returns `None` if the string is malformed.
 fn parse_trino_date(s: &str) -> Option<ColumnValue> {
-    let mut parts = s.splitn(3, '-');
-    let year: i16 = parts.next()?.parse().ok()?;
+    // Trino renders a year before 1 CE with a leading `-`, which is the same
+    // character that separates the fields, so the sign is taken off before the
+    // split rather than left for `splitn` to read as an empty year. This driver
+    // emits such a date itself, from a bound `SQL_DATE_STRUCT` with a negative
+    // year, so it has to be able to read one back.
+    //
+    // A year that does not fit `SQL_DATE_STRUCT`'s signed 16-bit field (Trino
+    // goes to 5881580, and renders those with a leading `+`) still returns
+    // `None`, and the caller keeps the value as text: truncating it would
+    // report a different year as though it were the real one.
+    let (negative, rest) = match s.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, s),
+    };
+    let mut parts = rest.splitn(3, '-');
+    let magnitude: i16 = parts.next()?.parse().ok()?;
+    let year = if negative { -magnitude } else { magnitude };
     let month: u16 = parts.next()?.parse().ok()?;
     let day: u16 = parts.next()?.parse().ok()?;
     Some(ColumnValue::Date { year, month, day })
@@ -2006,6 +2021,48 @@ mod tests {
                 day: 14
             }
         );
+    }
+
+    /// Trino renders a year before 1 CE with a leading `-`, which splits the
+    /// same way as the field separators, so the whole value fell through to
+    /// the string fallback: `SQLGetData(SQL_C_TYPE_DATE)` then failed on a
+    /// column the driver had described as `SQL_TYPE_DATE`.
+    ///
+    /// This driver produces such a date itself, from a bound `SQL_DATE_STRUCT`
+    /// with a negative year, so it has to be able to read one back.
+    #[test]
+    fn a_date_before_1_ce_parses_to_column_date() {
+        assert_eq!(
+            json_to_column_value(Value::String("-0001-01-01".into()), &TrinoTy::Date),
+            ColumnValue::Date {
+                year: -1,
+                month: 1,
+                day: 1
+            }
+        );
+    }
+
+    #[test]
+    fn year_zero_parses_to_column_date() {
+        assert_eq!(
+            json_to_column_value(Value::String("0000-01-01".into()), &TrinoTy::Date),
+            ColumnValue::Date {
+                year: 0,
+                month: 1,
+                day: 1
+            }
+        );
+    }
+
+    /// A year beyond `SQL_DATE_STRUCT`'s signed 16-bit field cannot be carried
+    /// as a date at all, so it keeps the documented string fallback rather
+    /// than being truncated into a different year.
+    #[test]
+    fn a_year_beyond_the_date_struct_falls_back_to_text() {
+        assert!(matches!(
+            json_to_column_value(Value::String("+99999-01-01".into()), &TrinoTy::Date),
+            ColumnValue::String(_)
+        ));
     }
 
     #[test]

@@ -10,7 +10,8 @@
 //! validated against a strict grammar (`Decimal`). Numeric and temporal
 //! variants are formatted from typed values and cannot inject.
 
-use stackable_odbc_core::types::ColumnValue;
+use stackable_odbc_core::errors::OdbcError;
+use stackable_odbc_core::types::{ColumnValue, SqlState};
 
 use super::TrinoError;
 
@@ -142,17 +143,21 @@ fn render_literal(value: &ColumnValue) -> Result<String, TrinoError> {
         ),
 
         ColumnValue::Date { year, month, day } => {
-            format!("DATE '{year:04}-{month:02}-{day:02}'")
+            check_date(*year, *month, *day)?;
+            format!("DATE '{}-{month:02}-{day:02}'", year4(*year))
         }
         ColumnValue::Time {
             hour,
             minute,
             second,
             fraction,
-        } => format!(
-            "TIME '{hour:02}:{minute:02}:{second:02}.{:03}'",
-            fraction / 1_000_000
-        ),
+        } => {
+            check_time(*hour, *minute, *second)?;
+            format!(
+                "TIME '{hour:02}:{minute:02}:{second:02}.{}'",
+                nanos(*fraction)
+            )
+        }
         ColumnValue::Timestamp {
             year,
             month,
@@ -161,10 +166,15 @@ fn render_literal(value: &ColumnValue) -> Result<String, TrinoError> {
             minute,
             second,
             fraction,
-        } => format!(
-            "TIMESTAMP '{year:04}-{month:02}-{day:02} {hour:02}:{minute:02}:{second:02}.{:03}'",
-            fraction / 1_000_000
-        ),
+        } => {
+            check_date(*year, *month, *day)?;
+            check_time(*hour, *minute, *second)?;
+            format!(
+                "TIMESTAMP '{}-{month:02}-{day:02} {hour:02}:{minute:02}:{second:02}.{}'",
+                year4(*year),
+                nanos(*fraction)
+            )
+        }
         ColumnValue::TimestampTz {
             year,
             month,
@@ -180,10 +190,13 @@ fn render_literal(value: &ColumnValue) -> Result<String, TrinoError> {
             } else {
                 '+'
             };
+            check_date(*year, *month, *day)?;
+            check_time(*hour, *minute, *second)?;
             let abs = timezone_offset_minutes.abs();
             format!(
-                "TIMESTAMP '{year:04}-{month:02}-{day:02} {hour:02}:{minute:02}:{second:02}.{:03} {sign}{:02}:{:02}'",
-                fraction / 1_000_000,
+                "TIMESTAMP '{}-{month:02}-{day:02} {hour:02}:{minute:02}:{second:02}.{} {sign}{:02}:{:02}'",
+                year4(*year),
+                nanos(*fraction),
                 abs / 60,
                 abs % 60
             )
@@ -203,6 +216,85 @@ fn render_literal(value: &ColumnValue) -> Result<String, TrinoError> {
         // itself is deliberately not included in the message.
         _ => return Err(unsupported("this parameter type")),
     })
+}
+
+/// SQLSTATE 22007 for a bound temporal value that names no real instant.
+///
+/// `SQLExecute`'s and `SQLExecDirect`'s diagnostics both list 22007 for "the
+/// data sent for a parameter ... was an invalid date, time, or timestamp
+/// value", with no `(DM)` marker. Rendering the value into a literal instead
+/// sends the coordinator something it cannot parse, and the application gets
+/// `HY000 [INVALID_LITERAL]` quoting SQL it never wrote, for a value that never
+/// had to leave the process.
+fn invalid_datetime(what: &str, rendered: String) -> TrinoError {
+    OdbcError::general(
+        format!("bound {what} is not a valid value: {rendered}"),
+        SqlState::invalid_datetime_format(),
+    )
+    .into()
+}
+
+/// Reject a year/month/day that names no real date.
+///
+/// Calendar-aware rather than a range check, because Feb 30 and Feb 29 of a
+/// common year pass every per-field bound and are still not dates.
+fn check_date(year: i16, month: u16, day: u16) -> Result<(), TrinoError> {
+    let valid = chrono::NaiveDate::from_ymd_opt(i32::from(year), u32::from(month), u32::from(day))
+        .is_some();
+    if valid {
+        Ok(())
+    } else {
+        Err(invalid_datetime(
+            "date",
+            format!("{}-{month:02}-{day:02}", year4(year)),
+        ))
+    }
+}
+
+/// Reject an hour/minute/second outside the clock.
+///
+/// The second goes to 61, not 59: `SQL_TIME_STRUCT` and `SQL_TIMESTAMP_STRUCT`
+/// are documented as carrying 0-61 because the spec permits leap seconds, so
+/// refusing 60 would reject a value the struct is defined to hold. Trino
+/// rejects them itself, which is its decision to make.
+fn check_time(hour: u16, minute: u16, second: u16) -> Result<(), TrinoError> {
+    if hour < 24 && minute < 60 && second <= 61 {
+        Ok(())
+    } else {
+        Err(invalid_datetime(
+            "time",
+            format!("{hour:02}:{minute:02}:{second:02}"),
+        ))
+    }
+}
+
+/// The fractional-seconds field of a temporal literal, always nine digits.
+///
+/// `SQL_TIMESTAMP_STRUCT::fraction` is nanoseconds and Trino accepts up to
+/// `timestamp(12)`, so every digit the application bound is rendered. Dividing
+/// to milliseconds discarded six of them, which stores a value the application
+/// never bound and makes `WHERE ts = ?` miss the row it was looking for.
+///
+/// The width is fixed rather than trimmed because a value at or above one
+/// second is out of range for the field: `1_000_000_000` formatted at its
+/// natural width is ten digits, and Trino reads the extra one as greater
+/// precision rather than as an error, turning one second into a tenth of one.
+/// Saturating keeps the literal honest about the range the field can express.
+fn nanos(fraction: u32) -> String {
+    format!("{:09}", fraction.min(999_999_999))
+}
+
+/// The year field of a temporal literal, always four digits and signed.
+///
+/// A `SQL_DATE_STRUCT` year is an `i16`, and `{year:04}` spends one of its four
+/// slots on the sign, so year -1 rendered as `-001`: a different year, which
+/// Trino accepts and this driver's own read path then cannot parse.
+fn year4(year: i16) -> String {
+    if year < 0 {
+        format!("-{:04}", year.unsigned_abs())
+    } else {
+        format!("{year:04}")
+    }
 }
 
 /// Wrap `s` in single quotes, doubling any embedded quote.
@@ -402,7 +494,216 @@ mod tests {
                     fraction: 500_000_000
                 }]
             ),
-            "SELECT TIMESTAMP '2026-07-04 01:02:03.500'"
+            "SELECT TIMESTAMP '2026-07-04 01:02:03.500000000'"
+        );
+    }
+
+    /// `SQL_TIMESTAMP_STRUCT::fraction` is nanoseconds and Trino goes to
+    /// `timestamp(12)`, so every digit the application bound has to survive.
+    /// Rendering milliseconds silently stores a different value than the one
+    /// bound, and makes `WHERE ts = ?` miss a row that exists.
+    ///
+    /// 500_000_000 is exactly representable in milliseconds, which is why the
+    /// case above passed throughout.
+    #[test]
+    fn a_bound_timestamp_keeps_every_nanosecond() {
+        assert_eq!(
+            interp(
+                "SELECT ?",
+                &[ColumnValue::Timestamp {
+                    year: 2026,
+                    month: 7,
+                    day: 4,
+                    hour: 1,
+                    minute: 2,
+                    second: 3,
+                    fraction: 123_456_789
+                }]
+            ),
+            "SELECT TIMESTAMP '2026-07-04 01:02:03.123456789'"
+        );
+    }
+
+    #[test]
+    fn a_bound_time_keeps_every_nanosecond() {
+        assert_eq!(
+            interp(
+                "SELECT ?",
+                &[ColumnValue::Time {
+                    hour: 1,
+                    minute: 2,
+                    second: 3,
+                    fraction: 123_456_789
+                }]
+            ),
+            "SELECT TIME '01:02:03.123456789'"
+        );
+    }
+
+    #[test]
+    fn a_bound_timestamp_with_zone_keeps_every_nanosecond() {
+        assert_eq!(
+            interp(
+                "SELECT ?",
+                &[ColumnValue::TimestampTz {
+                    year: 2026,
+                    month: 7,
+                    day: 4,
+                    hour: 1,
+                    minute: 2,
+                    second: 3,
+                    fraction: 123_456_789,
+                    timezone_offset_minutes: -330
+                }]
+            ),
+            "SELECT TIMESTAMP '2026-07-04 01:02:03.123456789 -05:30'"
+        );
+    }
+
+    /// A whole second's worth of nanoseconds is out of range for the field.
+    /// Dividing to milliseconds rendered it as `.1000`, a four-digit
+    /// "millisecond" component that Trino reads as `timestamp(4)`, so one
+    /// second became a tenth of one: wrong by a factor of ten, reported as
+    /// success.
+    #[test]
+    fn an_out_of_range_fraction_never_renders_a_wider_field() {
+        for fraction in [1_000_000_000, u32::MAX] {
+            let sql = interp(
+                "SELECT ?",
+                &[ColumnValue::Timestamp {
+                    year: 2026,
+                    month: 7,
+                    day: 4,
+                    hour: 1,
+                    minute: 2,
+                    second: 3,
+                    fraction,
+                }],
+            );
+            let digits = sql
+                .rsplit_once('.')
+                .expect("a fractional part")
+                .1
+                .trim_end_matches('\'');
+            assert_eq!(
+                digits.len(),
+                9,
+                "the fractional field must stay nine digits, got {sql}"
+            );
+        }
+    }
+
+    /// An out-of-range field in a bound `SQL_DATE_STRUCT` /
+    /// `SQL_TIMESTAMP_STRUCT` reached the coordinator as a literal and came
+    /// back as `HY000 [INVALID_LITERAL]`, quoting SQL the application never
+    /// wrote. `SQLExecute`'s diagnostics list `22007` for "the data sent for a
+    /// parameter ... was an invalid date, time, or timestamp value", and it is
+    /// the driver's to return: the value never had to leave the process.
+    #[test]
+    fn an_invalid_bound_date_reports_22007_rather_than_reaching_trino() {
+        use stackable_odbc_core::{errors::OdbcError, types::sql_state};
+
+        let invalid = [
+            ("month 13", 2020, 13, 1),
+            ("month 0", 2020, 0, 1),
+            ("day 0", 2020, 1, 0),
+            ("day 32", 2020, 1, 32),
+            ("feb 30", 2020, 2, 30),
+            ("feb 29 in a common year", 2021, 2, 29),
+        ];
+        for (label, year, month, day) in invalid {
+            let err = interpolate_params("SELECT ?", &[ColumnValue::Date { year, month, day }])
+                .expect_err(&format!("{label} must be refused"));
+            assert_eq!(
+                OdbcError::from(err).sqlstate().as_str(),
+                sql_state::INVALID_DATETIME_FORMAT,
+                "{label}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_invalid_bound_time_reports_22007() {
+        use stackable_odbc_core::{errors::OdbcError, types::sql_state};
+
+        for (label, hour, minute, second) in [
+            ("hour 24", 24, 0, 0),
+            ("minute 60", 0, 60, 0),
+            ("second 62", 0, 0, 62),
+        ] {
+            let err = interpolate_params(
+                "SELECT ?",
+                &[ColumnValue::Time {
+                    hour,
+                    minute,
+                    second,
+                    fraction: 0,
+                }],
+            )
+            .expect_err(&format!("{label} must be refused"));
+            assert_eq!(
+                OdbcError::from(err).sqlstate().as_str(),
+                sql_state::INVALID_DATETIME_FORMAT,
+                "{label}"
+            );
+        }
+    }
+
+    /// `SQL_TIME_STRUCT`'s second field is documented as 0-61, because the
+    /// spec permits leap seconds. Rejecting 60 or 61 here would refuse a value
+    /// the ODBC struct is defined to carry, so they are passed on and Trino
+    /// decides.
+    #[test]
+    fn a_leap_second_is_not_refused_by_the_driver() {
+        for second in [60, 61] {
+            assert!(
+                interpolate_params(
+                    "SELECT ?",
+                    &[ColumnValue::Time {
+                        hour: 23,
+                        minute: 59,
+                        second,
+                        fraction: 0
+                    }]
+                )
+                .is_ok(),
+                "second {second} is within SQL_TIME_STRUCT's documented range"
+            );
+        }
+    }
+
+    /// The valid cases must keep working, including a real leap day.
+    #[test]
+    fn a_valid_bound_date_is_unaffected() {
+        assert_eq!(
+            interp(
+                "SELECT ?",
+                &[ColumnValue::Date {
+                    year: 2020,
+                    month: 2,
+                    day: 29
+                }]
+            ),
+            "SELECT DATE '2020-02-29'"
+        );
+    }
+
+    /// A `SQL_DATE_STRUCT` year is signed. `{year:04}` spends one of its four
+    /// slots on the sign, so year -1 rendered as `-001-01-01`: a different
+    /// year, accepted by Trino and then unreadable by this driver's own read
+    /// path.
+    #[test]
+    fn a_negative_year_keeps_all_four_digits() {
+        assert_eq!(
+            interp(
+                "SELECT ?",
+                &[ColumnValue::Date {
+                    year: -1,
+                    month: 1,
+                    day: 1
+                }]
+            ),
+            "SELECT DATE '-0001-01-01'"
         );
     }
 
