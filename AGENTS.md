@@ -1741,8 +1741,9 @@ finalize pass makes the artifact the document's subject.
 **The artifact must be built with `cargo auditable`.** Syft reads the `.dep-v0`
 section that embeds, so the SBOM describes what actually linked rather than what
 `Cargo.toml` asked for, and dev-dependencies are excluded by construction: 167
-components against 301 packages in `Cargo.lock`. An artifact built without it
-yields an SBOM with a single component, which is the signature of that mistake.
+components against 301 packages in `Cargo.lock`. `sbom.sh` refuses an artifact
+carrying no such section, because one built with plain `cargo build` yields a
+handful of components and still looks like a valid document.
 
 Enrichment exists because syft's raw output is not shippable. `cargo-auditable`
 embeds only name, version and source kind, so **no component carries a license**,
@@ -1756,10 +1757,13 @@ dependency `pkg:generic` plus a `stackable:cargo-source` property.
 All of it keys off `cargo metadata`'s source *kind*, never off a crate name, so a
 dependency moving between path, git and crates.io needs no change to the script.
 
-Finalize removes syft's `type: "file"` self-entry, whose name is the absolute
-build path, and hoists the artifact into `metadata.component` with its sha256.
-That is both where the subject belongs and what keeps the builder's directory
-layout out of the release.
+Finalize hoists the artifact into `metadata.component` with its sha256 and drops
+syft's self-entries, one of which is named by the absolute build path. That is
+both where the subject belongs and what keeps the builder's directory layout out
+of the release. The entries are selected by **having no purl**, not by type: the
+ELF artifact yields one of type `file`, while the PE artifact yields that plus a
+second of type `application`. Every real component has a purl, the crates from
+enrichment and the native ones from the fragment alike.
 
 #### The native fragment, and why the two platforms differ
 
@@ -1785,6 +1789,8 @@ archive ships no runtime DLL, so an artifact that imported `libgcc_s_seh-1.dll`
 would fail to load on a machine without mingw installed.
 
 `./packaging/test-sbom.sh` runs every assertion against the real release
-artifact and needs no Trino. It builds the `.so` with `cargo auditable` if it is
+artifacts and needs no Trino. It builds the `.so` with `cargo auditable` if it is
 absent, and skips the Windows checks with a message when the cross build is not
-present.
+present. Both artifacts are generated as well as checked, because they take
+different branches through augment and finalize, and a Linux-only run leaves the
+PE paths unexercised.
