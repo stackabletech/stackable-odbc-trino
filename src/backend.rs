@@ -1684,7 +1684,7 @@ impl Backend for TrinoBackend {
 
     /// Trino has no manual-commit session mode, so this records the mode and
     /// issues nothing. The transaction opens at the first statement that needs
-    /// one; see [`TrinoConnection::ensure_transaction`].
+    /// one; see `TrinoConnection::ensure_transaction`.
     ///
     /// Switching *to* autocommit commits what is open first, which the
     /// `SQL_ATTR_AUTOCOMMIT` page requires of a driver whose data source has
@@ -1721,7 +1721,7 @@ impl Backend for TrinoBackend {
     /// gives a function interrupted by `SQLCancel`.
     ///
     /// This covers the cancel that lands *between* page requests. One landing
-    /// while a request is in flight is caught by [`map_trino_error`] instead,
+    /// while a request is in flight is caught by `map_trino_error` instead,
     /// from Trino's own `USER_CANCELED` code: the flag is set only once the
     /// cancelling thread's `DELETE` has returned, by which time the coordinator
     /// may already have failed the in-flight request. The two are complementary
@@ -1765,7 +1765,7 @@ impl Backend for TrinoBackend {
         Ok(QueryTimeout::CoreCancels)
     }
 
-    /// Answered from the flag [`map_trino_error_on`] sets, never from a probe.
+    /// Answered from the flag `map_trino_error_on` sets, never from a probe.
     ///
     /// A connection pool reads this on every checkout, and the spec asks a
     /// driver to minimise what it sends to the server, so a round trip here
@@ -2081,7 +2081,7 @@ impl Backend for TrinoBackend {
     }
 
     /// Trino's reserved words, raw: core subtracts ODBC's own, sorts and
-    /// joins them into `SQL_KEYWORDS`. See [`info::TRINO_RESERVED_KEYWORDS`]
+    /// joins them into `SQL_KEYWORDS`. See `info::TRINO_RESERVED_KEYWORDS`
     /// for where the list comes from and why it is static rather than probed.
     fn keywords(_conn: &TrinoConnection) -> Cow<'static, [Cow<'static, str>]> {
         Cow::Borrowed(info::reserved_keywords())
@@ -2194,7 +2194,7 @@ impl Backend for TrinoBackend {
     /// probe `connect` runs, already normalised to `##.##.####`.
     ///
     /// Connection-dependent, which is why the pre-connect path in
-    /// [`info::get_info_pre_connect`] answers the empty string instead: before
+    /// `info::get_info_pre_connect` answers the empty string instead: before
     /// a connection exists there is no server to report a version for, and the
     /// empty string is the spec's "not available".
     fn dbms_version(conn: &TrinoConnection) -> Cow<'static, str> {

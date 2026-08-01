@@ -56,6 +56,16 @@ repos:
         pass_filenames: false
         files: \.rs$
 
+      # Not `--all-targets`: that builds the test target, sets `cfg(test)`, and
+      # would pull the `#[cfg(test)]` modules into the check.
+      - id: cargo-doc
+        name: cargo-doc
+        language: system
+        entry: env RUSTDOCFLAGS=-Dwarnings cargo doc --locked --no-deps --document-private-items
+        stages: [pre-commit, pre-merge-commit]
+        pass_filenames: false
+        files: \.rs$|Cargo\.(toml|lock)
+
       - id: cargo-sort
         name: cargo-sort
         language: system
