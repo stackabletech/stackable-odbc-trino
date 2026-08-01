@@ -1730,3 +1730,61 @@ this to `main`.
 
 Publishing to crates.io is disabled (`publish = false`) and blocked anyway while
 `stackable-odbc-core` is a path dependency.
+
+### The SBOM
+
+`packaging/sbom.sh <artifact> <outdir>` writes a CycloneDX SBOM for one release
+artifact, in four stages: syft extracts the component list, `cargo metadata`
+enriches it, `packaging/sbom-native.json` supplies what cargo cannot see, and a
+finalize pass makes the artifact the document's subject.
+
+**The artifact must be built with `cargo auditable`.** Syft reads the `.dep-v0`
+section that embeds, so the SBOM describes what actually linked rather than what
+`Cargo.toml` asked for, and dev-dependencies are excluded by construction: 167
+components against 301 packages in `Cargo.lock`. An artifact built without it
+yields an SBOM with a single component, which is the signature of that mistake.
+
+Enrichment exists because syft's raw output is not shippable. `cargo-auditable`
+embeds only name, version and source kind, so **no component carries a license**,
+and a git or path dependency emits a purl indistinguishable from a crates.io
+package. A scanner resolving `pkg:cargo/trino-rust-client@0.11.0` would reach the
+real upstream crate, which is not what shipped. Enrichment fills every license
+from `cargo metadata`, rewrites a git dependency's purl to carry `?vcs_url=` with
+the **resolved commit** rather than the branch or tag, and marks a path
+dependency `pkg:generic` plus a `stackable:cargo-source` property.
+
+All of it keys off `cargo metadata`'s source *kind*, never off a crate name, so a
+dependency moving between path, git and crates.io needs no change to the script.
+
+Finalize removes syft's `type: "file"` self-entry, whose name is the absolute
+build path, and hoists the artifact into `metadata.component` with its sha256.
+That is both where the subject belongs and what keeps the builder's directory
+layout out of the release.
+
+#### The native fragment, and why the two platforms differ
+
+`packaging/sbom-native.json` is hand-maintained, so
+`sbom.sh --check-native <artifact>` verifies it and fails on drift. What it
+verifies differs by platform, because the platforms contribute different things:
+
+| | Linux `.so` | Windows `.dll` |
+|---|---|---|
+| Declared components | unixODBC | mingw-w64 runtime, libgcc |
+| How they are linked | dynamically, at load time | statically, into the artifact |
+| What `--check-native` asserts | the `DT_NEEDED` set matches the declared sonames | no toolchain runtime DLL is imported |
+
+The driver links **`libodbcinst.so.2` alone**; it does not link `libodbc`,
+despite `odbc-sys` naming both. The Windows DLL imports only the operating
+system's own libraries, `odbccp32.dll` included, and those are the platform
+rather than dependencies, so none is declared, for the same reason `libc` is not
+declared on Linux. What is declared there is the toolchain runtime, because it is
+statically linked and therefore redistributed inside the artifact.
+
+The Windows assertion is the inverse of the Linux one on purpose. The release
+archive ships no runtime DLL, so an artifact that imported `libgcc_s_seh-1.dll`
+would fail to load on a machine without mingw installed.
+
+`./packaging/test-sbom.sh` runs every assertion against the real release
+artifact and needs no Trino. It builds the `.so` with `cargo auditable` if it is
+absent, and skips the Windows checks with a message when the cross build is not
+present.
