@@ -165,6 +165,45 @@ else
   echo "SKIP  Windows checks: DLL not built (cargo auditable build --release --target x86_64-pc-windows-gnu)"
 fi
 
+# --- the .mez ---------------------------------------------------------------
+# The Power Query connector is M source in a zip, so syft finds nothing in it
+# and there is no cargo graph to enrich. Its SBOM is built directly: the
+# connector is the subject, and it genuinely has no dependencies.
+MEZ="$REPO_ROOT/connector/bin/StackableTrinoODBC.mez"
+if [ ! -f "$MEZ" ]; then
+  (cd "$REPO_ROOT/connector" && ./build.sh >/dev/null 2>&1) || true
+fi
+
+if [ -f "$MEZ" ]; then
+  "$REPO_ROOT/packaging/sbom.sh" "$MEZ" "$WORK" >/dev/null
+  MSBOM="$WORK/StackableTrinoODBC.mez.cdx.json"
+  MSPDX="$WORK/StackableTrinoODBC.mez.spdx.json"
+
+  check "mez: CycloneDX is written" "$([ -f "$MSBOM" ] && echo yes || echo no)" "yes"
+  check "mez: SPDX is written" "$([ -f "$MSPDX" ] && echo yes || echo no)" "yes"
+
+  check "mez: the connector is the subject" \
+    "$(jq -r '.metadata.component.name' "$MSBOM")" "StackableTrinoODBC.mez"
+
+  check "mez: the subject carries a sha256" \
+    "$(jq -r '.metadata.component.hashes[]? | select(.alg == "SHA-256") | .content' "$MSBOM" | tr -d '\n' | wc -c)" "64"
+
+  # The version is read from the connector's own [Version = "..."], which
+  # release.toml keeps in step with the crate version.
+  check "mez: the subject version matches the .pq" \
+    "$(jq -r '.metadata.component.version' "$MSBOM")" \
+    "$(grep -oE '\[Version = "[^"]+"\]' "$REPO_ROOT/connector/StackableTrinoODBC.pq" | head -1 | sed -E 's/.*"(.*)".*/\1/')"
+
+  # Zero is the honest answer, not a gap: the connector is pure M with no
+  # third-party dependencies.
+  check "mez: no components" "$(jq '.components | length' "$MSBOM")" "0"
+
+  check "mez: no build path leaks" \
+    "$(jq '[.. | strings | select(startswith("/home/") or startswith("/build/"))] | length' "$MSBOM")" "0"
+else
+  echo "SKIP  mez checks: connector/bin/StackableTrinoODBC.mez could not be built"
+fi
+
 # An artifact built without cargo auditable must be refused, not silently turned
 # into a near-empty SBOM. Strip the section to prove the guard fires.
 cp "$SO" "$WORK/no-audit.so"

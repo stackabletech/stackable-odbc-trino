@@ -129,6 +129,54 @@ require_audit_section() {
   fi
 }
 
+# The Power Query connector is M source in a zip. Syft finds nothing in it and
+# there is no cargo graph to enrich, so its document is built directly rather
+# than run through the pipeline. An empty component list is the honest answer:
+# the connector has no third-party dependencies.
+build_mez_sbom() {
+  local artifact="$1" sha version serial
+  sha="$(sha256sum "$artifact" | cut -d' ' -f1)"
+
+  # release.toml keeps this in step with the crate version; see AGENTS.md.
+  version="$(grep -oE '\[Version = "[^"]+"\]' "$REPO_ROOT/connector/StackableTrinoODBC.pq" \
+    | head -1 | sed -E 's/.*"(.*)".*/\1/')"
+  [ -n "$version" ] || { echo "ERROR: no [Version = \"...\"] in StackableTrinoODBC.pq" >&2; exit 1; }
+
+  # Derived from the artifact digest so the same input yields the same document.
+  serial="urn:uuid:${sha:0:8}-${sha:8:4}-${sha:12:4}-${sha:16:4}-${sha:20:12}"
+
+  jq -n --arg name "$BASENAME" --arg sha "$sha" --arg version "$version" \
+        --arg serial "$serial" --arg rustc "$(rustc --version)" \
+  '{
+    bomFormat: "CycloneDX",
+    specVersion: "1.7",
+    serialNumber: $serial,
+    version: 1,
+    metadata: {
+      component: {
+        type: "application",
+        name: $name,
+        version: $version,
+        description: "Power Query custom connector for the Stackable ODBC driver for Trino.",
+        licenses: [ { license: { id: "Apache-2.0" } } ],
+        hashes: [ { alg: "SHA-256", content: $sha } ]
+      },
+      properties: [ { name: "stackable:rustc-version", value: $rustc } ]
+    },
+    components: []
+  }' > "$OUT"
+
+  syft convert "$OUT" -o spdx-json="$OUT_SPDX" --quiet
+
+  echo "Wrote $OUT"
+  echo "Wrote $OUT_SPDX"
+}
+
+if [ "${BASENAME##*.}" = "mez" ]; then
+  build_mez_sbom "$ARTIFACT"
+  exit 0
+fi
+
 require_audit_section "$ARTIFACT"
 
 RAW="$OUTDIR/.$BASENAME.raw.json"
