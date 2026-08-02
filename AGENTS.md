@@ -1722,6 +1722,49 @@ exchange and `interpret_outcome` are plain functions with unit tests that run
 on Linux, so a change to any of those decisions breaks the build where the work
 is done rather than where it ships.
 
+#### Where the buttons are tested
+
+`integration-tests/windows/dsn_dialog_test.py` is the **only** check on
+`configure_dsn`. Everything else reaches the driver through a connection, and
+both `odbcconf` and `configure-dsn.ps1` call `SQLConfigDataSource` with a null
+*hwndParent* — the headless path — so nothing else opens the dialog at all. It
+drives `odbcad32` on the VM's console session and captures six screenshots into
+`integration-tests/generated/windows-dialog/`.
+
+Cancel and Remove are asserted but not photographed: what they produce is a
+transient dialog and an empty list, and both are checked against the registry
+instead. The mechanics that took measuring are documented at the top of the
+script; the two worth knowing before touching it are that **`GetWindowTextW`
+cannot read an edit control's text across a process boundary** and answers
+empty, which reads exactly like a failed write, and that **a synthetic mouse
+click on an inactive window is consumed by the activation**, so buttons take a
+posted `BM_CLICK` and only handle-less things — tab strips, list rows — are
+clicked by coordinate.
+
+### The Windows version resource
+
+`build.rs` embeds a `VERSIONINFO` into the driver DLL. Without one the ODBC
+Data Source Administrator lists the driver as `Not marked` under both
+**Version** and **Company**, which is what every Rust `cdylib` gets: rustc
+emits no resource. Measured on Windows Server 2022, `sqlsrv32.dll` lists as
+`10.00.20348.01` / `Microsoft Corporation` and carries exactly those strings.
+
+Three things about it are deliberate:
+
+- **Every value comes from cargo's environment**, so the resource cannot
+  disagree with `Cargo.toml`. `CARGO_PKG_AUTHORS` supplies the company with
+  the address stripped, `CARGO_PKG_DESCRIPTION` the product name.
+- **`release.toml` has no rule for it**, unlike
+  `connector/StackableTrinoODBC.pq`. The version is `CARGO_PKG_VERSION`, which
+  is the file `cargo-release` already bumps, so there is no second copy to
+  drift and nothing for a test to police.
+- **The gate is `CARGO_CFG_TARGET_OS`, never `cfg!(windows)`.** A build script
+  is compiled for the *host*, and the release DLL is cross-compiled from Linux
+  — `cfg!(windows)` is false there, so it would skip the resource on precisely
+  the build that ships. Only the gnu toolchain is wired up, since that is what
+  the release workflow uses; an MSVC target needs `rc.exe` and gets a
+  `cargo:warning` instead of a failure.
+
 ### The connector's advanced options
 
 `StackableTrinoODBC.Contents` takes `optional options as record`, and

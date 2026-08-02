@@ -51,6 +51,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the dialog, so an unset Schema shows the coordinator's own default instead
   of a blank.
 
+- **The Windows driver DLL carries a version resource.** The ODBC Data Source
+  Administrator reads its **Version** and **Company** columns from the driver
+  file's `VERSIONINFO`, and displays `Not marked` for a file that carries none
+  — which was every build, since rustc emits no such resource. The driver now
+  lists its version and `Stackable GmbH`.
+
+  The resource is generated at build time from `Cargo.toml`, so it cannot
+  disagree with the package it describes, and the version follows the one
+  `cargo-release` writes. It is embedded for the `x86_64-pc-windows-gnu`
+  toolchain that the release builds with; an MSVC build warns and continues.
+
 - **The Power Query connector reaches the driver's wider option surface.**
   `StackableTrinoODBC.Contents` takes an optional `options` record, rendered by
   Power BI as an "Advanced options" section, carrying 23 further

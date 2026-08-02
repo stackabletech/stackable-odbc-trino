@@ -39,6 +39,29 @@ export ODBC_TEST_HOST_GATEWAY=10.0.0.1
 uv run --with pywinrm python3 integration-tests/windows/windows_test.py --help
 ```
 
+### The setup dialog
+
+`dsn_dialog_test.py` drives the ODBC Data Source Administrator's **Add…**,
+**Configure…** and **Remove** buttons, which is the only thing that exercises
+`TrinoBackend::configure_dsn`: every other suite reaches the driver through a
+connection, and both `odbcconf` and `configure-dsn.ps1` call
+`SQLConfigDataSource` with a null *hwndParent*, so they take the headless path.
+
+Run `windows_test.py` first — it deploys the DLL and `configure-dsn.ps1`, which
+the driver looks for beside it.
+
+```bash
+uv run --with pywinrm python3 integration-tests/windows/dsn_dialog_test.py
+
+# Leave the Administrator open afterwards, to poke at by hand
+uv run --with pywinrm python3 integration-tests/windows/dsn_dialog_test.py --keep-open
+```
+
+Six screenshots of the **Add…** path land in
+`integration-tests/generated/windows-dialog/`, taken from the VM's framebuffer
+with `virsh screenshot` — WinRM lands in session 0, which has no desktop to
+photograph. They are what to look at when a check reports a mismatch.
+
 **Do not diagnose a Windows failure without rebuilding the DLL first.**
 `--skip-build` reuses whatever sits in `target/x86_64-pc-windows-gnu/release/`,
 which can predate the feature under test by days. A stale DLL once produced four
