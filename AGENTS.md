@@ -1676,6 +1676,33 @@ Secrets are written only when their **Save** box is ticked, which is off by
 default. A saved secret is stored unencrypted, and a System data source puts it
 in HKLM where every local user can read it.
 
+#### Test connection cannot drive an interactive login
+
+**`System.Data.Odbc` calls `SQLDriverConnectW` with `SQL_DRIVER_NOPROMPT`**,
+the same as pyodbc, so a connection made from the dialog's Test button may
+never show a login URL. Measured through the Windows Driver Manager against a
+live Keycloak: an `ExternalAuthentication` test returns
+
+```text
+[28000] ExternalAuthentication needs to show a login URL, and this connection
+        was made with SQL_DRIVER_NOPROMPT; supply AccessToken instead
+```
+
+which is right, and useful, and still lands under a **Connection failed**
+heading that reads as the settings being wrong. The button therefore checks the
+key first and reports that the login cannot be driven from here, with no
+attempt made.
+
+The data source itself is unaffected: writing it works, and an application that
+passes `SQL_DRIVER_COMPLETE` opens a browser normally — verified on the VM,
+where the driver launched Edge and Keycloak's login page rendered.
+
+Testing it properly would mean replacing `System.Data.Odbc` with a direct
+`SQLDriverConnectW` at `SQL_DRIVER_COMPLETE`, which the script could do since
+it already P/Invokes `odbccp32` for `ConfigDSN`. That also means reading the
+result columns through raw ODBC in PowerShell, so it is left until an OAuth
+user asks for it.
+
 #### The Administrator's buttons, through `Backend::configure_dsn`
 
 Core owns all of `ConfigDSN` — validating *fRequest*, rejecting `DRIVER=`,

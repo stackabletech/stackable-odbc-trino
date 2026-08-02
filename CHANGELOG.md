@@ -51,6 +51,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the dialog, so an unset Schema shows the coordinator's own default instead
   of a blank.
 
+  With **External authentication** ticked it says so rather than trying: the
+  dialog connects through .NET's ODBC provider, which forbids the driver from
+  showing a login URL, so an interactive login can never complete from here.
+  Such a data source is saved and used normally by applications that permit
+  prompting.
+
 - **The Windows driver DLL carries a version resource.** The ODBC Data Source
   Administrator reads its **Version** and **Company** columns from the driver
   file's `VERSIONINFO`, and displays `Not marked` for a file that carries none

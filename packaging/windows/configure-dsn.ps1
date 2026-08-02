@@ -839,6 +839,27 @@ $btnTest.Add_Click({
             'Incomplete', 'OK', 'Warning')
         return
     }
+    # An interactive login cannot be driven from here, and saying so is the
+    # whole point: this button connects through .NET's ODBC provider, which
+    # calls SQLDriverConnectW with SQL_DRIVER_NOPROMPT, and the driver refuses
+    # to show a login URL under it. Measured against the live driver, the
+    # attempt returns 28000 "ExternalAuthentication needs to show a login URL,
+    # and this connection was made with SQL_DRIVER_NOPROMPT". That is correct
+    # behaviour and a good diagnostic, but under a "Connection failed" heading
+    # it reads as the settings being wrong, which they are not.
+    if ($values.Contains('externalauthentication') -and
+        $values['externalauthentication'] -match '^(?i:true|1|yes)$') {
+        [void][System.Windows.Forms.MessageBox]::Show(
+            ("External authentication cannot be tested from this dialog.`r`n`r`n" +
+             "Testing connects through .NET's ODBC provider, which tells the " +
+             "driver that no prompt may be shown, so the login URL this data " +
+             "source needs can never be opened here.`r`n`r`n" +
+             "Save the data source and connect from an application that permits " +
+             "prompting; the driver opens a browser then. The other settings on " +
+             "this page have been checked and are complete."),
+            'Cannot be tested here', 'OK', 'Information')
+        return
+    }
     $form.Cursor = [System.Windows.Forms.Cursors]::WaitCursor
     $btnTest.Enabled = $false
     # One catch around the whole thing: WinForms swallows an exception thrown

@@ -165,6 +165,11 @@ Secrets are written only when their **Save** box is ticked, which is off by
 default. A saved secret is stored unencrypted, and a System data source puts it
 in `HKLM`, where every local user can read it.
 
+**Test connection** does not work for **External authentication**, and says so
+instead of failing: it connects in a way that forbids the driver from opening a
+login page. Save the data source and use it from your application, which will
+open a browser when it connects.
+
 ### Windows: scripted
 
 ```cmd
