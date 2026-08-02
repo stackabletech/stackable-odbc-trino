@@ -147,22 +147,23 @@ strings (shown below) work without it.
 
 ### Windows: the dialog
 
-`configure-dsn.ps1` ships in the archive and covers every connection-string
-option in one window:
+Open the **ODBC Data Source Administrator** (`odbcad32.exe`), press **Add…**
+and choose `stackable_odbc_trino`. The driver's dialog covers every
+connection-string option in one window, and **Configure…** reopens it on an
+existing data source.
+
+The same dialog runs on its own, without the Administrator:
 
 ```cmd
 powershell -ExecutionPolicy Bypass -File configure-dsn.ps1
 ```
 
+`configure-dsn.ps1` ships in the archive, and `install.bat` puts it beside the
+driver DLL. The Administrator's buttons need it there, so do not move it.
+
 Secrets are written only when their **Save** box is ticked, which is off by
 default. A saved secret is stored unencrypted, and a System data source puts it
 in `HKLM`, where every local user can read it.
-
-> The ODBC Data Source Administrator's own **Add** button does not work with
-> this driver yet: it asks the driver's setup DLL for a dialog, gets a headless
-> answer, and reports `ODBC_ERROR_INVALID_KEYWORD_VALUE`. Use the script above,
-> or `odbcconf` below. Both register a DSN the Administrator then lists and
-> edits normally.
 
 ### Windows: scripted
 

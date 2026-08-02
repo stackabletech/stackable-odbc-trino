@@ -192,25 +192,28 @@ ODBC API functions and the `ConfigDSNW` setup entry point.
 
 Three ways, in descending order of convenience.
 
-**The dialog.** `packaging/windows/configure-dsn.ps1` is a WinForms dialog
-covering the whole connection-string surface. It writes through
-`SQLConfigDataSourceW`, so the driver's own `ConfigDSN` stays in the loop:
+**The ODBC Data Source Administrator.** `odbcad32.exe` → **Add…** → select
+`stackable_odbc_trino`, or **Configure…** on an existing data source. Both
+display the driver's dialog: `ConfigDSN` reaches
+`TrinoBackend::configure_dsn`, which runs `configure-dsn.ps1` with `-Emit` and
+hands the keywords back for core to write. The script must be installed
+alongside the DLL, which `install.bat` does.
+
+**The dialog on its own**, which is the same WinForms dialog without the
+Administrator. It writes through `SQLConfigDataSourceW`, so the driver's own
+`ConfigDSN` stays in the loop:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File configure-dsn.ps1
 ```
 
-**`odbcconf`**, which is what the test harness uses:
+**`odbcconf`**, which is what the test harness uses. It passes a null
+*hwndParent*, so no dialog is displayed and the keywords on the command line
+are written as given:
 
 ```cmd
 odbcconf.exe /A {CONFIGDSN "stackable_odbc_trino" "DSN=MyTrino|Host=trino.example.com|Port=8443|User=admin|Password=secret|Catalog=hive|Schema=default|"}
 ```
-
-**The ODBC Data Source Administrator's "Add" button does not work yet.** That
-button loads the driver's setup DLL and asks it for a dialog; this driver
-answers headlessly, so `odbcad32` reports `ODBC_ERROR_INVALID_KEYWORD_VALUE`.
-Wiring it up needs core's `ffi/setup.rs` `config_dsn_w` to become generic over
-the backend.
 
 Note that a DSN stores the five `name:value;name2:value2` keys **bare**. Braces
 belong to connection-string syntax, where `;` separates parameters; a braced

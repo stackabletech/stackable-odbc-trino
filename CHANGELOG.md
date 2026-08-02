@@ -29,13 +29,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   writing it, and writes User or System data sources through the driver's own
   `ConfigDSN` rather than the registry.
 
-  It is not the ODBC Data Source Administrator's "Add…" button. That button
-  asks the driver's setup DLL to display a dialog, which this driver does not
-  do, so it still reports an error there.
+  It is also what the ODBC Data Source Administrator's **Add…** and
+  **Configure…** buttons display. The driver implements
+  `Backend::configure_dsn`, which runs the same script with `-Emit` and lets
+  core write the keywords it returns; the script remains runnable on its own,
+  and both paths share one field table, so the dialog cannot differ between
+  them. Cancelling the dialog leaves the data source untouched and reports no
+  error.
+
+  A removal opens no dialog: the Administrator has already asked for
+  confirmation, and this driver keeps nothing outside `ODBC.INI` that a removal
+  would need to clean up.
 
   Secrets are written only when their **Save** box is ticked, which is off by
   default: a data source keeps its values as plain registry values, and a
   System data source puts them in HKLM where every local user can read them.
+
+  **Test connection** reports the coordinator it reached, its Trino version,
+  the user the session runs as, and the catalog and schema the session
+  resolved to. The last two are read back from Trino rather than echoed from
+  the dialog, so an unset Schema shows the coordinator's own default instead
+  of a blank.
 
 - **The Power Query connector reaches the driver's wider option surface.**
   `StackableTrinoODBC.Contents` takes an optional `options` record, rendered by

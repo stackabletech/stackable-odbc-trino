@@ -1647,17 +1647,19 @@ undefined-behaviour risk lives and where both are run.
 ### The Windows DSN dialog
 
 `packaging/windows/configure-dsn.ps1` is a WinForms dialog covering the whole
-connection-string surface. It is **not** the ODBC Data Source Administrator's
-"Add…" button: that button loads the driver's setup DLL and asks it for a
-dialog, and this driver answers headlessly, so odbcad32 reports
-`ODBC_ERROR_INVALID_KEYWORD_VALUE` and the message core posts. Giving that
-button a dialog needs `ffi/setup.rs`'s `config_dsn_w` to become generic over
-the backend, which is a core change.
+connection-string surface. It is reached two ways: run directly, and from the
+ODBC Data Source Administrator's **Add…** and **Configure…** buttons, which
+load the driver's setup DLL and ask it for a dialog. `TrinoBackend::configure_dsn`
+in `src/backend/setup.rs` is what answers them, by running this same script
+with `-Emit`.
 
 Layout, the read path, the write path and validation are generated from one
 `$Fields` table, and `dsn_keys_match_the_connection_string_parser` in
 `src/lib.rs` fails `cargo test` if that table and the `PARAM_` constants ever
-disagree in either direction.
+disagree in either direction. **That one table is why the Administrator's
+button reuses the script rather than getting a dialog written in Rust**: a
+second dialog would be a second list of all 34 keywords to keep in step, and
+nothing would check it against the first.
 
 The write goes through `SQLConfigDataSourceW`, so the driver's own `ConfigDSN`
 stays in the loop. Two things about it are measured rather than assumed:
@@ -1673,6 +1675,52 @@ stays in the loop. Two things about it are measured rather than assumed:
 Secrets are written only when their **Save** box is ticked, which is off by
 default. A saved secret is stored unencrypted, and a System data source puts it
 in HKLM where every local user can read it.
+
+#### The Administrator's buttons, through `Backend::configure_dsn`
+
+Core owns all of `ConfigDSN` — validating *fRequest*, rejecting `DRIVER=`,
+merging the data source's stored keywords in for `Config` and `Remove`, calling
+`SQLValidDSN`, and writing through `SQLWriteDSNToIni`. `src/backend/setup.rs`
+supplies only the dialog. Five things about the path are load-bearing:
+
+- **A null `hwndParent` never prompts, and that is what stops the recursion.**
+  The spec makes it behaviour rather than an optimisation ("the function will
+  not display any dialog boxes if the handle is null"), and the script's own
+  `Write-Dsn` calls `SQLConfigDataSourceW` with `IntPtr::Zero` — so when the
+  standalone dialog writes, the hook it re-enters passes straight through
+  instead of launching a second copy of the script. `odbcconf`'s `CONFIGDSN`
+  is headless for the same reason, which is why the Windows harness still
+  creates its DSNs without a dialog appearing.
+- **`Remove` opens no dialog.** The Administrator has already confirmed the
+  deletion, and the driver keeps nothing outside `ODBC.INI` to clean up.
+- **The attributes travel over a pipe, as JSON, never a temp file.** A `Config`
+  request arrives with the whole stored section merged in, `PWD` included;
+  those values are already unencrypted in the registry, and a temp file would
+  be a *second* place to read them from.
+- **The exit code carries the verdict, because stdout carries the payload**: 0
+  accepted, 2 cancelled, anything else a failure whose stderr becomes the
+  message core posts with `SQLPostInstallerError`. A cancel is `Ok(None)` and
+  posts no error at all.
+- **The dialog is found beside the DLL**, via `GetModuleHandleExW` +
+  `GetModuleFileNameW`. `std::env::current_exe()` cannot be used: `ConfigDSN`
+  runs inside `odbcad32.exe` and would answer with the Administrator's path.
+  `install.bat` therefore copies `configure-dsn.ps1` as a hard requirement now
+  rather than best-effort.
+
+`-Emit` differs from the standalone dialog in four ways, each forced by core
+being the writer: the User/System radios are hidden, since the Administrator
+already chose the scope and set the installer's config mode; the name box is
+read-only when a `DSN` keyword arrived, which the spec requires and core
+enforces on the returned map; the prefill comes from the pipe rather than a
+second `ODBC.INI` read; and the form is `TopMost`, or it opens behind the
+window that asked for it. Keywords the `$Fields` table does not model are
+returned exactly as they arrived — on a **Configure…** that is the rest of the
+data source's section, and dropping them would delete settings nobody touched.
+
+Only the two OS calls are `#[cfg(windows)]`. `dialog_needed`, the JSON
+exchange and `interpret_outcome` are plain functions with unit tests that run
+on Linux, so a change to any of those decisions breaks the build where the work
+is done rather than where it ships.
 
 ### The connector's advanced options
 
