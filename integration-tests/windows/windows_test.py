@@ -38,6 +38,11 @@ REMOTE_TEST = rf"{REMOTE_DIR}\test_integration.py"
 REMOTE_HARNESS = rf"{REMOTE_DIR}\harness.py"
 # The test CA, so the VM can verify the coordinator rather than only skip it.
 REMOTE_CA = rf"{REMOTE_DIR}\ca.crt"
+# The driver's ConfigDSN runs this to display its setup dialog, and looks for it
+# beside the DLL. Deployed even though the automated configurations never open a
+# dialog: without it, the ODBC Administrator's Add... button fails on the VM,
+# and that is the one thing the harness could not otherwise be used to check.
+REMOTE_DSN_DIALOG = rf"{REMOTE_DIR}\configure-dsn.ps1"
 
 DRIVER_NAME = "stackable_odbc_trino"
 DSN_NAME = "test_trino"
@@ -101,6 +106,7 @@ def main():
     print("=== Deploying files via HTTP ===")
     harness_path = TEST_DIR / "suites" / "harness.py"
     ca_path = TEST_DIR / "generated" / "certs" / "ca.crt"
+    dialog_path = PROJECT_DIR / "packaging" / "windows" / "configure-dsn.ps1"
     for required in (harness_path, ca_path):
         if not required.exists():
             print(f"ERROR: {required} is missing; run ./integration-tests/setup.sh",
@@ -111,6 +117,7 @@ def main():
         "test_integration.py": test_path,
         "harness.py": harness_path,
         "ca.crt": ca_path,
+        "configure-dsn.ps1": dialog_path,
     }
     with http_file_server(files_to_serve) as port:
         base_url = f"http://{args.gateway}:{port}"
@@ -123,7 +130,9 @@ def main():
             f'Invoke-WebRequest -Uri "{base_url}/harness.py" '
             f'-OutFile "{REMOTE_HARNESS}"; '
             f'Invoke-WebRequest -Uri "{base_url}/ca.crt" '
-            f'-OutFile "{REMOTE_CA}"'
+            f'-OutFile "{REMOTE_CA}"; '
+            f'Invoke-WebRequest -Uri "{base_url}/configure-dsn.ps1" '
+            f'-OutFile "{REMOTE_DSN_DIALOG}"'
         )
         r = session.run_ps(download_ps)
         if r.status_code != 0:

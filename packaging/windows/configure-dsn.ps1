@@ -11,10 +11,11 @@
     directly. That keeps the driver in the loop and inherits whatever validation
     it performs.
 
-    This is not the ODBC Data Source Administrator's "Add..." button. That
-    button loads the driver's setup DLL and asks it to display a dialog, which
-    this driver does not do; it answers the call headlessly instead. Run this
-    script to get a dialog.
+    This is also what the ODBC Data Source Administrator's "Add..." and
+    "Configure..." buttons display. Those load the driver's setup DLL and ask
+    it for a dialog; the driver's Backend::configure_dsn hook runs this script
+    with -Emit and writes the keywords it returns. Run the script directly to
+    get the same dialog without going through the Administrator.
 
 .PARAMETER Dsn
     Data source to edit. Omitted, the dialog starts empty.
@@ -28,6 +29,16 @@
 
 .PARAMETER Set
     Key/value pairs for -NoGui, keyed by connection-string keyword.
+
+.PARAMETER Emit
+    Display the dialog and print the resulting keywords to stdout as JSON
+    instead of writing a data source. Reads the keywords to pre-fill from
+    stdin, also as JSON. This is the mode the driver's ConfigDSN hook uses:
+    the driver, not this script, performs the write.
+
+    Exit codes are the channel for the verdict, because stdout carries the
+    payload: 0 accepted, 2 cancelled, anything else a failure whose reason is
+    on stderr.
 
 .EXAMPLE
     .\configure-dsn.ps1
@@ -45,6 +56,7 @@ param(
     [switch]$System,
     [switch]$NoGui,
     [hashtable]$Set,
+    [switch]$Emit,
     [string]$DriverName = 'stackable_odbc_trino'
 )
 
@@ -171,6 +183,47 @@ function Get-FieldDefault {
     param($Field)
     if ($Field.Contains('Default')) { return $Field.Default }
     return ''
+}
+
+function ConvertTo-FieldValues {
+    <#
+        Normalise a caller-supplied keyword map onto the field table's own
+        keys: case folded, aliases resolved, DSN lifted out as the name.
+
+        Shared by -NoGui and -Emit, the two paths whose input comes from a
+        caller rather than from the dialog, and so the only two that can be
+        handed a keyword the table does not carry.
+
+        Unknown keywords are kept aside in Extra rather than rejected. -Emit
+        receives a data source's whole stored section, which carries keywords
+        this dialog does not model -- Driver, and anything written by hand --
+        and returning fewer keywords than arrived would delete them.
+        -NoGui rejects them instead: there the map is something a person just
+        typed, so an unrecognised keyword is far more likely a typo than a
+        keyword worth preserving, and silently ignoring it would write a data
+        source missing the setting they asked for.
+    #>
+    param([hashtable]$Set, [switch]$KeepUnknown)
+
+    $values = @{}
+    $extra = @{}
+    $name = ''
+    foreach ($k in $Set.Keys) {
+        $lk = "$k".ToLowerInvariant()
+        if ($lk -eq 'dsn') { $name = "$($Set[$k])"; continue }
+        $f = Get-Field $lk
+        if (-not $f) {
+            # Try the aliases before rejecting: a value lifted from a JDBC URL
+            # or an existing connection string should transfer unchanged.
+            $f = $script:Fields | Where-Object { $_.Contains('Alias') -and $_.Alias -eq $lk }
+        }
+        if (-not $f) {
+            if ($KeepUnknown) { $extra[$k] = "$($Set[$k])"; continue }
+            throw "Unknown connection-string keyword: $k"
+        }
+        $values[$f.Key] = "$($Set[$k])"
+    }
+    @{ Values = $values; Name = $name; Extra = $extra }
 }
 
 # ---------------------------------------------------------------------------
@@ -346,16 +399,130 @@ function Test-DsnConnection {
     try {
         $conn.Open()
         $cmd = $conn.CreateCommand()
-        $cmd.CommandText = 'SELECT version(), current_user'
+        # current_catalog and current_schema report what the session actually
+        # resolved to, which is not always what was typed: an unset Schema
+        # leaves the coordinator's default, and Trino answers with it.
+        $cmd.CommandText = 'SELECT version(), current_user, current_catalog, current_schema'
         $r = $cmd.ExecuteReader()
-        $msg = if ($r.Read()) { "Connected.`r`n`r`nServer: $($r[0])`r`nUser: $($r[1])" } else { 'Connected.' }
+        $host_port = "$($Values['host']):$($Values['port'])"
+        $facts = @()
+        if ($r.Read()) {
+            # Null when the session is on no catalog at all, which is what an
+            # unset Catalog gives and is worth showing as such rather than blank.
+            $cat = if ($r.IsDBNull(2)) { '(none)' } else { "$($r[2])" }
+            $sch = if ($r.IsDBNull(3)) { '(none)' } else { "$($r[3])" }
+            # Objects rather than two-element arrays: PowerShell flattens a
+            # nested array literal, so a list of pairs collapses into a list of
+            # strings and indexing a "pair" then indexes into a *string*.
+            $facts = @(
+                [PSCustomObject]@{ Name = 'Host';    Value = $host_port }
+                [PSCustomObject]@{ Name = 'Version'; Value = "$($r[0])" }
+                [PSCustomObject]@{ Name = 'User';    Value = "$($r[1])" }
+                [PSCustomObject]@{ Name = 'Catalog'; Value = $cat }
+                [PSCustomObject]@{ Name = 'Schema';  Value = $sch }
+            )
+        } else {
+            $facts = @([PSCustomObject]@{ Name = 'Host'; Value = $host_port })
+        }
         $r.Close()
-        return @{ Ok = $true; Message = $msg }
+        return @{ Ok = $true; Message = 'Connected.'; Facts = $facts }
     } catch {
-        return @{ Ok = $false; Message = $_.Exception.Message }
+        return @{ Ok = $false; Message = $_.Exception.Message; Facts = @() }
     } finally {
         if ($conn.State -ne 'Closed') { $conn.Close() }
     }
+}
+
+function Show-ConnectionResult {
+    <#
+        Report a connection test.
+
+        A success gets its own small form rather than a MessageBox, because the
+        facts are a two-column table and a MessageBox cannot align one: its
+        font is proportional, so padding a label with spaces lines nothing up.
+        A failure stays a MessageBox -- the driver's diagnostic is a paragraph,
+        not a table.
+    #>
+    param([hashtable]$Result)
+
+    if (-not $Result.Ok) {
+        [void][System.Windows.Forms.MessageBox]::Show($Result.Message,
+            'Connection failed', 'OK', 'Error')
+        return
+    }
+
+    $dlg = New-Object System.Windows.Forms.Form
+    $dlg.Text = 'Connection succeeded'
+    $dlg.FormBorderStyle = 'FixedDialog'
+    $dlg.StartPosition = 'CenterScreen'
+    $dlg.MinimizeBox = $false
+    $dlg.MaximizeBox = $false
+    $dlg.ShowInTaskbar = $false
+    # Same reason the main dialog sets it under -Emit: this belongs to a
+    # separate process from the ODBC Administrator that is waiting on it.
+    $dlg.TopMost = [bool]$Emit
+    # The form sizes itself to the layout below. Positioning by hand from a
+    # panel's Right/Bottom does not work, because an AutoSize panel has not
+    # been measured yet at that point -- the result was a window sized from
+    # stale bounds, invisible and modal, which locked its parent out of all
+    # input with nothing on screen to explain why.
+    $dlg.AutoSize = $true
+    $dlg.AutoSizeMode = 'GrowAndShrink'
+    $dlg.Padding = New-Object System.Windows.Forms.Padding(14)
+
+    $root = New-Object System.Windows.Forms.TableLayoutPanel
+    $root.ColumnCount = 2
+    $root.AutoSize = $true
+    $root.AutoSizeMode = 'GrowAndShrink'
+    $root.Dock = 'Fill'
+
+    $icon = New-Object System.Windows.Forms.PictureBox
+    $icon.Image = [System.Drawing.SystemIcons]::Information.ToBitmap()
+    $icon.SizeMode = 'AutoSize'
+    $icon.Margin = New-Object System.Windows.Forms.Padding(4, 4, 14, 8)
+    $root.Controls.Add($icon, 0, 0)
+
+    $head = New-Object System.Windows.Forms.Label
+    $head.Text = $Result.Message
+    $head.Font = New-Object System.Drawing.Font($dlg.Font, [System.Drawing.FontStyle]::Bold)
+    $head.AutoSize = $true
+    $head.Margin = New-Object System.Windows.Forms.Padding(0, 8, 0, 10)
+    $root.Controls.Add($head, 1, 0)
+
+    # Two columns, so the values share a left edge whatever the labels measure.
+    $grid = New-Object System.Windows.Forms.TableLayoutPanel
+    $grid.ColumnCount = 2
+    $grid.AutoSize = $true
+    $grid.AutoSizeMode = 'GrowAndShrink'
+    $grid.Margin = New-Object System.Windows.Forms.Padding(0)
+    foreach ($f in $Result.Facts) {
+        $k = New-Object System.Windows.Forms.Label
+        $k.Text = "$($f.Name):"
+        $k.AutoSize = $true
+        $k.Margin = New-Object System.Windows.Forms.Padding(0, 3, 16, 3)
+        $v = New-Object System.Windows.Forms.Label
+        $v.Text = $f.Value
+        $v.AutoSize = $true
+        $v.Margin = New-Object System.Windows.Forms.Padding(0, 3, 0, 3)
+        $grid.Controls.Add($k)
+        $grid.Controls.Add($v)
+    }
+    $root.Controls.Add($grid, 1, 1)
+
+    $ok = New-Object System.Windows.Forms.Button
+    $ok.Text = 'OK'
+    $ok.Size = New-Object System.Drawing.Size(90, 28)
+    $ok.Anchor = 'Right'
+    $ok.Margin = New-Object System.Windows.Forms.Padding(0, 16, 0, 0)
+    $ok.DialogResult = [System.Windows.Forms.DialogResult]::OK
+    $root.Controls.Add($ok, 1, 2)
+
+    $dlg.Controls.Add($root)
+    $dlg.AcceptButton = $ok
+    $dlg.CancelButton = $ok
+
+    [void]$dlg.ShowDialog()
+    $dlg.Dispose()
 }
 
 function Test-Values {
@@ -398,20 +565,9 @@ function Test-Values {
 if ($NoGui) {
     if (-not $Set) { throw '-NoGui requires -Set.' }
 
-    $values = @{}
-    $name = $Dsn
-    foreach ($k in $Set.Keys) {
-        $lk = "$k".ToLowerInvariant()
-        if ($lk -eq 'dsn') { $name = $Set[$k]; continue }
-        $f = Get-Field $lk
-        if (-not $f) {
-            # Try the aliases before rejecting: a value lifted from a JDBC URL
-            # or an existing connection string should transfer unchanged.
-            $f = $script:Fields | Where-Object { $_.Contains('Alias') -and $_.Alias -eq $lk }
-            if (-not $f) { throw "Unknown connection-string keyword: $k" }
-        }
-        $values[$f.Key] = "$($Set[$k])"
-    }
+    $parsed = ConvertTo-FieldValues $Set
+    $values = $parsed.Values
+    $name = if ($parsed.Name) { $parsed.Name } else { $Dsn }
 
     $problems = @(Test-Values $values $name)
     if ($problems.Count) { throw ($problems -join "`r`n") }
@@ -424,6 +580,40 @@ if ($NoGui) {
     $scope = if ($System) { 'System' } else { 'User' }
     Write-Output "$scope data source '$name' written."
     return
+}
+
+# ---------------------------------------------------------------------------
+# Emit mode input
+# ---------------------------------------------------------------------------
+# The keywords to pre-fill arrive on stdin as a JSON object. A pipe rather
+# than a file because a Configure... payload carries the data source's stored
+# secrets: the driver merges the whole ODBC.INI section in before calling, so
+# a temp file here would put a password on disk for the life of the dialog.
+
+$script:EmitExtra = @{}
+$script:EmitPrefill = @{}
+$script:EmitValues = @{}
+$script:EmitNameFixed = $false
+
+if ($Emit) {
+    $stdin = [Console]::In.ReadToEnd()
+    $incoming = @{}
+    if (-not [string]::IsNullOrWhiteSpace($stdin)) {
+        $json = $stdin | ConvertFrom-Json
+        foreach ($p in $json.PSObject.Properties) { $incoming[$p.Name] = "$($p.Value)" }
+    }
+
+    $parsed = ConvertTo-FieldValues $incoming -KeepUnknown
+    $script:EmitExtra = $parsed.Extra
+    $script:EmitPrefill = $parsed.Values
+    if ($parsed.Name) {
+        $Dsn = $parsed.Name
+        # The spec: "if a data source name was passed to it, ConfigDSN displays
+        # that name but does not allow the user to change it." The driver's
+        # core enforces this on the map coming back, so an editable box here
+        # would only produce a failed call.
+        $script:EmitNameFixed = $true
+    }
 }
 
 # ---------------------------------------------------------------------------
@@ -440,6 +630,10 @@ $form.Size = New-Object System.Drawing.Size(620, 560)
 $form.StartPosition = 'CenterScreen'
 $form.FormBorderStyle = 'FixedDialog'
 $form.MaximizeBox = $false
+# The ODBC Administrator owns the foreground while it waits on ConfigDSN, and
+# this dialog belongs to a separate process, so without this it opens behind
+# the window that asked for it.
+$form.TopMost = [bool]$Emit
 
 $tip = New-Object System.Windows.Forms.ToolTip
 $tip.AutoPopDelay = 20000
@@ -480,6 +674,16 @@ if (-not (Test-Elevated)) {
     if ($System) { $rbUser.Checked = $true }
 }
 $form.Controls.Add($lblElev)
+
+# Under -Emit the driver performs the write, and the Administrator has already
+# chosen the scope and set the installer's config mode accordingly. Offering a
+# choice the dialog cannot honour would be a lie, so the radios go away.
+if ($Emit) {
+    $rbUser.Visible = $false
+    $rbSystem.Visible = $false
+    $lblElev.Visible = $false
+}
+if ($script:EmitNameFixed) { $txtName.ReadOnly = $true }
 
 # --- tabs, built from the field table ---
 $tabs = New-Object System.Windows.Forms.TabControl
@@ -637,11 +841,17 @@ $btnTest.Add_Click({
     }
     $form.Cursor = [System.Windows.Forms.Cursors]::WaitCursor
     $btnTest.Enabled = $false
-    try { $result = Test-DsnConnection $values }
-    finally { $form.Cursor = [System.Windows.Forms.Cursors]::Default; $btnTest.Enabled = $true }
-    $icon = if ($result.Ok) { 'Information' } else { 'Error' }
-    $title = if ($result.Ok) { 'Connection succeeded' } else { 'Connection failed' }
-    [void][System.Windows.Forms.MessageBox]::Show($result.Message, $title, 'OK', $icon)
+    # One catch around the whole thing: WinForms swallows an exception thrown
+    # from a handler, so anything uncaught here leaves the button looking as
+    # though it did nothing at all.
+    try {
+        try { $result = Test-DsnConnection $values }
+        finally { $form.Cursor = [System.Windows.Forms.Cursors]::Default; $btnTest.Enabled = $true }
+        Show-ConnectionResult $result
+    } catch {
+        [void][System.Windows.Forms.MessageBox]::Show($_.Exception.ToString(),
+            'Could not test the connection', 'OK', 'Error')
+    }
 })
 $form.Controls.Add($btnTest)
 
@@ -657,15 +867,20 @@ $btnOk.Add_Click({
             'Incomplete', 'OK', 'Warning')
         return
     }
-    $isSystem = $rbSystem.Checked
-    $exists = @(Get-ExistingDsnNames $isSystem) -contains $txtName.Text
-    try {
-        Write-Dsn $values $txtName.Text $isSystem $exists
-    } catch {
-        [void][System.Windows.Forms.MessageBox]::Show($_.Exception.Message,
-            'Could not write the data source', 'OK', 'Error')
-        return
+    if (-not $Emit) {
+        $isSystem = $rbSystem.Checked
+        $exists = @(Get-ExistingDsnNames $isSystem) -contains $txtName.Text
+        try {
+            Write-Dsn $values $txtName.Text $isSystem $exists
+        } catch {
+            [void][System.Windows.Forms.MessageBox]::Show($_.Exception.Message,
+                'Could not write the data source', 'OK', 'Error')
+            return
+        }
     }
+    # The handler is a scriptblock with its own scope, and -Emit needs these
+    # after ShowDialog returns.
+    $script:EmitValues = $values
     $form.DialogResult = [System.Windows.Forms.DialogResult]::OK
     $form.Close()
 })
@@ -680,14 +895,40 @@ $form.Controls.Add($btnCancel)
 $form.CancelButton = $btnCancel
 
 # --- pre-fill when editing ---
-if ($Dsn) {
-    $txtName.Text = $Dsn
+if ($Dsn) { $txtName.Text = $Dsn }
+if ($Emit) {
+    # The driver has already merged the data source's stored keywords in, so
+    # reading ODBC.INI again here would only be able to disagree with it.
+    if ($script:EmitPrefill.Count) { Set-FormValues $script:EmitPrefill }
+} elseif ($Dsn) {
     $existing = Read-Dsn $Dsn ([bool]$System)
     if ($existing.Count) { Set-FormValues $existing }
 }
 
 $result = $form.ShowDialog()
-if ($result -eq [System.Windows.Forms.DialogResult]::OK) {
-    $scope = if ($rbSystem.Checked) { 'System' } else { 'User' }
-    Write-Output "$scope data source '$($txtName.Text)' written."
+
+if (-not $Emit) {
+    if ($result -eq [System.Windows.Forms.DialogResult]::OK) {
+        $scope = if ($rbSystem.Checked) { 'System' } else { 'User' }
+        Write-Output "$scope data source '$($txtName.Text)' written."
+    }
+    return
 }
+
+# --- emit mode: the verdict is the exit code, the payload is stdout ---
+if ($result -ne [System.Windows.Forms.DialogResult]::OK) {
+    # Cancelled. The driver returns Ok(None) and ConfigDSN posts no installer
+    # error, because nothing failed.
+    exit 2
+}
+
+$out = [ordered]@{ DSN = $txtName.Text }
+# Keywords the dialog does not model are returned exactly as they arrived. On
+# a Configure... this is the whole rest of the data source's section, and
+# dropping them would delete settings the user never touched.
+foreach ($k in $script:EmitExtra.Keys) { $out[$k] = $script:EmitExtra[$k] }
+foreach ($f in $script:Fields) {
+    if ($script:EmitValues.Contains($f.Key)) { $out[$f.Key] = $script:EmitValues[$f.Key] }
+}
+[Console]::Out.Write(($out | ConvertTo-Json -Compress -Depth 3))
+exit 0

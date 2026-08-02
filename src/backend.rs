@@ -16,6 +16,7 @@ use stackable_odbc_core::{
     backend::Backend,
     errors::OdbcError,
     prompt::Prompter,
+    setup::{ConfigRequest, SetupError},
     types::{
         ColumnDescriptor, ColumnPrivilegeRow, ColumnPrivilegesQuery, ColumnRow, ColumnValue,
         ColumnsQuery, ConnectParams, CursorBehavior, ExecuteOutcome, ForeignKeyRow,
@@ -43,6 +44,7 @@ use crate::backend::prompt::{BrowserPrompter, ClientRedirect};
 mod describe_param;
 mod execute;
 mod prompt;
+mod setup;
 
 /// The request timeout used for `SQL_ATTR_CONNECTION_TIMEOUT = 0`, the spec's
 /// "there is no timeout".
@@ -1372,6 +1374,20 @@ impl Backend for TrinoBackend {
     /// [`ConnectParams::prompter`] rather than calling this.
     fn prompter() -> Option<Arc<dyn Prompter>> {
         Some(Arc::new(BrowserPrompter))
+    }
+
+    /// The DSN setup dialog the ODBC Administrator's **Add…** and
+    /// **Configure…** buttons display.
+    ///
+    /// See the `backend::setup` module for how it is presented, and why the
+    /// dialog is `packaging/windows/configure-dsn.ps1` rather than a second
+    /// implementation in Rust.
+    fn configure_dsn(
+        hwnd_parent: *mut std::ffi::c_void,
+        request: ConfigRequest,
+        attributes: HashMap<String, String>,
+    ) -> Result<Option<HashMap<String, String>>, SetupError> {
+        setup::configure_dsn(hwnd_parent, request, attributes)
     }
 
     fn connect(params: &ConnectParams) -> Result<TrinoConnection, TrinoError> {
