@@ -599,6 +599,19 @@ pub(crate) const TRINO_SQL92_VALUE_EXPRESSIONS: u32 =
 /// requires of TRUNCATE, so only a digit count this crate cannot fold, a column
 /// or a parameter marker, widens the result to double.
 ///
+/// `ROUND` needs no rewrite despite sitting next to `TRUNCATE`. Trino's math
+/// reference documents a negative second argument for `truncate` alone, but
+/// `round` accepts one too, over double, real, decimal and bigint alike, and
+/// returns the input's type, which is what ODBC asks of it. Scaling it the way
+/// `TRUNCATE` is scaled would break that type preservation for no gain.
+///
+/// `ATAN2` is advertised and passed through with its arguments in the order
+/// the application wrote them, which is a deliberate deviation from the ODBC
+/// appendix. That text reads the first argument as x, while Trino, PostgreSQL,
+/// MySQL, Oracle and SQL Server's own `ATN2` all read it as y. The full
+/// reasoning, and the peer drivers it was checked against, sit next to the
+/// absent arm in [`crate::escape_dialect::rewrite_scalar_fn`].
+///
 /// <https://trino.io/docs/current/functions/math.html>
 pub(crate) const TRINO_NUMERIC_FUNCTIONS: u32 = SQL_FN_NUM_ABS
     | SQL_FN_NUM_ACOS
@@ -832,8 +845,12 @@ pub(crate) const TRINO_SYSTEM_FUNCTIONS: u32 =
 /// `EXTRACT` needs no rewrite: ODBC's `EXTRACT(field FROM source)` is already
 /// Trino's syntax, so the escape passes through untouched.
 ///
-/// One caveat: Trino's `week()` is ISO week numbering, so a client that
-/// trusts the ODBC convention can be off by one.
+/// One caveat: Trino's `week()` is ISO week numbering, and the divergence at a
+/// year boundary is the whole year rather than a single week. `week(DATE
+/// '2021-01-01')` measures 53, where a convention that starts week 1 on
+/// January 1, as SQL Server's does, answers 1. It is left as it is: ODBC fixes
+/// only the 1-53 range, which ISO numbering stays inside, and never says which
+/// convention produces it.
 ///
 /// Absent: `DAYNAME` and `MONTHNAME`, which Trino has no function for, only
 /// `format_datetime()` with a pattern.

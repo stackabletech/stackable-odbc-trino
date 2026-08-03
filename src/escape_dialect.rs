@@ -26,10 +26,14 @@
 //! hook, because ODBC spells it `POSITION(exp IN exp)`, which is already
 //! Trino's syntax; `NOW`, `MONTH`, `QUARTER`, `WEEK`, `YEAR`, `HOUR`,
 //! `MINUTE`, `SECOND`, `EXTRACT` and the numeric and string functions with no
-//! arm below are spelled identically in Trino, verified against
-//! <https://trino.io/docs/current/functions/string.html>,
+//! arm below agree with Trino on both the name and the signature, verified
+//! against <https://trino.io/docs/current/functions/string.html>,
 //! <https://trino.io/docs/current/functions/math.html> and
 //! <https://trino.io/docs/current/functions/datetime.html>.
+//!
+//! `ATAN2` is the one name where that agreement covers the spelling but not
+//! the ODBC appendix's argument order. It passes through deliberately; the
+//! reasoning is recorded at the end of [`rewrite_scalar_fn`].
 use stackable_odbc_core::escape::EscapeDialect;
 
 /// Remap an ODBC `{fn NAME(...)}` scalar-function name to Trino's spelling.
@@ -319,6 +323,29 @@ pub(crate) fn rewrite_scalar_fn(name: &str, args: &str) -> Option<String> {
         // Renaming alone returns a plausible, silently wrong day.
         "DAYOFWEEK" if parts.len() == 1 => Some(format!("((day_of_week({}) % 7) + 1)", parts[0])),
 
+        // SQL_FN_NUM_ATAN2 has no arm on purpose, and the omission is a
+        // decision rather than an oversight.
+        //
+        // ODBC's appendix reads `ATAN2(float_exp1, float_exp2)` as "the
+        // arctangent of the x and y coordinates, specified by float_exp1 and
+        // float_exp2, respectively", so the literal text puts x first. Trino's
+        // `atan2(y, x)` puts y first, and so does every other implementation
+        // that was checked: PostgreSQL, MySQL, Oracle, C, Java, Python, and
+        // SQL Server's own `ATN2`, whose documented example evaluates
+        // `ATN2(129.44, 35.175643)` to 1.30545, which is atan(129.44/35.175643)
+        // and therefore first-argument-is-y.
+        //
+        // Microsoft's engine thus contradicts Microsoft's own appendix, and
+        // psqlodbc, which does remap LOG, LENGTH and DAYOFWEEK exactly as this
+        // module does, carries ATAN2 in its table only as a commented-out
+        // `built_in` and passes it through untouched. Swapping here would make
+        // this the single driver in the ecosystem answering the complementary
+        // angle, breaking any application ported from another ODBC driver in
+        // order to match a sentence no implementation honours.
+        //
+        // The deviation from the appendix text is therefore intentional and is
+        // pinned by a discriminating case in the integration suite, one whose
+        // two readings give different non-zero answers.
         _ => None,
     }
 }
@@ -670,6 +697,13 @@ mod tests {
 
         // A function with no rewrite is remap_scalar_fn's business.
         assert_eq!(rewrite_scalar_fn("UCASE", "x"), None);
+        // ATAN2 reaches Trino with its arguments in the order the application
+        // wrote them, deviating from the ODBC appendix on purpose. Neither hook
+        // touches it, so both have to decline; see the comment on the absent
+        // arm. Asserting this keeps the deviation a decision under test rather
+        // than something a later edit can reverse without noticing.
+        assert_eq!(rewrite_scalar_fn("ATAN2", "1, 2"), None);
+        assert_eq!(remap_scalar_fn("ATAN2"), None);
         // An ODBC type keyword with no Trino equivalent, and a value that is
         // not a type keyword at all. Guessing a target type would produce a
         // cast the application never asked for.

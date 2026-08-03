@@ -25,7 +25,10 @@ What is checked here:
    an interesting way, but `DAYOFWEEK` renumbers, `TIMESTAMPDIFF` has an
    argument order, `LOG` is a different function from Trino's `log`, and
    `RAND` drops a seed Trino would read as a bound. Those are asserted on the
-   result, not on the absence of an error.
+   result, not on the absence of an error. `ATAN2` is asserted the same way
+   despite having no rewrite, because passing its arguments through in the
+   caller's order is a deliberate deviation from the ODBC appendix and the
+   inputs are chosen so that the two readings disagree.
 3. **Every `SQL_TSI_*` interval the driver advertises** works in both
    `TIMESTAMPADD` and `TIMESTAMPDIFF`, parsed from `TRINO_TIMESTAMP_INTERVALS`
    in `src/backend.rs`.
@@ -101,7 +104,13 @@ CALLS = {
     "SQL_FN_NUM_ACOS": ("{fn ACOS(1)}", 0.0),
     "SQL_FN_NUM_ASIN": ("{fn ASIN(0)}", 0.0),
     "SQL_FN_NUM_ATAN": ("{fn ATAN(0)}", 0.0),
-    "SQL_FN_NUM_ATAN2": ("{fn ATAN2(0, 1)}", 0.0),
+    # Passed through with the arguments in the order the caller wrote them,
+    # which is a deliberate deviation from the ODBC appendix; the reasoning is
+    # in `rewrite_scalar_fn`, next to the arm ATAN2 deliberately does not have.
+    # These inputs discriminate: reading the first argument as y, which is what
+    # Trino and every peer implementation do, gives atan(1/2) below, while the
+    # appendix's first-argument-is-x reading would give atan(2) = 1.1071487.
+    "SQL_FN_NUM_ATAN2": ("{fn ATAN2(1, 2)}", 0.4636476090008061),
     "SQL_FN_NUM_CEILING": ("{fn CEILING(1.2)}", 2),
     "SQL_FN_NUM_COS": ("{fn COS(0)}", 1.0),
     "SQL_FN_NUM_EXP": ("{fn EXP(0)}", 1.0),
@@ -123,7 +132,15 @@ CALLS = {
     "SQL_FN_NUM_LOG10": ("{fn LOG10(100)}", 2.0),
     "SQL_FN_NUM_POWER": ("{fn POWER(2, 3)}", 8.0),
     "SQL_FN_NUM_RADIANS": ("{fn RADIANS(0)}", 0.0),
-    "SQL_FN_NUM_ROUND": ("{fn ROUND(1.234, 1)}", 1.2),
+    # Passed through, and the negative digit count is the case worth asserting:
+    # ODBC specifies rounding to the left of the decimal point for a negative
+    # argument, and Trino's math reference documents that only for `truncate`.
+    # It works for round too, so this pins the behaviour the docs omit.
+    "SQL_FN_NUM_ROUND": ("{fn ROUND(1234.5, -2)}", 1200.0),
+    # Rewritten to scaled arithmetic. Trino's two-argument `truncate` is
+    # declared over `decimal` alone, so this has to be a DOUBLE: a decimal
+    # literal here would pass against the pass-through that FUNCTION_NOT_FOUNDs
+    # on every float column, which is the case ODBC's `numeric_exp` covers.
     "SQL_FN_NUM_TRUNCATE": ("{fn TRUNCATE(CAST(1.99 AS DOUBLE), 1)}", 1.9),
     # --- system ----------------------------------------------------------
     # Both lose their parentheses: Trino takes them as bare SQL-92 keywords.
