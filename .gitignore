@@ -23,3 +23,7 @@ packaging/dist/
 # Python bytecode from the test scripts
 __pycache__/
 *.pyc
+
+# Local cargo overrides, e.g. a [patch] pointing core at a sibling checkout.
+# See CONTRIBUTING.md. Never committed: it would redirect everyone else's build.
+.cargo/

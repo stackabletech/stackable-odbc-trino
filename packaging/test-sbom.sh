@@ -76,26 +76,30 @@ check "no absolute build path leaks" \
 check "the rust toolchain is recorded" \
   "$(jq '[.metadata.properties[]? | select(.name == "stackable:rustc-version")] | length' "$SBOM")" "1"
 
-# Measured: 2. stackable-odbc-core, which is a path dependency for now, and
-# stackable-odbc-trino, which is the root package and is path-local permanently.
-# When core becomes a git tag dependency this drops to 1.
-#
-# The eventual release gate is therefore NOT "zero path components". It is that
-# the only path-sourced component is the root package, which is what catches a
-# developer's local override shipping.
+# One: stackable-odbc-trino, the root package, which is path-local permanently.
+# The gate is not "zero path components": it is that the only path-sourced
+# component is the root package, which is what catches a developer's local
+# `[patch]` override shipping in a release artifact.
 check "path-sourced components" \
-  "$(jq '[.components[].properties[]? | select(.name == "stackable:cargo-source" and .value == "path")] | length' "$SBOM")" "2"
+  "$(jq '[.components[].properties[]? | select(.name == "stackable:cargo-source" and .value == "path")] | length' "$SBOM")" "1"
 
-check "the only non-root path component is core" \
+check "the only path-sourced component is the root package" \
   "$(jq -r '[.components[]
              | select(.properties[]? | select(.name == "stackable:cargo-source" and .value == "path"))
-             | select(.name != "stackable-odbc-trino") | .name] | join(",")' "$SBOM")" \
-  "stackable-odbc-core"
+             | .name] | join(",")' "$SBOM")" \
+  "stackable-odbc-trino"
+
+# Core is pinned by branch, so its commit moves with every core change. Assert
+# the shape rather than the value: a resolved 40-character commit, never the
+# branch name, or the purl would name whatever that branch points at today.
+check "core's purl names an immutable commit" \
+  "$(jq -r '[.components[] | select(.name == "stackable-odbc-core")
+             | select(.purl | test("\\?vcs_url=git\\+https://github\\.com/stackabletech/stackable-odbc-core\\.git@[0-9a-f]{40}$"))] | length' "$SBOM")" "1"
 
 # --- SPDX ------------------------------------------------------------------
 # SPDX is converted from the enriched CycloneDX rather than generated afresh, so
 # the enrichment reaches both formats from one implementation. These assert the
-# conversion actually carries it across.
+# conversion carries it across.
 
 check "SPDX carries the enriched licenses" \
   "$(jq '[.packages[] | select((.licenseDeclared // "NOASSERTION") == "NOASSERTION")] | length' "$SPDX")" "2"
@@ -168,7 +172,7 @@ fi
 # --- the .mez ---------------------------------------------------------------
 # The Power Query connector is M source in a zip, so syft finds nothing in it
 # and there is no cargo graph to enrich. Its SBOM is built directly: the
-# connector is the subject, and it genuinely has no dependencies.
+# connector is the subject, and it has no dependencies.
 MEZ="$REPO_ROOT/connector/bin/StackableTrinoODBC.mez"
 if [ ! -f "$MEZ" ]; then
   (cd "$REPO_ROOT/connector" && ./build.sh >/dev/null 2>&1) || true

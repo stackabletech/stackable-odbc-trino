@@ -22,7 +22,10 @@ open = "5"
 serde_json = "1"
 snafu = "0.9"
 # TODO: switch to a crates.io version dep once stackable-odbc-core is published.
-stackable-odbc-core = { path = "../stackable-odbc-core" }
+# `deny.toml` allows this repository by name, and `cargo publish` stays blocked
+# until then. To build against a local checkout, use a `[patch]` in your own
+# `.cargo/config.toml` rather than editing this line; see CONTRIBUTING.md.
+stackable-odbc-core = { git = "https://github.com/stackabletech/stackable-odbc-core.git", branch = "scaffolding" }
 # `time` is needed directly by `query_all_rows_within`, which bounds the login
 # round trip with `tokio::time::timeout`. It resolves without being declared,
 # because reqwest enables it, but a direct use must not rely on another crate's
@@ -44,7 +47,7 @@ serial_test = "4"
 # offline FFI tests need. It is default-off because it is test code, so it is
 # enabled here rather than on the [dependencies] entry above -- that keeps it
 # out of the shipped cdylib.
-stackable-odbc-core = { path = "../stackable-odbc-core", features = ["test-support"] }
+stackable-odbc-core = { git = "https://github.com/stackabletech/stackable-odbc-core.git", branch = "scaffolding", features = ["test-support"] }
 
 [lints.clippy]
 unwrap_in_result = "deny"

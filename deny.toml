@@ -43,7 +43,11 @@ private = { ignore = true }
 [sources]
 unknown-registry = "deny"
 unknown-git = "deny"
-# The Trino client is taken from Stackable's fork until its changes are
-# released upstream; see the TODO on the dependency in Cargo.toml. Only this
-# one repository is allowed, so any other git dependency still fails the gate.
-allow-git = ["https://github.com/stackabletech/trino-rust-client.git"]
+# Two Stackable repositories are allowed, each with a TODO on its dependency in
+# Cargo.toml: the Trino client is taken from Stackable's fork until its changes
+# are released upstream, and stackable-odbc-core is taken from git until it is
+# published to crates.io. Any other git dependency still fails the gate.
+allow-git = [
+  "https://github.com/stackabletech/stackable-odbc-core.git",
+  "https://github.com/stackabletech/trino-rust-client.git",
+]
