@@ -35,10 +35,21 @@ if [[ "$SKIP_DELETE" == false ]]; then
 fi
 
 # --- Set the stack up if it has not been ---
-# stack.env rather than `compose ps`: a running container is not the same as a
-# configured stack, and the suites read stack.env, not docker.
+# Two conditions, and neither implies the other. stack.env is what the suites
+# read, so a running coordinator without it is unusable. But `generated/`
+# survives a teardown, so the file on its own says only that the stack was
+# configured once, possibly in a previous session.
+#
+# Checking the file alone let a whole run execute against a coordinator that was
+# not there. That reports as a plausible mix rather than as an error: every
+# check needing the server fails with `unable to reach Trino server`, while the
+# ones asserting a *refusal* pass, because a refusal is what they wanted and a
+# dead port supplies one. A suite must not be able to pass for that reason.
 if [[ ! -f "$STACK_ENV" ]]; then
     echo "=== Stack not set up, calling setup.sh ==="
+    "$SCRIPT_DIR/setup.sh"
+elif ! service_running trino; then
+    echo "=== Stack configured but not running, calling setup.sh ==="
     "$SCRIPT_DIR/setup.sh"
 fi
 
