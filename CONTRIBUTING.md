@@ -100,7 +100,15 @@ pre-commit run --all-files
 ```
 
 That is the gate, and it is the single source of truth for what must pass. It
-runs rustfmt, clippy, `cargo test`, shellcheck and markdownlint.
+runs rustfmt, clippy, `cargo test`, `cargo doc` (with warnings denied, so a
+broken intra-doc link fails the commit), `cargo sort`, `cargo deny`, shellcheck,
+markdownlint, and a secret scan.
+
+Two of those are not in the build steps above, so install them once:
+
+```bash
+cargo install cargo-deny cargo-sort
+```
 
 Two more things a change usually needs:
 

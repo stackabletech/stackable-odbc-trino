@@ -69,9 +69,10 @@ Check it worked with `odbcinst -q -d`, which should list
 
 ### Power BI
 
-Both archives contain `StackableTrinoODBC.mez`, a Power Query custom connector,
-which is also published on its own. It gives Trino a proper entry in the
-**Get Data** dialog instead of the generic ODBC one.
+Power BI Desktop is Windows-only, so the connector ships in the Windows archive
+and as a standalone `StackableTrinoODBC-<version>.mez` on the releases page, not
+in the Linux tarball. It is a Power Query custom connector, and it gives Trino a
+proper entry in the **Get Data** dialog instead of the generic ODBC one.
 
 1. Copy the `.mez` into `%USERPROFILE%\Documents\Power BI Desktop\Custom Connectors\`.
 2. In **File > Options > Security**, allow any extension to load.
@@ -132,12 +133,12 @@ The authoritative list is `src/backend/types/connect_params.rs`.
 | `Source` | No | Query source Trino records and can route on. Default `stackable-odbc-trino/<version>` |
 | `ClientTags` | No | Comma-separated Trino client tags, which select a resource group |
 | `TlsVerify` | No | `true`/`full` (default), `ca`, or `false`/`none`. Alias: `SSLVerification` |
-| `Certificate` | No | Path to a PEM CA certificate for server verification. It becomes the only trust anchor, so the machine's CA store no longer applies. Required by `ca` |
-| `ClientCertificate` | No | Path to a PEM holding a client certificate chain and its PKCS#8 key, for mutual TLS |
+| `Certificate` | No | Path to a PEM CA certificate for server verification. It becomes the only trust anchor, so the machine's CA store no longer applies. Required by `ca`, refused with `Protocol=http` |
+| `ClientCertificate` | No | Path to a PEM holding a client certificate chain and its PKCS#8 key, for mutual TLS. Refused with `Protocol=http` |
 | `AccessToken` | No | JWT bearer token. Alias: `Token` |
 | `ExternalAuthentication` | No | `true` selects Trino's interactive OAuth 2.0 flow. Needs `https`, and excludes `Password` and `AccessToken` |
 | `ExternalAuthenticationTimeout` | No | Budget for one interactive login, in seconds. Default 300 |
-| `QueryTimeout` | No | Per-request HTTP timeout in seconds (default 30). Alias: `LoginTimeout` |
+| `QueryTimeout` | No | Per-request HTTP timeout in seconds (default 30). `0` disables it; anything that is not a whole number is refused. Alias: `LoginTimeout` |
 | `Encoding` | No | Trino's spooled query-data encoding: `json`, `json+zstd` or `json+lz4`. Unset returns every row inline. JDBC's `encoding` |
 | `SessionProperties` | No | Trino session properties, `{name:value;name2:value2}` |
 | `ResourceEstimates` | No | Scheduling hints, same form |
