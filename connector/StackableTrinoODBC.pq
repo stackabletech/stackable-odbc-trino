@@ -119,7 +119,7 @@ StackableTrinoODBC.ContentsType = type function (
         Documentation.FieldCaption = "Protocol",
         Documentation.AllowedValues = {"https", "http"}
     ]),
-    optional options as (type StackableTrinoODBC.OptionsType meta [
+    optional options as (StackableTrinoODBC.OptionsType meta [
         Documentation.FieldCaption = "Advanced options"
     ])
 ) as table meta [
@@ -228,14 +228,27 @@ StackableTrinoODBCImpl = (
             else
                 suppliedOptions,
 
+        // The dialog supplies every declared field, null for the ones left
+        // blank, so a blank must be removed rather than stringified:
+        // Text.From(null) is null, not "", and Odbc.DataSource refuses a
+        // null-valued connection-string property with "The value for property
+        // 'X' was of type Null, but we expected Number or Text".
+        presentOptions = Record.SelectFields(
+            checkedOptions,
+            List.Select(
+                Record.FieldNames(checkedOptions),
+                each Record.Field(checkedOptions, _) <> null
+            )
+        ),
+
         // A connection string carries text. Numbers and logicals reach the
         // driver as "30" and "TRUE", both of which its parser accepts.
         optionsAsText = Record.FromList(
             List.Transform(
-                Record.FieldValues(checkedOptions),
+                Record.FieldValues(presentOptions),
                 each if _ is text then _ else Text.From(_)
             ),
-            Record.FieldNames(checkedOptions)
+            Record.FieldNames(presentOptions)
         ),
 
         ConnectionStringWithOptions = ConnectionStringWithSchema & optionsAsText,
