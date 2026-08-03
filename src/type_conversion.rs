@@ -140,9 +140,15 @@ impl TrinoTypeName {
             Self::Double => SqlDataType::DOUBLE,
             Self::Decimal => SqlDataType::DECIMAL,
             Self::Varchar => SqlDataType::EXT_W_VARCHAR,
-            // information_schema returns "char" for fixed-length columns; map to EXT_W_CHAR.
-            // (trino_ty_to_sql_type maps TrinoTy::Char to EXT_W_VARCHAR; that path is used
-            // for query result columns where Trino has already widened them to VARCHAR.)
+            // `information_schema` spells a fixed-length column `char(n)`, and
+            // `SQLColumns` reports it as EXT_W_CHAR.
+            //
+            // So does the query path: `backend::execute` prefers
+            // `TrinoTypeName::parse` over `trino_ty_to_sql_type` precisely so
+            // the two agree, and `char(n)` parses. `trino_ty_to_sql_type`'s own
+            // `TrinoTy::Char(_) => EXT_W_VARCHAR` arm is the fallback for a
+            // signature this parser cannot read, not the ordinary result-column
+            // route.
             Self::Char => SqlDataType::EXT_W_CHAR,
             Self::Varbinary => SqlDataType::EXT_LONG_VAR_BINARY,
             Self::Date => SqlDataType::DATE,
@@ -333,6 +339,11 @@ pub fn trino_ty_to_sql_type(column_type: &TrinoTy) -> SqlDataType {
         TrinoTy::TrinoFloat(TrinoFloat::F64) => SqlDataType::DOUBLE,
         TrinoTy::TrinoFloat(TrinoFloat::F32) => SqlDataType::REAL,
         TrinoTy::Boolean => SqlDataType::EXT_BIT,
+        // `Char(_)` lands on EXT_W_VARCHAR rather than EXT_W_CHAR, and only
+        // reaches an application when `TrinoTypeName::parse` could not read the
+        // column's own signature: every caller tries that first, and it answers
+        // EXT_W_CHAR for a `char(n)`. Widening is the safe direction for a type
+        // this driver could not identify.
         TrinoTy::Varchar | TrinoTy::Char(_) => SqlDataType::EXT_W_VARCHAR,
         TrinoTy::Date => SqlDataType::DATE,
         TrinoTy::Time | TrinoTy::TimeWithTimeZone => SqlDataType::TIME,
@@ -611,26 +622,43 @@ pub fn trino_type_name_to_sql_type(name: &str) -> SqlDataType {
 ///
 /// Returns `None` if the string is malformed.
 fn parse_trino_date(s: &str) -> Option<ColumnValue> {
-    // Trino renders a year before 1 CE with a leading `-`, which is the same
-    // character that separates the fields, so the sign is taken off before the
-    // split rather than left for `splitn` to read as an empty year. This driver
-    // emits such a date itself, from a bound `SQL_DATE_STRUCT` with a negative
-    // year, so it has to be able to read one back.
-    //
-    // A year that does not fit `SQL_DATE_STRUCT`'s signed 16-bit field (Trino
-    // goes to 5881580, and renders those with a leading `+`) still returns
-    // `None`, and the caller keeps the value as text: truncating it would
-    // report a different year as though it were the real one.
+    let (year, month, day) = parse_ymd(s)?;
+    Some(ColumnValue::Date { year, month, day })
+}
+
+/// Split a Trino `YYYY-MM-DD` date into its three fields.
+///
+/// Shared by [`parse_trino_date`] and [`parse_trino_timestamp`], which have to
+/// agree: both read back values this driver itself emitted, through the same
+/// `year4` renderer in `backend::params`, so a year one accepts and the other
+/// rejects is a round trip that works for `DATE` and silently degrades a
+/// `TIMESTAMP` to text.
+///
+/// Trino renders a year before 1 CE with a leading `-`, which is the same
+/// character that separates the fields, so the sign is taken off before the
+/// split rather than left for `splitn` to read as an empty year.
+///
+/// A year that does not fit `SQL_DATE_STRUCT`'s signed 16-bit field (Trino goes
+/// to 5881580, and renders those with a leading `+`) returns `None`, and the
+/// caller keeps the value as text: truncating it would report a different year
+/// as though it were the real one.
+fn parse_ymd(s: &str) -> Option<(i16, u16, u16)> {
     let (negative, rest) = match s.strip_prefix('-') {
         Some(rest) => (true, rest),
         None => (false, s),
     };
     let mut parts = rest.splitn(3, '-');
     let magnitude: i16 = parts.next()?.parse().ok()?;
-    let year = if negative { -magnitude } else { magnitude };
+    // `checked_neg`, because `i16::MIN` has no positive counterpart and a bare
+    // `-` on it would wrap back to itself.
+    let year = if negative {
+        magnitude.checked_neg()?
+    } else {
+        magnitude
+    };
     let month: u16 = parts.next()?.parse().ok()?;
     let day: u16 = parts.next()?.parse().ok()?;
-    Some(ColumnValue::Date { year, month, day })
+    Some((year, month, day))
 }
 
 /// Convert Trino's decimal fractional-seconds text (up to 12 digits, i.e.
@@ -783,10 +811,12 @@ fn parse_trino_timestamp(s: &str) -> Option<ColumnValue> {
     // Strip optional timezone: take only the first token.
     let time_str = rest.split_whitespace().next()?;
 
-    let mut dp = date_str.splitn(3, '-');
-    let year: i16 = dp.next()?.parse().ok()?;
-    let month: u16 = dp.next()?.parse().ok()?;
-    let day: u16 = dp.next()?.parse().ok()?;
+    // Through `parse_ymd` rather than a local `splitn`, so a year before 1 CE
+    // reads here exactly as it does in `parse_trino_date`. `backend::params`
+    // renders a bound `SQL_TIMESTAMP_STRUCT` with the same `year4` it uses for
+    // a `SQL_DATE_STRUCT`, so a bare split left `-0001-01-01 00:00:00` with an
+    // empty first field and degraded the whole value to text.
+    let (year, month, day) = parse_ymd(date_str)?;
 
     let mut tp = time_str.splitn(3, ':');
     let hour: u16 = tp.next()?.parse().ok()?;
@@ -2025,6 +2055,50 @@ mod tests {
                 day: 1
             }
         );
+    }
+
+    /// The same argument as `a_date_before_1_ce_parses_to_column_date`, for the
+    /// type that had the local `splitn` the shared parser now replaces.
+    /// `backend::params` renders a bound `SQL_TIMESTAMP_STRUCT` through the same
+    /// `year4` as a `SQL_DATE_STRUCT`, so the two must read the same years.
+    #[test]
+    fn a_timestamp_before_1_ce_parses_to_column_timestamp() {
+        assert_eq!(
+            json_to_column_value(
+                Value::String("-0001-01-01 12:34:56.789".into()),
+                &TrinoTy::Timestamp
+            ),
+            ColumnValue::Timestamp {
+                year: -1,
+                month: 1,
+                day: 1,
+                hour: 12,
+                minute: 34,
+                second: 56,
+                fraction: 789_000_000,
+            }
+        );
+    }
+
+    /// The two parsers agree on every year either can meet, which is the
+    /// property that made the timestamp defect invisible: `DATE` round-tripped,
+    /// so the shared renderer looked correct.
+    #[test]
+    fn dates_and_timestamps_read_the_same_years() {
+        for year in ["-4713", "-0001", "0000", "0001", "1970", "9999"] {
+            let date = json_to_column_value(Value::String(format!("{year}-06-15")), &TrinoTy::Date);
+            let timestamp = json_to_column_value(
+                Value::String(format!("{year}-06-15 00:00:00")),
+                &TrinoTy::Timestamp,
+            );
+            let ColumnValue::Date { year: d, .. } = date else {
+                panic!("{year} did not parse as a DATE: {date:?}");
+            };
+            let ColumnValue::Timestamp { year: t, .. } = timestamp else {
+                panic!("{year} parsed as a DATE but not as a TIMESTAMP: {timestamp:?}");
+            };
+            assert_eq!(d, t, "the two parsers disagree about year {year}");
+        }
     }
 
     #[test]
