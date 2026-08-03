@@ -368,7 +368,7 @@ pub(crate) fn map_trino_error(e: trino_rust_client::error::Error) -> TrinoError 
             }
         }
         Error::HttpError(ref req_err) if req_err.is_timeout() => TrinoError::QueryTimeout {
-            message: format!("request timed out: {req_err}"),
+            message: format!("request timed out: {}", flatten_causes(req_err)),
         },
         Error::HttpNotOk(ref status, ref reason)
             if status.as_u16() == 401 || status.as_u16() == 403 =>
@@ -1665,8 +1665,12 @@ impl Backend for TrinoBackend {
             }
         }
 
+        // Flattened, because this is where a TLS trust store the client cannot
+        // assemble surfaces. `reqwest::ClientBuilder::build` reports that as a
+        // bare `builder error`, which the client wraps as `Error::HttpError`,
+        // and the reason a certificate was refused sits one `source()` down.
         let client = builder.build().map_err(|e| TrinoError::General {
-            message: format!("failed to build Trino client: {e}"),
+            message: format!("failed to build Trino client: {}", flatten_causes(&e)),
         })?;
 
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -2672,6 +2676,59 @@ mod tests {
         runtime
             .block_on(client.get_all::<trino_rust_client::Row>("SELECT 1".to_string()))
             .expect_err("nothing listens on 127.0.0.1:1")
+    }
+
+    /// A reqwest error whose `is_timeout()` is set, which is what
+    /// [`map_trino_error`] turns into `HYT00`.
+    ///
+    /// Built against a listener on the loopback interface that accepts the
+    /// connection and then answers nothing, so the request is still in flight
+    /// when the client's own timeout fires. A refused port would produce a
+    /// connect error instead, and no coordinator is needed to make a request
+    /// take longer than it is allowed to.
+    fn timeout_failure() -> trino_rust_client::error::Error {
+        let listener =
+            std::net::TcpListener::bind("127.0.0.1:0").expect("the loopback interface is bindable");
+        let port = listener
+            .local_addr()
+            .expect("a bound listener has an address")
+            .port();
+        // Holds the accepted connection open, which is what makes the request
+        // time out rather than fail. Detached, and outlived by the test.
+        std::thread::spawn(move || {
+            let _accepted = listener.accept();
+            std::thread::sleep(Duration::from_secs(5));
+        });
+
+        let client = ClientBuilder::new("test", "127.0.0.1")
+            .port(port)
+            .client_request_timeout(Duration::from_millis(250))
+            .build()
+            .expect("ClientBuilder::build performs no I/O");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("Runtime::build performs no I/O");
+        runtime
+            .block_on(client.get_all::<trino_rust_client::Row>("SELECT 1".to_string()))
+            .expect_err("a listener that answers nothing cannot satisfy the request")
+    }
+
+    /// The sibling of `a_link_failure_names_the_cause_beneath_reqwest`, for the
+    /// arm that classifies a timeout. reqwest hides the same detail here, and a
+    /// timeout waiting for a connection is a different operational problem from
+    /// one waiting for a coordinator that accepted the request and is still
+    /// thinking about it.
+    #[test]
+    fn a_timeout_names_the_cause_beneath_reqwest() {
+        let mapped = map_trino_error(timeout_failure());
+        let TrinoError::QueryTimeout { message } = mapped else {
+            panic!("a request that outran its timeout is HYT00, not {mapped:?}");
+        };
+        assert!(
+            message.contains("timed out") && message.len() > "request timed out: ".len(),
+            "the message must name what timed out beneath reqwest, got: {message}"
+        );
     }
 
     /// `SQL_ATTR_CONNECTION_DEAD` asserts the connection *has been lost*, so a

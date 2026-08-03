@@ -265,6 +265,15 @@ layers quote each other. Note that only two of those three are distinguishable
 in practice; the certificate cases collapse into one, for the SNI reason
 recorded below.
 
+The same applies wherever a reqwest error is stringified rather than attached,
+which is three places: that arm, the timeout arm beside it, and the client build
+in `connect`. The last one matters most for TLS, because
+`reqwest::ClientBuilder::build` reports a trust store it cannot assemble as a
+bare `builder error` and the client wraps that as `Error::HttpError`. Arms
+carrying a `source` need none of this: `QueryCause::Transport` holds the client
+error whole, and core's `Diagnostics` walks from there through reqwest to
+whatever rustls said.
+
 The `source` is a `QueryCause`, not the client error itself, and `query_cause`
 is the one place that decides which. A transport error is kept whole; its
 `Display` is a single line. A server-side `QueryError` is reduced to
