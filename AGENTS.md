@@ -261,9 +261,23 @@ trust and a host that does not resolve all reach the application as
 `error sending request for url (...)`: `is_connect()` is set for all three, and
 `reqwest::Error` names only its own layer while the sentence separating them
 sits further down `source()`. Segments already present are dropped, because the
-layers quote each other. Note that only two of those three are distinguishable
-in practice; the certificate cases collapse into one, for the SNI reason
-recorded below.
+layers quote each other.
+
+Measured against the compose stack, each failure now ends in its own sentence:
+
+| what went wrong | what the message ends with |
+|---|---|
+| a trust anchor that signed nothing | `invalid peer certificate: UnknownIssuer` |
+| connected by IP, so Jetty served its internal certificate | `invalid peer certificate: Other(OtherError(CaUsedAsEndEntity))` |
+| nothing listening on the port | `tcp connect error: Connection refused (os error 111)` |
+| the host does not resolve | `dns error: failed to lookup address information: Name or service not known` |
+
+The two certificate rows differ, which the SNI note below does not lead one to
+expect: an unmatched SNI reaches a *different* certificate rather than a
+mismatched one, and rustls rejects that as a CA presented as an end entity. The
+one case still indistinguishable is a `Certificate=` file that is not a
+certificate, which reads `UnknownIssuer` like an untrusted anchor because
+reqwest defers parsing to the handshake rather than to `Ssl::read_pem`.
 
 The same applies wherever a reqwest error is stringified rather than attached,
 which is three places: that arm, the timeout arm beside it, and the client build
