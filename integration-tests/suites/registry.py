@@ -87,6 +87,22 @@ SUITES = [
                 "and reaches neither the driver nor a Driver Manager",
     ),
     Suite("sql surface", "test_sql_surface.py"),
+    # Parses the advertised capability bitmaps out of the driver's own source
+    # and executes one `{fn ...}` per bit, so the rule info.rs states -- a bit
+    # is set only when the escape becomes Trino SQL that runs -- is checked
+    # against a coordinator rather than against a list of names.
+    Suite(
+        "escape sequences", "test_escapes.py",
+        deploy=(
+            "src/backend/info.rs",
+            "src/backend.rs",
+            "src/escape_dialect.rs",
+        ),
+    ),
+    # argv="none": every check varies one connection-string key against an
+    # otherwise identical connection, so it builds its own strings from
+    # stack.env rather than taking one.
+    Suite("session keys", "test_session_keys.py", argv="none"),
     Suite(
         "folding contract", "test_folding_contract.py",
         # It parses the connector's Constant visitor out of the .pq source, so
@@ -104,6 +120,9 @@ SUITES = [
         ),
     ),
     Suite("raw C ABI", "test_c_abi.py", argv="driver+conn", pyodbc=False),
+    # ctypes, because pyodbc exposes no SQLDescribeParam at all: the call it
+    # covers is reachable only through the C ABI.
+    Suite("describe param", "test_describe_param.py", argv="driver+conn", pyodbc=False),
     Suite("type matrix", "test_type_matrix.py", argv="driver+conn", pyodbc=False),
     # No required profile: with `spooling` active it drives the spooled
     # protocol, and without it asserts the fallback a coordinator with no

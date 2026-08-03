@@ -82,6 +82,20 @@ def load(path):
         "SQLGetInfoW": ([P, ctypes.c_uint16, P, S, ctypes.POINTER(S)], S),
         "SQLCancel": ([P], S),
         "SQLNumParams": ([P, ctypes.POINTER(S)], S),
+        # ParameterSizePtr is a SQLULEN, which is 64-bit on this platform;
+        # declaring it 32-bit would read half of it and half of the next slot.
+        # pyodbc exposes no equivalent, so ctypes is the only way to reach it.
+        "SQLDescribeParam": (
+            [
+                P,
+                ctypes.c_uint16,
+                ctypes.POINTER(S),
+                ctypes.POINTER(ctypes.c_uint64),
+                ctypes.POINTER(S),
+                ctypes.POINTER(S),
+            ],
+            S,
+        ),
         "SQLBindParameter": (
             [P, ctypes.c_uint16, S, S, S, ctypes.c_size_t, S, P, L, ctypes.POINTER(L)],
             S,

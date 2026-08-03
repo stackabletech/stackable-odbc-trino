@@ -182,6 +182,78 @@ def main():
         "SELECT x FROM (VALUES 1,2,3) t(x) LIMIT ?", want_count=2, params=[2]))
 
     # ------------------------------------------------------------------
+    print("\n--- batched parameters ---")
+    # The CHANGELOG claims "bound parameters singly and in batches", and only
+    # the singly half was covered. Trino has no wire-level parameter binding, so
+    # every set in a batch becomes its own interpolated statement: what has to
+    # hold is that all of them are submitted, in order, with their own values.
+    #
+    # A write, because that is what `executemany` is for, and against the hive
+    # catalog, which is the writable one in the base stack. Each probe makes and
+    # drops its own table so a failed run leaves nothing behind for the next.
+    batch_table = "hive.tx.odbc_batch_probe"
+
+    def with_batch_table(fn):
+        cur.execute(f"DROP TABLE IF EXISTS {batch_table}")
+        cur.execute(f"CREATE TABLE {batch_table} (id integer, label varchar)")
+        try:
+            fn()
+        finally:
+            cur.execute(f"DROP TABLE IF EXISTS {batch_table}")
+
+    def batch_inserts_every_row():
+        cur.executemany(
+            f"INSERT INTO {batch_table} VALUES (?, ?)",
+            [(1, "one"), (2, "two"), (3, "three")],
+        )
+        got = cur.execute(
+            f"SELECT id, label FROM {batch_table} ORDER BY id"
+        ).fetchall()
+        assert [tuple(r) for r in got] == [(1, "one"), (2, "two"), (3, "three")], got
+
+    R.run("executemany inserts every set", lambda: with_batch_table(batch_inserts_every_row))
+
+    def batch_keeps_values_with_their_row():
+        # Values that would still look plausible if a set were reused or the
+        # two columns crossed: the strings do not match the numbers.
+        cur.executemany(
+            f"INSERT INTO {batch_table} VALUES (?, ?)",
+            [(10, "b"), (20, "a"), (30, "c")],
+        )
+        got = cur.execute(
+            f"SELECT id, label FROM {batch_table} ORDER BY id"
+        ).fetchall()
+        assert [tuple(r) for r in got] == [(10, "b"), (20, "a"), (30, "c")], got
+
+    R.run("executemany keeps each value with its own row",
+          lambda: with_batch_table(batch_keeps_values_with_their_row))
+
+    def batch_handles_quotes_and_nulls():
+        # The escaping path, once per set: `params::quote_string` doubles an
+        # embedded quote, and a NULL becomes the keyword rather than a string.
+        cur.executemany(
+            f"INSERT INTO {batch_table} VALUES (?, ?)",
+            [(1, "O'Brien"), (2, None), (3, "a;b")],
+        )
+        got = cur.execute(
+            f"SELECT id, label FROM {batch_table} ORDER BY id"
+        ).fetchall()
+        assert [tuple(r) for r in got] == [(1, "O'Brien"), (2, None), (3, "a;b")], got
+
+    R.run("executemany escapes each set independently",
+          lambda: with_batch_table(batch_handles_quotes_and_nulls))
+
+    def prepared_handle_is_reusable():
+        # `execute` swaps the result into the existing handle and restores the
+        # template, so the same prepared statement runs again with new values.
+        # That is the main reason to prepare, and nothing else asserted it.
+        first = cur.execute("SELECT CAST(? AS INTEGER)", [1]).fetchone()[0]
+        second = cur.execute("SELECT CAST(? AS INTEGER)", [2]).fetchone()[0]
+        assert (first, second) == (1, 2), (first, second)
+
+    R.run("a prepared statement re-executes with new values", prepared_handle_is_reusable)
+
+    # ------------------------------------------------------------------
     print("\n--- statement forms with undeclared column lengths ---")
     # These return varchar columns with no declared length. They are grouped
     # because that is the property under test: the driver has to describe a

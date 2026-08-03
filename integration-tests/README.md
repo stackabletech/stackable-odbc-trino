@@ -14,8 +14,12 @@ catalog, the spooling suite, what SNI rules out) is in
 `run-tests.sh` calls `setup.sh` itself if the stack has not been set up.
 
 The coordinator serves HTTPS on 8443 and nothing else, so every connection
-here is TLS. `Protocol=http` is a supported connection-string value with no
-coverage in this stack; its parsing is unit-tested.
+here is TLS.
+
+`Protocol=http` therefore has no coverage in this stack, and that is a
+decision rather than an oversight: plaintext HTTP is not a configuration
+anyone deploys, and a listener for it would cost a config fragment and a
+profile for a mode with no users.
 
 ## Layout
 
