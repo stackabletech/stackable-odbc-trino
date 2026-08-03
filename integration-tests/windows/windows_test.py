@@ -129,6 +129,11 @@ def main():
 
     deploy(session, args.gateway, dll_path)
 
+    # Before `register_driver`, because the uninstaller it runs deregisters the
+    # driver: doing it afterwards would tear down the registration every suite
+    # below depends on.
+    check_installers(session)
+
     print("=== Registering ODBC driver ===")
     register_driver(session)
 
@@ -281,6 +286,12 @@ def deploy(session, gateway: str, dll_path: Path):
         # the VM, and that is the one thing the harness could not otherwise be
         # used to check.
         "configure-dsn.ps1": PROJECT_DIR / "packaging" / "windows" / "configure-dsn.ps1",
+        # The shipped installers, so `check_installers` can run the real thing
+        # rather than a paraphrase of it. They are what a user runs, and until
+        # this harness ran them nothing did: `register_driver` below registers
+        # the driver its own way.
+        "install.bat": PROJECT_DIR / "packaging" / "windows" / "install.bat",
+        "uninstall.bat": PROJECT_DIR / "packaging" / "windows" / "uninstall.bat",
         # The test CA, so the VM can verify the coordinator rather than only
         # skip it. Needed by every configuration, not by any one suite.
         "integration-tests/generated/certs/ca.crt":
@@ -636,6 +647,91 @@ def _port_available(port: int) -> bool:
             return True
         except OSError:
             return False
+
+
+def check_installers(session):
+    """Run the shipped install.bat and uninstall.bat, and check what they left.
+
+    Everything else in this file registers the driver its own way, so the two
+    scripts a user actually runs were exercised by nothing. Both halves have
+    failed silently in the past for the same reason: `odbcconf.exe` reports
+    success whether or not the action succeeded, so install.bat's `errorlevel`
+    check proved nothing, and uninstall.bat deleted only the DLL while
+    install.bat had placed two files.
+
+    The archive layout is reproduced rather than assumed: install.bat refuses to
+    run unless the DLL and configure-dsn.ps1 sit beside it, which is exactly the
+    property worth testing.
+    """
+    print("=== Checking the shipped installers ===")
+    staging = rf"{REMOTE_DIR}\archive"
+    install_dir = r"$env:ProgramFiles\Stackable\ODBC"
+    key = r"HKLM:\SOFTWARE\ODBC\ODBCINST.INI\stackable_odbc_trino"
+    listing = r"HKLM:\SOFTWARE\ODBC\ODBCINST.INI\ODBC Drivers"
+
+    # Start from a clean slate: a driver left registered by an earlier run would
+    # make the install check pass without installing anything.
+    session.run_ps(
+        f'cmd.exe /c "{staging}\\uninstall.bat" | Out-Null; '
+        f'Remove-Item -Recurse -Force -ErrorAction SilentlyContinue "{staging}"'
+    )
+
+    r = session.run_ps(
+        f'New-Item -ItemType Directory -Force -Path "{staging}" | Out-Null; '
+        f'Copy-Item "{REMOTE_DIR}\\stackable_odbc_trino.dll","{REMOTE_DIR}\\configure-dsn.ps1",'
+        f'"{REMOTE_DIR}\\install.bat","{REMOTE_DIR}\\uninstall.bat" -Destination "{staging}"; '
+        f'cmd.exe /c "{staging}\\install.bat"'
+    )
+    if r.status_code != 0:
+        print(f"ERROR: install.bat failed:\n{r.std_out.decode()}\n{r.std_err.decode()}",
+              file=sys.stderr)
+        sys.exit(1)
+
+    # What the ODBC Administrator reads. `Driver` alone is not enough: the
+    # Drivers tab is populated from the "ODBC Drivers" listing, and a driver
+    # present in one and not the other is invisible.
+    r = session.run_ps(
+        f'$ok = $true; '
+        f'foreach ($f in "stackable_odbc_trino.dll","configure-dsn.ps1") {{ '
+        f'  if (-not (Test-Path (Join-Path "{install_dir}" $f))) '
+        f'    {{ Write-Output "missing installed file: $f"; $ok = $false }} }}; '
+        f'if (-not (Test-Path "{key}")) '
+        f'  {{ Write-Output "missing registry key"; $ok = $false }}; '
+        f'if (-not (Get-ItemProperty -Path "{listing}" -Name "stackable_odbc_trino" '
+        f'  -ErrorAction SilentlyContinue)) '
+        f'  {{ Write-Output "not listed under ODBC Drivers"; $ok = $false }}; '
+        f'if ($ok) {{ Write-Output "INSTALL-OK" }}'
+    )
+    out = r.std_out.decode().strip()
+    if "INSTALL-OK" not in out:
+        print(f"ERROR: install.bat reported success but left an incomplete install:\n{out}",
+              file=sys.stderr)
+        sys.exit(1)
+    print("  install.bat: both files placed, driver registered and listed")
+
+    r = session.run_ps(f'cmd.exe /c "{staging}\\uninstall.bat"')
+    if r.status_code != 0:
+        print(f"ERROR: uninstall.bat failed:\n{r.std_err.decode()}", file=sys.stderr)
+        sys.exit(1)
+
+    r = session.run_ps(
+        f'$left = @(); '
+        f'foreach ($f in "stackable_odbc_trino.dll","configure-dsn.ps1") {{ '
+        f'  if (Test-Path (Join-Path "{install_dir}" $f)) {{ $left += $f }} }}; '
+        f'if (Test-Path "{install_dir}") {{ $left += "the install directory" }}; '
+        f'if (Test-Path "{key}") {{ $left += "the registry key" }}; '
+        f'if (Get-ItemProperty -Path "{listing}" -Name "stackable_odbc_trino" '
+        f'  -ErrorAction SilentlyContinue) {{ $left += "the ODBC Drivers entry" }}; '
+        f'if ($left.Count -eq 0) {{ Write-Output "UNINSTALL-OK" }} '
+        f'else {{ Write-Output ("left behind: " + ($left -join ", ")) }}'
+    )
+    out = r.std_out.decode().strip()
+    if "UNINSTALL-OK" not in out:
+        print(f"ERROR: uninstall.bat did not clean up:\n{out}", file=sys.stderr)
+        sys.exit(1)
+    print("  uninstall.bat: both files, the directory and both registry entries removed")
+
+    session.run_ps(f'Remove-Item -Recurse -Force -ErrorAction SilentlyContinue "{staging}"')
 
 
 def register_driver(session):

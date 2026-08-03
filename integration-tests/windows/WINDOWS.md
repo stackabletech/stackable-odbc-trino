@@ -57,10 +57,36 @@ the host, so no suite needs a Windows branch to find its own inputs.
 C:\odbc_test_trino\
   stackable_odbc_trino.dll        the driver
   configure-dsn.ps1               beside the DLL, where ConfigDSN looks for it
+  install.bat, uninstall.bat      the shipped installers, for check_installers
+  archive\                        a staged copy of the four files above, made
+                                  and removed by check_installers
   connector\                      what the folding contract suite parses
   integration-tests\suites\       every .py from suites/
   integration-tests\generated\    stack.env and certs\
 ```
+
+### The installer round trip
+
+Before it registers the driver its own way, `windows_test.py` runs the shipped
+`install.bat` and `uninstall.bat` out of `archive\`, which stages the four files
+the release zip puts side by side. `install.bat` refuses to run unless the DLL
+and `configure-dsn.ps1` are beside it, so the layout is part of what is checked.
+
+It then reads the state each one left, rather than trusting the exit code:
+
+- after install, both files under `%ProgramFiles%\Stackable\ODBC`, the
+  `stackable_odbc_trino` key under `HKLM\SOFTWARE\ODBC\ODBCINST.INI`, **and** an
+  entry in that key's `ODBC Drivers` listing, which is what populates the
+  Administrator's Drivers tab
+- after uninstall, none of the four, and the install directory gone
+
+`odbcconf.exe` exits 0 whether or not the action it was given succeeded, which
+is why the state is read rather than the status. `register_driver` works around
+the same unreliability by force-writing `Driver` and `Setup` after its own
+`odbcconf` call.
+
+This runs first because the uninstaller deregisters the driver: after it, the
+harness registers its own copy, and every suite below depends on that.
 
 `integration-tests\generated\stack.env` is the VM's own view of the stack,
 written by `windows_test.py` and kept on the host as

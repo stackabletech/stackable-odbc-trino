@@ -198,9 +198,46 @@ jobs:
       - name: Build Windows DLL
         run: cargo build --locked --target x86_64-pc-windows-gnu --release
 
+      # Named symbols and a floor, not a printed count. The count alone used to
+      # be piped into `xargs echo`, whose exit status is what the step was
+      # graded on, so a DLL exporting nothing at all passed. The Driver Manager
+      # resolves these by name, and a missing one is a load failure on a user's
+      # machine that no unit test can see.
+      #
+      # ConfigDSNW is in the list because it is the only Windows-only export:
+      # core builds it nowhere else, and it is what the ODBC Administrator's
+      # Add.../Configure... buttons call. The Linux .so has 60 of these; the DLL
+      # has 61.
       - name: Verify DLL exports
         run: |
-          x86_64-w64-mingw32-objdump -p target/x86_64-pc-windows-gnu/release/stackable_odbc_trino.dll | grep -c "SQL" | xargs -I{} echo "Trino DLL: {} ODBC symbols exported"
+          DLL=target/x86_64-pc-windows-gnu/release/stackable_odbc_trino.dll
+          EXPORTS=$(x86_64-w64-mingw32-objdump -p "$DLL" \
+            | awk '/Export Address Table/,/Ordinal base/' \
+            | grep -oE '\b(SQL|Config)[A-Za-z]+\b' | sort -u)
+          echo "$EXPORTS" | tr '\n' ' '; echo
+
+          missing=""
+          for sym in SQLAllocHandle SQLFreeHandle SQLDriverConnectW SQLConnectW \
+                     SQLBrowseConnectW SQLDisconnect SQLPrepareW SQLExecute \
+                     SQLExecDirectW SQLBindParameter SQLDescribeParam SQLFetch \
+                     SQLGetData SQLNumResultCols SQLDescribeColW SQLGetInfoW \
+                     SQLGetTypeInfoW SQLGetDiagRecW SQLTablesW SQLColumnsW \
+                     SQLEndTran SQLCancel ConfigDSNW; do
+            grep -qx "$sym" <<< "$EXPORTS" || missing="$missing $sym"
+          done
+          if [ -n "$missing" ]; then
+            echo "::error::the DLL does not export:$missing"
+            exit 1
+          fi
+
+          # A floor as well as the named set, so a wholesale regression in
+          # core's forward_ffi! is caught even if these particular names survive.
+          count=$(echo "$EXPORTS" | grep -c .)
+          if [ "$count" -lt 55 ]; then
+            echo "::error::only $count ODBC symbols exported; expected at least 55"
+            exit 1
+          fi
+          echo "Trino DLL: $count ODBC symbols exported, all required names present"
 
       # Two different assertions behind one flag. For the .so it compares
       # DT_NEEDED against the sonames sbom-native.json declares, in both

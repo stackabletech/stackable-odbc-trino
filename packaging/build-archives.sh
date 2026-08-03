@@ -51,6 +51,12 @@ if [ ! -f "$MEZ_SOURCE" ]; then
   exit 1
 fi
 
+# Cleared, not merely created. `sha256sums.txt` below globs the whole
+# directory, so artefacts left by a run at a different $VERSION would be
+# checksummed into this release's manifest, and the "Built:" count would
+# describe a directory rather than a release. CI starts from a fresh checkout
+# and never sees this; the person following packaging/README.md does.
+rm -rf "$DIST_DIR"
 mkdir -p "$DIST_DIR"
 
 # --- SBOMs ---

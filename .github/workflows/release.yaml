@@ -124,13 +124,27 @@ jobs:
 
           echo "--- Linux archive ---"
           tar -tzf "$LINUX"
-          for f in libstackable_odbc_trino.so install.sh uninstall.sh README.md LICENSE; do
+          for f in libstackable_odbc_trino.so install.sh uninstall.sh README.md LICENSE \
+                   libstackable_odbc_trino.so.cdx.json; do
             tar -tzf "$LINUX" | grep -qx "./$f" || { echo "::error::missing $f in linux archive"; exit 1; }
           done
+          # Asserted absent, not merely unlisted. Power BI Desktop is
+          # Windows-only, so the connector ships in the zip and as a standalone
+          # asset; README.md spent a release claiming the tarball carried it
+          # too, and a check that only looks for missing files cannot catch a
+          # promise about a file that was never there.
+          if tar -tzf "$LINUX" | grep -q '\.mez$'; then
+            echo "::error::the linux archive carries a .mez; README.md says it does not"
+            exit 1
+          fi
 
           echo "--- Windows archive ---"
           unzip -l "$WINDOWS"
-          for f in stackable_odbc_trino.dll StackableTrinoODBC.mez install.bat uninstall.bat README.md LICENSE; do
+          # configure-dsn.ps1 is checked because install.bat refuses to run
+          # without it: it is the ODBC Administrator's Add.../Configure... dialog.
+          for f in stackable_odbc_trino.dll StackableTrinoODBC.mez install.bat uninstall.bat \
+                   configure-dsn.ps1 README.md LICENSE \
+                   stackable_odbc_trino.dll.cdx.json StackableTrinoODBC.mez.cdx.json; do
             unzip -l "$WINDOWS" | grep -q " $f\$" || { echo "::error::missing $f in windows archive"; exit 1; }
           done
 
