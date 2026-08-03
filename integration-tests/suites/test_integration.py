@@ -10,7 +10,8 @@ Usage:
     python3 integration-tests/suites/test_integration.py "Driver=/path/to/driver.so;Host=localhost;Port=8080;User=admin;Protocol=http;Catalog=tpcds"
     python3 integration-tests/suites/test_integration.py "DSN=test_trino"
 
-Requires: pip install pyodbc
+Requires a running Trino (integration-tests/setup.sh) and `pip install pyodbc`.
+Needs no compose profile: the tpcds catalog is in the base stack.
 """
 
 import os
@@ -40,7 +41,7 @@ def conn_str_catalog(conn_str):
 
 
 def main():
-    # A connection string may be passed positionally -- run-tests.sh does, to
+    # A connection string may be passed positionally. run-tests.sh does, to
     # drive this suite against several configurations, and windows_test.py does
     # because the VM's stack is not this one. With no argument, the local stack
     # describes itself.
@@ -160,8 +161,7 @@ def main():
     R.run("MIN + MAX + COUNT(DISTINCT)", test_aggregation_functions)
 
     # ------------------------------------------------------------------
-    # Multiple WHERE conditions (exercises query variety without
-    # parameterised queries — SQLNumParams is not yet implemented)
+    # Multiple WHERE conditions, with literals rather than parameters
     # ------------------------------------------------------------------
     def test_where_integer():
         cur.execute("SELECT c_first_name FROM tpcds.sf1.customer WHERE c_customer_sk = 1")
@@ -285,7 +285,7 @@ def main():
     # ------------------------------------------------------------------
 
     def test_primary_keys_empty():
-        """tpcds tables have no PK constraints — should return empty, not error."""
+        """tpcds tables have no PK constraints, so this returns empty, not an error."""
         cur.execute("SELECT 1")
         cur.fetchall()
         rows = list(cur.primaryKeys("customer", catalog="tpcds", schema="sf1"))
@@ -294,7 +294,7 @@ def main():
     R.run("SQLPrimaryKeys empty (tpcds)", test_primary_keys_empty)
 
     def test_foreign_keys_empty():
-        """tpcds tables have no FK constraints — should return empty, not error."""
+        """tpcds tables have no FK constraints, so this returns empty, not an error."""
         cur.execute("SELECT 1")
         cur.fetchall()
         rows = list(cur.foreignKeys(foreignTable="customer",
@@ -308,7 +308,7 @@ def main():
         cur.execute("SELECT 1")
         cur.fetchall()
         rows = list(cur.statistics("customers"))
-        # We return empty result sets for statistics — just verify no error
+        # The driver returns an empty result set for statistics; check no error
         assert isinstance(rows, list), "statistics should return a list"
 
     R.run("SQLStatistics (no error)", test_statistics)
@@ -325,7 +325,7 @@ def main():
         cur.execute("SELECT 1")
         cur.fetchall()
         rows = list(cur.primaryKeys("customers", catalog="postgresql", schema="public"))
-        # Trino doesn't expose constraint metadata — expect empty, not error
+        # Trino exposes no constraint metadata; expect empty, not an error
         assert isinstance(rows, list), "primaryKeys should return a list"
 
     R.run("SQLPrimaryKeys postgresql (succeeds, empty)", test_primary_keys_postgresql_succeeds)
@@ -336,7 +336,7 @@ def main():
         rows = list(cur.foreignKeys(foreignTable="orders",
                                      foreignCatalog="postgresql",
                                      foreignSchema="public"))
-        # Trino doesn't expose constraint metadata — expect empty, not error
+        # Trino exposes no constraint metadata; expect empty, not an error
         assert isinstance(rows, list), "foreignKeys should return a list"
 
     R.run("SQLForeignKeys postgresql (succeeds, empty)", test_foreign_keys_postgresql_succeeds)
@@ -380,9 +380,10 @@ def main():
     # ------------------------------------------------------------------
     # Connection attributes, through the Driver Manager
     # ------------------------------------------------------------------
-    # integration-tests/suites/test_c_abi.py drives these with no DM in the loop; the point here is
-    # that unixODBC forwards them rather than answering them itself, so what an
-    # ordinary application sees is what the driver decided.
+    # integration-tests/suites/test_c_abi.py drives these with no DM in the
+    # loop. What is asserted here is that unixODBC forwards them rather than
+    # answering them itself, so what an ordinary application sees is what the
+    # driver decided.
 
     def test_connection_attribute_rules():
         SQL_ATTR_PACKET_SIZE = 112
@@ -415,15 +416,16 @@ def main():
     # SQL_DATABASE_NAME names the connected catalog
     # ------------------------------------------------------------------
     # The spec makes this and SQL_ATTR_CURRENT_CATALOG one value under two
-    # names, and both now read the driver's `current_catalog` declaration. Only
-    # the info-type half is asserted here: pyodbc's `set_attr` takes an integer
-    # value and it exposes no string `SQLGetConnectAttr`, so the attribute half
-    # -- including that setting it reports HYC00 -- lives in integration-tests/suites/test_c_abi.py,
-    # which calls both entry points directly.
+    # names, and both read the driver's `current_catalog` declaration. Only the
+    # info-type half is asserted here. pyodbc's `set_attr` takes an integer
+    # value and it exposes no string `SQLGetConnectAttr`, so the attribute half,
+    # including that setting it reports HYC00, lives in
+    # integration-tests/suites/test_c_abi.py, which calls both entry points
+    # directly.
     #
-    # Still worth having on this path: what the connection string asked for has
-    # to survive the Driver Manager and come back under the name an application
-    # reads, and a DSN connection reaches this through a different route than a
+    # This path is still needed: what the connection string asked for has to
+    # survive the Driver Manager and come back under the name an application
+    # reads, and a DSN connection reaches it through a different route than a
     # DSN-less one.
 
     def test_database_name_is_the_connected_catalog():
@@ -452,9 +454,9 @@ def main():
     #
     # SQL_SERVER_NAME and SQL_USER_NAME have no such clause, so an empty answer
     # there is a non-answer. The user is asserted against Trino's own
-    # current_user rather than against the connection string's User: those two
-    # differ under SessionUser and under ExternalAuthentication, and the whole
-    # reason the driver probes is to report the former.
+    # current_user rather than against the connection string's User. Those two
+    # differ under SessionUser and under ExternalAuthentication, and the driver
+    # probes in order to report the former.
 
     def test_identity_strings():
         dsn = conn_str_value(conn_str, "dsn")
@@ -487,8 +489,8 @@ def main():
     # The attribute is one of exactly two an application may set at the
     # connection level, and it decides whether a catalog function's string
     # arguments are identifiers or search patterns. Asserted end to end rather
-    # than by reading the attribute back: the read-back was always correct, and
-    # what was broken was that nothing acted on it.
+    # than by reading the attribute back, because a correct read-back proves
+    # only that the value was stored, not that a catalog function acted on it.
     #
     # A separate connection, because the setting outlives the statement and
     # would change every later catalog call on the shared one.
@@ -536,11 +538,10 @@ def main():
     # ------------------------------------------------------------------
     # The SQLGetInfo values backed by a required Backend declaration
     # ------------------------------------------------------------------
-    # Each of these was previously answered by a hard-wired value in
-    # stackable-odbc-core, on this driver's behalf. They are now declarations
-    # the compiler requires, so what an application reads is what the driver
-    # states about Trino. Asserted through the DM because that is the path that
-    # decides the value's shape as well as its content.
+    # Each of these is a required Backend declaration, so what an application
+    # reads is what the driver states about Trino rather than a generic default.
+    # Asserted through the DM, because that is the path that decides the value's
+    # shape as well as its content.
 
     def test_backend_declared_info_values():
         SQL_IC_LOWER = 2
@@ -595,11 +596,11 @@ def main():
             assert got == want, f"{label}: expected {want!r}, got {got!r}"
 
         # Version strings are not fixed values, so assert their shape instead.
-        # The spec's form is "##.##.####" -- major, minor, release -- optionally
-        # followed by the data source's own version text, which is why
-        # SQL_DBMS_VER's trailing "(467)" is allowed here and SQL_DRIVER_VER's
-        # absence of one is too. The major group is not held to two digits:
-        # Trino's is 467.
+        # The spec's form is "##.##.####" (major, minor, release), optionally
+        # followed by the data source's own version text. That suffix is why
+        # SQL_DBMS_VER's trailing "(467)" is allowed here, and why
+        # SQL_DRIVER_VER having none is allowed too. The major group is not held
+        # to two digits: Trino 467 reports three.
         import re
 
         version_shape = re.compile(r"^\d+\.\d{2}\.\d{4}( .*)?$")
@@ -616,20 +617,19 @@ def main():
 
     def test_query_timeout_fires_through_the_driver_manager():
         # The only place the query timeout is exercised through a Driver
-        # Manager. test_c_abi.py loads the .so directly, so it proves the
-        # driver and core cooperate but says nothing about unixODBC.
+        # Manager. test_c_abi.py loads the .so directly, so it proves the driver
+        # and core cooperate but says nothing about unixODBC.
         #
-        # This is NOT gated on Threading. Core enforces the deadline from a
-        # timer thread that calls Backend::cancel directly, inside the .so, so
-        # it never crosses the Driver Manager and no threading policy can
-        # serialise it. Measured both ways against the live coordinator: HYT00
-        # at 2.0s under Threading = 2 and under Threading = 3 alike. The
-        # setting matters for application-initiated SQLCancel instead -- see
-        # the cross-thread cancel test below.
+        # This is not gated on odbcinst.ini's Threading value. Core enforces the
+        # deadline from a timer thread that calls Backend::cancel directly,
+        # inside the .so, so it never crosses the Driver Manager and no
+        # threading policy can serialise it. Measured both ways against the live
+        # coordinator: HYT00 at 2.0s under Threading = 2 and under Threading = 3
+        # alike.
         #
         # pyodbc's Connection.timeout sets SQL_ATTR_QUERY_TIMEOUT on the
         # statements it creates. The query runs ~24s uncancelled, so a
-        # regression fails outright rather than flaking, and the elapsed time is
+        # regression fails outright rather than flaking. The elapsed time is
         # asserted as well: HYT00 arriving after the query finished on its own
         # would be the timeout not working, reported as though it were.
         import time
@@ -649,7 +649,7 @@ def main():
                 state = e.args[0]
                 assert state == "HYT00", f"expected HYT00, got {state}: {e}"
                 assert elapsed < 15, (
-                    f"HYT00 after {elapsed:.1f}s against a 2s deadline -- the "
+                    f"HYT00 after {elapsed:.1f}s against a 2s deadline. The "
                     f"query runs ~24s uncancelled, so this fired on completion "
                     f"rather than on the deadline"
                 )
@@ -677,17 +677,11 @@ def main():
 
     def test_cross_thread_cancel_interrupts_a_running_fetch():
         # This is what Threading = 2 in odbcinst.ini buys, and the only test
-        # that would notice it being lost. SQLCancel called from another thread
-        # goes *through* the Driver Manager, and at unixODBC's default
-        # Threading = 3 the DM serialises at the environment level and holds the
-        # cancelling thread behind the executing call. Measured against the live
-        # coordinator on a query that runs ~24s:
-        #
-        #   Threading = 3 -> SQLCancel blocked for the whole run; fetch raised
-        #                    HY010 after 23.9s, i.e. the query finished on its
-        #                    own and the cancel accomplished nothing.
-        #   Threading = 2 -> SQLCancel returned immediately; fetch raised HY008
-        #                    after 2.0s.
+        # that would notice it being lost. A cross-thread SQLCancel goes
+        # *through* the Driver Manager, so unixODBC's threading policy decides
+        # whether it is delivered or serialised behind the executing call. See
+        # "Threading = 2 is required, not tuning" in AGENTS.md for the measured
+        # comparison.
         #
         # HY008 is the spec's "operation canceled" for a function interrupted by
         # SQLCancel from a different thread, which SQLFetch's diagnostics table
@@ -718,18 +712,18 @@ def main():
                 # own and the cancelling thread was serialised behind it.
                 assert elapsed < 15, (
                     f"{state} after {elapsed:.1f}s: the query ran to completion "
-                    f"(~24s) before the cancel landed -- check that Threading = 2 "
+                    f"(~24s) before the cancel landed. Check that Threading = 2 "
                     f"is set in odbcinst.ini"
                 )
                 # unixODBC sometimes answers first, with its own Function
-                # sequence error: the cancelling thread's SQLCancel moves the
-                # Driver Manager's statement state while this thread is mid-loop,
-                # so this thread's next call is refused before it reaches the
-                # driver. HY010 is (DM)-marked, and measured on the direct and
-                # the spooled protocol alike, so it is not the driver's to
-                # report and not a defect. The cancel still interrupted the
-                # fetch, which is what this scenario claims; the driver's own
-                # HY008 path simply went unobserved, so that is noted.
+                # sequence error. The cancelling thread's SQLCancel moves the
+                # Driver Manager's statement state while this thread is
+                # mid-loop, so this thread's next call is refused before it
+                # reaches the driver. HY010 is (DM)-marked, and observed on the
+                # direct and the spooled protocol alike, so it is not the
+                # driver's to report and not a defect. The cancel still
+                # interrupted the fetch, which is what this scenario claims. The
+                # driver's own HY008 path went unobserved, so that is noted.
                 if state == "HY010":
                     R.note(
                         "SQLCancel from another thread",

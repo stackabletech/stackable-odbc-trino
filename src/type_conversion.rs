@@ -16,25 +16,26 @@ use trino_rust_client::{TrinoFloat, TrinoInt, TrinoTy};
 /// while `time(12)`/`timestamp(12)` (with or without time zone) succeed.
 pub(crate) const MAX_FRACTIONAL_SECONDS_PRECISION: i16 = 12;
 
-/// Default (undeclared) fractional-seconds scale this driver assumes for
-/// TIME/TIME WITH TIME ZONE/TIMESTAMP/TIMESTAMP WITH TIME ZONE when only a
-/// `TrinoTy` value (not the original `information_schema` type-name string)
-/// is available. `TrinoTy::Time`/`TimeWithTimeZone`/`Timestamp`/
-/// `TimestampWithTimeZone` carry no precision parameter at all (a
+/// Fractional-seconds scale assumed for TIME, TIME WITH TIME ZONE, TIMESTAMP
+/// and TIMESTAMP WITH TIME ZONE when only a `TrinoTy` value is available, with
+/// no `information_schema` type-name string to read a declared scale from.
+/// Those four `TrinoTy` variants carry no precision parameter (a
 /// `trino-rust-client` limitation; contrast `TrinoTy::Decimal(p, s)`, which
 /// does), so there is no per-column scale to read here.
 ///
-/// 3 (milliseconds), not 0: this is Trino's actual default declared
-/// precision when a column is created without an explicit one (confirmed by
+/// 3 (milliseconds), not 0: that is Trino's default declared precision for a
+/// column created without an explicit one, where the ANSI SQL default is 0.
 /// `time_with_fraction_keeps_milliseconds_via_get_data_string` in
-/// `ffi_integration_tests.rs`, whose own doc comment states "`time(3)` is
-/// Trino's normal default precision for TIME (unlike the ANSI SQL default of
-/// 0)"; the same is true for TIMESTAMP). A single shared constant is used
-/// for both TIME and TIMESTAMP: TIME's fraction survives via text
-/// conversions the same way TIMESTAMP's does, so there is no reason for the
-/// two to differ. Do not split this into per-type constants. This remains a
-/// simplification: parsing the *actual* declared scale per column, rather
-/// than assuming a default, is future work.
+/// `ffi_integration_tests.rs` confirms it for TIME, and TIMESTAMP behaves the
+/// same way.
+///
+/// One constant covers both TIME and TIMESTAMP. Splitting it in two would gain
+/// nothing, because TIME's fraction survives the text conversions exactly as
+/// TIMESTAMP's does.
+///
+/// A column declaring another scale is reported at 3 on this path. The
+/// declared scale reaches the driver only in the type-name string, which
+/// `type_name_scale` reads wherever the caller has one.
 const DEFAULT_TEMPORAL_SCALE_WITHOUT_TYPE_NAME: i16 = 3;
 
 /// Trino built-in type names as an enum, eliminating hardcoded strings across
@@ -180,10 +181,10 @@ impl TrinoTypeName {
             // ZONE), so the offset never survives into SQL_TIME_STRUCT;
             // only the fractional seconds do (preserved via `ColumnValue::
             // Time`'s `fraction` field, delivered through SQL_C_CHAR/WCHAR
-            // text conversions). Kept as a distinct match arm (not merged
-            // with `Time`) to match `trino_ty_precision`. Do not merge these
-            // arms: sharing one reports the wrong column size in the query
-            // path (`execute.rs`) for whichever variant does not own it.
+            // text conversions). Keep the two as distinct arms, matching
+            // `trino_ty_precision`: merging them makes one variant borrow the
+            // other's size, which the query path (`execute.rs`) then reports
+            // for a column that does not have it.
             Self::Time => Some(column_size(
                 SqlDataType::TIME,
                 0,
@@ -224,16 +225,14 @@ impl TrinoTypeName {
         }
     }
 
-    /// Whether this type carries a precision parameter in its type string.
-    ///
-    /// `true` for `Varchar(n)`, `Char(n)`, and `Decimal(p,s)`.
+    /// Whether the type string carries a precision: `varchar(n)`, `char(n)`
+    /// or `decimal(p,s)`.
     pub(crate) fn has_precision_param(&self) -> bool {
         matches!(self, Self::Varchar | Self::Char | Self::Decimal)
     }
 
-    /// Whether this type carries a scale parameter in its type string.
-    ///
-    /// `true` only for `Decimal(p,s)`.
+    /// Whether the type string carries a scale, which only `decimal(p,s)`
+    /// does.
     pub(crate) fn has_scale_param(&self) -> bool {
         matches!(self, Self::Decimal)
     }
@@ -241,19 +240,18 @@ impl TrinoTypeName {
     /// Whether this type's single parenthesised type-string argument is a
     /// fractional-seconds *scale*, not a precision.
     ///
-    /// `true` for `Time`, `TimeWithTimeZone`, `Timestamp`, and
-    /// `TimestampWithTimeZone`. This is a deliberately distinct concept from
-    /// [`Self::has_precision_param`]/[`Self::has_scale_param`] above:
-    /// `decimal(p,s)` and `varchar(n)`/`char(n)` carry a genuine *precision*
-    /// as their first (or only) argument, but Trino's temporal types spell
-    /// their scale as the sole argument: `timestamp(6)` declares 6
-    /// fractional-second digits, not a precision of 6. Do not conflate the
-    /// two (treating the argument as if it were `COLUMN_SIZE`/`SQL_DESC_LENGTH`
-    /// directly): that reports `SQL_DESC_LENGTH` as `6` for `timestamp(6)`
-    /// instead of the correct `26` (`20 + s` per the ODBC "Column Size"
-    /// appendix). See
-    /// `type_name_precision`/`type_name_scale` below for where this
-    /// distinction is applied.
+    /// `true` for `Time`, `TimeWithTimeZone`, `Timestamp` and
+    /// `TimestampWithTimeZone`, and a separate question from
+    /// [`Self::has_precision_param`] and [`Self::has_scale_param`].
+    /// `decimal(p,s)`, `varchar(n)` and `char(n)` carry a precision as their
+    /// first argument, while Trino's temporal types spell a scale as their
+    /// only one: `timestamp(6)` declares 6 fractional-second digits, not a
+    /// precision of 6.
+    ///
+    /// Reading that argument as `COLUMN_SIZE`/`SQL_DESC_LENGTH` reports
+    /// `timestamp(6)` at `6` instead of `26`, which is `20 + s` per the ODBC
+    /// "Column Size" appendix. `type_name_precision` and `type_name_scale`
+    /// below are where the distinction is applied.
     pub(crate) fn has_temporal_scale_param(&self) -> bool {
         matches!(
             self,
@@ -357,9 +355,7 @@ pub fn trino_ty_to_sql_type(column_type: &TrinoTy) -> SqlDataType {
             tracing::warn!(column_type = ?column_type, "compound Trino type mapped to SQL_WVARCHAR (rendered as text at write time)");
             SqlDataType::EXT_W_VARCHAR
         }
-        // Nullable wrapper: delegate to the inner type
         TrinoTy::Option(inner) => trino_ty_to_sql_type(inner),
-        // Trino reported an unknown type
         TrinoTy::Unknown => {
             tracing::warn!("unknown Trino type mapped to SQL_WVARCHAR");
             SqlDataType::EXT_W_VARCHAR
@@ -367,12 +363,12 @@ pub fn trino_ty_to_sql_type(column_type: &TrinoTy) -> SqlDataType {
     }
 }
 
-/// Narrow a [`column_size`]/[`TrinoTypeName::fixed_precision`] result (`i32`,
-/// always non-negative in practice for every arm that calls this) to the
-/// `u32` `trino_ty_precision` has always returned. Defensive: none of the
-/// SQL types routed through this ever produce a negative or overflowing
-/// value, but the fallback keeps this function panic-free rather than
-/// relying on that invariant silently.
+/// Narrow a [`column_size`] or [`TrinoTypeName::fixed_precision`] result to
+/// the `u32` [`trino_ty_precision`] returns.
+///
+/// No SQL type routed through here produces a negative or overflowing value,
+/// so the fallback exists to keep the function panic-free rather than to rely
+/// on that invariant silently.
 fn precision_as_u32(n: i32) -> u32 {
     u32::try_from(n).unwrap_or_else(|_| {
         tracing::warn!(
@@ -422,9 +418,8 @@ pub fn trino_ty_precision(ty: &TrinoTy) -> u32 {
         )),
         // Also HH:MM:SS.mmm, not HH:MM:SS.mmm+HH:MM: the offset is applied
         // and the value normalised to UTC (see `parse_trino_time_with_tz`),
-        // so only the fractional seconds (not the offset) are actually
-        // delivered, via the text conversions, since SQL_TIME_STRUCT itself
-        // still has no fraction field.
+        // so only the fractional seconds reach the application, through the
+        // text conversions. SQL_TIME_STRUCT has no fraction field of its own.
         TrinoTy::TimeWithTimeZone => precision_as_u32(column_size(
             SqlDataType::TIME,
             0,
@@ -439,8 +434,7 @@ pub fn trino_ty_precision(ty: &TrinoTy) -> u32 {
         )),
         // Also YYYY-MM-DD HH:MM:SS.mmm, not ...+HH:MM: the offset is applied
         // and the value normalised to UTC (see `parse_trino_timestamp_tz`),
-        // so only YYYY-MM-DD HH:MM:SS.mmm is actually delivered to
-        // SQL_TIMESTAMP_STRUCT.
+        // so only YYYY-MM-DD HH:MM:SS.mmm reaches SQL_TIMESTAMP_STRUCT.
         TrinoTy::TimestampWithTimeZone => precision_as_u32(column_size(
             SqlDataType::TIMESTAMP,
             0,
@@ -451,36 +445,31 @@ pub fn trino_ty_precision(ty: &TrinoTy) -> u32 {
             i32::try_from(*p).unwrap_or(i32::MAX),
             0,
         )),
-        // Nullable wrapper: delegate to the inner type
         TrinoTy::Option(inner) => trino_ty_precision(inner),
-        // Every other Trino type reaches this arm (Varchar, VarBinary, Uuid,
-        // Json, IntervalYearToMonth, IntervalDayToSecond, Array, Map, Row,
-        // Tuple, Unknown), all rendered as unbounded text by this driver
-        // (see `trino_ty_to_sql_type`/`column_value_to_string`), with no
-        // declared length available here at all: the caller
-        // (`backend/execute.rs`) only falls back to this function when the
-        // column has no `information_schema` type-name string to read a
-        // real length from (e.g. a computed `SELECT CAST(x AS VARCHAR)`
-        // expression with no catalog entry).
+        // Every other type (Varchar, VarBinary, Uuid, Json, the two
+        // intervals, Array, Map, Row, Tuple, Unknown) is rendered as
+        // unbounded text by this driver, with no declared length to read.
+        // `backend/execute.rs` falls back to this function only for a column
+        // with no `information_schema` type-name string, such as a computed
+        // `SELECT CAST(x AS VARCHAR)` with no catalog entry.
         //
-        // This is exactly the case the ODBC "Column Size"/"Display Size"
-        // appendices' footnote describes: "If the driver cannot determine
-        // the column or parameter length for a variable type, it returns
-        // SQL_NO_TOTAL." Do not report 0 here: it under-reports the length
-        // of a column that can legitimately hold arbitrarily long text and
-        // truncates `SQLGetData(SQL_C_WCHAR)`
-        // reads (see `metadata_sized_wchar_round_trip_covers_representative_types`
-        // in `ffi_integration_tests.rs`). Do not report `i32::MAX` either:
-        // 2147483647 is not an
-        // allocatable buffer size, and it also collides with the different,
-        // established "unbounded but known" convention `SQLGetTypeInfo`'s own
-        // VARCHAR/VARBINARY/JSON/INTERVAL rows use (`backend/info.rs`), which
-        // must keep reporting that literal number rather than being
-        // reinterpreted as "undeterminable". `PRECISION_UNDETERMINABLE` is
-        // stackable-odbc-core's dedicated sentinel for this exact case; the numeric
-        // `SQLColAttributeW`/`SQLDescribeCol` outputs recognise it and
-        // substitute `SQL_NO_TOTAL` (see `resolve_precision_isize`/
-        // `resolve_precision_ulen`).
+        // The ODBC "Column Size" and "Display Size" appendices cover exactly
+        // this in a footnote: "If the driver cannot determine the column or
+        // parameter length for a variable type, it returns SQL_NO_TOTAL."
+        // `PRECISION_UNDETERMINABLE` is core's sentinel for it, which the
+        // numeric `SQLColAttributeW` and `SQLDescribeCol` outputs recognise
+        // and substitute `SQL_NO_TOTAL` for (see `resolve_precision_isize`
+        // and `resolve_precision_ulen`).
+        //
+        // The two wrong answers here are 0 and `i32::MAX`. 0 under-reports a
+        // column that can hold arbitrarily long text and truncates
+        // `SQLGetData(SQL_C_WCHAR)` reads, which
+        // `metadata_sized_wchar_round_trip_covers_representative_types` in
+        // `ffi_integration_tests.rs` pins. 2147483647 is not an allocatable
+        // buffer size, and it carries a different meaning already:
+        // `SQLGetTypeInfo`'s VARCHAR, VARBINARY, JSON and INTERVAL rows
+        // (`backend/info.rs`) report that literal number for "unbounded but
+        // known", which must not be reinterpreted as "undeterminable".
         _ => PRECISION_UNDETERMINABLE,
     }
 }
@@ -502,10 +491,9 @@ pub fn trino_ty_scale(ty: &TrinoTy) -> i16 {
 /// `"varchar(255)"` → `"varchar"`
 /// `"timestamp with time zone"` (no argument) → `"timestamp with time zone"`
 ///
-/// This is deliberately not a truncation at the first `(`: Trino's
-/// time-zone-aware types carry the argument *before* a suffix
-/// (`" with time zone"`), so truncating there would discard the suffix and
-/// let the caller misidentify the type.
+/// Not a truncation at the first `(`: Trino's time-zone-aware types carry the
+/// argument *before* a suffix (`" with time zone"`), so truncating there would
+/// discard the suffix and let the caller misidentify the type.
 fn strip_precision_param(name: &str) -> String {
     let lower = name.trim().to_lowercase();
     let Some(start) = lower.find('(') else {
@@ -548,13 +536,12 @@ fn parse_scale_param(name: &str) -> Option<i32> {
 /// [`DEFAULT_TEMPORAL_SCALE_WITHOUT_TYPE_NAME`] when there is no argument at
 /// all (a bare `"timestamp"`) or it does not fit `i16`.
 ///
-/// This reuses [`parse_precision_param`]'s parenthesis-extraction (the
-/// argument sits in the same textual position for both), but is named and
-/// documented separately from it: for `Time`/`TimeWithTimeZone`/
-/// `Timestamp`/`TimestampWithTimeZone` the argument means *scale*, never
-/// *precision*; see [`TrinoTypeName::has_temporal_scale_param`] for why
-/// that distinction matters and must stay explicit in code rather than
-/// being read off the argument position alone.
+/// It reuses [`parse_precision_param`]'s parenthesis extraction, since the
+/// argument sits in the same textual position, and keeps its own name because
+/// the quantity is different: for `Time`, `TimeWithTimeZone`, `Timestamp` and
+/// `TimestampWithTimeZone` that argument is a *scale*, never a precision. See
+/// [`TrinoTypeName::has_temporal_scale_param`] for what conflating the two
+/// reports.
 fn temporal_scale_param(name: &str) -> i16 {
     parse_precision_param(name)
         .and_then(|s| i16::try_from(s).ok())
@@ -773,9 +760,8 @@ fn shift_time(time_part: &str, offset_minutes: i32) -> Option<ColumnValue> {
 
 /// Decode Trino's base64 VARBINARY payload into [`ColumnValue::Bytes`].
 ///
-/// Returns `None` if the string is not valid standard-alphabet base64. The raw
-/// payload is deliberately not logged by callers, since binary column contents
-/// may be sensitive.
+/// Returns `None` if the string is not valid standard-alphabet base64. Callers
+/// do not log the raw payload, since binary column contents may be sensitive.
 fn base64_decode(s: &str) -> Option<ColumnValue> {
     base64::Engine::decode(&base64::engine::general_purpose::STANDARD, s)
         .ok()
@@ -1441,16 +1427,15 @@ mod tests {
         );
         // Not "1e300": serde_json renders the exponent with an explicit sign
         // ("1e+300"), which is what `json_as_text` produces for a non-string
-        // value; verified by running this assertion against the real
-        // implementation rather than trusting the task brief's guessed value.
+        // value.
         assert_eq!(val, ColumnValue::String("1e+300".to_string()));
     }
 
     /// Trino encodes the three IEEE specials as JSON *strings*, not numbers
     /// (`["NaN", "Infinity", "-Infinity"]`, confirmed off the wire), because
     /// JSON has no literal for them. Without an arm for a string-valued float
-    /// column they fell through to `ColumnValue::String`, and core then refused
-    /// `String -> Double` with `22018`, making the values unreadable.
+    /// column they fall through to `ColumnValue::String`, and core then
+    /// refuses `String -> Double` with `22018`, leaving them unreadable.
     #[test]
     fn ieee_specials_are_read_as_floats_not_strings() {
         for (raw, want) in [
@@ -1472,8 +1457,9 @@ mod tests {
         }
     }
 
-    /// The same three, for `REAL`. They reached the F32 arm through the same
-    /// `as_f64()` that returns `None` for a string, so both arms were affected.
+    /// The same three, for `REAL`. The F32 arm reads them through the same
+    /// `as_f64()`, which returns `None` for a string, so both arms need the
+    /// string case.
     #[test]
     fn ieee_specials_are_read_as_floats_for_real_too() {
         for (raw, want) in [
@@ -1721,14 +1707,12 @@ mod tests {
 
     // --- TrinoTypeName::parse: INTERVAL types ---
     //
-    // `trino_type_info` (backend/info.rs) advertises
-    // "INTERVAL DAY TO SECOND"/"INTERVAL YEAR TO MONTH" rows. Without a
-    // `TrinoTypeName::parse` variant for either, no real interval column
-    // could be reported under the name its own SQLGetTypeInfo row
-    // advertises: `trino_bare_type_name` would fall through to the
-    // EXT_W_VARCHAR/"VARCHAR" fallback instead. These two variants close
-    // that gap the same way `Json`/`Uuid` already do for other
-    // text-rendered-but-typed Trino types.
+    // `trino_type_info` (backend/info.rs) advertises "INTERVAL DAY TO SECOND"
+    // and "INTERVAL YEAR TO MONTH" rows, so `TrinoTypeName::parse` needs a
+    // variant for each. Without one, `trino_bare_type_name` falls through to
+    // the EXT_W_VARCHAR/"VARCHAR" fallback and no interval column can be
+    // reported under the name its own SQLGetTypeInfo row advertises. This
+    // matches how `Json` and `Uuid` are handled, for the same reason.
 
     #[test]
     fn parse_interval_day_to_second() {
@@ -1766,9 +1750,10 @@ mod tests {
     /// That distinction is covered separately by
     /// `parse_timestamp_with_time_zone_and_param`, which asserts
     /// `TrinoTypeName::parse` resolves to the `TimestampWithTimeZone`
-    /// variant, not `Timestamp`. This test pins down `type_name_precision`'s
-    /// actual output for this input string; `execute.rs` computes precision
-    /// via `type_name_precision(&native_name).unwrap_or_else(|| trino_ty_precision(&ty))`.
+    /// variant, not `Timestamp`. What this test pins is
+    /// `type_name_precision`'s output for this input string, which is what
+    /// `execute.rs` reports:
+    /// `type_name_precision(&native_name).unwrap_or_else(|| trino_ty_precision(&ty))`.
     #[test]
     fn query_path_timestamp_with_time_zone_precision_is_23() {
         assert_eq!(type_name_precision("timestamp(3) with time zone"), Some(23));
@@ -1782,8 +1767,8 @@ mod tests {
     /// `..._timestamp_..._23` above; that
     /// distinction is covered separately by
     /// `parse_time_with_time_zone_and_param`, which asserts `TrinoTypeName::parse`
-    /// resolves to the `TimeWithTimeZone` variant, not `Time`. This test pins
-    /// down `type_name_precision`'s actual output for this input string.
+    /// resolves to the `TimeWithTimeZone` variant, not `Time`. What this test
+    /// pins is `type_name_precision`'s output for this input string.
     #[test]
     fn query_path_time_with_time_zone_precision_is_12() {
         assert_eq!(type_name_precision("time(3) with time zone"), Some(12));
@@ -1932,8 +1917,7 @@ mod tests {
     #[test]
     fn time_with_tz_precision_is_12() {
         // Not 18 (HH:MM:SS.mmm+HH:MM): the offset is applied and the value
-        // normalised to UTC, so only the fractional seconds (not the offset)
-        // are actually delivered.
+        // normalised to UTC, so only the fractional seconds are delivered.
         assert_eq!(trino_ty_precision(&TrinoTy::TimeWithTimeZone), 12);
     }
 
@@ -2024,9 +2008,10 @@ mod tests {
     }
 
     /// Trino renders a year before 1 CE with a leading `-`, which splits the
-    /// same way as the field separators, so the whole value fell through to
-    /// the string fallback: `SQLGetData(SQL_C_TYPE_DATE)` then failed on a
-    /// column the driver had described as `SQL_TYPE_DATE`.
+    /// same way as the field separators. A parser that does not strip the sign
+    /// first drops the whole value to the string fallback, and
+    /// `SQLGetData(SQL_C_TYPE_DATE)` then fails on a column the driver
+    /// described as `SQL_TYPE_DATE`.
     ///
     /// This driver produces such a date itself, from a bound `SQL_DATE_STRUCT`
     /// with a negative year, so it has to be able to read one back.
@@ -2080,8 +2065,8 @@ mod tests {
 
     #[test]
     fn time_with_fractional_seconds_parses_correctly() {
-        // The fraction must now be kept, not discarded: SQL_TIME_STRUCT cannot
-        // carry it, but the SQL_C_CHAR/SQL_C_WCHAR string rendering can.
+        // The fraction is kept, not discarded: SQL_TIME_STRUCT cannot carry
+        // it, but the SQL_C_CHAR/SQL_C_WCHAR string rendering can.
         assert_eq!(
             json_to_column_value(Value::String("09:05:03.336".into()), &TrinoTy::Time),
             ColumnValue::Time {
@@ -2111,8 +2096,9 @@ mod tests {
 
     #[test]
     fn time_with_timezone_normalises_to_utc() {
-        // TIMESTAMP WITH TIME ZONE already converts to UTC; TIME WITH TIME ZONE
-        // silently discarded the offset, so the two disagreed.
+        // The two "with time zone" types must agree: TIMESTAMP WITH TIME
+        // ZONE converts to UTC, so discarding the offset here rather than
+        // applying it would make TIME WITH TIME ZONE contradict it.
         let val = parse_trino_time_with_tz("13:14:15+02:00").expect("parses");
         assert_eq!(
             val,
@@ -2567,8 +2553,8 @@ mod tests {
         );
     }
 
-    /// Plain TIMESTAMP (no TZ) is a separate code path via TrinoTy::Timestamp.
-    /// Verify it is unaffected by the TZ conversion changes.
+    /// Plain TIMESTAMP (no TZ) is a separate code path, via
+    /// `TrinoTy::Timestamp`, and no UTC conversion applies to it.
     #[test]
     fn timestamp_no_tz_is_unaffected_by_tz_changes() {
         let val = json_to_column_value(

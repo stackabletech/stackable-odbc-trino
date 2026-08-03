@@ -23,11 +23,11 @@ Config_DriverName = "stackable_odbc_trino";
 // at connect and reads as the setting having no effect.
 //
 // The four keys the driver declares sensitive through
-// `Backend::sensitive_connect_keywords` are absent deliberately: an option set
-// here is stored in the query text inside the .pbix, which is a file people
-// mail to each other. AccessToken, ExtraCredentials, ExtraHeaders and
-// ProxyPassword therefore stay on the connection string or the data source,
-// where a credential store can hold them.
+// `Backend::sensitive_connect_keywords` are absent. An option set here is
+// stored in the query text inside the .pbix, which is a file people mail to
+// each other. AccessToken, ExtraCredentials, ExtraHeaders and ProxyPassword
+// therefore stay on the connection string or the data source, where a
+// credential store can hold them.
 Config_AdvancedOptions = {
     "Source", "ClientTags", "Path", "TimeZone", "Locale", "ClientInfo",
     "TraceToken", "SessionUser", "Roles",
@@ -64,16 +64,14 @@ Config_LimitClauseKind = LimitClauseKind.LimitOffset;
 
 // Let Power Query bind parameters rather than inlining literals.
 //
-// This was `false` while the driver's parameter binding was incomplete. It is
-// not any more: the declared `ParameterType` is honoured, so a numeric
-// delivered as characters reaches Trino as a decimal instead of a string, and
-// an unbound marker is reported rather than silently substituted.
+// The driver honours the declared `ParameterType`, so a numeric delivered as
+// characters reaches Trino as a decimal instead of a string, and an unbound
+// marker is reported rather than silently substituted.
 //
-// Setting it back to `false` re-adds `SQL_API_SQLBINDPARAMETER = false`, which
-// contradicts the driver — `get_functions` declares `BindParameter` — and this
-// file's rule is that an override is for what the driver gets *wrong*. It also
-// puts every constant back through the `Constant` visitor, the part that had
-// been keyed on PostgreSQL type names and folded nothing.
+// Setting this to `false` adds `SQL_API_SQLBINDPARAMETER = false`, which
+// contradicts the driver's own `get_functions` declaration of `BindParameter`.
+// An override in this file is for what the driver gets *wrong*. It also routes
+// every constant through the `Constant` visitor instead.
 Config_UseParameterBindings = true;
 
 // Trino uses single-quote escaping for string literals.
@@ -285,7 +283,7 @@ StackableTrinoODBCImpl = (
         // grammar at any version. Folding any of those produces SQL the
         // coordinator refuses.
         //
-        // Nothing Power Query actually generates is lost: comparison, IN,
+        // Nothing Power Query generates is lost: comparison, IN,
         // LIKE, BETWEEN, IS NULL, EXISTS and the four join types are all in
         // the driver's ungated set.
         SQLGetInfo = defaultConfig[SQLGetInfo],
@@ -318,57 +316,49 @@ StackableTrinoODBCImpl = (
             // databases (from the PostgreSQL DirectQuery reference connector).
             //
             // Each record field is looked up by `typeInfo[TYPE_NAME]`, which is
-            // this driver's own SQLGetTypeInfo output — so the field names are
-            // Trino type names, not the reference connector's PostgreSQL ones.
-            // `TEXT`, `TIMESTAMPTZ`, `TIMETZ`, `NUMERIC` and `FLOAT` came from
-            // that connector and matched nothing here, so a string, timestamp
-            // or time constant folded through none of them.
-            // `test_folding_contract.py` asserts every field name against
-            // SQLGetTypeInfo and every cast target against Trino.
+            // this driver's own SQLGetTypeInfo output, so the field names are
+            // Trino type names. A PostgreSQL name such as `TEXT`, `TIMESTAMPTZ`,
+            // `TIMETZ`, `NUMERIC` or `FLOAT` matches nothing here and would fold
+            // nothing. `test_folding_contract.py` asserts every field name
+            // against SQLGetTypeInfo and every cast target against Trino.
             Constant =
                 let
                     Quote = each Text.Format("'#{0}'", { _ }),
                     Cast = (value, typeName) => [
                         Text = Text.Format("CAST(#{0} as #{1})", { value, typeName })
                     ],
-                    // An entry is added only where the cast is unambiguous.
-                    // A wrong one is worse than an absent one: absent, Power
+                    // An entry is added only where the cast is unambiguous. A
+                    // wrong one is worse than an absent one: absent, Power
                     // Query evaluates the constant locally and the answer is
-                    // still right, only unfolded. The types deliberately left
-                    // out, each measured against a live coordinator:
+                    // still right, only unfolded. Microsoft documents this
+                    // override as deprecated ("Providing an override for the
+                    // Constant value within AstVisitor has been deprecated and
+                    // may be removed in future implementations"), so the list
+                    // is kept to what pays for itself.
                     //
-                    //   CHAR      `CAST('abc' AS CHAR)` is char(1), not
-                    //             char(3): it truncates to 'a', and
-                    //             `CAST('abc' AS CHAR) = CAST('abc' AS
-                    //             CHAR(3))` is false. A CHAR entry would fold
-                    //             an equality filter into one matching no
-                    //             rows. Trino has no way to spell the width
-                    //             here, and `varchar = char(n)` already
-                    //             compares true, so there is nothing to gain.
+                    // Three groups have no entry. Each is measured against a
+                    // live Trino 483 coordinator:
+                    //
+                    //   CHAR      `CAST('abc' AS CHAR)` is char(1), so it
+                    //             truncates to 'a' and does not equal
+                    //             `CAST('abc' AS CHAR(3))`. An entry would fold
+                    //             an equality filter into one matching no rows.
+                    //             Trino cannot spell the width here, and
+                    //             `varchar = char(n)` already compares true.
                     //   INTERVAL DAY TO SECOND, INTERVAL YEAR TO MONTH
-                    //             Trino cannot cast varchar to either:
-                    //             "Cannot cast varchar(10) to interval day to
-                    //             second". No CAST target exists to name.
+                    //             Trino cannot cast varchar to either: "Cannot
+                    //             cast varchar(10) to interval day to second".
+                    //             There is no CAST target to name.
                     //   VARBINARY The constant is an M binary value, and
-                    //             rendering it as Trino's `X'..'` literal is
-                    //             not something this can be checked to get
-                    //             right without Power BI Desktop in the loop.
-                    //   UUID, JSON, TIME/TIMESTAMP WITH TIME ZONE
-                    //             Each has a valid Trino cast, but the
-                    //             rendering turns on whether Power Query
-                    //             hands a text-valued constant to the visitor
-                    //             already quoted. That is unresolved, and is
-                    //             the same question the VARCHAR entry below
-                    //             rests on.
-                    //             Settle that first, in Power BI Desktop, and
-                    //             all five can be added together.
+                    //             rendering it as Trino's `X'..'` literal
+                    //             cannot be verified without Power BI Desktop.
                     //
-                    // Microsoft documents this whole override as deprecated
-                    // ("Providing an override for the Constant value within
-                    // AstVisitor has been deprecated and may be removed in
-                    // future implementations"), so the list below is kept to
-                    // what pays for itself rather than grown to cover every
-                    // TYPE_NAME the driver reports.
+                    // TODO: add UUID, JSON, TIME WITH TIME ZONE and TIMESTAMP
+                    // WITH TIME ZONE. Each has a valid Trino cast, but the
+                    // rendering turns on whether Power Query hands a
+                    // text-valued constant to the visitor already quoted, which
+                    // the VARCHAR entry below also rests on. Confirm that in
+                    // Power BI Desktop, then add all four.
                     Visitor = [
                         DECIMAL = each Cast(_, "DECIMAL"),
                         INTEGER = each Cast(_, "INTEGER"),
@@ -476,7 +466,7 @@ BuildOdbcConfig = () as record =>
             SQLGetInfo = []
         ],
 
-        // Parameter bindings disabled — inline literals instead.
+        // Parameter bindings disabled, so inline literals instead.
         withParams =
             if (Config_UseParameterBindings = false) then
                 let

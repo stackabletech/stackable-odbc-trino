@@ -166,7 +166,7 @@ fn fetch_input_params(
         conn,
         format!("DEALLOCATE PREPARE {DESCRIBE_PARAM_STATEMENT}"),
     ) {
-        // Worth a warning rather than a failure: the describe itself may have
+        // A warning rather than a failure: the describe itself may have
         // succeeded, and the cost of a leaked entry is a larger header on
         // later requests, not a wrong answer.
         tracing::warn!(error = %e, "could not deallocate the describe-input statement");

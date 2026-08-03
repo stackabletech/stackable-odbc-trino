@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# release.sh — convenience wrapper around cargo-release.
+# Convenience wrapper around cargo-release.
 #
 # Usage:
 #   release/release.sh patch              # dry-run a patch release

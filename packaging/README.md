@@ -3,87 +3,54 @@
 ODBC 3.x driver for [Trino](https://trino.io/), targeting Power BI
 DirectQuery and generic ODBC consumers on Linux and Windows.
 
-## Building from source
+This file ships inside both release archives. If you have just extracted one,
+start at [Installation](#installation).
 
-To produce the release archives yourself, run the following from the
-**repository root**:
+## What is in the archive
 
-```bash
-# One-time: add the Windows cross-compilation target and the SBOM tooling
-rustup target add x86_64-pc-windows-gnu
-cargo install cargo-auditable
-# syft: see https://github.com/anchore/syft for install options
+`stackable-odbc-trino-<version>-linux-x64.tar.gz`:
 
-# Build the Linux and Windows binaries
-cargo auditable build --release
-cargo auditable build --release --target x86_64-pc-windows-gnu
+| File | Purpose |
+|------|---------|
+| `libstackable_odbc_trino.so` | The driver |
+| `install.sh`, `uninstall.sh` | Registration with unixODBC |
+| `libstackable_odbc_trino.so.cdx.json` | CycloneDX SBOM for the driver |
+| `README.md`, `LICENSE` | This file, and Apache-2.0 |
 
-# Package into release archives (replace the version as appropriate)
-VERSION=0.0.1 ./packaging/build-archives.sh
-```
+`stackable-odbc-trino-<version>-windows-x64.zip`:
 
-`cargo auditable` embeds the dependency list into each binary, and the SBOM is
-generated from it. A binary built with plain `cargo build` is refused rather
-than turned into an SBOM that lists a handful of components.
+| File | Purpose |
+|------|---------|
+| `stackable_odbc_trino.dll` | The driver |
+| `install.bat`, `uninstall.bat` | Registration with the Windows Driver Manager |
+| `configure-dsn.ps1` | The data source dialog |
+| `StackableTrinoODBC.mez` | Power Query custom connector for Power BI |
+| `stackable_odbc_trino.dll.cdx.json` | CycloneDX SBOM for the driver |
+| `StackableTrinoODBC.mez.cdx.json` | CycloneDX SBOM for the connector |
+| `README.md`, `LICENSE` | This file, and Apache-2.0 |
 
-This produces the following in `packaging/dist/`:
+The connector is also published on its own, as
+`StackableTrinoODBC-<version>.mez`.
 
-- `stackable-odbc-trino-<version>-linux-x64.tar.gz` — the `.so` plus
-  `install.sh`, `uninstall.sh` and the SBOM describing it
-- `stackable-odbc-trino-<version>-windows-x64.zip` — the `.dll`,
-  `StackableTrinoODBC.mez`, `install.bat`, `uninstall.bat`,
-  `configure-dsn.ps1` and an SBOM for each of the two artefacts
-- `StackableTrinoODBC-<version>.mez` (standalone, for Power BI)
-- a CycloneDX (`.cdx.json`) and an SPDX (`.spdx.json`) SBOM per artefact
-- `sha256sums.txt` over everything above
-
-Verify a download with `sha256sum -c sha256sums.txt` from the directory you
+The release page carries `sha256sums.txt` over every published file. Verify a
+download with `sha256sum -c sha256sums.txt`, run from the directory you
 downloaded into.
 
-### The SBOM
+## Installation
 
-Every archive carries the CycloneDX SBOM for what is inside it, so an offline
-install has it without going back to the release page, and the SBOM records the
-sha256 of the very binary shipped beside it. SPDX is published alongside the
-release for tooling that asks for that format by name.
+### Linux (x86_64)
 
-The SBOM is generated from the binary rather than from `Cargo.toml`, so it lists
-what actually linked: 167 components, with development dependencies excluded by
-construction. It also covers what cargo cannot see, which differs by platform.
-The Linux build links unixODBC (`libodbcinst.so.2`, LGPL-2.1-or-later) at load
-time. The Windows build imports only Windows' own libraries and instead carries
-the mingw-w64 runtime and libgcc statically, the latter under
-`GPL-3.0-or-later WITH GCC-exception-3.1`.
-
-To install on Linux, extract and run the install script:
+Requires `unixODBC` (the `unixodbc` package) and root privileges for
+`odbcinst` registration.
 
 ```bash
 mkdir /tmp/trino-odbc
-tar xzf stackable-odbc-trino-0.0.1-linux-x64.tar.gz -C /tmp/trino-odbc
+tar xzf stackable-odbc-trino-<version>-linux-x64.tar.gz -C /tmp/trino-odbc
 cd /tmp/trino-odbc
 sudo ./install.sh
 ```
 
-On Windows, extract the `.zip` and run `install.bat` from an Administrator
-Command Prompt. See the installation instructions below for details.
-
-## Installation
-
-> **Note:** These instructions assume you are working from an extracted
-> release archive, where the driver binary sits alongside the install
-> scripts. If you are working from a source checkout, build the archives
-> first (see above).
-
-### Linux (x86_64)
-
-Requires `unixODBC` (`unixodbc` package) and root privileges for
-`odbcinst` registration.
-
-```bash
-sudo ./install.sh
-```
-
-Verify with `odbcinst -q -d` — the output should include
+Verify with `odbcinst -q -d`. The output should include
 `[stackable_odbc_trino]`.
 
 To uninstall:
@@ -97,15 +64,17 @@ If you created any DSNs, also remove them from `/etc/odbc.ini` (or
 
 ### Windows (x86_64)
 
-Open an **Administrator** Command Prompt (`cmd.exe`), then:
+Extract the `.zip`, open an **Administrator** Command Prompt (`cmd.exe`) in
+the extracted folder, then:
 
 ```cmd
 install.bat
 ```
 
-Verify with the ODBC Data Source Administrator
-(`%SystemRoot%\System32\odbcad32.exe`) — the Drivers tab should list
-`stackable_odbc_trino`.
+This copies the driver and `configure-dsn.ps1` to
+`%ProgramFiles%\Stackable\ODBC` and registers the driver. Verify with the ODBC
+Data Source Administrator (`%SystemRoot%\System32\odbcad32.exe`). The Drivers
+tab should list `stackable_odbc_trino`.
 
 To uninstall:
 
@@ -122,8 +91,9 @@ reg delete "HKCU\SOFTWARE\ODBC\ODBC.INI\ODBC Data Sources" /v "YourDsnName" /f
 
 ### Power BI custom connector (Windows only)
 
-The archive includes `StackableTrinoODBC.mez`, a Power Query custom connector
-that enables Power BI DirectQuery. After running `install.bat`:
+`StackableTrinoODBC.mez` is a Power Query custom connector that gives Trino its
+own entry in the **Get Data** dialog and enables DirectQuery. Install the
+driver first, then:
 
 1. Copy `StackableTrinoODBC.mez` to the Custom Connectors folder (create it if
    it does not exist):
@@ -141,9 +111,9 @@ that enables Power BI DirectQuery. After running `install.bat`:
 
 ## Create a DSN (optional)
 
-A DSN stores connection parameters so that users don't need the full
-connection string each time. This step is optional — DSN-less connection
-strings (shown below) work without it.
+A DSN stores connection parameters under a name, so an application can pick it
+from a list instead of asking for a full connection string. It is optional:
+the DSN-less connection strings below work without one.
 
 ### Windows: the dialog
 
@@ -155,20 +125,21 @@ existing data source.
 The same dialog runs on its own, without the Administrator:
 
 ```cmd
-powershell -ExecutionPolicy Bypass -File configure-dsn.ps1
+powershell -ExecutionPolicy Bypass -File "%ProgramFiles%\Stackable\ODBC\configure-dsn.ps1"
 ```
 
-`configure-dsn.ps1` ships in the archive, and `install.bat` puts it beside the
-driver DLL. The Administrator's buttons need it there, so do not move it.
+`install.bat` puts `configure-dsn.ps1` beside the driver DLL. The
+Administrator's buttons need it there, so do not move it.
 
 Secrets are written only when their **Save** box is ticked, which is off by
 default. A saved secret is stored unencrypted, and a System data source puts it
 in `HKLM`, where every local user can read it.
 
-**Test connection** does not work for **External authentication**, and says so
-instead of failing: it connects in a way that forbids the driver from opening a
-login page. Save the data source and use it from your application, which will
-open a browser when it connects.
+**Test connection** is unavailable for **External authentication**, because
+testing connects in a way that forbids the driver from opening a login page.
+The dialog says so rather than reporting a connection failure. Save the data
+source and use it from your application, which opens a browser when it
+connects.
 
 ### Windows: scripted
 
@@ -197,14 +168,6 @@ Catalog = hive
 Schema = default
 ```
 
-### One gotcha in a DSN
-
-`SessionProperties`, `ResourceEstimates`, `ExtraCredentials`, `Roles` and
-`ExtraHeaders` take a `name:value;name2:value2` list. In a *connection string*
-those values need `{braces}`, because `;` also separates one parameter from the
-next. In a *DSN* they are stored **bare**; a braced value there fails the
-connection with `08001`. `configure-dsn.ps1` handles the difference for you.
-
 ## Connection string
 
 DSN-less, HTTPS with username and password. `Protocol` defaults to `https`, so
@@ -220,9 +183,73 @@ DSN-less, plaintext HTTP:
 Driver=stackable_odbc_trino;Host=trino.example.com;Port=8080;Protocol=http;User=admin;Catalog=hive;Schema=default
 ```
 
-The full list of 34 connection options is in the
+Every connection option is listed in the
 [project README](https://github.com/stackabletech/stackable-odbc-trino#connecting).
+Five of them take a `name:value;name2:value2` list and need `{braces}` in a
+connection string but not in a DSN; see
+[Values that contain a semicolon](https://github.com/stackabletech/stackable-odbc-trino#values-that-contain-a-semicolon).
+The Windows dialog handles that difference for you.
 
 ## Support
 
-<https://github.com/stackabletech/stackable-odbc-trino>
+- [Issues](https://github.com/stackabletech/stackable-odbc-trino/issues) for
+  bugs and feature requests
+- [Discussions](https://github.com/orgs/stackabletech/discussions) for questions
+- [Discord](https://discord.gg/7kZ3BNnCAF) to talk to us
+
+For a connection or query problem, attach a driver log. Set `ODBC_LOG_LEVEL` to
+`debug` and `ODBC_LOG_FILE` to a writable path in the environment of the
+application that loads the driver, then reproduce the problem. Logging is off
+unless `ODBC_LOG_LEVEL` is set.
+
+## The SBOM
+
+Each archive carries the CycloneDX SBOM for what is inside it, so an offline
+install has it without going back to the release page. The SBOM records the
+sha256 of the binary shipped beside it. SPDX is published alongside the release,
+for tooling that asks for that format by name.
+
+It is generated from the binary rather than from `Cargo.toml`, so it lists what
+linked, with development dependencies excluded by construction. It also covers
+what cargo cannot see: the Linux build links unixODBC at load time, and the
+Windows build carries the mingw-w64 runtime and libgcc statically. Those
+components, with their licences, are declared in
+[`packaging/sbom-native.json`](https://github.com/stackabletech/stackable-odbc-trino/blob/main/packaging/sbom-native.json).
+
+## Building the release archives
+
+Everything below is for people building the driver themselves. Set up the
+compiler and the unixODBC development libraries first, following
+[CONTRIBUTING.md](https://github.com/stackabletech/stackable-odbc-trino/blob/main/CONTRIBUTING.md).
+
+From the **repository root**:
+
+```bash
+# One-time: the Windows cross-compilation target and the SBOM tooling
+rustup target add x86_64-pc-windows-gnu
+cargo install cargo-auditable
+# syft: see https://github.com/anchore/syft for install options
+
+# Build the Linux and Windows binaries
+cargo auditable build --release
+cargo auditable build --release --target x86_64-pc-windows-gnu
+
+# Package into release archives (replace the version as appropriate)
+VERSION=0.0.1 ./packaging/build-archives.sh
+```
+
+`cargo auditable` is required, not a preference: it embeds the dependency list
+that the SBOM is generated from, and `packaging/sbom.sh` refuses a binary
+without it.
+
+The result, in `packaging/dist/`:
+
+- `stackable-odbc-trino-<version>-linux-x64.tar.gz`
+- `stackable-odbc-trino-<version>-windows-x64.zip`
+- `StackableTrinoODBC-<version>.mez`, the standalone connector
+- a CycloneDX (`.cdx.json`) and an SPDX (`.spdx.json`) SBOM per artefact
+- `sha256sums.txt` over everything above
+
+`./packaging/test-sbom.sh` runs every SBOM assertion against the real
+artefacts, including the component count and the per-platform native
+components. It needs no running Trino.

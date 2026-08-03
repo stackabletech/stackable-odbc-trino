@@ -21,8 +21,8 @@ zip -j "$MEZ_FILE" \
 
 echo "Built: $MEZ_FILE ($(du -h "$MEZ_FILE" | cut -f1))"
 echo ""
-echo "To install in PowerBI Desktop:"
+echo "To install in Power BI Desktop:"
 echo "  1. Copy $MEZ_FILE to: %USERPROFILE%\\Documents\\Power BI Desktop\\Custom Connectors\\"
 echo "  2. Enable custom connectors: File > Options > Security > Allow any extension"
-echo "  3. Restart PowerBI Desktop"
-echo "  4. Get Data > More > Database > Trino (ODBC)"
+echo "  3. Restart Power BI Desktop"
+echo "  4. Get Data > More > Database > Stackable Trino"

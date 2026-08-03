@@ -97,28 +97,25 @@ fn login_deadline(login_timeout: Option<u32>) -> Option<Duration> {
 /// The name to report as `SQL_USER_NAME`, which the spec defines as "the name
 /// used in a particular database, which can be different from the login name".
 ///
-/// That distinction is real here. Under `ExternalAuthentication` there is no
-/// `User` at all, since `connect` calls `ClientBuilder::without_user`, and the
+/// The two differ here. Under `ExternalAuthentication` there is no `User` at
+/// all, since `connect` calls `ClientBuilder::without_user`, and the
 /// coordinator derives the identity from the token: the connection string names
-/// nobody while the session runs as somebody. `SessionUser` is the other
-/// direction, setting `X-Trino-User` while `User` still authenticates, but only
-/// where the deployment grants impersonation. Against this stack's default
-/// access control the connect is refused outright with `Access Denied: User
-/// admin cannot impersonate user analyst`, which is the same rule
+/// nobody while the session runs as somebody. So `probed`, Trino's own
+/// `current_user` as read by [`probe_session`], wins whenever it is available,
+/// for the reason [`TrinoBackend::current_catalog`] reads the session.
+///
+/// Only a failed probe reaches the fallbacks, ordered by how close each is to
+/// the question. `SessionUser` comes first: a connection that carried one and
+/// still succeeded is one whose impersonation Trino permitted, so the session
+/// runs as that name, while `User` merely authenticated. The empty string is
+/// the spec's "not available" for a string info type, reachable only when a
+/// failed probe meets an `ExternalAuthentication` connection that named no
+/// user.
+///
+/// `SessionUser` cannot be demonstrated against the test stack: its default
+/// access control refuses the connect with `Access Denied: User admin cannot
+/// impersonate user analyst`, the same rule
 /// `integration-tests/suites/test_oauth.py` measures for a disagreeing `User`.
-///
-/// So `probed`, Trino's own `current_user` as read by [`probe_session`], is the
-/// answer whenever it is available, for the same reason
-/// [`TrinoBackend::current_catalog`] reads the session rather than the
-/// connection string.
-///
-/// Only a failed probe reaches the fallbacks, and they are ordered by how close
-/// each is to the question. `SessionUser` comes first because a connection that
-/// carried one and still succeeded is one whose impersonation Trino permitted,
-/// so the session is running as that name; `User` merely authenticated. The
-/// empty string is the spec's "not available" for a string info type, and is
-/// reachable only when a failed probe meets an `ExternalAuthentication`
-/// connection that named no user.
 fn session_user_name(
     probed: Option<&str>,
     session_user: Option<&str>,
@@ -158,11 +155,6 @@ pub(crate) const TRINO_TIMESTAMP_INTERVALS: u32 = SQL_FN_TSI_SECOND
     | SQL_FN_TSI_QUARTER
     | SQL_FN_TSI_YEAR;
 
-/// Maps a `trino_rust_client` error to the most appropriate [`TrinoError`] variant,
-/// preserving SQLSTATE semantics for link failures, timeouts, and auth errors.
-///
-/// Every error from the client library must be routed through here; hand-building
-/// a `TrinoError` at the call site silently degrades a specific SQLSTATE to `HY000`.
 /// SQLSTATE for "operation canceled", which core provides no named
 /// constructor for. See [`TrinoError::OperationCancelled`].
 const SQL_STATE_CANCELLED: &str = "HY008";
@@ -188,10 +180,10 @@ const TRINO_ERROR_USER_CANCELED: i32 = 3;
 ///
 /// None of that is actionable through ODBC: the stack describes the
 /// coordinator's internals, the application already gets Trino's own error code
-/// verbatim through `NativeErrorPtr`, and the summary that names what actually
-/// went wrong is the first line. The stack is therefore logged at `debug`
-/// rather than marshalled: `ODBC_LOG_LEVEL` / `ODBC_LOG_FILE` are what a
-/// person debugging Trino itself reaches for.
+/// verbatim through `NativeErrorPtr`, and the summary naming the failure is the
+/// first line. The stack is therefore logged at `debug` rather than marshalled:
+/// `ODBC_LOG_LEVEL` and `ODBC_LOG_FILE` are what a person debugging Trino
+/// itself reaches for.
 #[derive(Debug, Snafu)]
 pub enum QueryCause {
     /// A transport failure, kept verbatim; its `Display` is already one line.
@@ -213,7 +205,7 @@ fn query_cause(e: trino_rust_client::error::Error) -> (QueryCause, i32) {
     match e {
         Error::Query(query_error) => {
             // Logged rather than discarded: this is the only copy, and it is
-            // what a person debugging the coordinator actually wants.
+            // what a person debugging the coordinator wants.
             if let Some(ref failure) = query_error.failure_info {
                 tracing::debug!(
                     error_name = %query_error.error_name,
@@ -291,23 +283,17 @@ pub(crate) fn map_trino_error_on(
 }
 
 /// The error a statement reports for a cancellation it learned about from the
-/// token rather than from a failed request.
+/// token, with no failed request to classify.
 ///
-/// [`map_trino_error`] covers the cancel that lands while a page request is in
-/// flight, recognising Trino's `USER_CANCELED` on the response. A cancel that
-/// completes *between* requests leaves no failed response to classify, so the
-/// next `fetch` finds only [`CancelState::is_cancelled`] and the error has to
-/// be built here.
+/// This is the between-requests half of the pair
+/// [`TrinoError::OperationCancelled`] documents; the in-flight half comes from
+/// [`map_trino_error`]. Both reach the application as `HY008`, and core
+/// relabels either to `HYT00` when the failure follows a query timeout it
+/// armed.
 ///
-/// Reporting the same `USER_CANCELED` name and native code is accurate rather
-/// than invented: the flag is set only once `cancel`'s `DELETE` has succeeded,
-/// so the coordinator really did cancel the query, and code 3 is what it calls
-/// that.
-///
-/// Both arms therefore reach the application as `HY008`, and core relabels
-/// either to `HYT00` when the failure follows a query timeout it armed.
-/// Reporting `NoData` instead would tell an application its result set had
-/// ended normally when its rows had in fact been discarded.
+/// Reporting Trino's own `USER_CANCELED` name and code 3 here is a statement of
+/// fact: `cancel` publishes the flag alongside a `DELETE` it also reports on,
+/// so the coordinator has been told to stop.
 pub(crate) fn cancelled_between_requests() -> TrinoError {
     TrinoError::OperationCancelled {
         source: QueryCause::Server {
@@ -318,6 +304,20 @@ pub(crate) fn cancelled_between_requests() -> TrinoError {
     }
 }
 
+/// Classify a `trino_rust_client` error into the [`TrinoError`] variant whose
+/// SQLSTATE the failure deserves: `08S01` for a lost link, `HYT00` for a
+/// timeout, `28000` for an authentication rejection, `HY008` for a cancelled
+/// query, `HY000` for everything else.
+///
+/// **Every** error from the client library goes through here. Hand-building a
+/// `TrinoError` at the call site degrades a specific SQLSTATE to `HY000` and
+/// throws away Trino's own error code, which `SQLGetDiagRec` reports through
+/// `NativeErrorPtr` and is the only value an application can act on.
+///
+/// Prefer [`map_trino_error_on`] wherever a [`Liveness`] handle is in scope: it
+/// delegates the whole classification here and only observes the result, which
+/// is what carries a connection-level failure to
+/// `SQL_ATTR_CONNECTION_DEAD`.
 pub(crate) fn map_trino_error(e: trino_rust_client::error::Error) -> TrinoError {
     use trino_rust_client::error::Error;
     match e {
@@ -339,7 +339,6 @@ pub(crate) fn map_trino_error(e: trino_rust_client::error::Error) -> TrinoError 
         Error::HttpError(ref req_err) if req_err.is_timeout() => TrinoError::QueryTimeout {
             message: format!("request timed out: {req_err}"),
         },
-        // HTTP 401 Unauthorized or 403 Forbidden
         Error::HttpNotOk(ref status, ref reason)
             if status.as_u16() == 401 || status.as_u16() == 403 =>
         {
@@ -500,31 +499,28 @@ fn validation_query(catalog: Option<&str>) -> String {
     }
 }
 
-/// Verify that the freshly built client can actually reach and use Trino.
+/// Prove that the freshly built client can reach and use Trino.
 ///
-/// `ClientBuilder::build` performs no I/O, so without this the driver would
-/// report success from `SQLDriverConnect` against an unreachable coordinator,
+/// `ClientBuilder::build` performs no I/O. Without this round trip
+/// `SQLDriverConnect` would report success against an unreachable coordinator,
 /// wrong credentials or a catalog that does not exist, and the failure would
-/// only surface on the application's first query, long after the point where
-/// the ODBC spec (and every application) expects a connection error.
+/// surface on the application's first query, long after the spec and every
+/// application expect a connection error.
 ///
-/// Failures are reclassified for the connect-time context. A transport failure
-/// becomes 08001, the SQLSTATE for establishing a connection, rather than the
-/// 08S01 that [`map_trino_error`] produces for the same error mid-session. A
-/// connection whose catalog does not resolve cannot run anything, so that
-/// counts as a failure to establish a usable connection too. Two variants are
-/// already right for connect time and pass through unchanged: `AuthFailure`
-/// keeps 28000 and `QueryTimeout` keeps HYT00, both more specific than 08001.
+/// Failures are reclassified for the connect-time context: a transport failure
+/// becomes `08001`, the SQLSTATE for establishing a connection, where
+/// [`map_trino_error`] produces `08S01` for the same error mid-session. A
+/// connection whose catalog does not resolve can run nothing, so it counts as a
+/// failure to establish too. Two variants are already right for connect time
+/// and pass through unchanged: `AuthFailure` keeps `28000` and `QueryTimeout`
+/// keeps `HYT00`, both more specific than `08001`.
 ///
-/// `login_timeout` is `SQL_ATTR_LOGIN_TIMEOUT`, which the spec defines as the
-/// seconds "to wait for a login request to complete before returning to the
-/// application". This call is that login: the one round trip that decides
-/// whether `SQLDriverConnect` succeeds. It is applied here rather than
-/// on the HTTP client because the client's request timeout also bounds every
-/// later query, and the two attributes are separately settable. `Some(0)` never
-/// reaches this function: the spec makes it "the timeout is disabled and a
-/// connection attempt will wait indefinitely", which is the same behaviour as
-/// the unset case.
+/// `login_timeout` is `SQL_ATTR_LOGIN_TIMEOUT`, the seconds "to wait for a
+/// login request to complete before returning to the application", and this
+/// call is that login. It is applied here and not on the HTTP client, whose
+/// request timeout also bounds every later query; the two attributes are set
+/// separately. `Some(0)` never arrives: [`login_deadline`] collapses the spec's
+/// "wait indefinitely" onto the unset case.
 fn validate_connection(
     conn: &TrinoConnection,
     catalog: Option<&str>,
@@ -648,6 +644,19 @@ struct SessionProbe {
 /// points with. All per-connection state lives in `TrinoConnection`.
 pub struct TrinoBackend;
 
+/// Everything one ODBC connection owns: the Trino HTTP client, the Tokio
+/// runtime every call into it blocks on, and the facts about the session that
+/// `SQLGetInfo` and `SQLGetConnectAttr` report.
+///
+/// One runtime per connection is the whole of the async bridge. Core's
+/// `Backend` trait is synchronous and `trino-rust-client` is not, so every
+/// client call goes through `conn.runtime.block_on(...)`; never introduce a
+/// second runtime, and never `block_on` from inside an async context.
+///
+/// The three `Arc`-shared fields ([`Liveness`], [`TransactionState`] and, by
+/// way of [`TrinoCancelToken`], [`CancelState`]) travel to every statement this
+/// connection produces, because a statement is where a lost link, an aborted
+/// transaction and a cancelled query are all first seen.
 pub struct TrinoConnection {
     pub runtime: Arc<tokio::runtime::Runtime>,
     pub client: Arc<Client>,
@@ -820,7 +829,7 @@ impl TrinoConnection {
     /// Read from the client rather than tracked here: the client owns the id,
     /// captures it from `X-Trino-Started-Transaction-Id` and clears it on the
     /// response to a `COMMIT`. A second copy here could disagree with the
-    /// headers actually going out.
+    /// headers going out.
     pub(crate) fn in_transaction(&self) -> bool {
         self.runtime
             .block_on(self.client.transaction_id())
@@ -857,7 +866,7 @@ impl TrinoConnection {
     /// `NOT_SUPPORTED` one included, and then refuses everything until a
     /// `ROLLBACK`, `COMMIT` included, which is what makes this flag necessary
     /// rather than merely informative. [`TrinoBackend::end_tran`] reads it to
-    /// send the rollback the session actually needs.
+    /// send the rollback the session needs.
     pub(crate) fn note_statement_error(&self) {
         self.txn.note_statement_error();
     }
@@ -907,16 +916,12 @@ impl CancelState {
     ///
     /// Called at the point a statement-producing call learns its query id.
     ///
-    /// The reset is belt-and-braces rather than load-bearing. Core mints a new
-    /// token at every statement-producing call, so a re-execute arrives with a
-    /// fresh [`CancelState`] whose flag is already clear, and [`cancel`] sets
-    /// the flag only after a `DELETE` that needed a query id this method had
-    /// already recorded. There is therefore no reachable path on which a
-    /// cancellation is pending here, but the flag's whole purpose is to keep
-    /// a live query off a stale one's teardown, so it is cleared explicitly at
-    /// the one point that knows a new query has begun.
-    ///
-    /// [`cancel`]: crate::backend::execute::cancel
+    /// The reset keeps a live query off a stale one's teardown, and this is the
+    /// one point that knows a new query has begun. No reachable path arrives
+    /// with a cancellation pending: core mints a new token at every
+    /// statement-producing call, so a re-execute gets a fresh [`CancelState`]
+    /// whose flag is already clear. The clear is explicit anyway, because
+    /// nothing else would notice if that stopped holding.
     pub(crate) fn begin_query(&self, query_id: String) {
         self.cancelled.store(false, Ordering::SeqCst);
         match self.query_id.lock() {
@@ -960,9 +965,9 @@ pub struct TrinoCancelToken {
 /// operation; neither talks to a server. Validation happens in the separate
 /// `validate_connection` call [`TrinoBackend::connect`] makes afterwards.
 ///
-/// Every capability declaration takes a `&TrinoConnection` now, so the offline
+/// Every capability declaration takes a `&TrinoConnection`, so the offline
 /// tests that assert what this driver reports need one. They assert values that
-/// do not depend on the coordinator, which is exactly what this stands in for.
+/// do not depend on the coordinator, which is what this stands in for.
 #[cfg(test)]
 pub(crate) fn disconnected_trino_conn() -> TrinoConnection {
     disconnected_trino_conn_with_catalog(None)
@@ -996,9 +1001,9 @@ pub(crate) fn disconnected_trino_conn_with_catalog(catalog: Option<&str>) -> Tri
         // left them blank would let `SQL_SERVER_NAME` and `SQL_USER_NAME`
         // regress to core's non-answer with the snapshot still passing.
         //
-        // The DSN is the exception and is genuinely empty: nothing here
-        // connected by DSN, which is the one case the spec defines the empty
-        // string for.
+        // The DSN is the exception, and its emptiness is defined rather than
+        // missing: nothing here connected by DSN, which is the one case the
+        // spec gives the empty string to.
         data_source_name: String::new(),
         server_name: "localhost".to_string(),
         user_name: "test".to_string(),
@@ -1015,6 +1020,23 @@ pub(crate) fn disconnected_trino_conn_with_catalog(catalog: Option<&str>) -> Tri
     }
 }
 
+/// One ODBC statement handle: the SQL, the result set's column metadata, the
+/// page of rows currently buffered, and the link back to the connection that
+/// produced it.
+///
+/// Trino streams a result set as a chain of pages joined by `next_uri`, so a
+/// statement holds one page at a time and fetches the next on demand. Three
+/// consequences shape the fields below. The client, runtime and `next_uri` must
+/// outlive the call that created the statement, so they are held here rather
+/// than borrowed. Trino sends column metadata on one page only, so
+/// `raw_columns` keeps it for every later page, spooled ones included. And a
+/// page fetch is where a lost link, an aborted transaction and a cancelled
+/// query are usually first seen, so `liveness`, `txn` and `cancel_state` are
+/// shared back to the connection.
+///
+/// Every one of those five is `None` for a statement that reaches no network:
+/// a prepared-but-unexecuted handle, and the catalog result sets core builds in
+/// memory.
 pub struct TrinoStatement {
     /// SQL stored by SQLPrepare, consumed by SQLExecute.
     pending_sql: Option<String>,
@@ -1134,9 +1156,9 @@ pub enum TrinoError {
     /// through `NativeErrorPtr`, where it is the only value an application can
     /// act on; every failure reporting `0` tells it nothing.
     ///
-    /// The message deliberately does not interpolate `source`: core walks the
-    /// whole causal chain when it builds the diagnostic record, so doing both
-    /// would print the client error twice.
+    /// The message does not interpolate `source`: core walks the whole causal
+    /// chain when it builds the diagnostic record, so doing both would print
+    /// the client error twice.
     #[snafu(display("query failed"))]
     Query {
         source: QueryCause,
@@ -1150,13 +1172,14 @@ pub enum TrinoError {
     /// thread in a multithreaded application". That clause carries no `(DM)`
     /// annotation, so it is the driver's to report, not the Driver Manager's.
     ///
-    /// Recognised from Trino's own `USER_CANCELED` error code rather than from
-    /// this driver's cancel flag, because the two race: the cancelling thread
-    /// sets its flag only after its `DELETE` returns, by which time the
-    /// coordinator may already have failed the in-flight page request. The
-    /// server's verdict needs no cross-thread ordering, and it also covers a
-    /// query killed by someone else entirely: another client, or
-    /// `CALL system.runtime.kill_query`.
+    /// Two paths produce it, and both are needed. A cancel landing while a page
+    /// request is in flight is recognised from Trino's own `USER_CANCELED`
+    /// error code, in [`map_trino_error`]; the server's verdict needs no
+    /// cross-thread ordering and also covers a query killed by someone else,
+    /// such as `CALL system.runtime.kill_query`. A cancel landing *between*
+    /// requests fails no response, so the next `fetch` sees only
+    /// [`CancelState::is_cancelled`] and builds the error from
+    /// [`cancelled_between_requests`].
     #[snafu(display("query was cancelled"))]
     OperationCancelled {
         source: QueryCause,
@@ -1239,7 +1262,7 @@ impl From<TrinoError> for OdbcError {
 /// - token + !secure     -> Err (a bearer token must not travel over plain HTTP)
 /// - token + secure      -> Jwt
 /// - no token + secure   -> Basic(user, password): Basic even when no
-///   password is supplied (`Basic(user, None)`); preserves prior behavior
+///   password is supplied, as `Basic(user, None)`
 /// - no token + !secure  -> None (user-only `X-Trino-User` header; a password
 ///   supplied over HTTP is dropped with a warning by `connect`, not here)
 fn resolve_auth(
@@ -1278,8 +1301,8 @@ fn resolve_auth(
                 .into(),
         }),
         (false, Some(_), None) => Ok(AuthChoice::Jwt),
-        // No token: preserve the pre-existing behavior, Basic over HTTPS
-        // (even with no password: Basic(user, None)), user-only over HTTP.
+        // No token: Basic over HTTPS, even with no password, as
+        // `Basic(user, None)`; user-only over HTTP.
         (false, None, _) if secure => Ok(AuthChoice::Basic),
         (false, None, _) => Ok(AuthChoice::None),
     }
@@ -1427,8 +1450,8 @@ impl Backend for TrinoBackend {
         .client_tags(p.client_tags().clone())
         .client_request_timeout(request_timeout);
         // `None` here means either that this driver declared no prompter or
-        // that the application passed `SQL_DRIVER_NOPROMPT`. Core deliberately
-        // does not distinguish the two, and neither does anything below.
+        // that the application passed `SQL_DRIVER_NOPROMPT`. Core does not
+        // distinguish the two, and neither does anything below.
         let prompter = params.prompter();
         let auth = match resolve_auth(
             p.secure(),
@@ -1701,9 +1724,9 @@ impl Backend for TrinoBackend {
         //
         // Trino refuses a COMMIT on an aborted transaction and leaves the id in
         // place, so the session stays wedged until something rolls back. A
-        // rollback is therefore what actually goes out, and the commit is
-        // reported as the failure it is: telling an application its writes
-        // landed when they were discarded is the one outcome worth avoiding.
+        // rollback is therefore what goes out, and the commit is reported as
+        // the failure it is. Telling an application its writes landed when they
+        // were discarded is the one outcome to avoid.
         let aborted = conn.txn.aborted();
 
         // Every open result set on this connection dies with the transaction,
@@ -1719,7 +1742,7 @@ impl Backend for TrinoBackend {
         result.map_err(|e| map_trino_error_on(&conn.liveness, e))?;
 
         if aborted && commit {
-            // `25S03` rather than `HY000`, and the difference is load-bearing.
+            // `25S03`, not `HY000`, and the difference is observable.
             // `SQLEndTran`'s Suspended State section names `25S03`, `40001`,
             // `40002` and `HYC00` as the four SQLSTATEs that confirm the
             // transaction did not complete; any other one leaves the Driver
@@ -1775,13 +1798,9 @@ impl Backend for TrinoBackend {
     /// observes it, and core turns a `true` here into the `HY008` the spec
     /// gives a function interrupted by `SQLCancel`.
     ///
-    /// This covers the cancel that lands *between* page requests. One landing
-    /// while a request is in flight is caught by `map_trino_error` instead,
-    /// from Trino's own `USER_CANCELED` code: the flag is set only once the
-    /// cancelling thread's `DELETE` has returned, by which time the coordinator
-    /// may already have failed the in-flight request. The two are complementary
-    /// rather than redundant, and the server's verdict also catches a query
-    /// killed by something else, such as `CALL system.runtime.kill_query`.
+    /// This covers the cancel that lands *between* page requests; see
+    /// `TrinoError::OperationCancelled` for the in-flight half and why both
+    /// exist.
     fn is_cancelled(token: &TrinoCancelToken) -> bool {
         token.state.is_cancelled()
     }
@@ -1789,27 +1808,26 @@ impl Backend for TrinoBackend {
     /// Core enforces `SQL_ATTR_QUERY_TIMEOUT` by cancelling, because Trino
     /// offers no per-statement server-side deadline this driver can set.
     ///
-    /// The alternative would be `SET SESSION query_max_run_time`, which
-    /// `trino-rust-client` would carry (it tracks `X-Trino-Set-Session`), and
-    /// it is rejected on two counts. It is a *session* property, so it would
-    /// give every statement on the connection the most recently set value,
-    /// where core's timer is armed per statement and matches the attribute's
-    /// actual scope. And it would cost a round trip inside `SQLSetStmtAttr`,
-    /// which applications call freely and the spec does not expect to block.
+    /// The alternative, `SET SESSION query_max_run_time`, would work, since
+    /// `trino-rust-client` tracks `X-Trino-Set-Session`, and is rejected on two
+    /// counts. It is a *session* property, so every statement on the connection
+    /// would get the most recently set value, where core's timer is armed per
+    /// statement and matches the attribute's scope. And it would cost a round
+    /// trip inside `SQLSetStmtAttr`, which applications call freely and the
+    /// spec does not expect to block.
     ///
-    /// Returning [`QueryTimeout::CoreCancels`] asserts that
-    /// [`Backend::cancel`] really cancels, which it does: it issues Trino's
-    /// `DELETE /v1/query/{id}`, so the coordinator stops the work rather than
-    /// the client merely abandoning it: the property that normally argues for
+    /// [`QueryTimeout::CoreCancels`] asserts that [`Backend::cancel`] really
+    /// cancels, and it does: it issues Trino's `DELETE /v1/query/{id}`, so the
+    /// coordinator stops the work. That property is what normally argues for
     /// [`QueryTimeout::DataSource`]. [`Backend::is_cancelled`] is implemented
-    /// alongside, as that variant requires.
+    /// alongside, as this variant requires.
     ///
     /// The deadline covers `SQLFetch`, which is what makes it useful against
     /// Trino: the coordinator answers with column metadata before it has
     /// computed a row, so `exec_direct` returns in milliseconds and a slow
     /// query spends its time paging.
     ///
-    /// Unaffected by unixODBC's `Threading` level, unlike a cross-thread
+    /// unixODBC's `Threading` level does not affect it, unlike a cross-thread
     /// `SQLCancel`: core's timer calls [`Backend::cancel`] directly from inside
     /// this shared object, so it never crosses the Driver Manager.
     fn set_query_timeout(
@@ -1960,9 +1978,8 @@ impl Backend for TrinoBackend {
     /// and the system catalog stores it lower case.
     ///
     /// Not the `SQL_IC_SENSITIVE` a reader of the SQL standard would expect,
-    /// and measured against a live coordinator rather than assumed. A column
-    /// created in PostgreSQL as `"MixedCol"`, reached through the `postgresql`
-    /// catalog:
+    /// and measured against a live coordinator. A column created in PostgreSQL
+    /// as `"MixedCol"`, reached through the `postgresql` catalog:
     ///
     /// | Probe | Result |
     /// |---|---|
@@ -1977,11 +1994,10 @@ impl Backend for TrinoBackend {
     /// definition exactly. The same holds one level up: `CREATE TABLE
     /// postgresql.s."MixedCase"` lands in PostgreSQL as `mixedcase`.
     ///
-    /// This matters to an application generating SQL from
-    /// `SQLColumns`/`SQLTables` output: under `SQL_IC_SENSITIVE` it would
-    /// believe a quoted name must match the catalog's spelling exactly, which
-    /// Trino does not require and which core's previous hard-wired answer
-    /// asserted on this driver's behalf.
+    /// An application generating SQL from `SQLColumns` / `SQLTables` output
+    /// reads this to decide how to quote. `SQL_IC_SENSITIVE` would tell it a
+    /// quoted name must match the catalog's spelling exactly, which Trino does
+    /// not require.
     fn quoted_identifier_case(_conn: &TrinoConnection) -> u16 {
         SQL_IC_LOWER
     }
@@ -2001,27 +2017,24 @@ impl Backend for TrinoBackend {
     ///
     /// Entry level requires referential integrity in `CREATE TABLE`, and
     /// Trino's grammar rejects all four constraint forms outright: `PRIMARY
-    /// KEY`, `UNIQUE`, `CHECK` and `REFERENCES` each fail with `SYNTAX_ERROR`,
-    /// which is also why this driver reports `SQL_INTEGRITY = "N"`. That one
-    /// requirement is enough to rule the level out.
+    /// KEY`, `UNIQUE`, `CHECK` and `REFERENCES` each fail with `SYNTAX_ERROR`.
+    /// That one requirement rules the level out, and is the same measurement
+    /// behind `SQL_INTEGRITY = "N"`. Entry level's other demand, `COMMIT` and
+    /// `ROLLBACK`, *is* met, so the constraint grammar is the whole of the
+    /// argument and a Trino release that accepted `PRIMARY KEY` calls for
+    /// re-examining this.
     ///
-    /// Entry level's other demand, `COMMIT` and `ROLLBACK`, *is* met: this
-    /// driver reports `SQL_TC_DML` and implements [`TrinoBackend::end_tran`].
-    /// So the constraint grammar is the whole of the argument, and a Trino
-    /// release that accepted `PRIMARY KEY` would be worth re-examining here.
+    /// `0` is not one of the four `SQL_SC_*` values, the spec's list having no
+    /// "conforms to nothing" entry, and it is the only honest answer when the
+    /// lowest named level is not met. `SQL_SC_SQL92_ENTRY` would be the
+    /// overstatement the capability hooks exist to prevent.
     ///
-    /// `0` is not one of the four `SQL_SC_*` values (the spec's list has no
-    /// "conforms to nothing" entry), but it is the only honest answer when the
-    /// lowest named level is not met. Claiming `SQL_SC_SQL92_ENTRY` would be
-    /// the overstatement the capability hooks exist to prevent.
-    ///
-    /// Note that [`Backend::group_by`] reporting
-    /// `SQL_GB_GROUP_BY_CONTAINS_SELECT` is *not* a reason to avoid entry
-    /// level: `CONTAINS_SELECT` is strictly more permissive than the
-    /// `EQUALS_SELECT` the spec names for an entry-level driver, and the spec
-    /// itself directs applications to read the general level here and "use the
-    /// other information types to determine variations from the stated
-    /// standards compliance level".
+    /// [`Backend::group_by`] reporting `SQL_GB_GROUP_BY_CONTAINS_SELECT` is no
+    /// reason to avoid entry level. `CONTAINS_SELECT` is strictly more
+    /// permissive than the `EQUALS_SELECT` the spec names for an entry-level
+    /// driver, and the spec directs applications to read the general level here
+    /// and "use the other information types to determine variations from the
+    /// stated standards compliance level".
     fn sql_conformance(_conn: &TrinoConnection) -> u32 {
         0
     }
@@ -2031,7 +2044,7 @@ impl Backend for TrinoBackend {
     /// the two lists are the same list, and a unit named here that the
     /// dialect declines would be a claim an application cannot use.
     ///
-    /// `SQL_FN_TSI_FRAC_SECOND` is deliberately absent. ODBC defines it as
+    /// `SQL_FN_TSI_FRAC_SECOND` is absent. ODBC defines it as
     /// billionths of a second; Trino's `date_add`/`date_diff` reject
     /// `nanosecond` and their finest unit is `millisecond`, which ODBC has no
     /// bit for. Claiming it would be a factor of a million out.
@@ -2278,9 +2291,9 @@ impl Backend for TrinoBackend {
     /// `ConnectParams` remains the fallback for the window before the first
     /// response has been seen.
     ///
-    /// [`Backend::set_current_catalog`] is deliberately *not* implemented; see
-    /// below for why. An application can therefore read this catalog and cannot
-    /// change it through ODBC, only by executing `USE`.
+    /// [`Backend::set_current_catalog`] is *not* implemented, so an application
+    /// can read this catalog and cannot change it through ODBC, only by
+    /// executing `USE`. See below.
     fn current_catalog(conn: &TrinoConnection) -> Option<Cow<'static, str>> {
         conn.runtime
             .block_on(conn.client.session_snapshot())
@@ -2290,33 +2303,13 @@ impl Backend for TrinoBackend {
     }
 
     // `set_current_catalog` keeps core's default, which reports `HYC00`, so
-    // `SQLSetConnectAttr(SQL_ATTR_CURRENT_CATALOG)` fails rather than
-    // pretending. Trino cannot switch a catalog without also switching the
-    // schema, and it is the second half that makes accepting the call a lie.
-    //
-    // The only statement that moves the session catalog is `USE`, and its
-    // grammar requires a schema. Measured against a live coordinator:
-    //
-    // | Statement | Result |
-    // |---|---|
-    // | `USE postgresql.public` | `X-Trino-Set-Catalog: postgresql`, `X-Trino-Set-Schema: public` |
-    // | `USE "postgresql"."public"` | the same |
-    // | `USE postgresql` | `NOT_FOUND`, parsed as a *schema* named `postgresql` |
-    //
-    // So there is no way to honour "set the catalog to X" without inventing a
-    // schema to go with it. Every catalog has an `information_schema`, so that
-    // invention would succeed and then leave an unqualified `SELECT ... FROM
-    // orders` resolving inside `information_schema`: the application's names
-    // pointing somewhere it never asked for, which is exactly the failure
-    // `HYC00` exists to avoid, displaced from the catalog to the schema.
-    // Reconnecting under a new catalog is the other option and is worse: it
-    // drops the session's prepared statements and its connection pool under a
-    // call the application thinks is an attribute write.
-    //
-    // `trino-rust-client` is not the constraint here and would not need to
-    // change: it already tracks `X-Trino-Set-Catalog` into its session and
-    // carries the new value on later requests. Trino's grammar is. Revisit if
-    // `SET SESSION CATALOG`, or any catalog-only form of `USE`, ever lands.
+    // `SQLSetConnectAttr(SQL_ATTR_CURRENT_CATALOG)` fails instead of
+    // pretending. `USE` is the only statement moving the session catalog, and
+    // its grammar requires a schema (`USE postgresql` is `NOT_FOUND`, parsed as
+    // a schema name), so honouring "set the catalog to X" means inventing one.
+    // AGENTS.md, "Why the catalog cannot be set", carries the measurements and
+    // the rejected alternatives. Revisit if `SET SESSION CATALOG`, or any
+    // catalog-only form of `USE`, ever lands.
 
     fn get_info(
         conn: &TrinoConnection,
@@ -2432,9 +2425,9 @@ impl Backend for TrinoBackend {
     }
 
     /// Answered from Trino's `DESCRIBE INPUT`, so a client sizing its buffers
-    /// from `SQLDescribeParam` gets the type Trino actually inferred rather
-    /// than core's generic `VARCHAR`. See `backend::describe_param` for the
-    /// round trip and why it cannot go through the bound-parameter path.
+    /// from `SQLDescribeParam` gets the type Trino inferred rather than core's
+    /// generic `VARCHAR`. See `backend::describe_param` for the round trip and
+    /// why it cannot go through the bound-parameter path.
     fn describe_param(
         conn: &TrinoConnection,
         sql: &str,
@@ -2494,7 +2487,7 @@ mod auth_tests {
     use super::*;
 
     /// Not requesting external authentication, and being allowed to prompt,
-    /// is the shape every pre-existing case has.
+    /// is the shape of every case but the OAuth 2.0 ones.
     fn without_external(
         secure: bool,
         password: Option<&str>,
@@ -2621,8 +2614,8 @@ mod tests {
     /// PASSWORD authentication on every request. `admin` is the only principal
     /// in the generated `password.db`.
     ///
-    /// The parse-only tests below deliberately do *not* use this. Their port
-    /// and protocol are incidental to what they assert.
+    /// The parse-only tests below do *not* use this: their port and protocol
+    /// are incidental to what they assert.
     const LIVE: &str = concat!(
         "Host=localhost;Port=8443;Protocol=https;User=admin;Password=admin;Certificate=",
         env!("CARGO_MANIFEST_DIR"),
@@ -2805,7 +2798,7 @@ mod tests {
     /// over anything the connection string said. Under
     /// `ExternalAuthentication` there is no `User` at all and the identity
     /// provider's mapping is the only source; under `SessionUser` the two
-    /// genuinely differ.
+    /// differ outright.
     #[test]
     fn user_name_prefers_what_the_session_reports() {
         assert_eq!(
@@ -2926,8 +2919,7 @@ mod tests {
         );
     }
 
-    /// Ignored because `connect` now validates the connection with a real
-    /// query: a successful connect requires a live Trino.
+    /// A successful connect runs a validation query, so this needs a live Trino.
     #[test]
     #[ignore = "requires Trino at localhost:8443; run with: cargo test -- --ignored backend"]
     fn connect_creates_runtime() {
@@ -2948,9 +2940,9 @@ mod tests {
         assert!(TrinoBackend::connect(&params).is_err());
     }
 
-    // These assert on the parsed parameters rather than calling `connect`:
-    // `connect` now validates the connection with a real query, so it cannot
-    // succeed without a live Trino, and what these cover is the parsing.
+    // These assert on the parsed parameters rather than calling `connect`,
+    // which cannot succeed without a live Trino: it runs a validation query.
+    // What they cover is the parsing.
 
     #[test]
     fn connect_custom_query_timeout_accepted() {
@@ -3131,11 +3123,11 @@ mod tests {
         );
     }
 
-    /// A declaration naming a keyword this driver does not actually read is a
-    /// silent no-op, so it is asserted against the constants the parser uses
-    /// rather than against string literals repeated here.
+    /// A declaration naming a keyword this driver never reads is a silent
+    /// no-op, so it is asserted against the constants the parser uses rather
+    /// than against string literals repeated here.
     ///
-    /// `Password` is absent deliberately: it is core's own spec-defined
+    /// `Password` is absent for a reason: it is core's own spec-defined
     /// keyword, redacted there by name rather than by this hook.
     #[test]
     fn every_trino_specific_secret_keyword_is_declared_sensitive() {
@@ -3271,12 +3263,12 @@ mod tests {
         );
     }
 
-    /// `TrinoError::Query`'s own `Display` is deliberately empty, because core
-    /// walks its `source` when it builds the diagnostic. Reclassifying it to
-    /// 08001 by way of `to_string()` therefore yields the bare words "query
-    /// failed" and throws away both the cause and Trino's error code, which is
-    /// every connect-time failure that is not an auth or timeout error: a
-    /// malformed session property, an undecodable page, a 500 from a proxy.
+    /// `TrinoError::Query`'s own `Display` is empty, because core walks its
+    /// `source` when it builds the diagnostic. Reclassifying it to 08001 by way
+    /// of `to_string()` therefore yields the bare words "query failed" and
+    /// throws away both the cause and Trino's error code, which is every
+    /// connect-time failure that is not an auth or timeout error: a malformed
+    /// session property, an undecodable page, a 500 from a proxy.
     #[test]
     fn a_failed_connect_keeps_the_cause_that_explains_it() {
         use stackable_odbc_core::errors::OdbcError;
@@ -3540,7 +3532,6 @@ mod tests {
             assert_eq!(stmt.fetch().expect("fetch"), FetchResult::Row);
         }
 
-        // Cancel should succeed.
         let result = TrinoBackend::cancel(&cancel);
         assert!(result.is_ok(), "cancel failed: {result:?}");
 
@@ -3569,11 +3560,11 @@ mod tests {
     /// The scenario `Backend::CancelToken` exists for: `SQLCancel` arriving on
     /// a different thread from the one executing the statement.
     ///
-    /// The previous `cancel(&mut Self::Statement)` signature could not express
-    /// this at all: the executing thread holds that `&mut`. It also exercises
-    /// two threads inside `block_on` on the same *current-thread* runtime,
-    /// which is the shape this driver's Tokio bridge has and the one place
-    /// this design could plausibly deadlock rather than cancel.
+    /// A `cancel(&mut Self::Statement)` signature could not express it at all:
+    /// the executing thread holds that `&mut`. It also runs two threads inside
+    /// `block_on` on the same *current-thread* runtime, which is the shape this
+    /// driver's Tokio bridge has and the one place the design could deadlock
+    /// instead of cancelling.
     #[test]
     #[serial(backend)]
     #[ignore = "requires Trino; run in isolation: cargo test -- --ignored backend"]
@@ -3641,7 +3632,7 @@ mod tests {
             "a fetch interrupted by SQLCancel must report HY008, got {odbc:?}"
         );
 
-        // The proof the cancel actually took effect. tpcds.sf1.customer holds
+        // The proof the cancel took effect. tpcds.sf1.customer holds
         // 100,000 rows; had the cancel been a no-op the loop would have drained
         // all of them and every assertion above would pass vacuously.
         const CUSTOMER_ROWS: u64 = 100_000;
@@ -3698,14 +3689,10 @@ mod tests {
         );
     }
 
-    // -----------------------------------------------------------------------
-    // Transactions
-    //
-    // The write scenarios name the `hive` catalog deliberately. It is the only
-    // connector Trino ships that accepts a write outside autocommit; `tpcds`
-    // and `postgresql` answer AUTOCOMMIT_WRITE_CONFLICT. See the hive catalog
-    // section in AGENTS.md.
-    // -----------------------------------------------------------------------
+    // The transaction scenarios below name the `hive` catalog for their
+    // writes. It is the only connector Trino ships that accepts a write
+    // outside autocommit; `tpcds` and `postgresql` answer
+    // AUTOCOMMIT_WRITE_CONFLICT. See the hive catalog section in AGENTS.md.
 
     /// A transaction-state error from the client is not a server-side query
     /// rejection, and must not be reported as one: `TrinoError::Query` carries

@@ -38,7 +38,7 @@ fi
 # stack.env rather than `compose ps`: a running container is not the same as a
 # configured stack, and the suites read stack.env, not docker.
 if [[ ! -f "$STACK_ENV" ]]; then
-    echo "=== Stack not set up — calling setup.sh ==="
+    echo "=== Stack not set up, calling setup.sh ==="
     "$SCRIPT_DIR/setup.sh"
 fi
 

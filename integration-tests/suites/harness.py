@@ -3,8 +3,8 @@
 
 Standard library only, and `pyodbc` is imported lazily inside `Stack.connect`.
 `test_c_abi.py` and `test_type_matrix.py` load the driver's `.so` with `ctypes`
-and deliberately have no dependency on a Driver Manager, on `uv` or on pyodbc;
-a module-scope pyodbc import here would give them one silently.
+and depend on neither a Driver Manager, nor `uv`, nor pyodbc. A module-scope
+pyodbc import here would give them all three silently.
 """
 
 import os

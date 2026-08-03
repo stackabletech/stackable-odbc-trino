@@ -11,6 +11,9 @@ which is the headless path, so nothing else exercises the dialog at all.
     uv run --with pywinrm python3 \
         integration-tests/windows/dsn_dialog_test.py
 
+Requires a running Trino and the Windows VM. Needs no compose profile: the
+dialog's Test button connects to the base stack.
+
 Screenshots land in `integration-tests/generated/windows-dialog/`, numbered in
 the order they were taken, and are what a reviewer looks at when a step reports
 a mismatch. `--keep-open` leaves the Administrator up to poke at by hand.
@@ -21,8 +24,8 @@ checked but not photographed: what they produce is a *transient* dialog and an
 empty list, neither of which a picture settles, and both are asserted against
 the registry instead.
 
-Three things about the mechanics are load-bearing, and each one silently
-produced a wrong answer before it was understood:
+Four things about the mechanics decide whether a step measures anything, and
+each one fails by giving a plausible wrong answer rather than an error:
 
 - **WinRM lands in session 0**, which has no visible desktop. A GUI started
   from it is invisible and an in-guest screenshot is blank. Every UI step
@@ -32,15 +35,15 @@ produced a wrong answer before it was understood:
 - **Neither dialog ships a UI Automation provider**, so every control arrives
   as a generic `Pane` with no `InvokePattern` and, unreliably, no
   `ValuePattern`. Buttons take a posted `BM_CLICK`, text fields take
-  `WM_SETTEXT`, and the tab strip -- which is not a control with a handle at
-  all -- takes a mouse click at its coordinates.
+  `WM_SETTEXT`, and the tab strip, which is not a control with a handle at all,
+  takes a mouse click at its coordinates.
 - **Control text is read from UI Automation's `Name`, never `GetWindowTextW`**,
   which does not retrieve an edit control's text across a process boundary and
   answers empty. That empty answer reads exactly like the write having failed.
 - **`BM_CLICK` is posted, never sent.** A button that opens a modal dialog does
-  not return from its click until that dialog closes, so `SendMessage` hung the
-  driving script for as long as the dialog was up, and the stuck instance then
-  made every later scheduled run refuse to start.
+  not return from its click until that dialog closes, so `SendMessage` hangs the
+  driving script for as long as the dialog is up, and the stuck instance makes
+  every later scheduled run refuse to start.
 """
 import argparse
 import base64
@@ -60,9 +63,9 @@ DSN_NAME = "trino_dialog_test"
 TRINO_VM_HOSTNAME = "trino"
 
 # WinRM runs each command through cmd.exe, which caps its command line at 8191
-# characters, and pywinrm re-encodes the script as UTF-16 base64 on the way --
+# characters, and pywinrm re-encodes the script as UTF-16 base64 on the way, so
 # about 2.7x. A chunk this size stays under that with room to spare. A larger
-# one failed the upload *silently*, leaving the previous script in place to run
+# one fails the upload *silently*, leaving the previous script in place to run
 # again, which looks exactly like the new one having no effect.
 UPLOAD_CHUNK = 1200
 
@@ -146,9 +149,9 @@ function Click-Ctl($Ctl) {
   Click-Point ([int]($r.X + $r.Width / 2)) ([int]($r.Y + $r.Height / 2))
 }
 
-# A list view's rows are not exposed to UI Automation either -- neither the
-# driver list nor the data source list has a child per row -- so a row is
-# selected by clicking where it sits. The caller supplies the index, computed
+# A list view's rows are not exposed to UI Automation either. Neither the driver
+# list nor the data source list has a child per row, so a row is selected by
+# clicking where it sits. The caller supplies the index, computed
 # from the registry, because the control cannot be asked what it contains.
 function Click-ListRow($Win, [int]$Index) {
   $list = $null
@@ -198,18 +201,17 @@ function Test-CtlReadOnly($Ctl) {
 }
 
 # Each field is an edit box that follows its label in creation order, and the
-# labels are the only named thing on a tab. Looking a control up by its label
-# rather than by a fixed index matters: the descendant list gains and loses
-# leading entries between dialog instances, so an index that addressed the
-# name box on one run addressed its *label* on the next -- and a label has no
-# ValuePattern, which is where that showed up.
+# labels are the only named thing on a tab. A control is looked up by its label
+# rather than by a fixed index because the descendant list gains and loses
+# leading entries between dialog instances: an index addressing the name box on
+# one run addresses its *label* on the next, and a label has no ValuePattern.
 function Get-FieldCtl($Win, [string]$Label) {
   $all = @($Win.FindAll($TS::Descendants, $TRUE_COND))
   for ($i = 0; $i -lt $all.Count; $i++) {
     if ($all[$i].Current.Name -ne $Label) { continue }
     # A secret's row is label, Save box, edit; a file's row is label, Browse
-    # button, edit. Taking the element straight after the label therefore
-    # returned a CheckBox for Password, which has no ValuePattern.
+    # button, edit. Taking the element straight after the label would yield a
+    # CheckBox for Password, which has no ValuePattern.
     for ($j = $i + 1; $j -lt $all.Count; $j++) {
       $n = $all[$j].Current.Name
       if ($n -eq "Save" -or $n -eq "Browse...") { continue }
@@ -269,7 +271,7 @@ class Vm:
         """Wake the console's display.
 
         It blanks after a few minutes idle, and a blanked console screenshots
-        as a solid black frame while every UI step still reports success — the
+        as a solid black frame while every UI step still reports success. The
         run looks fine and the evidence is worthless.
         """
         subprocess.run(
@@ -356,10 +358,10 @@ class Vm:
         The list is a plain `SysListView32` with no UI Automation provider, so
         its items cannot be found by name and the row has to be clicked by
         position. odbcad32 lists the registered drivers in ordinal order, which
-        puts every capitalised name ahead of a lower-case one -- `SQL Server`
+        puts every capitalised name ahead of a lower-case one: `SQL Server`
         sorts before `stackable_odbc_trino`. Pressing Finish without selecting
         first configures whichever driver happens to be first, which on a VM
-        with the stock SQL Server driver present opened *its* wizard and looked
+        with the stock SQL Server driver present opens *its* wizard and looks
         like the driver's own dialog failing to appear.
         """
         _, out, _ = self.ps(r'''

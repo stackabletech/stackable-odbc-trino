@@ -6,8 +6,9 @@ spool: `./integration-tests/setup.sh --profile spooling`. The fallback scenario
 is the other way round and runs when the profile is *off*, since a coordinator
 with no spooling manager is what most deployments are.
 
-Measured against the running stack (2026-07-30), driving the REST API directly
-with an `X-Trino-Query-Data-Encoding` header and counting segments by type:
+Measured against this stack's coordinator (Trino 483) by driving the REST API
+directly with an `X-Trino-Query-Data-Encoding` header and counting segments by
+type:
 
     SELECT 1                              -> 1 inline segment, 0 spooled
     900 rows of customer                  -> 1 inline segment, 0 spooled
@@ -16,8 +17,8 @@ with an `X-Trino-Query-Data-Encoding` header and counting segments by type:
 
 The last row is the trap: **what spools is bytes, not rows.** A narrow
 projection of the same 20,000 rows stays under the coordinator's inlining
-threshold and never reaches object storage, so `SELECT *` is deliberate here and
-not laziness. The scenarios read the driver's log for the segment fetches rather
+threshold and never reaches object storage, which is why the queries here are
+`SELECT *`. The scenarios read the driver's log for the segment fetches rather
 than trusting a row count, because rows that arrive inline are byte-identical to
 rows that arrive spooled and prove nothing about this driver's decode path.
 """
@@ -242,8 +243,8 @@ def cancel_during_a_spooled_fetch_reports_hy008(stack, results):
                     f"got {state} after {elapsed:.1f}s: {e}"
                     + (
                         "; an error only after the query would have finished on "
-                        "its own means unixODBC serialised the cancelling thread "
-                        "-- check that Threading = 2 is set in odbcinst.ini"
+                        "its own means unixODBC serialised the cancelling thread. "
+                        "Check that Threading = 2 is set in odbcinst.ini"
                         if not prompt
                         else ""
                     ),

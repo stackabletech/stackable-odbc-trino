@@ -1,4 +1,15 @@
-// values from https://github.com/Microsoft/ODBC-Specification/blob/master/Windows/inc/sqlext.h
+// The ODBC constants from sqlext.h, translated to M.
+//
+// Vendored from Microsoft's Power Query connector samples, unmodified apart
+// from stripped trailing whitespace and this header:
+// https://github.com/microsoft/DataConnectors/blob/master/samples/ODBC/SqlODBC/OdbcConstants.pqm
+//
+// The values themselves come from
+// https://github.com/Microsoft/ODBC-Specification/blob/master/Windows/inc/sqlext.h
+//
+// StackableTrinoODBC.pq loads it as `ODBC` with Extension.LoadFunction. Take
+// fixes from upstream rather than editing it here, including the one `todo`
+// comment further down, which is upstream's.
 [
     Flags = (flags as list) =>
         if (List.IsEmpty(flags)) then

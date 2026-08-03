@@ -3,17 +3,17 @@
 Raw C ABI pen test for the Trino ODBC driver.
 
 Loads the driver's shared object with ctypes and calls its exported entry
-points directly. There is **no Driver Manager in the loop**, which is the whole
-point: unixODBC intercepts a large part of the ODBC state machine and answers
-it itself, so a driver's own handling of an out-of-order or malformed call is
-invisible to any test that goes through pyodbc or isql. Everything asserted
-here is the driver's own behaviour.
+points directly, with **no Driver Manager in the loop**. unixODBC intercepts a
+large part of the ODBC state machine and answers it itself, so a driver's own
+handling of an out-of-order or malformed call is invisible to any test that
+goes through pyodbc or isql. Everything asserted here is the driver's own
+behaviour.
 
 That also means the spec's **(DM)** diagnostics must not be expected. Where the
 spec attributes a SQLSTATE to the Driver Manager, nothing produces it here, and
 a probe that demanded it would be asserting the absence of a component rather
-than the presence of a behaviour. Those probes assert what the driver
-actually does, with a comment naming the (DM) diagnostic they do not demand.
+than the presence of a behaviour. Those probes assert what the driver does,
+with a comment naming the (DM) diagnostic they do not demand.
 
 Covers: handle lifecycle and parentage, invalid and stale handles, double free,
 use after free, connection state, cursor state, prepare / execute / re-execute,
@@ -22,8 +22,9 @@ SQLFreeStmt options, and statement and connection attribute round-trips.
 Usage:
     python3 integration-tests/suites/test_c_abi.py [path/to/libstackable_odbc_trino.so] [conn-str]
 
-Requires a running Trino (integration-tests/setup.sh). Only the Python standard library is
-needed -- ctypes, not pyodbc.
+Requires a running Trino (integration-tests/setup.sh). No compose profile is
+needed: the tpcds and hive catalogs are both in the base stack. Only the Python
+standard library is used (ctypes, not pyodbc).
 """
 
 import ctypes
@@ -342,9 +343,9 @@ def main():
 
     # ---------------------------------------------------------------
     print("\n--- cursor state with no cursor ---")
-    # HY010, not 24000, and the distinction is deliberate: 24000 is for a
-    # statement that *was* executed but has no result set, HY010 for one never
-    # put in an executed state. This statement is the latter.
+    # HY010, not 24000. 24000 is for a statement that *was* executed but has no
+    # result set, HY010 for one never put in an executed state. This statement
+    # is the latter.
     r = lib.SQLFetch(stmt)
     check(
         "fetch on a never-executed statement",
@@ -449,26 +450,25 @@ def main():
     # ---------------------------------------------------------------
     print("\n--- statement attributes: substituted values (01S02) ---")
     # The spec's 01S02 row closes the set of statement attributes a driver may
-    # substitute for, and for each the driver must store the value it will
-    # actually use -- that is what makes the row's parenthesis true,
-    # "(SQLGetStmtAttr can be called to determine the temporarily substituted
-    # value.)". The read-back is asserted, not merely observed: a driver that
-    # kept the requested value would be claiming a block cursor it does not
-    # implement, and an application reading its own number back has no way to
-    # tell.
+    # substitute for. For each, the driver must store the value it will use,
+    # which is what makes the row's parenthesis true: "(SQLGetStmtAttr can be
+    # called to determine the temporarily substituted value.)". The read-back is
+    # asserted, not merely observed. A driver that kept the requested value
+    # would be claiming a block cursor it does not implement, and an application
+    # reading its own number back has no way to tell.
     #
-    # SQL_ATTR_QUERY_TIMEOUT is deliberately absent: the driver enforces it
-    # (Backend::set_query_timeout answers QueryTimeout::CoreCancels), so it is
-    # accepted rather than substituted. It is checked on its own below.
+    # SQL_ATTR_QUERY_TIMEOUT is absent from the list because the driver enforces
+    # it (Backend::set_query_timeout answers QueryTimeout::CoreCancels), so it
+    # is accepted rather than substituted. It is checked on its own below.
     #
-    # SQLULEN is 64-bit here, so the read-back buffer is too. It is zeroed
-    # before each read; see the KNOWN note on the write width below.
+    # SQLULEN is 64-bit here, so the read-back buffer is too, and it is zeroed
+    # before each read. The full-width write is asserted separately below.
     #
     # A *fresh* statement, not the shared one: SQL_ATTR_CONCURRENCY,
     # SQL_ATTR_CURSOR_TYPE, SQL_ATTR_SIMULATE_CURSOR and SQL_ATTR_USE_BOOKMARKS
     # "must be set before the statement is executed", and the shared handle has
-    # been prepared and executed by now. Setting one of those on it answers
-    # HY011 -- correctly, which is what the group below this one asserts.
+    # been prepared and executed by now. Setting one of those on it correctly
+    # answers HY011, which is what the group below this one asserts.
     val = ctypes.c_uint64(0)
     outlen32 = ctypes.c_int32(0)
     attr_stmt = ctypes.c_void_p()
@@ -482,10 +482,10 @@ def main():
         ("SQL_ATTR_MAX_ROWS", SQL_ATTR_MAX_ROWS, 100, 0),
         ("SQL_ATTR_ROW_ARRAY_SIZE", SQL_ATTR_ROW_ARRAY_SIZE, 10, 1),
         ("SQL_ATTR_SIMULATE_CURSOR", SQL_ATTR_SIMULATE_CURSOR, 2, SQL_SC_NON_UNIQUE),
-        # Two deviations from the spec's closed list, deliberate and documented
-        # in core: substituting keeps SQL_ATTR_CURSOR_SCROLLABLE consistent with
-        # SQL_ATTR_CURSOR_TYPE, and refusing SQL_ATTR_PARAMSET_SIZE would fail a
-        # call every parameter-array-capable tool makes while accepting it
+        # Two deviations from the spec's closed list, documented in core.
+        # Substituting keeps SQL_ATTR_CURSOR_SCROLLABLE consistent with
+        # SQL_ATTR_CURSOR_TYPE. For SQL_ATTR_PARAMSET_SIZE, refusing would fail
+        # a call every parameter-array-capable tool makes, while accepting it
         # verbatim would silently drop every set past the first.
         ("SQL_ATTR_CURSOR_SCROLLABLE", SQL_ATTR_CURSOR_SCROLLABLE, 1, SQL_NONSCROLLABLE),
         ("SQL_ATTR_PARAMSET_SIZE", SQL_ATTR_PARAMSET_SIZE, 500, 1),
@@ -515,9 +515,9 @@ def main():
     # SQLGetStmtAttr reporting 42 rather than 0 is how an application learns the
     # deadline is really in force.
     #
-    # This needs Threading = 2 in odbcinst.ini to actually fire -- at unixODBC's
-    # default of 3 the timer thread is serialised against the executing call.
-    # Setting the attribute succeeds either way; only expiry is affected.
+    # Core arms the deadline from a timer thread inside the .so, so no Driver
+    # Manager threading policy can serialise it and this suite exercises the
+    # same path a unixODBC client gets.
     r = lib.SQLSetStmtAttrW(attr_stmt, SQL_ATTR_QUERY_TIMEOUT, P(42), 0)
     check(
         "set SQL_ATTR_QUERY_TIMEOUT=42 (enforced, not substituted)",
@@ -537,18 +537,14 @@ def main():
         got_state=f"read {val.value}, expected 42",
     )
 
-    # The deadline reaches the call that actually waits. Trino returns column
-    # metadata before it has computed anything, so SQLExecDirect finishes in
-    # milliseconds and every second of a slow query is spent paging inside
-    # SQLFetch -- which is where SQL_ATTR_QUERY_TIMEOUT has to bite or it bounds
-    # nothing. SQLFetch's diagnostics table carries HYT00 ("the query timeout
-    # period expired before the data source returned the requested result set.
-    # The timeout period is set through SQLSetStmtAttr, SQL_ATTR_QUERY_TIMEOUT")
-    # with no (DM) marker, so it is the driver's to return.
-    #
-    # This was a KNOWN note until stackable-odbc-core armed the fetch site:
-    # before that, SQLExecDirect returned SQL_SUCCESS in 0.1s and the following
-    # SQLFetch returned SQL_SUCCESS after 24.6s under a 2-second deadline.
+    # The deadline reaches the call that waits. Trino returns column metadata
+    # before it has computed anything, so SQLExecDirect finishes in milliseconds
+    # and every second of a slow query is spent paging inside SQLFetch. That is
+    # where SQL_ATTR_QUERY_TIMEOUT has to bite or it bounds nothing. SQLFetch's
+    # diagnostics table carries HYT00 ("the query timeout period expired before
+    # the data source returned the requested result set. The timeout period is
+    # set through SQLSetStmtAttr, SQL_ATTR_QUERY_TIMEOUT") with no (DM) marker,
+    # so it is the driver's to return.
     #
     # A dedicated statement and a query that takes ~24s uncancelled, so a
     # regression is a hard failure rather than a flake. Elapsed time is checked
@@ -589,8 +585,8 @@ def main():
 
     # The cancelled query must not strand the connection. A server-side cancel
     # leaves the pooled TCP socket carrying residual bytes if anything keeps
-    # paging it, which surfaces later as an unrelated query failing -- so the
-    # real assertion is that the next query on the same connection works.
+    # paging it, which surfaces later as an unrelated query failing. The
+    # assertion is therefore that the next query on the same connection works.
     r = lib.SQLFreeHandle(SQL_HANDLE_STMT, timeout_stmt)
     check("free the timed-out statement", r, SQL_SUCCESS)
 
@@ -632,11 +628,11 @@ def main():
 
     print("\n--- statement attributes: too late to set (HY011) ---")
     # The four the spec's Comments say "must be set before the statement is
-    # executed". The shared `stmt` has been prepared and executed by this
-    # point, so each is refused -- and refused *before* the substitution and
-    # HYC00 rules above are consulted, which is why they had to run on a fresh
-    # handle. An application that sets one of these mid-cursor is asking for a
-    # different cursor over a result set that already exists.
+    # executed". The shared `stmt` has been prepared and executed by this point,
+    # so each is refused, and refused *before* the substitution and HYC00 rules
+    # above are consulted. That is why those had to run on a fresh handle. An
+    # application that sets one of these mid-cursor is asking for a different
+    # cursor over a result set that already exists.
     for label, attr, value in (
         ("SQL_ATTR_CONCURRENCY", SQL_ATTR_CONCURRENCY, 2),
         ("SQL_ATTR_CURSOR_TYPE", SQL_ATTR_CURSOR_TYPE, SQL_CURSOR_STATIC),
@@ -664,7 +660,7 @@ def main():
     check("get SQL_ATTR_AUTOCOMMIT", r, SQL_SUCCESS)
 
     print("\n--- connection attributes the driver owns ---")
-    # SQL_ATTR_PACKET_SIZE: the spec states this one directly -- "if the
+    # SQL_ATTR_PACKET_SIZE: the spec states this one directly. "If the
     # application sets packet size after a connection has already been made,
     # the driver will return SQLSTATE HY011 (Attribute cannot be set now)".
     r = lib.SQLSetConnectAttrW(dbc, SQL_ATTR_PACKET_SIZE, P(8192), 0)
@@ -701,12 +697,13 @@ def main():
     print("\n--- SQL_ATTR_METADATA_ID inherits from the connection ---")
     # SQLSetStmtAttr's Comments make this one of exactly two attributes an
     # application may set at the connection level. It is not a cosmetic
-    # read-back: it decides whether the catalog functions treat their arguments
-    # as identifiers or as search patterns, and the connection-level route
-    # previously reached no statement at all -- SQL_SUCCESS, the value echoed
-    # back by SQLGetConnectAttr, and then pattern semantics with no diagnostic.
-    # Per the ODBC 2.x rule it inherits, this is the default for statements
-    # allocated afterwards only, so the pre-existing one is checked too.
+    # read-back: the value decides whether the catalog functions treat their
+    # arguments as identifiers or as search patterns. A connection-level set
+    # that reached no statement would answer SQL_SUCCESS, echo the value back
+    # from SQLGetConnectAttr, and then apply pattern semantics with no
+    # diagnostic. Per the ODBC 2.x rule it inherits, the value is the default
+    # for statements allocated afterwards only, so the pre-existing one is
+    # checked too.
     r = lib.SQLSetConnectAttrW(dbc, SQL_ATTR_METADATA_ID, P(SQL_TRUE), 0)
     check("set SQL_ATTR_METADATA_ID on the connection", r, SQL_SUCCESS)
     inherit_stmt = ctypes.c_void_p()
@@ -738,9 +735,10 @@ def main():
 
     print("\n--- an execution reports its parameter set ---")
     # The parameter-side counterpart of what SQLFetch writes through
-    # SQL_ATTR_ROWS_FETCHED_PTR. An application binding a status array to detect
-    # per-set errors previously read back its own initial buffer contents, which
-    # is indistinguishable from every set having succeeded.
+    # SQL_ATTR_ROWS_FETCHED_PTR. An application binds a status array to detect
+    # per-set errors, so a driver that left the buffer untouched would be
+    # indistinguishable from one reporting that every set succeeded. The buffers
+    # are poisoned before the call for that reason.
     param_stmt = ctypes.c_void_p()
     lib.SQLAllocHandle(SQL_HANDLE_STMT, dbc, ctypes.byref(param_stmt))
     processed = ctypes.c_uint64(0xFFFFFFFFFFFFFFFF)
@@ -842,9 +840,8 @@ def main():
     # Setting it is refused rather than silently accepted. Trino's only
     # catalog-switching statement is `USE`, whose grammar requires a schema, so
     # honouring this would mean inventing one and moving where the session's
-    # unqualified names resolve. Storing the value and returning SQL_SUCCESS --
-    # what the driver did before -- told an application its names had moved
-    # when nothing had.
+    # unqualified names resolve. Storing the value and returning SQL_SUCCESS
+    # would tell an application its names had moved when nothing had.
     newcat, _kc = w("postgresql")
     r = lib.SQLSetConnectAttrW(
         dbc, SQL_ATTR_CURRENT_CATALOG, ctypes.cast(newcat, P), SQL_NTS
@@ -891,7 +888,6 @@ def main():
         )
 
     # ---------------------------------------------------------------
-    # ---------------------------------------------------------------
     print("\n--- transactions ---")
     # SQL_ATTR_AUTOCOMMIT off is manual-commit mode. The driver records it and
     # opens the transaction at the first statement, so this reaches no
@@ -932,16 +928,15 @@ def main():
     print("\n--- privilege catalog functions ---")
     # pyodbc exposes no tablePrivileges()/columnPrivileges(), so this is the
     # only suite that reaches SQLTablePrivilegesW and SQLColumnPrivilegesW at
-    # all. Against tpcds both answer an empty result set, for different
-    # reasons:
+    # all. Against tpcds both answer an empty result set, for different reasons:
     #
     #  - SQLTablePrivileges runs a real query against
-    #    information_schema.table_privileges. It is empty for tpcds because
-    #    that connector implements no permission management, not because the
-    #    driver declines to look. A SQL_ERROR here means the query was
-    #    rejected. The hive catalog, which runs sql-standard security, is
-    #    probed below and does return rows.
-    #  - SQLColumnPrivileges reads nothing anywhere: Trino grants on tables,
+    #    information_schema.table_privileges. It is empty for tpcds because that
+    #    connector implements no permission management, not because the driver
+    #    declines to look. A SQL_ERROR here means the query was rejected. The
+    #    hive catalog runs sql-standard security, is probed below, and does
+    #    return rows.
+    #  - SQLColumnPrivileges reads nothing anywhere. Trino grants on tables,
     #    never on columns, and publishes no column-privilege metadata.
     #
     # Both must still describe their result set, because an application sizes
@@ -1032,10 +1027,10 @@ def main():
 
     # ---------------------------------------------------------------
     print("\n--- procedure catalog functions ---")
-    # Trino has callable procedures -- CALL system.runtime.kill_query(...) is
-    # one -- but publishes no metadata naming them: system.jdbc.procedures is
-    # a JDBC-compatibility view that is hardwired empty. An empty result set
-    # is therefore the honest answer, and it must still be a described one.
+    # Trino has callable procedures (CALL system.runtime.kill_query(...) is one)
+    # but publishes no metadata naming them: system.jdbc.procedures is a
+    # JDBC-compatibility view that is hardwired empty. An empty result set is
+    # therefore the honest answer, and it must still be a described one.
     sysc, _kp5 = w("system")
     runt, _kp6 = w("runtime")
 
@@ -1069,15 +1064,15 @@ def main():
 
     # ---------------------------------------------------------------
     print("\n--- bound parameter types ---")
-    # Both of these are stackable-odbc-core gaps reached through this driver,
-    # recorded as KNOWN so the suite stays green until core changes. Tighten
-    # each into a `check` as soon as its fix lands.
+    # Two probes over core's parameter handling, reached through this driver.
+    # Each pins a defect an application sees rather than a call's return code,
+    # and each falls back to a KNOWN note if it cannot be asserted. Tighten a
+    # note back into a `check` as soon as it can be.
     #
-    # 1. SQLBindParameter's declared SQL type is discarded. core's
-    #    read_param_value matches on the C type alone, so SQL_C_CHAR +
-    #    SQL_NUMERIC -- what every client sends for a numeric delivered as
-    #    text -- becomes a string, and Trino refuses to compare it to a
-    #    decimal column.
+    # 1. SQLBindParameter's declared SQL type must survive. SQL_C_CHAR +
+    #    SQL_NUMERIC is what a client sends for a numeric delivered as text, so
+    #    a core that matched on the C type alone would hand Trino a string and
+    #    `WHERE decimal_col = ?` would fail with TYPE_MISMATCH.
     dec = ctypes.create_string_buffer(b"12.34")
     dec_ind = ctypes.c_longlong(SQL_NTS)
     sql, _kd = w("SELECT CAST(? AS VARCHAR)")
@@ -1105,9 +1100,9 @@ def main():
     lib.SQLFreeStmt(stmt, SQL_CLOSE)
 
     # 2. A statement with a parameter marker and nothing bound. The spec's
-    #    answer is 07002 (COUNT field incorrect); core's collect_params pads
-    #    every unbound marker with NULL instead, so the statement runs with
-    #    NULLs substituted and the application is never told.
+    #    answer is 07002 (COUNT field incorrect). Padding the marker with NULL
+    #    instead runs the statement with a value the application never supplied
+    #    and tells it nothing.
     unbound, _ku = w("SELECT 1 WHERE 2 = ?")
     r = lib.SQLExecDirectW(stmt, unbound, SQL_NTS)
     state = sqlstate(lib, SQL_HANDLE_STMT, stmt)

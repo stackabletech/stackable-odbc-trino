@@ -2,24 +2,26 @@
 """
 SQL surface pen test for the Trino ODBC driver.
 
-Walks the SQL a BI tool actually emits and checks the driver carries it through
-intact: joins of every shape, aggregates, the GROUP BY extensions, window
-functions, subqueries, CTEs, set operations, parameters in every clause that
-accepts one, the ODBC catalog functions, and the statement forms whose result
-columns have no declared length (DESCRIBE, SHOW, EXPLAIN).
+Walks the SQL a BI tool emits and checks the driver carries it through intact:
+joins of every shape, aggregates, the GROUP BY extensions, window functions,
+subqueries, CTEs, set operations, parameters in every clause that accepts one,
+the ODBC catalog functions, and the statement forms whose result columns have no
+declared length (DESCRIBE, SHOW, EXPLAIN).
 
-Where a query has one right answer it is asserted. Where it does not -- a plan
-listing, a server-dependent count -- the assertion is that it returns a result
-of the expected shape, which is still enough to catch a translation or fetch
+Where a query has one right answer it is asserted. Where it does not (a plan
+listing, a server-dependent count), the assertion is that it returns a result of
+the expected shape, which is still enough to catch a translation or fetch
 failure.
 
-Every query is read-only against the tpcds catalogue.
+Every query is read-only, against the tpcds and postgresql catalogs.
 
 Usage:
     python3 integration-tests/suites/test_sql_surface.py "<connection-string>"
     python3 integration-tests/suites/test_sql_surface.py "DSN=trino_http"
 
-Requires: pip install pyodbc (run through `uv run --with pyodbc`).
+Requires a running Trino (integration-tests/setup.sh) and `pip install pyodbc`,
+normally through `uv run --with pyodbc`. Needs no compose profile: the tpcds and
+postgresql catalogs are both in the base stack.
 """
 
 import os
@@ -174,7 +176,7 @@ def main():
         "SELECT count(*) FROM (VALUES 1,2) a(x) JOIN (VALUES 1,2) b(y) ON a.x = b.y "
         "AND a.x > ?", 1, params=[1]))
     R.run("NULL parameter", lambda: scalar("SELECT CAST(? AS INTEGER) IS NULL", True, params=[None]))
-    # LIMIT is worth its own probe: Trino does not accept a parameter there, so
+    # LIMIT gets its own probe: Trino does not accept a parameter there, so
     # the driver rendering the value as a literal is what makes it work at all.
     R.run("parameter in LIMIT", lambda: rows(
         "SELECT x FROM (VALUES 1,2,3) t(x) LIMIT ?", want_count=2, params=[2]))
@@ -218,11 +220,10 @@ def main():
     def datetime_columns_report_the_verbose_type():
         """SQLColumns and SQLGetTypeInfo must not disagree about a datetime.
 
-        The spec has SQL_DATA_TYPE carry the *verbose* type -- SQL_DATETIME (9)
-        -- with the concise type in DATA_TYPE and the subcode in
-        SQL_DATETIME_SUB. SQLGetTypeInfo has always answered that way, so
-        reporting the concise type from SQLColumns made the driver contradict
-        itself about the same column.
+        The spec has SQL_DATA_TYPE carry the *verbose* type, SQL_DATETIME (9),
+        with the concise type in DATA_TYPE and the subcode in SQL_DATETIME_SUB.
+        Reporting the concise type from SQLColumns would make the driver
+        contradict SQLGetTypeInfo about the same column.
         """
         SQL_DATETIME = 9
         # SQLGetTypeInfo columns: DATA_TYPE 2, SQL_DATA_TYPE 16, SQL_DATETIME_SUB 17.
@@ -230,9 +231,9 @@ def main():
         # SQLColumns columns: DATA_TYPE 5, SQL_DATA_TYPE 14, SQL_DATETIME_SUB 15.
         #
         # postgresql rather than the connected tpcds, because it is the catalog
-        # carrying date, time and timestamp columns together -- and because
-        # reaching another catalog at all is what the qualified
-        # `information_schema` reference makes possible.
+        # carrying date, time and timestamp columns together. Reaching another
+        # catalog at all is what the qualified `information_schema` reference
+        # makes possible.
         rows = cur.columns(catalog="postgresql", schema="public",
                            table="types_test").fetchall()
         assert rows, "no columns returned for the postgresql catalog"
@@ -258,8 +259,8 @@ def main():
         Trino resolves a bare `information_schema` through the session catalog,
         and each catalog's copy describes only itself, so filtering on
         `table_catalog` could never reach another catalog. An application that
-        enumerates catalogs -- which is what Power Query's navigator does --
-        then found every catalog but its own empty.
+        enumerates catalogs, which is what Power Query's navigator does, would
+        then find every catalog but its own empty.
         """
         assert cur.tables(catalog="postgresql", schema="public").fetchall(), \
             "no tables for the postgresql catalog"

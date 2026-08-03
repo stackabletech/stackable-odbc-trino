@@ -1,4 +1,15 @@
-﻿let
+﻿// Trace-logging helpers for the Power Query connector.
+//
+// Vendored from Microsoft's Power Query connector samples, unmodified apart
+// from stripped trailing whitespace and this header:
+// https://github.com/microsoft/DataConnectors/blob/master/samples/ODBC/SqlODBC/Diagnostics.pqm
+//
+// connector/build.sh zips it into the .mez. Nothing in
+// StackableTrinoODBC.pq loads it today; it is kept so a connector change that
+// needs trace logging can call Extension.LoadFunction("Diagnostics.pqm").
+// Take fixes from upstream rather than editing it here.
+
+let
     Diagnostics.LogValue = (prefix, value, optional delayed) =>
         Diagnostics.Trace(
             TraceLevel.Information,

@@ -91,6 +91,17 @@ fn strip_trailing_semicolons(sql: &str) -> &str {
     trimmed
 }
 
+/// Submit `sql` to Trino and return the statement holding its first page.
+///
+/// Polls until a page carrying column metadata arrives, because
+/// `StatementBackend::column_count` must be accurate as soon as this returns:
+/// core infers cursor state from it. A queued or planning query emits
+/// metadata-less pages until the coordinator is ready, so the wait can be long,
+/// and the query id is published to the cancel token before it starts.
+///
+/// Rows are not waited for. Trino sends metadata before it has evaluated a row,
+/// so a statement that fails at execution time returns `Ok` here and reports
+/// the failure from [`TrinoStatement::fetch`].
 pub(super) fn exec_direct(
     conn: &TrinoConnection,
     cancel: &TrinoCancelToken,
@@ -111,7 +122,6 @@ pub(super) fn exec_direct(
     // interpolating its parameters, so this is the only site that needs it.
     conn.ensure_transaction()?;
 
-    // Submit the query to Trino.
     let submit_start = Instant::now();
     let mut page = {
         let _span = tracing::info_span!("trino.submit").entered();
@@ -130,7 +140,6 @@ pub(super) fn exec_direct(
 
     log_page_stats(&page.stats, 1);
 
-    // Poll through initial pages until we get column metadata.
     let mut page_count: u32 = 1;
     let mut empty_page_count: u32 = 0;
     let mut total_fetch_time = submit_elapsed;
@@ -163,8 +172,6 @@ pub(super) fn exec_direct(
         return Err(conn.statement_error(error.into()));
     }
 
-    // Extract column metadata.
-    //
     // `Column` carries the real name and Trino's native type text
     // ("varchar(50)", "decimal(10,2)"). `TrinoTy::from_column` consumes the
     // `Column` and discards both (including the varchar length, which
@@ -233,11 +240,10 @@ pub(super) fn exec_direct(
         trino_types.push((column_name, ty));
     }
 
-    // Extract fields before consuming page.data for conversion.
+    // Read out before `page.data` is consumed below.
     let next_uri = page.next_uri;
     let query_id = page.id;
 
-    // Convert the first batch of rows (if any).
     let convert_start = Instant::now();
     let batch = {
         let _span = tracing::info_span!("trino.convert_batch", page = page_count).entered();
@@ -316,6 +322,12 @@ pub(super) fn prepare(
     })
 }
 
+/// Run the SQL [`prepare`] stored on `stmt`, with `params` rendered into it.
+///
+/// Trino has no wire-level parameter binding, so the values become literals and
+/// the result goes through [`exec_direct`]. The handle stays re-executable: the
+/// template is kept, so the same prepared statement can be run again with
+/// different values.
 pub(super) fn execute(
     conn: &TrinoConnection,
     cancel: &TrinoCancelToken,
@@ -349,12 +361,6 @@ pub(super) fn execute(
     Ok(ExecuteOutcome::default())
 }
 
-/// Cancel a running Trino query via the REST API.
-///
-/// Called by `SQLCancel`, possibly from a thread holding no lock on the
-/// connection while another thread executes on the same statement. Everything
-/// this needs is therefore reached through the token: the statement itself may
-/// be under `&mut` on the other thread and is not touchable from here.
 /// A column number past the end of the result set.
 ///
 /// `SQLGetData` and `SQLDescribeCol` both list "the value specified for the
@@ -381,10 +387,16 @@ pub(super) fn column_index_must_be_positive() -> TrinoError {
     .into()
 }
 
+/// Cancel a running Trino query through the REST API.
+///
+/// Called by `SQLCancel`, possibly from a thread holding no lock on the
+/// connection while another thread executes on the same statement. Everything
+/// this needs is therefore reached through the token: the statement itself may
+/// be under `&mut` on the other thread and is not touchable from here.
 pub(super) fn cancel(token: &TrinoCancelToken) -> Result<(), TrinoError> {
     // Taken, not read: a second SQLCancel for the same query has nothing left
     // to do, and Trino answers a DELETE for an already-cancelled query with an
-    // error that is not worth surfacing.
+    // error nothing can act on.
     let query_id = match token.state.query_id.lock() {
         Ok(mut slot) => slot.take(),
         // A poisoned lock is an internal invariant violation rather than a
@@ -407,31 +419,20 @@ pub(super) fn cancel(token: &TrinoCancelToken) -> Result<(), TrinoError> {
 
     tracing::debug!(query_id = %query_id, "cancelling Trino query");
 
-    // Publish the cancellation *before* the DELETE, and unconditionally.
+    // The cancellation is published *before* the DELETE, and unconditionally.
+    // `is_cancelled` is what stops the fetch loop, and the caller's intent to
+    // stop does not depend on a round trip: a DELETE that fails while the
+    // coordinator keeps answering pages would otherwise leave `SQLCancel` and
+    // `SQL_ATTR_QUERY_TIMEOUT` unenforceable, which
+    // `a_cancel_whose_delete_fails_still_stops_the_statement` measures.
     //
-    // Two things read this flag, and only one of them is about the server.
-    // `fetch`, `close_cursor` and `Drop` stay off `next_uri` because after a
-    // server-side cancel `get_next` fails and leaves the pooled TCP socket
-    // carrying residual bytes, corrupting later queries that reuse it from the
-    // same reqwest pool. But `is_cancelled` is also what stops the fetch loop
-    // at all, and the caller's intent to stop does not depend on a round trip.
+    // Setting it here also closes a race against `map_trino_error`'s
+    // `USER_CANCELED` arm: the coordinator can fail the in-flight request
+    // before the cancelling thread has recorded anything.
     //
-    // Setting it only on success made `SQL_ATTR_QUERY_TIMEOUT` and `SQLCancel`
-    // unenforceable in exactly the conditions that produce them. Measured
-    // against a scripted coordinator that errors on the cancel endpoint and
-    // keeps answering pages: core's timer fired at 3s, this ran, the DELETE
-    // failed, the flag stayed clear, and `SQLFetch` paged 86,287 times over 40
-    // seconds without returning. The same server answering the DELETE with
-    // `204` ended the fetch at 3.0s with `HYT00`.
-    //
-    // Setting it early also closes a race the old ordering had against
-    // `map_trino_error`'s `USER_CANCELED` arm: the coordinator could fail the
-    // in-flight request before the cancelling thread had recorded anything.
-    //
-    // Nothing is stranded by doing this when the DELETE fails. A cancelled
-    // result set is abandoned either way, and the socket it leaves behind is
-    // the one the success path already accepts: reqwest evicts it on its idle
-    // timeout (90s).
+    // Nothing is stranded when the DELETE fails. A cancelled result set is
+    // abandoned either way, and reqwest evicts the socket it leaves behind on
+    // its 90-second idle timeout.
     token.state.cancelled.store(true, Ordering::SeqCst);
 
     // The failure is still reported. Core logs it, and a caller that wanted the
@@ -448,13 +449,11 @@ impl TrinoStatement {
     /// Whether a commit or rollback has discarded this statement's result set.
     ///
     /// Trino answers `GENERIC_INTERNAL_ERROR: Already finished` for a page
-    /// request on a result set whose transaction has ended, so the drain that
-    /// normally keeps the pooled socket clean would fail instead: the same
-    /// shape of problem a server-side cancel creates, and solved the same way.
-    ///
-    /// The connection bumps its epoch before it sends the `COMMIT`, so a
-    /// statement whose recorded epoch has fallen behind is one whose rows the
-    /// coordinator is already discarding.
+    /// request on a result set whose transaction has ended, so `close_cursor`
+    /// has to skip its drain rather than attempt it. The connection bumps its
+    /// epoch before it sends the `COMMIT`, so a statement whose recorded epoch
+    /// has fallen behind is one whose rows the coordinator is already
+    /// discarding.
     ///
     /// `false` for a statement built without an epoch: the in-memory catalog
     /// results, which hold no `next_uri` and so have nothing to drain.
@@ -515,25 +514,24 @@ impl TrinoStatement {
         err
     }
 
-    /// Turn a failed page fetch into the right outcome, distinguishing a
-    /// cancellation from a genuine failure.
+    /// Turn a failed page fetch into the right outcome, separating a
+    /// cancellation from a failure.
     ///
-    /// Both discard the buffered rows, but they leave the statement in
-    /// different states. A failure marks it `fetch_failed`, so a further fetch
-    /// reports `24000`, the cursor position being genuinely undefined. A
-    /// cancellation is not an abandonment: the application asked for it, so the
-    /// statement is kept off `abandon_result_set` and its cursor counts as
-    /// finished rather than undefined.
+    /// Both discard the buffered rows and leave the statement in different
+    /// states. A failure marks it `fetch_failed`, so a further fetch reports
+    /// the `24000` an undefined cursor position calls for. A cancellation is
+    /// not an abandonment, since the application asked for it, so the statement
+    /// is kept off `abandon_result_set` and its cursor counts as finished.
     ///
-    /// Finished is not the same as exhausted. The cancellation is still an
-    /// error, and every later fetch reports `HY008` too, from the
-    /// `is_cancelled` check at the top of [`TrinoStatement::fetch`]. `NoData`
-    /// would say "your result set ended", which is false when rows were
-    /// discarded, and would let a query timeout enforced by cancelling reach
-    /// the application as an empty result set with no diagnostic.
+    /// Finished is not exhausted. The cancellation is still an error, and every
+    /// later fetch reports `HY008` too, from the `is_cancelled` check at the
+    /// top of [`TrinoStatement::fetch`]. `NoData` would say "your result set
+    /// ended", which is false when rows were discarded, and would let a query
+    /// timeout enforced by cancelling reach the application as an empty result
+    /// set with no diagnostic.
     ///
-    /// Either way the drain is suppressed by `next_uri = None`: paging a
-    /// cancelled query fails and leaves the pooled socket dirty.
+    /// Either way `next_uri = None` suppresses the drain: paging a cancelled
+    /// query fails and leaves the pooled socket dirty.
     fn end_page_fetch(&mut self, err: TrinoError) -> TrinoError {
         if matches!(err, TrinoError::OperationCancelled { .. }) {
             tracing::debug!(
@@ -572,35 +570,25 @@ impl StatementBackend for TrinoStatement {
         loop {
             // A concurrent SQLCancel, or a query timeout core enforced by
             // cancelling, has already stopped this query server-side. Discard
-            // what is left rather than serving rows from a result set the
-            // application asked to abandon, and above all do not poll
-            // `next_uri`; see `cancel` for why that dirties the socket.
+            // what is left, and above all do not poll `next_uri`; see `cancel`
+            // for why that dirties the socket.
             //
-            // Reported as an error, not `NoData`. `NoData` is "your result set
-            // ended", which is false here: rows were discarded, and an
-            // application that asked for a 30-second deadline and got an empty
-            // answer at 30 seconds cannot tell a timeout from an empty table.
-            // `end_page_fetch` recognises the cancelled variant and keeps it
-            // off `abandon_result_set`, so the cursor is finished rather than
-            // left in the undefined position `24000` describes.
-            //
-            // This is the half of the cancel that `map_trino_error` cannot see:
-            // a cancel landing between page requests leaves no failed response
-            // to classify. Core relabels it `HYT00` when its own timer fired.
+            // This is the half of the cancel `map_trino_error` cannot see: one
+            // landing between page requests leaves no failed response to
+            // classify. `end_page_fetch` reports it as `HY008`, and core
+            // relabels that to `HYT00` when its own timer fired.
             if self.is_cancelled() {
                 return Err(self.end_page_fetch(super::cancelled_between_requests()));
             }
 
-            // Try to advance within the current batch.
             if self.batch_cursor < self.batch.len() {
                 self.batch_cursor += 1;
                 return Ok(FetchResult::Row);
             }
 
-            // Current batch exhausted: fetch the next page from Trino.
             let next_url = match self.next_uri.take() {
                 Some(url) => url,
-                None => return Ok(FetchResult::NoData), // No more pages.
+                None => return Ok(FetchResult::NoData),
             };
 
             let client = self.client.as_ref().ok_or_else(|| {
@@ -618,7 +606,6 @@ impl StatementBackend for TrinoStatement {
 
             tracing::debug!(url = %next_url, "fetching next page from Trino");
 
-            // Phase: HTTP fetch
             let fetch_start = Instant::now();
             let fetched = {
                 let _span = tracing::info_span!("trino.fetch_page").entered();
@@ -645,10 +632,9 @@ impl StatementBackend for TrinoStatement {
 
             log_page_stats(&page.stats, self.page_count);
 
-            // Extract fields before consuming page.data for conversion.
+            // Read out before `page.data` is consumed below.
             self.next_uri = page.next_uri;
 
-            // Phase: row conversion
             let convert_start = Instant::now();
             let decoded = {
                 let _span =
@@ -732,22 +718,20 @@ impl StatementBackend for TrinoStatement {
     }
 
     fn row_count(&self) -> Option<i64> {
-        // With streaming, we don't know the total row count until exhausted.
+        // Rows stream page by page, so the total is unknown until the result
+        // set is exhausted.
         None
     }
 
     fn close_cursor(&mut self) -> Result<(), TrinoError> {
-        // Drain remaining Trino response pages so the underlying HTTP
-        // connection is cleanly returned to reqwest's connection pool.
+        // Drain the remaining Trino response pages, so the socket goes back to
+        // reqwest's pool clean. Residual bytes left on it corrupt whichever
+        // later query reuses it.
         //
-        // Skipped when a commit or rollback has already discarded the result
-        // set: see `result_set_died_with_a_transaction`.
-        // Without this, residual bytes on the socket corrupt subsequent
-        // queries that reuse the pooled connection.
-        //
-        // Skipped entirely once the query has been cancelled server-side:
-        // `get_next` then fails and leaves exactly the residual bytes this
-        // drain exists to avoid.
+        // Skipped in the two states where the drain would fail and leave
+        // exactly those bytes: a query cancelled server-side, whose `get_next`
+        // fails, and a result set a commit or rollback has already discarded
+        // (see `result_set_died_with_a_transaction`).
         let mut drain_failure = None;
         if self.is_cancelled() || self.result_set_died_with_a_transaction() {
             self.next_uri = None;
@@ -797,7 +781,7 @@ impl StatementBackend for TrinoStatement {
 /// `next_uri` is already `None`. Drop always runs.
 impl Drop for TrinoStatement {
     fn drop(&mut self) {
-        // Log profiling summary for any query that actually executed.
+        // Only a query that reached the coordinator has anything to report.
         if self.page_count > 0 {
             tracing::info!(
                 query_id = ?self.query_id,

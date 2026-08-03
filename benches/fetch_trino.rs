@@ -87,7 +87,6 @@ fn shape_a_query(rows: usize, cols: usize) -> String {
         ));
     }
     for i in 0..n_d {
-        // Fixed decimal value, for the same reason.
         select_exprs.push(format!("CAST(12345678.90 AS DECIMAL(18,2)) AS d_{i}"));
     }
     format!(

@@ -31,10 +31,9 @@ mod tests {
     ///
     /// Power BI reads that attribute to decide whether an installed `.mez` is
     /// newer than the one already present, and a release ships the `.mez` and
-    /// the driver binary together, so two different numbers describe one
-    /// release, and the one a bug report quotes is whichever artefact the
-    /// reporter happens to have. They had already drifted: the connector said
-    /// `1.0.0` against a crate at `0.0.1`.
+    /// the driver binary together. Two different numbers would describe one
+    /// release, and a bug report quotes whichever artefact the reporter
+    /// happens to have.
     ///
     /// `release.toml` rewrites the connector as part of the version bump, in
     /// the same commit. This asserts the result, so a hand-edit to either file

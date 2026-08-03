@@ -107,8 +107,8 @@ STANDALONE_MEZ="StackableTrinoODBC-${VERSION}.mez"
 cp "$MEZ_SOURCE" "$DIST_DIR/$STANDALONE_MEZ"
 
 # --- SBOMs as release assets ---
-# Renamed to carry the version, so an asset downloaded on its own still says
-# which release it describes.
+# Named with the version, so an asset downloaded on its own still says which
+# release it describes.
 for fmt in cdx spdx; do
   cp "$SBOM_DIR/$(basename "$LINUX_SO").$fmt.json" \
      "$DIST_DIR/stackable-odbc-trino-${VERSION}-linux-x64.$fmt.json"

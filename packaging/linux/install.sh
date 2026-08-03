@@ -25,16 +25,13 @@ cp "$LIB_DIR/$DRIVER_LIB" "$INSTALL_DIR/"
 TMP_INI="$(mktemp)"
 trap 'rm -f "$TMP_INI"' EXIT
 # Threading=2 asks unixODBC to serialise at the connection level rather than at
-# its default environment level (3). It is required for correctness, not a
-# tuning knob: SQLCancel called from one thread while another executes on the
-# same statement is held behind that call at Threading=3, so it lands only once
-# the statement it was meant to interrupt has already finished on its own.
-# Measured on a query that runs ~24s: at Threading=3 the fetch raised HY010
-# after 23.9s, at Threading=2 it raised HY008 after 2.0s.
+# its default environment level (3), and it is required for correctness. At
+# Threading=3 a cross-thread SQLCancel is held behind the call it was meant to
+# interrupt. Measured on a query that runs ~24s: Threading=3 raised HY010 from
+# the fetch after 23.9s, Threading=2 raised HY008 after 2.0s.
 #
-# This does NOT affect SQL_ATTR_QUERY_TIMEOUT, which fires either way: core
-# enforces that deadline from a timer thread calling Backend::cancel directly,
-# inside the driver, so it never crosses the Driver Manager.
+# SQL_ATTR_QUERY_TIMEOUT is unaffected and fires either way. See
+# "Threading = 2 is required, not tuning" in the project's AGENTS.md.
 cat > "$TMP_INI" <<EOF
 [stackable_odbc_trino]
 Description=Stackable ODBC driver for Trino

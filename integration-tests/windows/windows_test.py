@@ -12,7 +12,8 @@ Usage:
     uv run --with pywinrm python3 integration-tests/windows/windows_test.py --skip-build
     uv run --with pywinrm python3 integration-tests/windows/windows_test.py --host 192.168.197.138
 
-Requires: pywinrm (pip install pywinrm)
+Requires a running Trino on the host, the Windows VM, and `pip install pywinrm`.
+Needs no compose profile: the suites it deploys run against the base stack.
 """
 
 import argparse
@@ -50,8 +51,9 @@ DSN_NAME = "test_trino"
 # Absolute path to Python on the VM.
 REMOTE_PYTHON = r'"C:\Program Files\Python312\python.exe"'
 
-# The host-only network gateway — the VM reaches the host (and Docker) via this
-# IP. Override with --gateway or ODBC_TEST_HOST_GATEWAY for non-default subnets.
+# The host-only network gateway. The VM reaches the host (and Docker) through
+# this IP. Override with --gateway or ODBC_TEST_HOST_GATEWAY for a non-default
+# subnet.
 DEFAULT_HOST_GATEWAY = "192.168.197.1"
 HTTP_PORT = 8081  # avoid conflict with the file server's own use
 

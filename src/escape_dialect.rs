@@ -2,16 +2,15 @@
 //! literals, and the `{fn}` scalar-function remap for the names Trino spells
 //! differently from ODBC.
 //!
-//! Both function hooks are traceable to the `SQL_*_FUNCTIONS` bitmaps
-//! `src/backend/info.rs` advertises for Trino, and the three are kept in exact
-//! correspondence: a bit is advertised only if `{fn NAME(...)}` translates
-//! into Trino SQL that runs. A bit without a translation is a capability an
-//! application is told it has and then cannot use.
+//! Both function hooks correspond exactly to the `SQL_*_FUNCTIONS` bitmaps
+//! `src/backend/info.rs` advertises: a bit is advertised only if
+//! `{fn NAME(...)}` translates into Trino SQL that runs. A bit without a
+//! translation is a capability an application is told it has and cannot use.
 //!
-//! There are two hooks because there are two kinds of difference:
+//! Two hooks, for two kinds of difference:
 //!
 //! - [`remap_scalar_fn`] swaps the identifier in front of the parentheses and
-//!   never sees the arguments. That is all a pure spelling difference needs:
+//!   never sees the arguments, which is all a spelling difference needs:
 //!   `UCASE` → `upper`, `LOG` → `ln`.
 //! - [`rewrite_scalar_fn`] receives the whole call and returns its
 //!   replacement, for the functions where ODBC and Trino agree on the
@@ -21,16 +20,14 @@
 //!   re-quoted, and `DAYOFWEEK` → an expression converting Trino's ISO day
 //!   numbering to ODBC's.
 //!
-//! `POSITION` needs neither: ODBC spells it `POSITION(exp IN exp)`, which is
-//! already Trino's syntax, so the escape passes through untouched.
-//!
-//! `NOW`, `MONTH`, `QUARTER`, `WEEK`, `YEAR`, `HOUR`, `MINUTE`, `SECOND`,
-//! `EXTRACT` and the numeric/string functions not listed as arms below are
-//! already spelled identically in Trino (verified against
+//! Everything else passes through unchanged (`None`). `POSITION` needs no
+//! hook, because ODBC spells it `POSITION(exp IN exp)`, which is already
+//! Trino's syntax; `NOW`, `MONTH`, `QUARTER`, `WEEK`, `YEAR`, `HOUR`,
+//! `MINUTE`, `SECOND`, `EXTRACT` and the numeric and string functions with no
+//! arm below are spelled identically in Trino, verified against
 //! <https://trino.io/docs/current/functions/string.html>,
-//! <https://trino.io/docs/current/functions/math.html>, and
-//! <https://trino.io/docs/current/functions/datetime.html>), so they pass
-//! through unchanged (`None`).
+//! <https://trino.io/docs/current/functions/math.html> and
+//! <https://trino.io/docs/current/functions/datetime.html>.
 use stackable_odbc_core::escape::EscapeDialect;
 
 /// Remap an ODBC `{fn NAME(...)}` scalar-function name to Trino's spelling.
@@ -41,18 +38,18 @@ pub(crate) fn remap_scalar_fn(name: &str) -> Option<&'static str> {
         "UCASE" => Some("upper"),
         "LCASE" => Some("lower"),
         "CHAR" => Some("chr"),
-        // SQL_FN_NUM_LOG — ODBC's LOG is the natural logarithm; Trino's own
-        // `log(b, x)` is base-b and a different function, so this maps to
+        // SQL_FN_NUM_LOG: ODBC's LOG is the natural logarithm, while Trino's
+        // own `log(b, x)` is base-b and a different function, so this maps to
         // `ln()` specifically (see the SQL_NUMERIC_FUNCTIONS doc comment in
         // backend/info.rs).
         "LOG" => Some("ln"),
-        // SQL_FN_SYS_IFNULL — Trino has no `ifnull`, but two-argument
+        // SQL_FN_SYS_IFNULL: Trino has no `ifnull`, but two-argument
         // `coalesce(a, b)` is exactly equivalent (same doc comment).
         "IFNULL" => Some("coalesce"),
-        // SQL_FN_TD_DAYOFMONTH / SQL_FN_TD_DAYOFYEAR — same semantics as
+        // SQL_FN_TD_DAYOFMONTH / SQL_FN_TD_DAYOFYEAR: same semantics as
         // ODBC (1-31 / 1-366), just spelled with underscores in Trino.
-        // DAYOFWEEK is deliberately NOT remapped here: its numbering differs,
-        // so it goes through `rewrite_scalar_fn` instead.
+        // DAYOFWEEK is NOT remapped here, because its numbering differs; it
+        // goes through `rewrite_scalar_fn` instead.
         "DAYOFMONTH" => Some("day_of_month"),
         "DAYOFYEAR" => Some("day_of_year"),
         _ => None,
@@ -83,27 +80,25 @@ fn trino_interval_unit(keyword: &str) -> Option<&'static str> {
 
 /// ODBC type keyword → the Trino type `{fn CONVERT(value, SQL_type)}` casts to.
 ///
-/// The keywords are the ones the spec defines for the conversion escape, and
-/// the whole set is covered because `SQL_CONVERT_FUNCTIONS` reports
-/// `SQL_FN_CVT_CAST`: a client reading that bitmap may send any of them, and
-/// one without an arm here reaches Trino as a bare identifier and fails with
-/// `COLUMN_NOT_FOUND`.
+/// The whole set of keywords the spec defines for this escape is covered,
+/// because `SQL_CONVERT_FUNCTIONS` reports `SQL_FN_CVT_CAST`: a client reading
+/// that bitmap may send any of them, and one without an arm here reaches Trino
+/// as a bare identifier and fails with `COLUMN_NOT_FOUND`.
 ///
-/// Two mappings are worth their own note, both measured against a live
+/// Two mappings are not the obvious ones, both measured against a live
 /// coordinator rather than read off the documentation:
 ///
 /// - `SQL_CHAR` maps to `VARCHAR`, not to Trino's `CHAR`. A bare `CHAR` in
-///   Trino is `CHAR(1)`, so `CAST('hello world' AS CHAR)` returns `"h"`, and the
-///   escape would silently truncate every conversion to one character. ODBC's
+///   Trino is `CHAR(1)`, so `CAST('hello world' AS CHAR)` returns `"h"`, and
+///   the escape would truncate every conversion to one character. ODBC's
 ///   `{fn CONVERT}` carries no length to give `CHAR(n)` instead.
-/// - `SQL_FLOAT` maps to `DOUBLE`. ODBC's `SQL_FLOAT` is double precision;
-///   Trino's `REAL` is the single-precision type, which is `SQL_REAL`.
+/// - `SQL_FLOAT` maps to `DOUBLE`. ODBC's `SQL_FLOAT` is double precision,
+///   and Trino's single-precision type, `REAL`, is ODBC's `SQL_REAL`.
 ///
-/// The `SQL_INTERVAL_*` keywords are deliberately absent. Trino's interval
-/// types cannot be reached by a bare `CAST` from an arbitrary expression, so
-/// there is nothing honest to rewrite them to, and declining leaves the call
-/// on the fallback path instead of casting to something the application did
-/// not ask for.
+/// The `SQL_INTERVAL_*` keywords are absent: a bare `CAST` from an arbitrary
+/// expression cannot reach Trino's interval types, so there is nothing honest
+/// to rewrite them to. Declining leaves the call on the fallback path instead
+/// of casting to something the application did not ask for.
 fn trino_convert_target(keyword: &str) -> Option<&'static str> {
     match keyword.trim().to_ascii_uppercase().as_str() {
         "SQL_BIGINT" => Some("BIGINT"),
@@ -127,8 +122,8 @@ fn trino_convert_target(keyword: &str) -> Option<&'static str> {
 
 /// Split a `{fn ...}` argument list on its top-level commas.
 ///
-/// Core hands the argument text over whole, deliberately: only the dialect
-/// knows each function's arity, and a naive split would corrupt
+/// Core hands the argument text over whole, because only the dialect knows
+/// each function's arity and a naive split would corrupt
 /// `{fn LOCATE(',', x)}`. So this walks the text with the same awareness core
 /// applies to the statement: a comma inside a string literal, a quoted
 /// identifier, a comment or a nested parenthesis is not a separator.
@@ -207,7 +202,7 @@ pub(crate) fn rewrite_scalar_fn(name: &str, args: &str) -> Option<String> {
     let empty = args.trim().is_empty();
 
     match upper.as_str() {
-        // SQL_FN_STR_LOCATE_2 — `position(substring IN string)` takes ODBC's
+        // SQL_FN_STR_LOCATE_2: `position(substring IN string)` takes ODBC's
         // argument order. Only the two-argument form: ODBC's optional third
         // argument is a *start offset*, where the third argument of Trino's
         // `strpos` is an occurrence index, so there is nothing to rewrite it
@@ -223,13 +218,13 @@ pub(crate) fn rewrite_scalar_fn(name: &str, args: &str) -> Option<String> {
         "CURTIME" | "CURRENT_TIME" if empty => Some("current_time".into()),
         "CURRENT_TIMESTAMP" if empty => Some("current_timestamp".into()),
 
-        // SQL_FN_SYS_USERNAME / SQL_FN_SYS_DBNAME — bare keywords again.
+        // SQL_FN_SYS_USERNAME / SQL_FN_SYS_DBNAME: bare keywords again.
         // `current_catalog` is NULL when the connection set no catalog, which
         // is the honest answer to "which database am I in" in that case.
         "USERNAME" if empty => Some("current_user".into()),
         "DBNAME" if empty => Some("current_catalog".into()),
 
-        // SQL_FN_TD_TIMESTAMPADD / SQL_FN_TD_TIMESTAMPDIFF — ODBC passes the
+        // SQL_FN_TD_TIMESTAMPADD / SQL_FN_TD_TIMESTAMPDIFF: ODBC passes the
         // unit as an unquoted keyword and Trino wants a string literal, so
         // the argument has to be re-quoted, not just the name swapped.
         // Argument order matches: ODBC's TIMESTAMPDIFF(interval, ts1, ts2) is
@@ -243,7 +238,7 @@ pub(crate) fn rewrite_scalar_fn(name: &str, args: &str) -> Option<String> {
             Some(format!("date_diff('{unit}', {}, {})", parts[1], parts[2]))
         }
 
-        // SQL_FN_CVT_CAST — ODBC passes the target as an unquoted `SQL_*`
+        // SQL_FN_CVT_CAST: ODBC passes the target as an unquoted `SQL_*`
         // keyword in an argument position, which is neither a Trino type name
         // nor even valid there: `CONVERT(x, SQL_INTEGER)` reaches the server as
         // a two-argument function call and fails resolving `sql_integer` as a
@@ -259,11 +254,11 @@ pub(crate) fn rewrite_scalar_fn(name: &str, args: &str) -> Option<String> {
             Some(format!("CAST({} AS {target})", parts[0]))
         }
 
-        // SQL_FN_TD_DAYOFWEEK — Trino's `day_of_week` is ISO-numbered
+        // SQL_FN_TD_DAYOFWEEK: Trino's `day_of_week` is ISO-numbered
         // (1 = Monday .. 7 = Sunday) and ODBC specifies 1 = Sunday ..
         // 7 = Saturday, so the *value* needs converting, not just the name:
         // `(iso % 7) + 1` maps Monday 1 -> 2 and Sunday 7 -> 1.
-        // Renaming alone would have returned a plausible, silently wrong day.
+        // Renaming alone returns a plausible, silently wrong day.
         "DAYOFWEEK" if parts.len() == 1 => Some(format!("((day_of_week({}) % 7) + 1)", parts[0])),
 
         _ => None,
@@ -295,12 +290,12 @@ mod tests {
     use super::*;
 
     /// `split_args` is the one piece of parsing this crate does that core
-    /// deliberately declined to: core hands the argument text over whole
-    /// because only the dialect knows each function's arity, and warns that
-    /// splitting naively would corrupt `{fn LOCATE(',', x)}`. So the comma
-    /// cases below are the point of the function, not edge cases around it:
-    /// a separator that is really a character inside a literal, an
-    /// identifier, a comment or a nested call.
+    /// declines to: core hands the argument text over whole because only the
+    /// dialect knows each function's arity, and warns that splitting naively
+    /// would corrupt `{fn LOCATE(',', x)}`. So the comma cases below are the
+    /// point of the function, not edge cases around it: a separator that is
+    /// really a character inside a literal, an identifier, a comment or a
+    /// nested call.
     #[test]
     fn split_args_splits_only_on_top_level_commas() {
         for (input, expected) in [
@@ -507,7 +502,7 @@ mod tests {
 
     /// `SQL_TIMEDATE_ADD_INTERVALS` / `SQL_TIMEDATE_DIFF_INTERVALS` name the
     /// units `TIMESTAMPADD`/`TIMESTAMPDIFF` accept, so every bit advertised
-    /// there must be a unit [`trino_interval_unit`] can actually rewrite.
+    /// there must be a unit [`trino_interval_unit`] can rewrite.
     /// Otherwise the driver names an interval whose escape then falls through
     /// untranslated.
     ///
@@ -619,7 +614,7 @@ mod tests {
         assert_eq!(remap_scalar_fn("NOW"), None);
     }
 
-    // Deliberately NOT remapped despite being advertised; see module doc.
+    // NOT remapped despite being advertised; see the module doc.
     #[test]
     fn locate_not_remapped() {
         assert_eq!(remap_scalar_fn("LOCATE"), None);

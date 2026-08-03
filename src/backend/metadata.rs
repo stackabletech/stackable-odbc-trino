@@ -46,32 +46,20 @@ fn has_odbc_wildcards(s: &str) -> bool {
     false
 }
 
-/// Build a SQL filter condition for an `information_schema` query.
+/// Build one WHERE condition for an `information_schema` query, from one
+/// catalog-function argument.
 ///
-/// This is part of the **driver-internal** implementation of ODBC catalog
-/// functions (SQLTablesW, SQLColumnsW, etc.).  When an ODBC application
-/// (or the Power Query Mashup Engine) calls e.g. `SQLColumnsW(catalog,
-/// schema, table, column)`, the driver must translate those arguments into
-/// a SQL query against Trino's `information_schema` tables.  This function
-/// builds individual WHERE conditions for that query.
+/// The condition's shape follows the argument's:
 ///
-/// The .mez connector is **not** involved here.  The .mez controls how
-/// Power Query generates user-facing SQL (via AstVisitor / SqlCapabilities),
-/// but ODBC catalog functions are entirely the driver's responsibility.
-/// The .mez's `SQLColumns` callback only receives the *result table* after
-/// the driver has already queried Trino.
+/// - **With unescaped wildcards**: a `LIKE` clause carrying an explicit
+///   `ESCAPE '\'`, so Trino honours ODBC's backslash convention.
+/// - **Without**: an exact `=` match, with the escape backslashes stripped so
+///   `call\_center` matches the table named `call_center`.
 ///
-/// # Wildcard handling
-///
-/// The ODBC spec allows catalog function arguments to contain `%` and `_`
-/// wildcards, with `\` as the escape character.  ODBC applications encode
-/// literal special characters with a backslash: `call\_center` means the
-/// exact table name `call_center`, not a single-character wildcard match.
-///
-/// - **With wildcards** (unescaped `%` or `_`): emit a `LIKE` clause with
-///   an explicit `ESCAPE '\'` so Trino honours the backslash convention.
-/// - **Without wildcards**: emit an exact `=` match, stripping the escape
-///   backslashes so `call\_center` becomes `call_center`.
+/// The Power Query connector is not involved. It controls how Power Query
+/// generates user-facing SQL, while the ODBC catalog functions are the
+/// driver's alone; its `SQLColumns` callback sees only the result table this
+/// query produced.
 fn push_filter(conditions: &mut Vec<String>, column: &str, value: &str) {
     let escaped = value.replace('\'', "''");
     if has_odbc_wildcards(&escaped) {
@@ -87,23 +75,22 @@ fn push_filter(conditions: &mut Vec<String>, column: &str, value: &str) {
 /// The catalog functions turn it into an empty result set: the spec has them
 /// filter, and a filter naming something absent selects nothing. Failing
 /// instead would make an application browsing a stale catalog list error
-/// rather than simply find nothing there.
+/// rather than find nothing there.
 const TRINO_CATALOG_NOT_FOUND: i32 = 44;
 
 /// The `information_schema.<table>` reference a catalog-scoped query runs
 /// against.
 ///
 /// Trino resolves a bare `information_schema` through the **session** catalog,
-/// and each catalog's copy describes only itself. So filtering on
-/// `table_catalog` alone cannot reach another catalog: `SQLColumns` for a
-/// catalog other than the connected one matched nothing whatever the WHERE
-/// clause said, which left an application enumerating catalogs and finding
-/// every one but its own empty.
+/// and each catalog's copy describes only itself. Filtering on `table_catalog`
+/// alone therefore cannot reach another catalog: an application enumerating
+/// catalogs would find every one but the connected one empty, whatever the
+/// WHERE clause said.
 ///
-/// The catalog is a *identifier* here, not a literal, so it is delimited and
+/// The catalog is an *identifier* here, not a literal, so it is delimited and
 /// its embedded quotes doubled. A pattern cannot appear in a FROM clause, so
-/// anything wildcarded (and the absent and `%` cases) keeps the session
-/// catalog, which is the previous behaviour.
+/// a wildcarded catalog (and the absent and `%` cases) keeps the session
+/// catalog.
 fn information_schema_ref(catalog: Option<&str>, table: &str) -> String {
     match catalog.filter(|c| !c.is_empty() && *c != "%" && !has_odbc_wildcards(c)) {
         Some(cat) => {
@@ -142,8 +129,10 @@ fn trino_error_code(error: &TrinoError) -> Option<i32> {
     }
 }
 
-/// Build the SQL WHERE clause for an information_schema.tables query.
-/// Filters are only included if Some and non-empty/non-wildcard.
+/// The WHERE clause for an `information_schema.tables` query.
+///
+/// An absent, empty or `%` argument means "match everything", so it
+/// contributes no condition rather than a `LIKE '%'`.
 fn build_tables_where_clause(
     catalog: Option<&str>,
     schema: Option<&str>,
@@ -166,8 +155,8 @@ fn build_tables_where_clause(
     }
 }
 
-/// Build the SQL WHERE clause for an information_schema.columns query.
-/// Filters are only included if Some and non-empty/non-wildcard.
+/// The WHERE clause for an `information_schema.columns` query: the same three
+/// filters as [`build_tables_where_clause`], plus the column name.
 fn build_columns_where_clause(
     catalog: Option<&str>,
     schema: Option<&str>,
@@ -216,15 +205,15 @@ const NUM_PREC_RADIX_DECIMAL: i16 = 10;
 /// and the `SQL_DATETIME_SUB` field returns the subcode. For other data types,
 /// this column returns a NULL."
 ///
-/// `SQLGetTypeInfo` already answers this way for the same types, through
+/// `SQLGetTypeInfo` answers the same way for the same types, through
 /// `TypeInfoRow::with_verbose_type` in `info`. Reporting the concise type here
-/// made the driver contradict itself about, say, a `DATE` column: `91` from
+/// would make the driver contradict itself about a `DATE` column: `91` from
 /// `SQLColumns` against `9` plus subcode `1` from `SQLGetTypeInfo`.
 ///
-/// Trino's two interval types are deliberately absent. They map to
-/// `SQL_WVARCHAR`, not to an ODBC interval type (see
-/// `type_conversion::trino_ty_to_sql_type`), so `SQL_INTERVAL` would be a
-/// claim this driver's own type mapping does not make.
+/// Trino's two interval types are absent. They map to `SQL_WVARCHAR`, not to
+/// an ODBC interval type (see `type_conversion::trino_ty_to_sql_type`), so
+/// `SQL_INTERVAL` would be a claim this driver's own type mapping does not
+/// make.
 fn verbose_type(concise: SqlDataType) -> (i16, Option<i16>) {
     match concise {
         SqlDataType::DATE => (SqlDataType::DATETIME.0, Some(SQL_CODE_DATE)),
@@ -242,17 +231,15 @@ fn verbose_type(concise: SqlDataType) -> (i16, Option<i16>) {
 /// fit an `i32` (Trino reports unbounded varchar as `varchar(2147483647)` in
 /// some connectors, and `2147483647 * 4` overflows).
 ///
-/// `VARBINARY` (→ `SQL_LONGVARBINARY`) is deliberately NOT given a byte-length
-/// branch here. Trino's type system carries no length parameter for
-/// `varbinary` at all; verified against a live coordinator:
-/// `information_schema.columns.data_type` reports the bare string
-/// `"varbinary"` for every binary column, with nothing for `type_name_precision`
-/// to parse (`TrinoTypeName::Varbinary` has `has_precision_param() == false`
-/// and `fixed_precision() == None`). A prior fix added a binary branch here
-/// keyed on `ty_precision`, but since that argument is unconditionally `None`
-/// for `EXT_LONG_VAR_BINARY`, the branch could never execute: NULL was, and
-/// remains, the honest answer for Trino `CHAR_OCTET_LENGTH` on binary
-/// columns.
+/// `VARBINARY` (→ `SQL_LONGVARBINARY`) gets no byte-length branch, because
+/// NULL is the only answer Trino can support. Its type system carries no
+/// length parameter for `varbinary` at all: verified against a live
+/// coordinator, `information_schema.columns.data_type` reports the bare string
+/// `"varbinary"` for every binary column, with nothing for
+/// `type_name_precision` to parse (`TrinoTypeName::Varbinary` has
+/// `has_precision_param() == false` and `fixed_precision() == None`). A branch
+/// keyed on `ty_precision` could never execute, since that argument is
+/// unconditionally `None` for `EXT_LONG_VAR_BINARY`.
 fn char_octet_length(sql_type: SqlDataType, ty_precision: Option<i32>) -> Option<i32> {
     let is_character = matches!(
         sql_type,
@@ -270,9 +257,9 @@ fn char_octet_length(sql_type: SqlDataType, ty_precision: Option<i32>) -> Option
 
 /// The catalog names, for `SQLTables`' `SQL_ALL_CATALOGS` enumeration.
 ///
-/// Uses `system.jdbc.catalogs`, which works without a default session catalog,
-/// `information_schema` does not, and this is exactly the call an application
-/// makes before it has picked one.
+/// Uses `system.jdbc.catalogs`, which works without a default session catalog
+/// where `information_schema` does not. This is exactly the call an
+/// application makes before it has picked one.
 pub(super) fn catalogs(conn: &TrinoConnection) -> Result<Vec<String>, TrinoError> {
     tracing::debug!("TrinoBackend::catalogs");
 
@@ -319,6 +306,12 @@ const TABLE_TYPE_TABLE: &str = "TABLE";
 /// ODBC's `TABLE_TYPE` for Trino's `VIEW`.
 const TABLE_TYPE_VIEW: &str = "VIEW";
 
+/// Return the tables and views matching the given filters, from
+/// `information_schema.tables`.
+///
+/// Trino's `BASE TABLE` becomes ODBC's `TABLE`; a `table_type` that is neither
+/// that nor `VIEW` drops the row, because [`table_types`] advertises only
+/// those two and a row must carry a type an application was told to expect.
 pub(super) fn tables(
     conn: &TrinoConnection,
     query: &TablesQuery<'_>,
@@ -381,6 +374,16 @@ pub(super) fn tables(
         .collect())
 }
 
+/// Return the columns matching the given filters, from
+/// `information_schema.columns`.
+///
+/// Trino's `information_schema.columns` has no
+/// `character_maximum_length`, `numeric_precision` or `numeric_scale`, so
+/// every size ODBC asks for is parsed out of the `data_type` string instead
+/// (`varchar(100)` → precision 100, `decimal(10,2)` → precision 10, scale 2).
+/// A row whose `table_name`, `column_name` or `ordinal_position` is not of the
+/// expected type is dropped with a `warn!` rather than reported with a
+/// substitute.
 pub(super) fn columns(
     conn: &TrinoConnection,
     query: &ColumnsQuery<'_>,
@@ -412,11 +415,6 @@ pub(super) fn columns(
         }
     }
 
-    // Note: Trino's information_schema.columns does not expose
-    // character_maximum_length, numeric_precision, or numeric_scale.
-    // Precision and scale are derived from the data_type string instead
-    // (e.g. "varchar(100)" → precision 100, "decimal(10,2)" → prec 10 scale 2).
-    //
     // No ORDER BY: core sorts the result set into the spec's order
     // (TABLE_CAT, TABLE_SCHEM, TABLE_NAME, ORDINAL_POSITION).
     let sql = format!(
@@ -495,20 +493,16 @@ pub(super) fn columns(
                     | SqlDataType::DOUBLE
                     | SqlDataType::DECIMAL
             );
-            // Precision/scale are parsed from the data_type string since
-            // Trino's information_schema.columns lacks dedicated columns.
             let (ty_precision, ty_scale) = parse_trino_precision_scale(&data_type_raw);
             // COLUMN_SIZE is reported for every type `type_name_precision`
             // can resolve a value for: parametric types (VARCHAR/CHAR/
             // DECIMAL, read from the type string) and fixed-precision types
             // (the integer/float/boolean/date/time family, via
-            // `TrinoTypeName::fixed_precision`). Gating on `ty_precision`
-            // directly, rather than re-deriving a separate list of
-            // "types with a size" here, means a type only needs to be
-            // taught to `fixed_precision`/`has_precision_param` once; no
-            // second enumeration to keep in sync (see: this exact class of
-            // bug for DATE/TIME/TIMESTAMP/BOOLEAN, and CHAR_OCTET_LENGTH's
-            // separate VARBINARY miss below).
+            // `TrinoTypeName::fixed_precision`). Gate on `ty_precision`
+            // itself rather than re-deriving a list of "types with a size"
+            // here, so a new type is taught to
+            // `fixed_precision`/`has_precision_param` once and there is no
+            // second enumeration to fall out of step with it.
             let col_size = ty_precision;
             let num_prec_radix = if is_numeric {
                 Some(NUM_PREC_RADIX_DECIMAL)
@@ -520,11 +514,10 @@ pub(super) fn columns(
             // SQL_TYPE_TIME and SQL_TYPE_TIMESTAMP, this column contains the
             // number of digits in the fractional seconds component. ... NULL
             // is returned for data types where DECIMAL_DIGITS is not
-            // applicable." So this is meaningful for DECIMAL/NUMERIC *and*
-            // TIME/TIMESTAMP (integer/floating-point types report NULL);
-            // `ty_scale` already carries the right quantity for both cases
-            // (see `type_name_scale`), this just needs to stop discarding it
-            // for the datetime types.
+            // applicable." So it is meaningful for DECIMAL/NUMERIC *and* for
+            // TIME/TIMESTAMP, while integer and floating-point types report
+            // NULL. `ty_scale` carries the right quantity for both cases; see
+            // `type_name_scale`.
             let decimal_digits = if matches!(
                 sql_type,
                 SqlDataType::DECIMAL | SqlDataType::TIME | SqlDataType::TIMESTAMP
@@ -623,10 +616,10 @@ fn table_privilege_row(vals: &[serde_json::Value]) -> Option<TablePrivilegeRow> 
 /// non-empty only for connectors that implement it: Hive and Iceberg under
 /// `sql-standard` security, say. A connector without it answers with zero rows
 /// rather than an error, which is why this queries unconditionally instead of
-/// gating on the catalog. Both catalogs in this project's test stack are in
-/// that group, so the integration tests can assert the call's success and
-/// shape but never a row; [`table_privilege_row`] carries the unit tests that
-/// cover the conversion itself.
+/// gating on the catalog. The test stack has one catalog in each group: `hive`
+/// runs under `sql-standard` security and returns rows, while `tpcds` and
+/// `postgresql` return none. [`table_privilege_row`] carries the unit tests
+/// that cover the conversion itself.
 ///
 /// Note that Trino's `information_schema` is synthesised by Trino, not passed
 /// through to the underlying database: a `GRANT` issued directly in PostgreSQL
@@ -735,12 +728,11 @@ pub(super) fn procedure_columns(
 ///
 /// Trino has no concept of primary keys at the engine level: no connector
 /// exposes `information_schema.table_constraints` or `key_column_usage`.
-/// The official Trino JDBC driver returns an empty result set from
-/// `DatabaseMetaData.getPrimaryKeys()` using `WHERE false`.
+/// Trino's own JDBC driver answers `DatabaseMetaData.getPrimaryKeys()` with
+/// `WHERE false`, and this matches it.
 ///
-/// We match that behavior: no rows, which core serves as `SQL_SUCCESS` with
-/// the spec's 6-column schema. This allows BI tools (PowerBI, Tableau) to
-/// proceed with schema discovery without error.
+/// No rows, which core serves as `SQL_SUCCESS` with the spec's six-column
+/// schema, so a BI tool's schema discovery proceeds instead of erroring.
 ///
 /// Ref: <https://github.com/trinodb/trino/issues/22408>
 pub(super) fn primary_keys(
@@ -758,8 +750,8 @@ pub(super) fn primary_keys(
 
 /// Return foreign key relationships.
 ///
-/// Trino has no concept of foreign keys, same limitation as primary keys.
-/// No connector exposes `information_schema.referential_constraints`.
+/// Trino has no concept of foreign keys, the same limitation as primary keys:
+/// no connector exposes `information_schema.referential_constraints`.
 ///
 /// Ref: <https://github.com/trinodb/trino/issues/22408>
 pub(super) fn foreign_keys(
@@ -781,10 +773,10 @@ pub(super) fn foreign_keys(
 /// Return index statistics for a table.
 ///
 /// Trino exposes no cross-connector index or cardinality metadata: there is no
-/// engine-level equivalent of `SQLStatistics`, and index shape is a per-connector
-/// physical detail Trino deliberately hides. Rather than leave the trait default,
-/// this reports the deliberate empty result explicitly, matching `primary_keys`
-/// and `foreign_keys`.
+/// engine-level equivalent of `SQLStatistics`, and index shape is a
+/// per-connector physical detail Trino hides. Stated here rather than left to
+/// the trait default, matching `primary_keys` and `foreign_keys`, so the
+/// reason is recorded and the call is logged.
 pub(super) fn statistics(
     _conn: &TrinoConnection,
     query: &StatisticsQuery<'_>,
@@ -801,9 +793,9 @@ pub(super) fn statistics(
 /// Return the optimal row-identifier or row-version columns for a table.
 ///
 /// Trino has no rowid, no row-version column, and no engine-level unique-key
-/// metadata to derive an optimal identifier from, so there is nothing to report.
-/// Like `statistics`, this returns the deliberate empty result explicitly rather
-/// than via the trait default.
+/// metadata to derive an optimal identifier from, so there is nothing to
+/// report. Stated here rather than left to the trait default, like
+/// `statistics`.
 pub(super) fn special_columns(
     _conn: &TrinoConnection,
     query: &SpecialColumnsQuery<'_>,
@@ -970,9 +962,9 @@ mod tests {
     #[test]
     fn an_exact_catalog_qualifies_the_information_schema_reference() {
         // Trino resolves a bare `information_schema` through the *session*
-        // catalog, and each catalog's copy describes only itself. Asking for
-        // another catalog's tables therefore matched nothing at all, however
-        // the WHERE clause was written.
+        // catalog, and each catalog's copy describes only itself. An
+        // unqualified reference matches nothing for any other catalog,
+        // however the WHERE clause is written.
         assert_eq!(
             information_schema_ref(Some("postgresql"), "columns"),
             "\"postgresql\".information_schema.columns"

@@ -3,11 +3,10 @@
 
 Needs no profile: the `hive` catalog is in the base stack.
 
-Every scenario that writes names `hive` deliberately. It is the only connector
-Trino ships that accepts a write outside autocommit -- the coordinator gates
-that on the SPI's `Connector.isSingleStatementWritesOnly()`, and `tpcds` and
-`postgresql` answer `AUTOCOMMIT_WRITE_CONFLICT`. See the hive catalog section
-in `AGENTS.md`.
+Every scenario that writes names `hive`. It is the only connector Trino ships
+that accepts a write outside autocommit. The coordinator gates that on the SPI's
+`Connector.isSingleStatementWritesOnly()`, and `tpcds` and `postgresql` answer
+`AUTOCOMMIT_WRITE_CONFLICT`. See the hive catalog section in `AGENTS.md`.
 
 Three measured Trino behaviours shape what is asserted here, and each is the
 reason a scenario looks the way it does rather than the obvious way:
@@ -38,7 +37,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from harness import Results, Stack  # noqa: E402
 
 # pyodbc enables ODBC connection pooling by default, and a pooled connection is
-# handed back to the application without the driver being reconnected -- so it
+# handed back to the application without the driver being reconnected, so it
 # arrives still carrying whatever commit mode the previous borrower left on it.
 # Measured here: a dozen pyodbc connections produced two `TrinoBackend::connect`
 # calls and no `disconnect` at all, and a `CREATE TABLE` on a "fresh" connection
@@ -212,8 +211,8 @@ def a_failed_statement_aborts_the_transaction(stack, results):
             f"count is {count_rows(stack, table)}",
         )
 
-        # The whole point of rolling back rather than leaving the session
-        # wedged: Trino refuses every statement on an aborted transaction.
+        # Why the driver rolls back rather than leaving the session wedged:
+        # Trino refuses every statement on an aborted transaction.
         conn.autocommit = True
         value = conn.cursor().execute("SELECT 1").fetchone()[0]
         results.check("the connection still works", value == 1, f"got {value}")

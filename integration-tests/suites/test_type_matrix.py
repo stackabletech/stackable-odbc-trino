@@ -5,8 +5,8 @@ Type-transform fuzz for the Trino ODBC driver.
 Drives every (Trino value, C data type) pair through `SQLGetData` on the raw C
 ABI and checks the outcome against invariants rather than against a transcribed
 copy of the ODBC conversion matrix. Transcribing the matrix would mostly test
-the transcription; the invariants below are the properties whose violation is
-an actual defect, and they hold for every cell of it.
+the transcription. The invariants below are the properties whose violation is a
+defect, and they hold for every cell of it.
 
     1. The call returns. No pair may crash, abort or hang the process.
     2. A failure carries a SQLSTATE. `SQL_ERROR` with no diagnostic record
@@ -18,15 +18,15 @@ an actual defect, and they hold for every cell of it.
     6. A successful conversion round-trips. Where the value is checkable as
        text, what comes back is what went in.
 
-Covers the paths the previous session left unfuzzed: the full type-transform
-matrix, NULL and the IEEE specials per type, integer boundary values, and
-trailing semicolons.
+Covers the full type-transform matrix, NULL and the IEEE specials per type,
+integer boundary values, and trailing semicolons.
 
 Usage:
     python3 integration-tests/suites/test_type_matrix.py [path/to/driver.so] [conn-str]
 
-Requires a running Trino (integration-tests/setup.sh). Standard library only -- ctypes, no
-pyodbc and no uv, so its output survives being redirected to a file.
+Requires a running Trino (integration-tests/setup.sh). Needs no compose profile:
+the tpcds catalog is in the base stack. Standard library only (ctypes, no pyodbc
+and no uv), so its output survives being redirected to a file.
 """
 
 import ctypes
@@ -141,7 +141,7 @@ VALUES = [
 ]
 
 # Every value above, as its own NULL. NULL must be reported as NULL for every
-# target type -- a driver that reports a NULL as 0 or "" corrupts data silently.
+# target type. A driver that reports a NULL as 0 or "" corrupts data silently.
 NULL_VALUES = [
     ("null boolean", "CAST(NULL AS BOOLEAN)"),
     ("null tinyint", "CAST(NULL AS TINYINT)"),

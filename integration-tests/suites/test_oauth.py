@@ -3,13 +3,9 @@
 
 Requires the `oauth` profile: `./integration-tests/setup.sh --profile oauth`.
 
-**This suite cannot use pyodbc.** pyodbc calls `SQLDriverConnectW` with
-`SQL_DRIVER_NOPROMPT` unconditionally, including for a `DSN=` string, and core
-reads that value as forbidding a prompt, so the driver refuses an
-`ExternalAuthentication` connection made through it. The suite therefore loads
-the driver with ctypes and passes `SQL_DRIVER_COMPLETE` itself. `isql` is
-unaffected: it connects by DSN through `SQLConnect`, which carries no
-*DriverCompletion*, and core reads the absent argument as permitting a prompt.
+**This suite cannot use pyodbc**, which passes `SQL_DRIVER_NOPROMPT`
+unconditionally. It loads the driver with ctypes and passes
+`SQL_DRIVER_COMPLETE` itself. See "The OAuth 2.0 flow" in `AGENTS.md`.
 
 The browser is `oauth_browser.py`, installed as a PATH-shadowed `xdg-open`
 because `open` 5.4.0 runs `xdg-open` first and unconditionally and ignores

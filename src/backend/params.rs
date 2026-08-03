@@ -213,7 +213,7 @@ fn render_literal(value: &ColumnValue) -> Result<String, TrinoError> {
         // ColumnValue is #[non_exhaustive]. A variant added upstream must fail
         // loudly here rather than be rendered by a guess: this function emits
         // SQL text, so an unreviewed rendering is an injection risk. The value
-        // itself is deliberately not included in the message.
+        // itself is kept out of the message, which reaches a diagnostic.
         _ => return Err(unsupported("this parameter type")),
     })
 }
@@ -272,7 +272,7 @@ fn check_time(hour: u16, minute: u16, second: u16) -> Result<(), TrinoError> {
 ///
 /// `SQL_TIMESTAMP_STRUCT::fraction` is nanoseconds and Trino accepts up to
 /// `timestamp(12)`, so every digit the application bound is rendered. Dividing
-/// to milliseconds discarded six of them, which stores a value the application
+/// to milliseconds discards six of them, which stores a value the application
 /// never bound and makes `WHERE ts = ?` miss the row it was looking for.
 ///
 /// The width is fixed rather than trimmed because a value at or above one
@@ -287,7 +287,7 @@ fn nanos(fraction: u32) -> String {
 /// The year field of a temporal literal, always four digits and signed.
 ///
 /// A `SQL_DATE_STRUCT` year is an `i16`, and `{year:04}` spends one of its four
-/// slots on the sign, so year -1 rendered as `-001`: a different year, which
+/// slots on the sign, so year -1 renders as `-001`: a different year, which
 /// Trino accepts and this driver's own read path then cannot parse.
 fn year4(year: i16) -> String {
     if year < 0 {
@@ -315,8 +315,8 @@ fn quote_string(s: &str) -> String {
 }
 
 /// True when `s` is a bare decimal number: optional sign, digits, optional
-/// fractional part. Deliberately strict: anything else is rejected rather
-/// than escaped, because a DECIMAL literal cannot be quoted.
+/// fractional part. Strict, because a DECIMAL literal cannot be quoted:
+/// anything else is rejected rather than escaped.
 fn is_plain_decimal(s: &str) -> bool {
     let body = s
         .strip_prefix('-')
@@ -503,8 +503,8 @@ mod tests {
     /// Rendering milliseconds silently stores a different value than the one
     /// bound, and makes `WHERE ts = ?` miss a row that exists.
     ///
-    /// 500_000_000 is exactly representable in milliseconds, which is why the
-    /// case above passed throughout.
+    /// The case above cannot catch that: 500_000_000 is exactly representable
+    /// in milliseconds, so it survives either rendering.
     #[test]
     fn a_bound_timestamp_keeps_every_nanosecond() {
         assert_eq!(
@@ -561,9 +561,9 @@ mod tests {
     }
 
     /// A whole second's worth of nanoseconds is out of range for the field.
-    /// Dividing to milliseconds rendered it as `.1000`, a four-digit
+    /// Dividing to milliseconds renders it as `.1000`, a four-digit
     /// "millisecond" component that Trino reads as `timestamp(4)`, so one
-    /// second became a tenth of one: wrong by a factor of ten, reported as
+    /// second becomes a tenth of one: wrong by a factor of ten, reported as
     /// success.
     #[test]
     fn an_out_of_range_fraction_never_renders_a_wider_field() {
@@ -594,9 +594,10 @@ mod tests {
     }
 
     /// An out-of-range field in a bound `SQL_DATE_STRUCT` /
-    /// `SQL_TIMESTAMP_STRUCT` reached the coordinator as a literal and came
-    /// back as `HY000 [INVALID_LITERAL]`, quoting SQL the application never
-    /// wrote. `SQLExecute`'s diagnostics list `22007` for "the data sent for a
+    /// `SQL_TIMESTAMP_STRUCT` would otherwise reach the coordinator as a
+    /// literal and come back as `HY000 [INVALID_LITERAL]`, quoting SQL the
+    /// application never wrote.
+    /// `SQLExecute`'s diagnostics list `22007` for "the data sent for a
     /// parameter ... was an invalid date, time, or timestamp value", and it is
     /// the driver's to return: the value never had to leave the process.
     #[test]
@@ -689,7 +690,7 @@ mod tests {
     }
 
     /// A `SQL_DATE_STRUCT` year is signed. `{year:04}` spends one of its four
-    /// slots on the sign, so year -1 rendered as `-001-01-01`: a different
+    /// slots on the sign, so year -1 renders as `-001-01-01`: a different
     /// year, accepted by Trino and then unreadable by this driver's own read
     /// path.
     #[test]

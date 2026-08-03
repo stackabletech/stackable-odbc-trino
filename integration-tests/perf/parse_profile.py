@@ -169,7 +169,7 @@ def main():
     if total_empty > 0:
         avg_empty = total_empty / len(queries)
         print(f"  Empty pages:        {total_empty} total"
-              f" (avg {avg_empty:.1f}/query) — Trino REST polling while server works")
+              f" (avg {avg_empty:.1f}/query): Trino REST polling while server works")
 
 
 if __name__ == "__main__":

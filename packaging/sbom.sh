@@ -5,14 +5,14 @@
 #   sbom.sh <artifact> <outdir>     write <outdir>/<basename>.cdx.json
 #
 # The artifact must be built with `cargo auditable`, which embeds a .dep-v0
-# section holding the crates actually linked in. Syft reads that section, so the
+# section holding the crates that were linked in. Syft reads that section, so the
 # component list describes what shipped rather than what Cargo.toml asked for,
 # and dev-dependencies are excluded by construction.
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
-# Overridable so the tests can feed a deliberately drifted fragment.
+# Overridable so the tests can feed a drifted fragment on purpose.
 SBOM_NATIVE="${SBOM_NATIVE:-$REPO_ROOT/packaging/sbom-native.json}"
 
 usage() {

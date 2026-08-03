@@ -10,7 +10,8 @@ Usage:
     python3 integration-tests/perf/test_stress.py "Driver=/path/to/driver.so;Host=localhost;Port=8080;User=admin;Protocol=http;Catalog=tpcds"
     python3 integration-tests/perf/test_stress.py "DSN=test_trino"
 
-Requires: pip install pyodbc
+Requires a running Trino (integration-tests/setup.sh) and `pip install pyodbc`.
+Needs no compose profile: the tpcds catalog is in the base stack.
 """
 
 import os

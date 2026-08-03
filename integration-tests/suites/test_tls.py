@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """TLS verification modes and mutual TLS, against the test CA.
 
-This is the first suite to drive `TlsVerify`, `SSLVerification`, `Certificate`
-and `ClientCertificate` against a real coordinator. Their parsing is
-unit-tested in `src/backend/types/connect_params.rs`; the TLS behaviour was not
-covered anywhere.
+Drives `TlsVerify`, `SSLVerification`, `Certificate` and `ClientCertificate`
+against a real coordinator. Their parsing is unit-tested in
+`src/backend/types/connect_params.rs`; this is where the TLS behaviour itself is
+covered.
 
 What each mode is checked for:
 
@@ -29,8 +29,8 @@ time. Measured against this stack:
     SNI=nosuchname.example  -> CN=test       (Trino's internal certificate)
     no SNI, by IP           -> CN=test
 
-Two ways out were tried against the live stack and both failed, so do not
-retry them:
+Neither way of removing the second certificate works, both measured against
+the live stack, so do not retry them:
 
     * removing `internal-communication.https.required` stops the certificate
       being generated, and stops Trino starting:
@@ -43,6 +43,9 @@ retry them:
 Closing this needs a TLS endpoint that serves one fixed certificate. The
 Keycloak the `oauth` profile brings in is a candidate, but the driver only ever
 speaks to Trino, so it would test rustls rather than the driver.
+
+Requires a running Trino with the certificates `integration-tests/setup.sh`
+generates, and `pip install pyodbc`. Needs no compose profile.
 
 Usage:
     uv run --with pyodbc python3 integration-tests/suites/test_tls.py

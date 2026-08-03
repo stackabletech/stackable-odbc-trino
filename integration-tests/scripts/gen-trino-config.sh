@@ -45,10 +45,10 @@ done
 # CERTIFICATE first, so a connection presenting a client certificate is
 # authenticated by it and one that presents none falls through to PASSWORD.
 #
-# OAUTH2 goes last, and that ordering is load-bearing rather than cosmetic:
+# OAUTH2 goes last, and the ordering decides what the client is tested against.
 # Trino emits one `WWW-Authenticate` header per configured type in this order, so
 # `Basic realm="Trino"` precedes the Bearer challenge. That is the arrangement
-# the client's header scan has to survive, and a stack that emitted the Bearer
+# the client's header scan has to survive, and a stack emitting the Bearer
 # challenge first would let a client reading only the first header pass.
 AUTH_TYPES="CERTIFICATE,PASSWORD"
 if [[ ",$PROFILES," == *",oauth,"* ]]; then

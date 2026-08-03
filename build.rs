@@ -2,18 +2,17 @@
 //!
 //! The ODBC Data Source Administrator reads its **Version** and **Company**
 //! columns from the driver file's version resource, and prints `Not marked`
-//! for a file that carries none — which is every Rust `cdylib`, since rustc
+//! for a file that carries none. Every Rust `cdylib` carries none, since rustc
 //! emits no such resource. Measured on Windows Server 2022: `sqlsrv32.dll`
 //! lists as `10.00.20348.01` / `Microsoft Corporation` and carries exactly
 //! those two strings.
 //!
 //! Nothing here is hand-maintained. Every string comes from `Cargo.toml`
 //! through cargo's own environment, so the resource cannot disagree with the
-//! package — in particular the version, which follows `CARGO_PKG_VERSION` and
-//! therefore follows whatever `cargo-release` wrote into `Cargo.toml`. That is
-//! why `release.toml` has no rule for this file, unlike
-//! `connector/StackableTrinoODBC.pq`, which carries its own version literal
-//! and has nothing deriving it.
+//! package. The version follows `CARGO_PKG_VERSION`, and therefore whatever
+//! `cargo-release` wrote into `Cargo.toml`, which is why `release.toml` has no
+//! rule for this file. `connector/StackableTrinoODBC.pq` needs one because it
+//! carries its own version literal with nothing deriving it.
 
 use std::path::PathBuf;
 use std::process::Command;
@@ -26,7 +25,7 @@ fn main() {
     // `CARGO_CFG_TARGET_OS`, never `cfg!(windows)`: a build script is compiled
     // for and run on the *host*, so `cfg!(windows)` describes the machine doing
     // the building. The release DLL is cross-compiled from Linux, where it is
-    // false — it would skip the resource on precisely the build that ships.
+    // false, so it would skip the resource on precisely the build that ships.
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
         return;
     }
@@ -35,8 +34,8 @@ fn main() {
     // Visual Studio installation, which this repo never builds with:
     // `.github/workflows/release.yaml` installs `gcc-mingw-w64-x86-64` and
     // builds `x86_64-pc-windows-gnu`. Warn rather than fail, so a local MSVC
-    // build still works — it just produces a DLL the Administrator lists as
-    // `Not marked`, which is what every such build did before this existed.
+    // build still works. It produces a DLL the Administrator lists as
+    // `Not marked`.
     let target_env = std::env::var("CARGO_CFG_TARGET_ENV").unwrap_or_default();
     if target_env != "gnu" {
         println!(
@@ -90,9 +89,9 @@ fn main() {
 
 /// Abort the build with a message.
 ///
-/// `exit` rather than `panic!`, which the crate's clippy configuration denies:
-/// cargo renders a build script's stderr and its exit status as a build error
-/// either way, and this one carries no backtrace nobody would read.
+/// `exit` rather than `panic!`, which the crate's clippy configuration denies.
+/// Cargo renders a build script's stderr and its exit status as a build error
+/// either way, and this way adds no backtrace for nobody to read.
 fn fail(message: &str) -> ! {
     eprintln!("error: {message}");
     std::process::exit(1);

@@ -26,15 +26,15 @@ export PROFILES
 
 # --- Dependency checks (fail fast) ---
 missing=()
-docker compose version &>/dev/null || missing+=("'docker compose' v2 plugin — sudo apt install docker-compose-plugin  OR  https://docs.docker.com/compose/install/")
-command -v cargo &>/dev/null || missing+=("'cargo' — https://rustup.rs")
-command -v curl &>/dev/null || missing+=("'curl' — sudo apt install curl")
-command -v openssl &>/dev/null || missing+=("'openssl' — sudo apt install openssl")
+docker compose version &>/dev/null || missing+=("'docker compose' v2 plugin: sudo apt install docker-compose-plugin  OR  https://docs.docker.com/compose/install/")
+command -v cargo &>/dev/null || missing+=("'cargo': https://rustup.rs")
+command -v curl &>/dev/null || missing+=("'curl': sudo apt install curl")
+command -v openssl &>/dev/null || missing+=("'openssl': sudo apt install openssl")
 # keytool builds the truststore: openssl cannot write a PKCS12 that Java reads
 # as a trust anchor. See the comment in gen-certs.sh.
-command -v keytool &>/dev/null || missing+=("'keytool' — sudo apt install default-jdk-headless")
+command -v keytool &>/dev/null || missing+=("'keytool': sudo apt install default-jdk-headless")
 if [[ ! -f "$GENERATED/password.db" ]] && ! command -v htpasswd &>/dev/null && ! python3 -c "import bcrypt" 2>/dev/null; then
-    missing+=("'htpasswd' or 'python3-bcrypt' — sudo apt install apache2-utils  OR  pip install bcrypt")
+    missing+=("'htpasswd' or 'python3-bcrypt': sudo apt install apache2-utils  OR  pip install bcrypt")
 fi
 if [[ ${#missing[@]} -gt 0 ]]; then
     echo "ERROR: Missing required dependencies:" >&2
@@ -58,7 +58,7 @@ echo "=== Assembling Trino config ==="
 
 echo "=== Starting the stack ==="
 # A profile change must recreate the coordinator. Compose would start the new
-# service and leave trino running on its previously assembled config, so
+# service and leave trino running on its already-assembled config, so
 # enabling a profile would appear to do nothing at all.
 PROFILE_STAMP="$GENERATED/.profiles"
 RECREATE=()
@@ -113,7 +113,7 @@ echo "=== Seeding the hive catalog ==="
 if [[ ",$PROFILES," == *",oauth,"* ]]; then
     keycloak_ready() {
         # The discovery document rather than /health/ready: this is the endpoint
-        # whose absence actually breaks the flow, and it proves the realm import
+        # whose absence breaks the flow, and it proves the realm import
         # finished, which a health probe does not.
         curl -sf --cacert "$CERT_DIR/ca.crt" \
             "$KEYCLOAK_ISSUER/.well-known/openid-configuration" |

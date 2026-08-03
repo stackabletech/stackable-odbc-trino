@@ -196,8 +196,8 @@ function ConvertTo-FieldValues {
 
         Unknown keywords are kept aside in Extra rather than rejected. -Emit
         receives a data source's whole stored section, which carries keywords
-        this dialog does not model -- Driver, and anything written by hand --
-        and returning fewer keywords than arrived would delete them.
+        this dialog does not model (Driver, and anything written by hand), and
+        returning fewer keywords than arrived would delete them.
         -NoGui rejects them instead: there the map is something a person just
         typed, so an unrecognised keyword is far more likely a typo than a
         keyword worth preserving, and silently ignoring it would write a data
@@ -288,7 +288,7 @@ function Get-InstallerErrors {
 function Read-Dsn {
     <#
         Pre-fill from an existing data source. Returns a hashtable keyed by
-        connection-string keyword, holding only the keywords actually present.
+        connection-string keyword, holding only the keywords present.
     #>
     param([string]$Name, [bool]$IsSystem)
 
@@ -399,7 +399,7 @@ function Test-DsnConnection {
     try {
         $conn.Open()
         $cmd = $conn.CreateCommand()
-        # current_catalog and current_schema report what the session actually
+        # current_catalog and current_schema report what the session
         # resolved to, which is not always what was typed: an unset Schema
         # leaves the coordinator's default, and Trino answers with it.
         $cmd.CommandText = 'SELECT version(), current_user, current_catalog, current_schema'
@@ -440,8 +440,8 @@ function Show-ConnectionResult {
         A success gets its own small form rather than a MessageBox, because the
         facts are a two-column table and a MessageBox cannot align one: its
         font is proportional, so padding a label with spaces lines nothing up.
-        A failure stays a MessageBox -- the driver's diagnostic is a paragraph,
-        not a table.
+        A failure stays a MessageBox, because the driver's diagnostic is a
+        paragraph and not a table.
     #>
     param([hashtable]$Result)
 
@@ -463,9 +463,9 @@ function Show-ConnectionResult {
     $dlg.TopMost = [bool]$Emit
     # The form sizes itself to the layout below. Positioning by hand from a
     # panel's Right/Bottom does not work, because an AutoSize panel has not
-    # been measured yet at that point -- the result was a window sized from
-    # stale bounds, invisible and modal, which locked its parent out of all
-    # input with nothing on screen to explain why.
+    # been measured yet at that point. That yields a window sized from stale
+    # bounds, invisible and modal, which locks its parent out of all input with
+    # nothing on screen to explain why.
     $dlg.AutoSize = $true
     $dlg.AutoSizeMode = 'GrowAndShrink'
     $dlg.Padding = New-Object System.Windows.Forms.Padding(14)
@@ -754,9 +754,9 @@ foreach ($tabName in $script:TabOrder) {
 
         # A data source keeps its values as plain registry values, so a saved
         # secret is stored unencrypted, and a System data source puts it in
-        # HKLM where every local user can read it. Off by default: the
+        # HKLM where every local user can read it. Off by default, so the
         # application supplies the secret at connect time unless the person
-        # configuring it deliberately asks for the opposite.
+        # configuring it asks otherwise.
         if (Test-FieldSecret $f) {
             $save = New-Object System.Windows.Forms.CheckBox
             $save.Text = 'Save'
@@ -839,14 +839,14 @@ $btnTest.Add_Click({
             'Incomplete', 'OK', 'Warning')
         return
     }
-    # An interactive login cannot be driven from here, and saying so is the
-    # whole point: this button connects through .NET's ODBC provider, which
-    # calls SQLDriverConnectW with SQL_DRIVER_NOPROMPT, and the driver refuses
-    # to show a login URL under it. Measured against the live driver, the
-    # attempt returns 28000 "ExternalAuthentication needs to show a login URL,
-    # and this connection was made with SQL_DRIVER_NOPROMPT". That is correct
-    # behaviour and a good diagnostic, but under a "Connection failed" heading
-    # it reads as the settings being wrong, which they are not.
+    # An interactive login cannot be driven from here, so the button says so
+    # rather than attempting one. This button connects through .NET's ODBC
+    # provider, which calls SQLDriverConnectW with SQL_DRIVER_NOPROMPT, and the
+    # driver refuses to show a login URL under it. Measured against the live
+    # driver, the attempt returns 28000 "ExternalAuthentication needs to show a
+    # login URL, and this connection was made with SQL_DRIVER_NOPROMPT". That is
+    # correct and a good diagnostic, but under a "Connection failed" heading it
+    # reads as the settings being wrong, which they are not.
     if ($values.Contains('externalauthentication') -and
         $values['externalauthentication'] -match '^(?i:true|1|yes)$') {
         [void][System.Windows.Forms.MessageBox]::Show(

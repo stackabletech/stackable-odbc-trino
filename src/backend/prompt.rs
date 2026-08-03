@@ -49,6 +49,8 @@ impl Prompter for BrowserPrompter {
 pub(crate) struct ClientRedirect(Arc<dyn Prompter>);
 
 impl ClientRedirect {
+    /// Wrap the [`Prompter`] core handed back, so the client's login URL
+    /// reaches it.
     pub(crate) fn new(prompter: Arc<dyn Prompter>) -> Self {
         Self(prompter)
     }

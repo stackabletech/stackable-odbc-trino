@@ -12,7 +12,7 @@
 [![Security Audit](https://github.com/stackabletech/stackable-odbc-trino/actions/workflows/security_audit.yaml/badge.svg)](https://github.com/stackabletech/stackable-odbc-trino/actions/workflows/security_audit.yaml)
 [![OpenSSF Scorecard](https://api.securityscorecards.dev/projects/github.com/stackabletech/stackable-odbc-trino/badge)](https://scorecard.dev/viewer/?uri=github.com/stackabletech/stackable-odbc-trino)
 [![Apache License 2.0](https://img.shields.io/badge/license-Apache--2.0-green)](./LICENSE)
-[![ODBC 3.80](https://img.shields.io/badge/ODBC-3.80-blue)](#what-it-deliberately-does-not-do)
+[![ODBC 3.80](https://img.shields.io/badge/ODBC-3.80-blue)](#compatibility)
 [![Platforms](https://img.shields.io/badge/platforms-Linux%20%7C%20Windows-blue)](#quick-start)
 [![Trino](https://img.shields.io/badge/Trino-compatible-blue)](https://trino.io)
 [![Power BI](https://img.shields.io/badge/Power%20BI-connector%20included-blue)](#power-bi)
@@ -21,46 +21,41 @@
 
 ## What is this?
 
-[Trino](https://trino.io) is a query engine that runs SQL across many different
-systems at once. One query can join a table in PostgreSQL against files in S3
-and a Kafka topic, and Trino makes all of it look like one database.
+[Trino](https://trino.io) runs SQL across many systems at once, so one query can
+join a table in PostgreSQL against files in S3 and a Kafka topic. Most desktop
+analytics tools cannot talk to Trino directly, but nearly all of them speak
+ODBC.
 
-Most of the tools people actually build dashboards in do not know how to talk to
-Trino. They know how to talk to **ODBC**: a standard, decades old, that every
-desktop analytics tool speaks. A tool loads a small library called a *driver*,
-calls the standard functions, and the driver turns them into whatever that
-particular database understands.
-
-This repository is that driver for Trino. Install it, and Power BI, Excel,
-Tableau, DBeaver, `isql` and Python's `pyodbc` can all query Trino as if it were
-any ordinary database. Linux and Windows are both first-class targets.
+This is the ODBC driver for Trino. Install it, and Power BI, Excel, Tableau,
+DBeaver, `isql` and Python's `pyodbc` can query Trino like any other database.
+Linux and Windows are both first-class targets.
 
 ## Quick start
 
-Grab an archive from the
+Download an archive from the
 [releases page](https://github.com/stackabletech/stackable-odbc-trino/releases).
 
 ### Windows
 
 1. Unzip `stackable-odbc-trino-<version>-windows-x64.zip`.
-2. Right-click `install.bat` and choose **Run as administrator**. This tells
-   Windows the driver exists.
+2. Right-click `install.bat` and choose **Run as administrator**. This registers
+   the driver with Windows.
 3. Open **ODBC Data Sources (64-bit)** from the Start menu, click **Add**, and
-   pick **Stackable Trino ODBC**. Fill in your coordinator's hostname, port and
-   login, then click **OK**.
+   pick `stackable_odbc_trino` from the list. Fill in your coordinator's
+   hostname, port and login, then click **OK**.
 
-Step 3 creates a *DSN*, which is just a saved connection with a name, like a
-browser bookmark. Once it exists, every tool on the machine can pick it from a
-list instead of asking you to type a connection string.
+Step 3 creates a *DSN*: a saved connection with a name. Once it exists, every
+tool on the machine can pick it from a list instead of asking you to type a
+connection string.
 
 The archive also ships `configure-dsn.ps1`, a standalone dialog covering every
-option below, if you would rather script it or want the full surface in one
-window.
+option below, if you would rather script the setup or see the full surface in
+one window.
 
 ### Linux
 
-You need unixODBC (the `unixodbc` package), and root, because the driver has to
-be registered system-wide.
+You need unixODBC (the `unixodbc` package). Installing the driver registers it
+system-wide, so it needs root.
 
 ```bash
 mkdir /tmp/trino-odbc
@@ -69,8 +64,8 @@ cd /tmp/trino-odbc
 sudo ./install.sh
 ```
 
-Check it worked with `odbcinst -q -d`. You should see `[stackable_odbc_trino]`
-in the output.
+Check it worked with `odbcinst -q -d`, which should list
+`[stackable_odbc_trino]`.
 
 ### Power BI
 
@@ -80,9 +75,9 @@ which is also published on its own. It gives Trino a proper entry in the
 
 1. Copy the `.mez` into `%USERPROFILE%\Documents\Power BI Desktop\Custom Connectors\`.
 2. In **File > Options > Security**, allow any extension to load.
-3. Restart Power BI Desktop. Trino now appears under **Get Data**.
+3. Restart Power BI Desktop. **Stackable Trino** now appears under **Get Data**.
 
-### Then use it
+### Your first query
 
 ```python
 import pyodbc
@@ -95,70 +90,8 @@ for row in conn.cursor().execute("SELECT name FROM tpch.tiny.nation LIMIT 5"):
     print(row.name)
 ```
 
-For the full install and uninstall reference see
-[`packaging/README.md`](packaging/README.md), and for managing drivers and DSNs
-by hand on Windows see
-[`integration-tests/windows/WINDOWS.md`](integration-tests/windows/WINDOWS.md).
-
-## Highlights
-
-- **Sign in the way your company already does.** Username and password, a bearer
-  token, a client certificate, or a real browser login through Trino's OAuth 2.0
-  flow: the driver shows you a URL, you log in with your normal company account,
-  and it picks up the token when you are done. That login is shared across the
-  whole application, so a tool opening ten connections at startup opens one
-  browser tab, not ten.
-
-- **Run queries as somebody else, on purpose.** `SessionUser` authenticates as
-  you but runs the SQL under another user's name, which is how a shared service
-  keeps per-user permissions. `Roles` picks the authorisation role per catalog,
-  which Hive and Iceberg need before they will let you write anything.
-
-- **Encryption has a middle setting, not just on and off.** Most drivers make
-  you choose between full verification and none, so one coordinator reached
-  under an internal hostname ends up with checking switched off everywhere.
-  Here `TlsVerify=ca` still verifies the certificate against your CA and only
-  skips the hostname match. Turning verification off entirely stays possible,
-  and stays a deliberate choice.
-
-- **The stop button actually stops the query.** Cancelling from your tool tells
-  the coordinator to kill the query, so it stops burning cluster time rather
-  than running to completion while nobody is listening. The query timeout is
-  just as literal: Trino sends the column names almost immediately and the rows
-  much later, so a timer that only covers sending the query would never fire.
-  This one keeps running while the rows arrive.
-
-- **Big results can skip the coordinator.** Setting `Encoding=json+zstd` turns
-  on Trino's spooling protocol, where large results travel through object
-  storage instead of being streamed through the coordinator one page at a time.
-  It is off by default because not every laptop can reach that storage, and a
-  coordinator that does not support it just answers normally, so switching it on
-  can never break a connection that otherwise worked.
-
-- **Your tool can browse the data.** Catalogs, schemas, tables, columns, types
-  and privileges all show up in the object browser, so you can click through
-  what is there instead of guessing table names. When a query has parameters in
-  it, the driver asks Trino what type each one is with `DESCRIBE INPUT` rather
-  than guessing, which is why a filter on a `decimal` column keeps working.
-
-- **Real transactions.** Turn autocommit off and the driver opens a Trino
-  transaction on your next statement, then commits or rolls back when you say
-  so. If a statement inside the transaction fails, Trino abandons the whole
-  thing, and the driver rolls back and tells you the commit did not happen
-  instead of reporting a success that threw your writes away.
-
-- **Power BI does the work in Trino, not on your laptop.** The bundled connector
-  folds filters, joins, grouping and row limits down into the SQL it sends, so a
-  report over a billion-row table asks Trino for the answer instead of dragging
-  the table across the network first. DirectQuery is supported, and a contract
-  test checks the connector's declarations against what this driver reports and
-  what Trino really accepts.
-
-- **Windows is a first-class target.** It gets its own installer and a proper
-  dialog for setting up a saved connection, and the test suite is run through
-  the Windows Driver Manager in a VM before every release, not only through
-  Linux's. Windows' Driver Manager is much stricter than unixODBC and tends to
-  fail silently, so this is measured rather than assumed.
+For the full install and uninstall reference, see
+[`packaging/README.md`](packaging/README.md).
 
 ## Connecting
 
@@ -175,8 +108,8 @@ The keys most people need:
 |-----|----------|---------|
 | `Host` | Yes | Trino coordinator hostname |
 | `Port` | Yes | Coordinator port |
-| `User` | Yes¹ | Username. ¹Optional under `ExternalAuthentication`, where the login supplies it |
-| `Password` | No | Password |
+| `User` | Yes¹ | Username. Alias: `UID`. ¹Optional under `ExternalAuthentication`, where the login supplies it |
+| `Password` | No | Password. Alias: `PWD` |
 | `Catalog` | No | Catalog to start in |
 | `Schema` | No | Schema to start in |
 | `TlsVerify` | No | `true`/`full` (default), `ca`, or `false`/`none` |
@@ -191,8 +124,8 @@ The authoritative list is `src/backend/types/connect_params.rs`.
 |-----|----------|---------|
 | `Host` | Yes | Trino coordinator hostname |
 | `Port` | Yes | Coordinator port |
-| `User` | Yes¹ | Username (Basic Auth). ¹Optional under `ExternalAuthentication`, where the identity provider supplies it |
-| `Password` | No | Password (Basic Auth) |
+| `User` | Yes¹ | Username (Basic Auth). Alias: `UID`. ¹Optional under `ExternalAuthentication`, where the identity provider supplies it |
+| `Password` | No | Password (Basic Auth). Alias: `PWD` |
 | `Protocol` | No | `https` (default) or `http` |
 | `Catalog` | No | Default catalog |
 | `Schema` | No | Default schema |
@@ -226,98 +159,150 @@ The authoritative list is `src/backend/types/connect_params.rs`.
 
 </details>
 
-### One gotcha worth knowing
+### Values that contain a semicolon
 
 Five keys take a list of pairs: `SessionProperties`, `ResourceEstimates`,
 `ExtraCredentials`, `Roles` and `ExtraHeaders`. They use JDBC's format exactly,
 so a value copied out of a JDBC URL works unchanged. That format separates pairs
 with `;`, which is also what separates one connection-string key from the next,
-so those values have to be wrapped in braces:
+so wrap those values in braces:
 
 ```text
 SessionProperties={query_max_run_time:10m;example.foo:bar};Encoding=json+zstd
 ```
 
-Leave the braces off and the connection string ends the value at the first `;`,
-silently throwing away every pair but the first.
+Without the braces, the connection string ends the value at the first `;` and
+silently discards every pair but the first.
 
-In a DSN it is the other way round: braces are connection-string syntax, so the
-value is stored bare. The Windows dialog handles that for you.
+In a DSN it is the other way round. Braces are connection-string syntax, so the
+value is stored bare:
 
-## What it deliberately does not do
+```text
+SessionProperties=query_max_run_time:10m;example.foo:bar
+```
 
-Everything here is reported to the application as unsupported rather than
-quietly ignored, so a tool can react instead of trusting a wrong answer.
+Braces in a DSN fail the connection outright, so the mistake is at least loud in
+that direction. The Windows dialog handles both cases for you.
+
+## What you get
+
+- **Sign in the way your company already does.** Username and password, a bearer
+  token, a client certificate, or a browser login through Trino's OAuth 2.0
+  flow. For the browser login the driver shows you a URL, you sign in with your
+  normal account, and it picks up the token when you are done. That login is
+  shared across the whole application, so a tool opening ten connections opens
+  one browser tab.
+
+- **Run queries as somebody else, on purpose.** `SessionUser` authenticates as
+  you but runs the SQL under another user's name, which is how a shared service
+  keeps per-user permissions. `Roles` picks the authorisation role per catalog,
+  which Hive and Iceberg need before they will let you write anything.
+
+- **Encryption has a middle setting.** Most drivers offer full verification or
+  none, so one coordinator reached under an internal hostname ends up with
+  checking switched off everywhere. `TlsVerify=ca` still verifies the
+  certificate against your CA and only skips the hostname match.
+
+- **The stop button stops the query.** Cancelling from your tool tells the
+  coordinator to kill the query, so it stops consuming cluster time. Query
+  timeouts work the same way, and cover the time spent receiving rows rather
+  than only the time spent starting the query.
+
+- **Your tool can browse the data.** Catalogs, schemas, tables, columns, types
+  and privileges all show up in the object browser, so you can click through
+  what is there instead of guessing table names.
+
+- **Real transactions.** Turn autocommit off and the driver opens a Trino
+  transaction on your next statement, then commits or rolls back when you say
+  so. If a statement inside the transaction fails, Trino abandons the whole
+  thing, and the driver rolls back and tells you the commit did not happen
+  rather than reporting a success that threw your writes away.
+
+- **Power BI does the work in Trino, not on your laptop.** The bundled connector
+  pushes filters, joins, grouping and row limits down into the SQL it sends, so
+  a report over a billion-row table asks Trino for the answer instead of
+  dragging the table across the network first. DirectQuery is supported.
+
+- **Big results can skip the coordinator.** Setting `Encoding=json+zstd` turns
+  on Trino's spooling protocol, where large results travel through object
+  storage instead of streaming through the coordinator a page at a time. It is
+  off by default because not every machine can reach that storage, and a
+  coordinator that does not support it answers normally, so switching it on
+  cannot break a connection that already worked.
+
+## Limits
+
+Each of these is reported to your tool as unsupported rather than quietly
+ignored, so the tool can react instead of trusting a wrong answer.
 
 - **No primary keys, foreign keys, indexes or stored procedures.** Trino
   publishes no metadata for any of them, so those lookups return nothing.
-- **The current catalog cannot be changed after connecting.** Trino's `USE`
-  moves the catalog and the schema together, so honouring "switch to catalog X"
-  would mean inventing a schema and leaving your unqualified table names
-  resolving somewhere you never asked for. Set `Catalog` when connecting.
+- **The catalog cannot be changed after connecting.** Trino's `USE` moves the
+  catalog and the schema together, so honouring "switch to catalog X" would mean
+  inventing a schema, and your unqualified table names would start resolving
+  somewhere you never asked for. Set `Catalog` when you connect.
 - **Row and field size limits are not faked.** Trino can only limit a result set
-  through `LIMIT` in the SQL you wrote, and the standard forbids a driver from
-  emulating those settings by throwing rows away after they arrive.
-- **One isolation level.** Catalogs disagree about which levels they accept, so
-  the driver advertises only the one every catalog supports and refuses the rest
-  up front rather than letting the query fail later for a reason nobody can see.
+  through `LIMIT` in the SQL you wrote.
+- **One isolation level.** Trino catalogs disagree about which levels they
+  accept, so the driver offers the one they all support and refuses the rest up
+  front, rather than letting a query fail later for a reason nobody can see.
 
-## Building from source
+## Compatibility
 
-Building or testing needs the unixODBC development libraries, because the ODBC
-bindings link against them. You do not need a running Trino, or any ODBC setup:
+| | |
+|---|---|
+| ODBC | 3.80 |
+| Platforms | Linux x86-64, Windows x86-64 |
+| Driver Managers | unixODBC, and the Windows Driver Manager |
+| Trino | tested against 483 |
+| Tested with | Power BI Desktop, `pyodbc`, `isql`, DBeaver |
 
-```bash
-sudo apt-get install unixodbc-dev   # Debian/Ubuntu
-```
+Older Trino versions are likely to work, since the driver uses the stable REST
+protocol, but 483 is what the test suite runs against.
 
-Everything generic about being an ODBC driver lives in
-[`stackable-odbc-core`](https://github.com/stackabletech/stackable-odbc-core),
-which this repository builds on. It is not published yet, so clone it as a
-sibling directory:
+## Troubleshooting
 
-```bash
-git clone https://github.com/stackabletech/stackable-odbc-core
-git clone https://github.com/stackabletech/stackable-odbc-trino
-cd stackable-odbc-trino
-cargo build --release
-```
-
-Output: `target/release/libstackable_odbc_trino.so`
-
-For Windows, cross-compile with MinGW (`gcc-mingw-w64-x86-64`):
+**Turn on logging first.** The driver logs to a file when you ask it to, and
+that is usually enough to see what a tool is really sending:
 
 ```bash
-rustup target add x86_64-pc-windows-gnu
-cargo build --release --target x86_64-pc-windows-gnu
+export ODBC_LOG_LEVEL=debug
+export ODBC_LOG_FILE=/tmp/trino-odbc.log
 ```
 
-Output: `target/x86_64-pc-windows-gnu/release/stackable_odbc_trino.dll`
+On Windows, set the same two as environment variables. The log may contain your
+SQL, so check it before sharing.
 
-To assemble the release archives, see [`packaging/README.md`](packaging/README.md).
+**The driver does not appear in the list.** On Linux, run `odbcinst -q -d`; if
+`[stackable_odbc_trino]` is missing, the install did not complete. On Windows,
+make sure you opened **ODBC Data Sources (64-bit)**: a 64-bit driver is invisible
+to the 32-bit Administrator, and both are in the Start menu under similar names.
 
-## Testing
+**TLS errors.** The default verifies the certificate chain and the hostname. If
+your coordinator's certificate does not carry the name you are connecting under,
+use `TlsVerify=ca` with `Certificate` pointing at your CA's PEM file. That still
+verifies the certificate and only relaxes the name check.
 
-```bash
-cargo test    # unit and FFI tests; needs no running Trino
-cargo bench   # Criterion fetch-throughput benchmark; needs TRINO_BENCH_URL
-```
+**Only the first session property applies.** Wrap the value in braces. See
+[Values that contain a semicolon](#values-that-contain-a-semicolon).
 
-The integration suite runs against a real Trino in Docker. It is **not** run in
-CI, because the Trino and Postgres compose stack is bigger than a standard
-GitHub runner, so run it locally before a release:
+**The browser login never opens.** Some tools, `pyodbc` among them, tell the
+driver it may not display anything. The driver reports this rather than hanging.
+Use `AccessToken` with those tools, or connect through one that allows a prompt.
 
-```bash
-./integration-tests/setup.sh       # spin up Trino, build the driver, write ODBC config
-./integration-tests/run-tests.sh   # run the tests, then tear Trino down
-```
+## Getting help
 
-The Windows tests run the same suites through the Windows Driver Manager in a
-VM; see
-[`integration-tests/windows/WINDOWS.md`](integration-tests/windows/WINDOWS.md).
+- [GitHub Discussions](https://github.com/orgs/stackabletech/discussions) for
+  questions
+- [Discord](https://discord.gg/7kZ3BNnCAF) to talk to us
+- [Issues](https://github.com/stackabletech/stackable-odbc-trino/issues) for
+  bugs, and [SECURITY.md](SECURITY.md) for anything security-related
 
-For architecture, conventions and the full testing reference, see
-[AGENTS.md](AGENTS.md).
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for building from source, running the
+tests, and how the repository is laid out. [CHANGELOG.md](CHANGELOG.md) records
+what changed in each release.
 
 ## License
 

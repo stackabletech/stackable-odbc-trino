@@ -228,8 +228,8 @@ unsafe fn cleanup(env: *mut c_void, conn: *mut c_void, stmt: *mut c_void) {
 // SqlFileUsage/SqlQuotedIdentifierCase and the ten PowerBI capability info
 // types below have no arm in default_get_info or trino_get_info's match:
 // they only get a real value via TrinoBackend::get_info_raw, reached through
-// the get_info_raw-first fallback in sql_get_info_w. See the "ordering is
-// load-bearing" note on info_type_default_response in
+// the get_info_raw-first fallback in sql_get_info_w. See the note on
+// ordering at info_type_default_response in
 // stackable-odbc-core/src/ffi/info.rs.
 //
 // These need `handle.connection = Some(_)` to reach that fallback at all
@@ -353,8 +353,8 @@ unsafe fn assert_get_info_str(conn: *mut c_void, info_type: InfoType, expected: 
 /// `TrinoBackend::keywords` returns Trino's raw reserved words and
 /// `stackable-odbc-core` subtracts `ODBC_RESERVED_KEYWORDS`, sorts and joins
 /// them. A unit test in `backend/info.rs` can only redo that subtraction
-/// itself, which proves the list is right but not that core is actually
-/// asking this backend for it. A core that never calls the hook answers every
+/// itself, which proves the list is right but not that core asks this
+/// backend for it. A core that never calls the hook answers every
 /// backend with the empty string, and `SQLGetInfo` still returns `SUCCESS`, so
 /// only a call through the real entry point can tell the two apart.
 ///
@@ -464,15 +464,14 @@ fn get_info_named_but_unhandled_types_fall_back_to_get_info_raw() {
 // SQLGetInfoW info-type conformance test
 // ---------------------------------------------------------------------------
 //
-// Three real, shipped bugs were all "nothing enumerated the spec": a value
-// the Windows Driver Manager treats as an integer where the driver returned
-// a string (or vice versa), and conversion bitmaps that returned 0 (which
-// makes the Windows DM block SQLGetData with HYC00). Line coverage stayed
-// green throughout, because the code path that produced the wrong answer
-// ran constantly, with no assertion on what it returned for every info
-// type, only on the ones a test happened to name.
+// The failures this catches are all "nothing enumerated the spec": a value
+// the Windows Driver Manager treats as an integer where the driver returns a
+// string (or the reverse), and a conversion bitmap of 0, which makes the
+// Windows DM block SQLGetData with HYC00. Line coverage cannot see any of
+// them, because the code path producing the wrong answer runs constantly and
+// only the info types a test happens to name are asserted on.
 //
-// These two tests close that gap by iterating every `InfoType` odbc-sys
+// These two tests iterate every `InfoType` odbc-sys
 // compiles (derived from `info_type_from_raw`, not a hand-copied list; see
 // `stackable_odbc_core::conformance`) through the real `sql_get_info_w` FFI entry
 // point, against the real `TrinoBackend`. Both use the network-free
@@ -776,8 +775,8 @@ fn varbinary_get_data_returns_raw_bytes() {
     }
 }
 
-/// End-to-end proof that `TrinoBackend::escape_dialect()` is actually wired
-/// into the execute path: `SQLExecDirect` is given raw ODBC escape syntax
+/// End-to-end proof that `TrinoBackend::escape_dialect()` is wired into the
+/// execute path: `SQLExecDirect` is given raw ODBC escape syntax
 /// (`{fn UCASE(...)}`, `{d '...'}`) that is not valid Trino SQL on its own,
 /// and only succeeds because `sql_exec_direct_w` translates it first (see
 /// `crate::escape_dialect`).
@@ -816,10 +815,10 @@ fn escape_fn_and_date_literal_translate_for_trino() {
 /// Every `{fn ...}` escape the `SQL_*_FUNCTIONS` bitmaps advertise, executed
 /// against a real coordinator.
 ///
-/// This is the check the bitmaps actually need. The unit tests assert that a
-/// rewrite exists and what text it produces, but only the server can say
-/// whether that text runs, and each of these is advertised
-/// while failing there with `FUNCTION_NOT_FOUND` or `COLUMN_NOT_FOUND`.
+/// This is the check the bitmaps need. The unit tests assert that a rewrite
+/// exists and what text it produces, and only the server can say whether that
+/// text runs: an advertised escape can still fail there with
+/// `FUNCTION_NOT_FOUND` or `COLUMN_NOT_FOUND`.
 ///
 /// Where the value is deterministic it is asserted; where it is not (`now()`,
 /// `current_user`) executing without error is the whole point. `DAYOFWEEK` is
@@ -1239,12 +1238,12 @@ fn string_parameter_with_quotes_is_not_injected() {
         let mut buf: Vec<u8> = payload.as_bytes().to_vec();
         // The indicator is passed explicitly rather than left NULL. A NULL
         // `StrLen_or_IndPtr` means "this buffer is null-terminated" per
-        // SQLBindParameter, so the driver scans for a NUL, and `to_vec()`
-        // produces exactly `payload.len()` bytes with no terminator. That
-        // combination made the driver read past the allocation into whatever
-        // the heap held next, so this assertion failed with the payload plus
-        // trailing garbage whenever earlier tests had dirtied the allocator,
-        // and passed when the test ran alone. See
+        // SQLBindParameter, so the driver scans for a NUL, while `to_vec()`
+        // produces exactly `payload.len()` bytes with no terminator. The two
+        // together read past the allocation into whatever the heap holds
+        // next, which appears here as the payload plus trailing garbage, and
+        // only when an earlier test has dirtied the allocator: run alone,
+        // this test passes either way. See
         // `string_parameter_bound_as_nts_is_not_injected` for the
         // null-terminated form of the same binding.
         let mut ind_in: isize = buf.len() as isize;
@@ -3003,8 +3002,8 @@ fn queries_reach_trino_tagged_with_the_drivers_source() {
             SqlReturn::SUCCESS
         );
         let source = String::from_utf16_lossy(&buf[..(len as usize) / 2]);
-        // `env!` rather than a literal, so bumping the crate version cannot
-        // leave this asserting a version the driver no longer reports.
+        // `env!` rather than a literal, so the assertion tracks the version
+        // the driver reports rather than needing a bump of its own.
         assert_eq!(
             source,
             format!("stackable-odbc-trino/{}", env!("CARGO_PKG_VERSION")),
@@ -3400,34 +3399,33 @@ unsafe fn collect_describe_col(stmt: *mut c_void) -> Vec<(String, i16, usize, i1
 }
 
 /// The query path (`SQLDescribeColW`) and the catalog path (`SQLColumnsW`)
-/// must not derive type, size and scale independently and disagree: `char`
-/// (WVARCHAR vs WCHAR), `timestamp` (23 vs 29) and `varchar(n)` (0 vs n).
-/// Both derive from the same native Trino type text, so these columns of
-/// `postgresql.public.types_test` must agree between the two paths.
+/// derive type, size and scale from the same native Trino type text, so the
+/// columns of `postgresql.public.types_test` must agree between them. The
+/// ways they can disagree are `char` (WVARCHAR against WCHAR), `timestamp`
+/// (23 against 29) and `varchar(n)` (0 against n).
 ///
-/// Covers `VARCHAR` / `CHAR` / `DECIMAL` / integer / floating-point columns
-/// plus `DATE` / `TIME` / `TIMESTAMP` / `BOOLEAN`. The latter four depend on
+/// Covers `VARCHAR`, `CHAR`, `DECIMAL`, integer and floating-point columns
+/// plus `DATE`, `TIME`, `TIMESTAMP` and `BOOLEAN`. Those last four depend on
 /// `SQLColumns`' `COLUMN_SIZE` gate (`backend/metadata.rs`) reporting
-/// `type_name_precision`'s value for every type it can resolve one for,
-/// rather than a separately maintained "is_char || is_numeric" list that
-/// DATE/TIME/TIMESTAMP/BOOLEAN fall outside of, which would make the catalog
-/// path report `COLUMN_SIZE` as `NULL` for them regardless of what the query
-/// path said.
+/// `type_name_precision`'s value for every type it can resolve one for. A
+/// separately maintained "is_char || is_numeric" list leaves the four out,
+/// and the catalog path then reports their `COLUMN_SIZE` as `NULL` whatever
+/// the query path says.
 ///
-/// The catalog path needs the session's default catalog/schema switched to
-/// `postgresql`/`public` first: the generic `SQLColumnsW` query reads
-/// Trino's `information_schema.columns` unqualified, which Trino resolves
-/// against the *session's* default catalog. The shared connection defaults
-/// to `Catalog=tpcds`, so a `table_catalog='postgresql'` filter on that
-/// session returns zero rows even though the table exists: that's Trino's
-/// information_schema scoping, not a defect. `USE`
-/// switches it on the shared connection (and switches back afterwards)
-/// rather than opening a second connection: a second connection would open
-/// a second `reqwest` pool against the same coordinator, which is exactly
-/// the "intermittent TCP socket corruption" scenario this file's own docs
-/// warn about for `backend::tests`, reproducible here too. The query path
-/// has no such restriction (a fully qualified `SELECT` works from any
-/// session), so it runs before the catalog is switched.
+/// The catalog path needs the session's default catalog and schema switched
+/// to `postgresql`/`public` first. `SQLColumnsW` reads
+/// `information_schema.columns` unqualified, which Trino resolves against the
+/// *session's* default catalog, and the shared connection defaults to
+/// `Catalog=tpcds`: a `table_catalog='postgresql'` filter on that session
+/// returns zero rows though the table exists. That is Trino's
+/// information_schema scoping, not a defect.
+///
+/// `USE` switches the shared connection and switches it back, rather than
+/// opening a second connection. A second one means a second `reqwest` pool
+/// against the same coordinator, which is the intermittent TCP socket
+/// corruption this file's own docs warn about for `backend::tests`, and it
+/// reproduces here. The query path works from any session, given a fully
+/// qualified `SELECT`, so it runs before the switch.
 #[test]
 #[serial]
 #[ignore = "requires Trino at localhost:8443; run ./integration-tests/setup.sh first"]
@@ -3554,21 +3552,19 @@ fn set_pos_returns_hyc00() {
 // priority cases.
 //
 // Omitted from the metadata-sized backbone below, with reasons:
-// - BOOLEAN/TINYINT/SMALLINT: fixed-width types whose COLUMN_SIZE is a
-//   simple appendix constant, already covered by `column_size.rs`'s own
-//   spec-table test; a live-Trino round trip adds little over BIGINT/DOUBLE
-//   below for the same numeric shape.
+// - BOOLEAN/TINYINT/SMALLINT: fixed-width types whose COLUMN_SIZE is an
+//   appendix constant, covered by `column_size.rs`'s own spec-table test.
+//   BIGINT and DOUBLE below cover the same numeric shape against Trino.
 // - VARBINARY/JSON/UUID/INTERVAL/ARRAY: string-representable types whose
-//   rendering is already covered by existing tests in this file
-//   (`varbinary_get_data_returns_raw_bytes` etc.); not core to the temporal/
-//   DECIMAL sizing this matrix covers. VARBINARY specifically also
-//   cannot be given a bounded declared length: Trino's VARBINARY type has no
-//   length parameter at all, so any VARBINARY column's DISPLAY_SIZE is the
-//   "unbounded" convention (i32::MAX * 2, see `is_binary_type` in
-//   col_attr.rs), which is not an allocatable buffer size; an application
-//   reading it is expected to use chunked `SQLGetData` calls instead of
-//   sizing one buffer from COLUMN_SIZE, which is exactly what
-//   `varbinary_get_data_returns_raw_bytes` already does.
+//   rendering is covered elsewhere in this file
+//   (`varbinary_get_data_returns_raw_bytes` and friends), away from the
+//   temporal and DECIMAL sizing this matrix is about. VARBINARY cannot be
+//   given a bounded declared length at all, since Trino's VARBINARY carries
+//   no length parameter, so its DISPLAY_SIZE is the "unbounded" convention
+//   (i32::MAX * 2, see `is_binary_type` in col_attr.rs). That is not an
+//   allocatable buffer size: an application reads such a column with chunked
+//   `SQLGetData` calls rather than sizing one buffer from COLUMN_SIZE, which
+//   is what `varbinary_get_data_returns_raw_bytes` does.
 
 /// Mirrors `odbc_sys::Timestamp` (`SQL_TIMESTAMP_STRUCT`)'s field layout so
 /// this test file can read a `SQL_C_TYPE_TIMESTAMP` buffer without adding
@@ -3664,15 +3660,14 @@ unsafe fn last_sqlstate(stmt: *mut c_void) -> String {
 fn metadata_sized_wchar_round_trip_covers_representative_types() {
     unsafe {
         let (_env, _conn, stmt) = alloc_stmt();
-        // col_varchar is selected from the real `types_test` table (not a bare
-        // `CAST('...' AS VARCHAR)` literal) deliberately: a computed VARCHAR
-        // expression with no catalog entry has no declared length anywhere
-        // for `trino_ty_precision` to read (`TrinoTy::Varchar` isn't among
-        // its matched arms, so it falls to the `_ => 0` default), which
-        // under-reports DISPLAY_SIZE for that one shape, a real, separate
-        // gap unrelated to the temporal/DECIMAL sizing.
-        // Selecting a cataloged VARCHAR(200) column instead exercises the
-        // normal, intended path (information_schema-derived precision).
+        // col_varchar comes from the real `types_test` table rather than a
+        // bare `CAST('...' AS VARCHAR)` literal, so that it exercises the
+        // normal path: a catalogued VARCHAR(200) column whose precision comes
+        // from `information_schema`. A computed VARCHAR expression has no
+        // catalog entry and therefore no declared length for
+        // `trino_ty_precision` to read, which under-reports DISPLAY_SIZE for
+        // that shape alone, separately from the temporal and DECIMAL sizing
+        // this test is about.
         assert_eq!(
             exec_direct(
                 stmt,
@@ -3919,14 +3914,14 @@ fn a_trailing_semicolon_does_not_fail_the_statement() {
 /// code, and must not carry Trino's `failure_info`.
 ///
 /// `QueryError`'s own `Display` renders the coordinator's Java stack, and core
-/// walks the whole causal chain into the message, so before `QueryCause` split
-/// the two apart every diagnostic ran to thousands of characters, measured
-/// between 1,700 and 15,000 against a live coordinator, `DIVISION_BY_ZERO`
-/// being the worst at ~168 frames.
+/// walks the whole causal chain into the message, so a diagnostic carrying it
+/// runs to thousands of characters: measured between 1,700 and 15,000 against
+/// a live coordinator, `DIVISION_BY_ZERO` worst at ~168 frames. `QueryCause`
+/// is what keeps the two apart.
 ///
-/// The bound below is deliberately loose. It is not asserting a particular
-/// length, it is asserting that no stack is in there, and it would fail by
-/// orders of magnitude if one came back.
+/// The bound below is loose on purpose. It asserts that no stack is in there,
+/// not a particular length, and a returning stack would exceed it by orders
+/// of magnitude.
 #[test]
 #[serial]
 #[ignore = "requires Trino at localhost:8443; run ./integration-tests/setup.sh first"]
@@ -4059,9 +4054,9 @@ fn numeric_looking_text_column_read_as_sbigint() {
 /// is the Trino analogue of "a temporal column read as SQL_C_TYPE_TIMESTAMP
 /// where the stored value is text": Trino's native TIMESTAMP columns are
 /// already parsed to `ColumnValue::Timestamp` before `write_column_value`
-/// ever runs (see `type_conversion.rs`), so the case that actually exercises
+/// runs (see `type_conversion.rs`), so only a VARCHAR-typed source reaches
 /// `write_column_value`'s `(ColumnValue::String, CDataType::TypeTimestamp)`
-/// arm end-to-end is a VARCHAR-typed source, not a native TIMESTAMP column.
+/// arm end to end.
 #[test]
 #[serial]
 #[ignore = "requires Trino at localhost:8443; run ./integration-tests/setup.sh first"]
@@ -4210,26 +4205,26 @@ unsafe fn sqlstate_of(handle_type: HandleType, handle: *mut c_void) -> String {
 }
 
 /// The spec's `01S02` row closes the set of statement attributes a driver may
-/// substitute for, and for each of them core stores the value it will actually
-/// use rather than the one asked for. That is what makes the row's parenthesis
-/// true ("`SQLGetStmtAttr` can be called to determine the temporarily
-/// substituted value."), and it is the half an application acts on: a tool
-/// that sets `SQL_ATTR_MAX_ROWS = 100` and reads back `100` believes it will
-/// receive at most a hundred rows, while this driver returns every one.
+/// substitute for, and core stores the value it will use for each rather than
+/// the one asked for. That is what makes the row's parenthesis true
+/// ("`SQLGetStmtAttr` can be called to determine the temporarily substituted
+/// value."), and it is the half an application acts on: a tool that sets
+/// `SQL_ATTR_MAX_ROWS = 100` and reads back `100` expects at most a hundred
+/// rows, while this driver returns every one.
 ///
 /// `SQL_ATTR_CURSOR_SCROLLABLE` and `SQL_ATTR_PARAMSET_SIZE` are checked
-/// alongside them although the spec's list does not name either; both are
-/// documented deviations at their arms in core, and pinning them here is what
-/// stops the deviation being undone by accident.
+/// alongside them although the spec's list names neither. Both are documented
+/// deviations at their arms in core, and pinning them here stops the
+/// deviation being undone by accident.
 ///
 /// `SQL_ATTR_QUERY_TIMEOUT` is **not** in this list. This driver answers
 /// `Backend::set_query_timeout`, so a statement on a live connection accepts
-/// the value rather than substituting `0`; see
-/// `query_timeout_is_accepted_on_a_connected_statement`. It would still pass
-/// here, because these handles are never connected and core substitutes when it
-/// has no connection to offer the value to, and that is exactly why keeping it
-/// would be misleading: the assertion would hold for a reason unrelated to what
-/// it claims to check.
+/// the value instead of substituting `0`; see
+/// `query_timeout_is_accepted_on_a_connected_statement`. It would pass here
+/// anyway, because these handles are never connected and core substitutes
+/// with no connection to offer the value to, and that is what makes keeping
+/// it misleading: the assertion would hold for a reason unrelated to what it
+/// claims.
 #[test]
 fn set_stmt_attr_substitutes_and_reports_the_value_it_will_use() {
     // (attribute, requested value, the value core will report back)
@@ -4738,14 +4733,13 @@ fn set_connect_attr_accepts_packet_size_before_connecting() {
 /// 64-bit platform.
 ///
 /// A short write is the same class of defect as a wrongly-shaped `SQLGetInfo`
-/// answer, in the other direction: `SQLGetStmtAttr`'s `BufferLength` is
+/// answer, in the other direction. `SQLGetStmtAttr`'s `BufferLength` is
 /// ignored for a non-string value, so an application writing
-/// `SQLULEN v; SQLGetStmtAttr(stmt, SQL_ATTR_MAX_ROWS, &v, 0, NULL);` would
-/// keep whatever was on its stack in the top four bytes of `v` and read a row
-/// limit of some enormous number rather than the `0` core reported. Core did
-/// exactly that until this driver's suite found it, which is why the buffer
-/// below is poisoned rather than zeroed: a zeroed one cannot tell a correct
-/// write from a short one.
+/// `SQLULEN v; SQLGetStmtAttr(stmt, SQL_ATTR_MAX_ROWS, &v, 0, NULL);` keeps
+/// whatever was on its stack in the top four bytes of `v` and reads an
+/// enormous row limit rather than the `0` core reported. The buffer below is
+/// poisoned rather than zeroed for that reason: a zeroed one cannot tell a
+/// correct write from a short one.
 #[test]
 fn statement_attributes_are_written_at_the_full_sqlulen_width() {
     // The integer-valued attributes, each at a value whose top half is zero,
@@ -4943,13 +4937,12 @@ fn execution_writes_the_processed_count_and_the_parameter_status() {
 ///
 /// The spec says so directly: "in ODBC 3.x, the value returned for this
 /// InfoType can also be returned by calling `SQLGetConnectAttr` with an
-/// Attribute argument of `SQL_ATTR_CURRENT_CATALOG`". Until core grew
-/// [`TrinoBackend::current_catalog`] they did not: this driver answered the
-/// info type from its own `get_info_raw` while the attribute was a handle-local
-/// string nothing ever seeded, so a connection opened against `tpcds` reported
-/// `"tpcds"` under one name and `""` under the other.
+/// Attribute argument of `SQL_ATTR_CURRENT_CATALOG`".
 ///
-/// One source now feeds both, which is why `info.rs` has no arm for either.
+/// [`TrinoBackend::current_catalog`] is the single source both read, which is
+/// why `info.rs` has an arm for neither. Two sources means a connection
+/// opened against `tpcds` reporting `"tpcds"` under one name and `""` under
+/// the other, since a handle-local attribute string has nothing to seed it.
 #[test]
 fn the_current_catalog_reads_the_same_under_both_of_its_names() {
     unsafe {
@@ -5014,16 +5007,15 @@ fn the_current_catalog_reads_the_same_under_both_of_its_names() {
 /// `SQLSetConnectAttr(SQL_ATTR_CURRENT_CATALOG)` reports `HYC00`, because this
 /// driver cannot switch catalogs.
 ///
-/// Core's `set_current_catalog` default, deliberately left in place. Trino's
-/// only catalog-switching statement is `USE`, whose grammar requires a schema
+/// Core's `set_current_catalog` default is left in place. Trino's only
+/// catalog-switching statement is `USE`, whose grammar requires a schema
 /// (`USE postgresql` is `NOT_FOUND`, parsed as a schema name), so honouring
 /// the call would mean inventing a schema and silently moving the session's
 /// unqualified name resolution into it. See the comment beside
 /// `TrinoBackend::current_catalog` for the coordinator probes.
 ///
-/// This is a visible change from the previous store-and-succeed: an
-/// application that sets the attribute now gets `SQL_ERROR`. It is the honest
-/// answer, and the failing call is the one that was doing nothing.
+/// An application that sets the attribute therefore gets `SQL_ERROR`. That is
+/// the honest answer: succeeding would report a switch that did not happen.
 #[test]
 fn setting_the_current_catalog_is_refused_rather_than_silently_ignored() {
     unsafe {

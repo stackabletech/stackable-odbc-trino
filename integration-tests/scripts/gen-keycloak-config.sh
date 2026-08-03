@@ -7,8 +7,7 @@
 # lib.sh is what stops the two disagreeing. Everything mounted into a container
 # comes from generated/, never from the checkout.
 #
-# Three fields in realm-trino.json are load-bearing, and JSON cannot say so
-# itself:
+# Three fields in realm-trino.json carry a requirement JSON cannot state itself:
 #
 #   directAccessGrantsEnabled  enables the password grant, which is how a token's
 #                              claims are read with no browser in the loop.

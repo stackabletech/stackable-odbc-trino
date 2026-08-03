@@ -95,17 +95,19 @@ fn trino_type_info() -> &'static [TypeInfoRow] {
     static ROWS: OnceLock<Vec<TypeInfoRow>> = OnceLock::new();
     ROWS.get_or_init(|| {
         vec![
-            // INTERVAL DAY TO SECOND — trino_ty_to_sql_type has no dedicated
-            // ODBC interval type for this (see the "String-representable types
-            // without a dedicated ODBC type" comment in type_conversion.rs); Trino
-            // interval values are rendered as text, so DATA_TYPE matches what is
-            // actually reported (EXT_W_VARCHAR), the same as INTERVAL YEAR TO
-            // MONTH/JSON/UUID/VARCHAR further down this list. TYPE_NAME is sourced
-            // from `TrinoTypeName::IntervalDayToSecond::name()` (not a hardcoded
-            // string) so this row and `trino_bare_type_name`'s parser cannot drift
-            // apart: without a matching `TrinoTypeName` variant, no real interval
-            // column could report this TYPE_NAME (`trino_bare_type_name` would fall
-            // through to "VARCHAR" instead); see `every_type_info_row_is_reachable_via_trino_bare_type_name`.
+            // INTERVAL DAY TO SECOND has no dedicated ODBC interval type in
+            // `trino_ty_to_sql_type` (see the "String-representable types
+            // without a dedicated ODBC type" comment in type_conversion.rs).
+            // Trino renders interval values as text, so DATA_TYPE is the
+            // EXT_W_VARCHAR this driver reports for them, as it is for
+            // INTERVAL YEAR TO MONTH, JSON, UUID and VARCHAR below.
+            //
+            // TYPE_NAME comes from `TrinoTypeName::IntervalDayToSecond::name()`
+            // and not a literal, so this row and `trino_bare_type_name`'s
+            // parser cannot drift apart. Without a matching `TrinoTypeName`
+            // variant no real interval column could report this TYPE_NAME:
+            // `trino_bare_type_name` would fall through to "VARCHAR". Pinned by
+            // `every_type_info_row_is_reachable_via_trino_bare_type_name`.
             TypeInfoRow::new(
                 TrinoTypeName::IntervalDayToSecond.name(),
                 SqlDataType::EXT_W_VARCHAR,
@@ -116,8 +118,9 @@ fn trino_type_info() -> &'static [TypeInfoRow] {
                 MaxScale(0),
             ))
             .with_literal_affixes(Some("'"), Some("'")),
-            // INTERVAL YEAR TO MONTH — same rationale as INTERVAL DAY TO SECOND
-            // above, including sourcing TYPE_NAME from `TrinoTypeName::name()`.
+            // INTERVAL YEAR TO MONTH, for the reason INTERVAL DAY TO SECOND
+            // above gives, including sourcing TYPE_NAME from
+            // `TrinoTypeName::name()`.
             TypeInfoRow::new(
                 TrinoTypeName::IntervalYearToMonth.name(),
                 SqlDataType::EXT_W_VARCHAR,
@@ -128,7 +131,7 @@ fn trino_type_info() -> &'static [TypeInfoRow] {
                 MaxScale(0),
             ))
             .with_literal_affixes(Some("'"), Some("'")),
-            // JSON — stored/returned as VARCHAR in ODBC context
+            // JSON: no ODBC type of its own, so it is reported as text.
             TypeInfoRow::new(TrinoTypeName::Json.name(), SqlDataType::EXT_W_VARCHAR)
                 .with_column_size(catalog_column_size(
                     SqlDataType::EXT_W_VARCHAR,
@@ -137,7 +140,7 @@ fn trino_type_info() -> &'static [TypeInfoRow] {
                 ))
                 .with_literal_affixes(Some("'"), Some("'"))
                 .with_case_sensitive(true),
-            // UUID — returned as 36-char VARCHAR string
+            // UUID: 36 characters of text, which is where the size comes from.
             TypeInfoRow::new(TrinoTypeName::Uuid.name(), SqlDataType::EXT_W_VARCHAR)
                 .with_column_size(catalog_column_size(
                     SqlDataType::EXT_W_VARCHAR,
@@ -145,7 +148,6 @@ fn trino_type_info() -> &'static [TypeInfoRow] {
                     MaxScale(0),
                 ))
                 .with_literal_affixes(Some("'"), Some("'")),
-            // VARCHAR
             TypeInfoRow::new(TrinoTypeName::Varchar.name(), SqlDataType::EXT_W_VARCHAR)
                 .with_column_size(catalog_column_size(
                     SqlDataType::EXT_W_VARCHAR,
@@ -155,7 +157,6 @@ fn trino_type_info() -> &'static [TypeInfoRow] {
                 .with_literal_affixes(Some("'"), Some("'"))
                 .with_create_params(Some("max length"))
                 .with_case_sensitive(true),
-            // CHAR
             TypeInfoRow::new(TrinoTypeName::Char.name(), SqlDataType::EXT_W_CHAR)
                 .with_column_size(catalog_column_size(
                     SqlDataType::EXT_W_CHAR,
@@ -165,11 +166,9 @@ fn trino_type_info() -> &'static [TypeInfoRow] {
                 .with_literal_affixes(Some("'"), Some("'"))
                 .with_create_params(Some("length"))
                 .with_case_sensitive(true),
-            // BOOLEAN
             TypeInfoRow::new(TrinoTypeName::Boolean.name(), SqlDataType::EXT_BIT).with_column_size(
                 catalog_column_size(SqlDataType::EXT_BIT, MaxPrecision(0), MaxScale(0)),
             ),
-            // TINYINT
             TypeInfoRow::new(TrinoTypeName::TinyInt.name(), SqlDataType::EXT_TINY_INT)
                 .with_column_size(catalog_column_size(
                     SqlDataType::EXT_TINY_INT,
@@ -180,7 +179,6 @@ fn trino_type_info() -> &'static [TypeInfoRow] {
                 .with_auto_unique_value(Some(false))
                 .with_scale_range(Some(0), Some(0))
                 .with_num_prec_radix(Some(10)),
-            // BIGINT
             TypeInfoRow::new(TrinoTypeName::BigInt.name(), SqlDataType::EXT_BIG_INT)
                 .with_column_size(catalog_column_size(
                     SqlDataType::EXT_BIG_INT,
@@ -191,7 +189,6 @@ fn trino_type_info() -> &'static [TypeInfoRow] {
                 .with_auto_unique_value(Some(false))
                 .with_scale_range(Some(0), Some(0))
                 .with_num_prec_radix(Some(10)),
-            // VARBINARY
             TypeInfoRow::new(
                 TrinoTypeName::Varbinary.name(),
                 SqlDataType::EXT_LONG_VAR_BINARY,
@@ -202,8 +199,8 @@ fn trino_type_info() -> &'static [TypeInfoRow] {
                 MaxScale(0),
             ))
             .with_literal_affixes(Some("X'"), Some("'")),
-            // SQL_CHAR (1) — ANSI alias. See the SQL_VARCHAR comment further down
-            // this list re TYPE_NAME.
+            // SQL_CHAR (1): ANSI alias. See the SQL_VARCHAR comment further
+            // down this list for why the TYPE_NAME differs from CHAR's.
             TypeInfoRow::new("SQL_CHAR", SqlDataType::CHAR)
                 .with_column_size(catalog_column_size(
                     SqlDataType::CHAR,
@@ -213,7 +210,6 @@ fn trino_type_info() -> &'static [TypeInfoRow] {
                 .with_literal_affixes(Some("'"), Some("'"))
                 .with_create_params(Some("length"))
                 .with_case_sensitive(true),
-            // DECIMAL
             TypeInfoRow::new(TrinoTypeName::Decimal.name(), SqlDataType::DECIMAL)
                 .with_column_size(catalog_column_size(
                     SqlDataType::DECIMAL,
@@ -225,7 +221,6 @@ fn trino_type_info() -> &'static [TypeInfoRow] {
                 .with_auto_unique_value(Some(false))
                 .with_scale_range(Some(0), Some(MAX_DECIMAL_SCALE))
                 .with_num_prec_radix(Some(10)),
-            // INTEGER
             TypeInfoRow::new(TrinoTypeName::Integer.name(), SqlDataType::INTEGER)
                 .with_column_size(catalog_column_size(
                     SqlDataType::INTEGER,
@@ -236,7 +231,6 @@ fn trino_type_info() -> &'static [TypeInfoRow] {
                 .with_auto_unique_value(Some(false))
                 .with_scale_range(Some(0), Some(0))
                 .with_num_prec_radix(Some(10)),
-            // SMALLINT
             TypeInfoRow::new(TrinoTypeName::SmallInt.name(), SqlDataType::SMALLINT)
                 .with_column_size(catalog_column_size(
                     SqlDataType::SMALLINT,
@@ -247,7 +241,6 @@ fn trino_type_info() -> &'static [TypeInfoRow] {
                 .with_auto_unique_value(Some(false))
                 .with_scale_range(Some(0), Some(0))
                 .with_num_prec_radix(Some(10)),
-            // REAL
             TypeInfoRow::new(TrinoTypeName::Real.name(), SqlDataType::REAL)
                 .with_column_size(catalog_column_size(
                     SqlDataType::REAL,
@@ -256,7 +249,6 @@ fn trino_type_info() -> &'static [TypeInfoRow] {
                 ))
                 .with_unsigned(Some(false))
                 .with_num_prec_radix(Some(2)),
-            // DOUBLE
             TypeInfoRow::new(TrinoTypeName::Double.name(), SqlDataType::DOUBLE)
                 .with_column_size(catalog_column_size(
                     SqlDataType::DOUBLE,
@@ -265,11 +257,12 @@ fn trino_type_info() -> &'static [TypeInfoRow] {
                 ))
                 .with_unsigned(Some(false))
                 .with_num_prec_radix(Some(2)),
-            // SQL_VARCHAR (12) — ANSI alias needed by pyodbc/Windows DM.
-            // When the DM queries SQLGetTypeInfo(SQL_VARCHAR=12), it needs to find a
-            // matching row or it refuses to perform type conversions (e.g. bigint→string).
-            // TYPE_NAME must differ from the WVARCHAR entry ("VARCHAR") because Power
-            // Query builds a record keyed by TYPE_NAME and crashes on duplicates.
+            // SQL_VARCHAR (12): ANSI alias, needed by pyodbc and the Windows
+            // DM. A DM querying SQLGetTypeInfo(SQL_VARCHAR=12) that finds no
+            // matching row refuses to perform type conversions such as
+            // bigint to string. The TYPE_NAME has to differ from the WVARCHAR
+            // entry's "VARCHAR": Power Query builds a record keyed by
+            // TYPE_NAME and crashes on duplicates.
             TypeInfoRow::new("SQL_VARCHAR", SqlDataType::VARCHAR)
                 .with_column_size(catalog_column_size(
                     SqlDataType::VARCHAR,
@@ -279,8 +272,6 @@ fn trino_type_info() -> &'static [TypeInfoRow] {
                 .with_literal_affixes(Some("'"), Some("'"))
                 .with_create_params(Some("max length"))
                 .with_case_sensitive(true),
-            // DATE
-            // DATA_TYPE=91 (SQL_TYPE_DATE), SQL_DATA_TYPE=9 (SQL_DATETIME), SQL_DATETIME_SUB=1 (SQL_CODE_DATE)
             TypeInfoRow::new(TrinoTypeName::Date.name(), SqlDataType::DATE)
                 .with_column_size(catalog_column_size(
                     SqlDataType::DATE,
@@ -289,8 +280,6 @@ fn trino_type_info() -> &'static [TypeInfoRow] {
                 ))
                 .with_literal_affixes(Some("DATE '"), Some("'"))
                 .with_verbose_type(SqlDataType::DATETIME.0, Some(SQL_CODE_DATE)),
-            // TIME
-            // DATA_TYPE=92 (SQL_TYPE_TIME), SQL_DATA_TYPE=9 (SQL_DATETIME), SQL_DATETIME_SUB=2 (SQL_CODE_TIME)
             TypeInfoRow::new(TrinoTypeName::Time.name(), SqlDataType::TIME)
                 .with_column_size(catalog_column_size(
                     SqlDataType::TIME,
@@ -301,13 +290,12 @@ fn trino_type_info() -> &'static [TypeInfoRow] {
                 .with_create_params(Some("precision"))
                 .with_scale_range(Some(0), Some(MAX_FRACTIONAL_SECONDS_PRECISION))
                 .with_verbose_type(SqlDataType::DATETIME.0, Some(SQL_CODE_TIME)),
-            // TIME WITH TIME ZONE — shares DATA_TYPE=92 with plain TIME above
-            // (see TrinoTypeName::sql_type); needs its own row so an application
-            // that looks up SQLGetTypeInfo by TYPE_NAME (e.g. building a CREATE
-            // TABLE statement) can find "TIME WITH TIME ZONE" at all, as it is a
-            // distinct, commonly-used Trino type. Grouped immediately after TIME
-            // to keep DATA_TYPE=92 rows adjacent per the spec's "ordered by
-            // DATA_TYPE" guidance.
+            // TIME WITH TIME ZONE shares plain TIME's DATA_TYPE (see
+            // TrinoTypeName::sql_type) and still needs its own row: an
+            // application looking SQLGetTypeInfo up by TYPE_NAME, to build a
+            // CREATE TABLE statement say, would otherwise not find this type
+            // at all. Grouped immediately after TIME, per the spec's "ordered
+            // by DATA_TYPE".
             TypeInfoRow::new(TrinoTypeName::TimeWithTimeZone.name(), SqlDataType::TIME)
                 .with_column_size(
                     catalog_column_size(
@@ -320,8 +308,6 @@ fn trino_type_info() -> &'static [TypeInfoRow] {
                 .with_create_params(Some("precision"))
                 .with_scale_range(Some(0), Some(MAX_FRACTIONAL_SECONDS_PRECISION))
                 .with_verbose_type(SqlDataType::DATETIME.0, Some(SQL_CODE_TIME)),
-            // TIMESTAMP
-            // DATA_TYPE=93 (SQL_TYPE_TIMESTAMP), SQL_DATA_TYPE=9 (SQL_DATETIME), SQL_DATETIME_SUB=3 (SQL_CODE_TIMESTAMP)
             TypeInfoRow::new(TrinoTypeName::Timestamp.name(), SqlDataType::TIMESTAMP)
                 .with_column_size(catalog_column_size(
                     SqlDataType::TIMESTAMP,
@@ -332,8 +318,8 @@ fn trino_type_info() -> &'static [TypeInfoRow] {
                 .with_create_params(Some("precision"))
                 .with_scale_range(Some(0), Some(MAX_FRACTIONAL_SECONDS_PRECISION))
                 .with_verbose_type(SqlDataType::DATETIME.0, Some(SQL_CODE_TIMESTAMP)),
-            // TIMESTAMP WITH TIME ZONE — shares DATA_TYPE=93 with plain
-            // TIMESTAMP above; same rationale as TIME WITH TIME ZONE.
+            // TIMESTAMP WITH TIME ZONE shares plain TIMESTAMP's DATA_TYPE,
+            // for the reason TIME WITH TIME ZONE above gives.
             TypeInfoRow::new(
                 TrinoTypeName::TimestampWithTimeZone.name(),
                 SqlDataType::TIMESTAMP,
@@ -354,13 +340,6 @@ fn trino_type_info() -> &'static [TypeInfoRow] {
     })
 }
 
-/// Info lookup shared by the connected and pre-connect paths.
-///
-/// Every arm below is connection-independent, so this can be called from unit
-/// tests without a live Trino connection. `conn` is threaded through solely for
-/// core's fall-through: the capability declarations `default_get_info` consults
-/// each take a connection now, so it answers the full set with `Some(conn)` and
-/// only what is knowable without a data source with `None`.
 /// One of the connection's own strings, or the empty string pre-connect.
 ///
 /// The empty string is what core substitutes for every declaration it cannot
@@ -371,6 +350,14 @@ fn conn_string(conn: Option<&TrinoConnection>, field: fn(&TrinoConnection) -> &S
     conn.map(field).cloned().unwrap_or_default()
 }
 
+/// Info lookup shared by the connected and pre-connect paths.
+///
+/// Only the three identity strings read `conn`, through [`conn_string`], so
+/// every other arm answers without a live Trino and the unit tests need none.
+/// `conn` is otherwise threaded straight through to core's fall-through: the
+/// capability declarations `default_get_info` consults each take a connection,
+/// so it answers the full set with `Some(conn)` and only what is knowable
+/// without a data source with `None`.
 fn trino_get_info(
     conn: Option<&TrinoConnection>,
     info_type: InfoType,
@@ -379,13 +366,14 @@ fn trino_get_info(
         // A schema-qualified name (`schema.table`) is usable in DML, in a
         // `CALL schema.procedure()` invocation, in `CREATE`/`ALTER`/`DROP
         // TABLE`, and in `GRANT`/`REVOKE`, all confirmed against the Trino
-        // SQL statement reference. `SQL_SU_INDEX_DEFINITION` is deliberately
-        // absent: Trino's grammar has no `CREATE INDEX`/`DROP INDEX`
-        // statement at all, so no schema-qualified name is ever usable
-        // there. Do not claim `SQL_SU_INDEX_DEFINITION` in place of
-        // `SQL_SU_PRIVILEGE_DEFINITION` (both being bit `0x08`/`0x10` of the
-        // same nibble makes the swap easy to miss): that would overclaim a
-        // statement Trino cannot execute and underclaim one it can.
+        // SQL statement reference. `SQL_SU_INDEX_DEFINITION` is absent:
+        // Trino's grammar has no `CREATE INDEX`/`DROP INDEX` statement at
+        // all, so no schema-qualified name is ever usable there.
+        //
+        // Do not claim `SQL_SU_INDEX_DEFINITION` in place of
+        // `SQL_SU_PRIVILEGE_DEFINITION`. They are bits `0x08` and `0x10` of one
+        // nibble, which makes the swap easy to miss, and it would overclaim a
+        // statement Trino cannot execute while underclaiming one it can.
         InfoType::SchemaUsage => {
             return Ok(InfoValue::U32(
                 SQL_SU_DML_STATEMENTS
@@ -408,18 +396,17 @@ fn trino_get_info(
         }
         // Trino's qualified names read catalog.schema.table, catalog first.
         InfoType::CatalogLocation => return Ok(InfoValue::U16(SQL_CL_START)),
-        // SQL_GD_BLOCK is deliberately not claimed: it means SQLGetData can
-        // be called for a row in a block cursor after a bulk fetch, but no
-        // driver in this workspace has block cursors: `SQLSetStmtAttrW`
+        // SQL_GD_BLOCK is not claimed. It means `SQLGetData` may be called for
+        // a row in a block cursor after a bulk fetch, and there are no block
+        // cursors here: `SQLSetStmtAttrW`
         // (`stackable-odbc-core/src/ffi/stmt_attr.rs`) rejects any
         // SQL_ATTR_ROW_ARRAY_SIZE other than 1, substituting 1 back with
-        // 01S02, so an application can never obtain a multi-row rowset from
-        // either backend. SQL_GD_BOUND does hold: `sql_get_data`
-        // (`stackable-odbc-core/src/ffi/fetch.rs`) never checks `stmt.bindings` before
-        // reading a column, so a column bound via `SQLBindCol` can still be
-        // fetched again through `SQLGetData`. AGENTS.md's "always return
-        // 0x0F" Windows DM checklist item overclaimed SQL_GD_BLOCK for both
-        // drivers; corrected there too.
+        // 01S02, so an application can never obtain a multi-row rowset.
+        //
+        // SQL_GD_BOUND does hold: `sql_get_data`
+        // (`stackable-odbc-core/src/ffi/fetch.rs`) never checks
+        // `stmt.bindings` before reading a column, so a column bound with
+        // `SQLBindCol` can still be fetched again through `SQLGetData`.
         InfoType::GetDataExtensions => {
             return Ok(InfoValue::U32(
                 SQL_GD_ANY_COLUMN | SQL_GD_ANY_ORDER | SQL_GD_BOUND,
@@ -471,26 +458,21 @@ fn trino_get_info(
         InfoType::UserName => {
             return Ok(InfoValue::String(conn_string(conn, |c| &c.user_name)));
         }
-        // SQL_CATALOG_NAME, SQL_NULL_COLLATION, SQL_OJ_CAPABILITIES,
-        // SQL_IDENTIFIER_CASE, SQL_DEFAULT_TXN_ISOLATION and
-        // SQL_TXN_ISOLATION_OPTION are deliberately *not* answered here. Core
-        // derives each from a `Backend` hook (`supports_catalogs`,
-        // `null_collation`, `outer_join_capabilities`, `identifier_case`,
-        // `default_txn_isolation`,
-        // `txn_isolation_options`), and an arm here would shadow the hook for
-        // `SQLGetInfo` while the hook still drove `SQLGetConnectAttr` and the
-        // `HY024` validation in `sql_set_connect_attr`, so the two answers
-        // could then disagree for the same connection. See the hook
-        // implementations in `crate::backend`.
+        // Nothing a capability method on `TrinoBackend` declares may also have
+        // an arm here. An arm wins for `SQLGetInfo` while the method keeps
+        // driving `SQLGetConnectAttr` and the `HY024` validation in
+        // `sql_set_connect_attr`, so the two can disagree for one connection.
         //
-        // Ten more joined that list when core made them required declarations:
-        // SQL_DRIVER_NAME, SQL_DRIVER_VER, SQL_DBMS_NAME, SQL_DBMS_VER,
-        // SQL_TXN_CAPABLE, SQL_QUOTED_IDENTIFIER_CASE, SQL_INTEGRITY,
-        // SQL_MULTIPLE_ACTIVE_TXN, SQL_SPECIAL_CHARACTERS and
-        // SQL_ACCESSIBLE_PROCEDURES. Each had an arm here or a hard-wired
-        // answer in core; each is now a `TrinoBackend` method, which is the
-        // one place its value lives. Re-adding an arm for any of them would
-        // reintroduce exactly the two-sources problem above.
+        // The sixteen info types this covers, with the method core derives each
+        // from: SQL_CATALOG_NAME (`supports_catalogs`), SQL_NULL_COLLATION
+        // (`null_collation`), SQL_OJ_CAPABILITIES (`outer_join_capabilities`),
+        // SQL_IDENTIFIER_CASE (`identifier_case`), SQL_DEFAULT_TXN_ISOLATION
+        // (`default_txn_isolation`), SQL_TXN_ISOLATION_OPTION
+        // (`txn_isolation_options`), SQL_DRIVER_NAME, SQL_DRIVER_VER,
+        // SQL_DBMS_NAME, SQL_DBMS_VER, SQL_TXN_CAPABLE,
+        // SQL_QUOTED_IDENTIFIER_CASE, SQL_INTEGRITY, SQL_MULTIPLE_ACTIVE_TXN,
+        // SQL_SPECIAL_CHARACTERS and SQL_ACCESSIBLE_PROCEDURES. See the method
+        // implementations in `crate::backend`, which is where each value lives.
         _ => {}
     }
 
@@ -503,6 +485,15 @@ fn trino_get_info(
     })
 }
 
+/// `SQLGetInfo` on a connected handle, for an info type core has an
+/// [`InfoType`] variant for.
+///
+/// Answers from an arm in [`trino_get_info`] where this driver knows better
+/// than core, and otherwise from core's `default_get_info`, which reads the
+/// capability declarations on `TrinoBackend`. The rule callers depend on:
+/// nothing a capability method declares may also have an arm here, or the two
+/// can disagree for one connection. Info types with no `InfoType` variant go
+/// through [`get_info_raw`] instead, which runs first.
 pub(super) fn get_info(
     conn: &TrinoConnection,
     info_type: InfoType,
@@ -513,6 +504,14 @@ pub(super) fn get_info(
     trino_get_info(Some(conn), info_type)
 }
 
+/// `SQLGetInfo` before `SQLDriverConnect`, which the Windows Driver Manager
+/// does for the identity group.
+///
+/// The same lookup with no connection, so core skips every declaration that
+/// needs one and substitutes its own benign default. A value this driver
+/// reports when connected is therefore not necessarily what an application sees
+/// here, and returning `SQL_ERROR` instead is not an option: it corrupts the
+/// Windows DM's state (see AGENTS.md).
 pub(super) fn get_info_pre_connect(info_type: InfoType) -> Result<InfoValue, TrinoError> {
     // Before a connection exists there is no server to report a version for.
     // The empty string is the spec's "not available"; returning SQL_ERROR here
@@ -529,8 +528,8 @@ const TRINO_CORRESPONDING_SINCE: u32 = 475;
 const TRINO_MATCH_AND_UNIQUE_SINCE: u32 = 482;
 const TRINO_OVERLAPS_SINCE: u32 = 483;
 
-/// `SQL_ALTER_TABLE` — the `ALTER TABLE` clauses Trino's grammar accepts,
-/// each confirmed against a live coordinator rather than read off the docs:
+/// `SQL_ALTER_TABLE`: the `ALTER TABLE` clauses Trino's grammar accepts, each
+/// confirmed against a live coordinator rather than read off the docs.
 ///
 /// | Statement | Result |
 /// |---|---|
@@ -543,7 +542,7 @@ const TRINO_OVERLAPS_SINCE: u32 = 483;
 /// | `ADD CONSTRAINT pk_a PRIMARY KEY (a)` | `SYNTAX_ERROR` |
 ///
 /// `SQL_AT_DROP_COLUMN` is the ODBC 2.0 flag, used because ODBC 3.0 has no bit
-/// for a `DROP COLUMN` without `CASCADE`/`RESTRICT` — the only form Trino has.
+/// for a `DROP COLUMN` without `CASCADE`/`RESTRICT`, the only form Trino has.
 /// `SQL_AT_ADD_CONSTRAINT` *is* a live ODBC 3.0 bit (FIPS Transitional level)
 /// despite sitting in `sql.h` beside the two deprecated ones.
 ///
@@ -552,7 +551,7 @@ const TRINO_OVERLAPS_SINCE: u32 = 483;
 pub(super) const TRINO_ALTER_TABLE: u32 =
     SQL_AT_ADD_COLUMN_SINGLE | SQL_AT_ADD_CONSTRAINT | SQL_AT_DROP_COLUMN;
 
-/// `SQL_OJ_CAPABILITIES` — Trino supports `LEFT`, `RIGHT`, `FULL` and `INNER`
+/// `SQL_OJ_CAPABILITIES`: Trino supports `LEFT`, `RIGHT`, `FULL` and `INNER`
 /// outer joins, nested outer joins, all comparison operators in the `ON`
 /// clause, and does not require the outer-join tables in any particular order.
 pub(super) const TRINO_OUTER_JOIN_CAPABILITIES: u32 = SQL_OJ_LEFT
@@ -563,20 +562,20 @@ pub(super) const TRINO_OUTER_JOIN_CAPABILITIES: u32 = SQL_OJ_LEFT
     | SQL_OJ_INNER
     | SQL_OJ_ALL_COMPARISON_OPS;
 
-/// `SQL_AGGREGATE_FUNCTIONS` — every ODBC aggregate has a Trino equivalent.
+/// `SQL_AGGREGATE_FUNCTIONS`: every ODBC aggregate has a Trino equivalent.
 /// `DISTINCT`/`ALL` come from the `setQuantifier` production in Trino's
 /// grammar rather than the function reference, which does not spell them out.
 /// <https://trino.io/docs/current/functions/aggregate.html>
 pub(crate) const TRINO_AGGREGATE_FUNCTIONS: u32 =
     SQL_AF_AVG | SQL_AF_COUNT | SQL_AF_MAX | SQL_AF_MIN | SQL_AF_SUM | SQL_AF_DISTINCT | SQL_AF_ALL;
 
-/// `SQL_SQL92_VALUE_EXPRESSIONS` — all four are present.
+/// `SQL_SQL92_VALUE_EXPRESSIONS`: all four are present.
 /// <https://trino.io/docs/current/functions/conditional.html>,
 /// <https://trino.io/docs/current/functions/conversion.html>
 pub(crate) const TRINO_SQL92_VALUE_EXPRESSIONS: u32 =
     SQL_SVE_CASE | SQL_SVE_CAST | SQL_SVE_COALESCE | SQL_SVE_NULLIF;
 
-/// `SQL_NUMERIC_FUNCTIONS` — every defined ODBC numeric function has a Trino
+/// `SQL_NUMERIC_FUNCTIONS`: every defined ODBC numeric function has a Trino
 /// equivalent except `COT`, which Trino's math reference does not list (its
 /// trigonometric set is acos/asin/atan/atan2/cos/cosh/sin/sinh/tan/tanh).
 ///
@@ -620,10 +619,10 @@ pub(crate) const TRINO_NUMERIC_FUNCTIONS: u32 = SQL_FN_NUM_ABS
 /// ask. Trino's own JDBC driver hardcodes `getSQLKeywords()` for the same
 /// reason.
 ///
-/// Deliberately **not** gated on `server_major`, unlike the SQL-92 predicate
-/// and join-operator bitmaps. The safe direction is inverted here: over-
+/// **Not** gated on `server_major`, unlike the SQL-92 predicate and
+/// join-operator bitmaps. The safe direction is inverted here: over-
 /// reporting a keyword only makes an application quote an identifier it need
-/// not have, while under-reporting leaves a genuinely reserved word unquoted
+/// not have, while under-reporting leaves a reserved word unquoted
 /// and the statement fails to parse. So this tracks the newest list rather
 /// than the connected server's. The drift is small and additive: of the
 /// twelve sampled against a live 467, eleven were already reserved and only
@@ -735,35 +734,36 @@ pub(super) fn reserved_keywords() -> &'static [Cow<'static, str>] {
 
 /// What the `SQL_*_FUNCTIONS` bitmaps mean here.
 ///
-/// The spec defines them in terms of the ODBC scalar-function escape, not in
-/// terms of what the data source can do by some other spelling: "an
-/// application can determine which string functions are supported by a driver
-/// by calling `SQLGetInfo` with an *information type* of
-/// `SQL_STRING_FUNCTIONS`", and what it emits next is `{fn NAME(...)}`. So a
-/// bit may only be set when `stackable_odbc_core::escape::translate_escapes`,
-/// driven by [`crate::escape_dialect`], turns that escape into Trino SQL that
-/// runs. `untranslatable_escapes_are_never_advertised` holds the two in step.
+/// The spec defines them in terms of the ODBC scalar-function escape, not what
+/// the data source can do by some other spelling: "an application can determine
+/// which string functions are supported by a driver by calling `SQLGetInfo`
+/// with an *information type* of `SQL_STRING_FUNCTIONS`", and what it emits
+/// next is `{fn NAME(...)}`.
 ///
-/// Twelve of these were dropped once it turned out their escapes reached the
-/// coordinator untranslated and failed there, and restored once
-/// `EscapeDialect::rewrite_scalar_fn` made the rewrites expressible.
-/// `crate::escape_dialect` records what each one becomes.
+/// So a bit may only be set when
+/// `stackable_odbc_core::escape::translate_escapes`, driven by
+/// [`crate::escape_dialect`], turns that escape into Trino SQL that runs. A bit
+/// whose name `EscapeDialect::rewrite_scalar_fn` does not handle reaches the
+/// coordinator verbatim and fails there, as `FUNCTION_NOT_FOUND: 'curdate'` or
+/// `COLUMN_NOT_FOUND: 'sql_tsi_day'`.
+/// `untranslatable_escapes_are_never_advertised` holds the two in step, and
+/// `crate::escape_dialect` records what each name becomes.
 ///
-/// `SQL_STRING_FUNCTIONS` — `LCASE` is `lower()`, `UCASE` is `upper()`,
-/// `CHAR` is `chr()`; `LOCATE(a, b)` becomes `position(a IN b)`; the rest are
+/// `SQL_STRING_FUNCTIONS`: `LCASE` is `lower()`, `UCASE` is `upper()`, `CHAR`
+/// is `chr()`, `LOCATE(a, b)` becomes `position(a IN b)`, and the rest are
 /// spelled identically in Trino.
 ///
-/// `SQL_FN_STR_LOCATE_2` rather than `SQL_FN_STR_LOCATE`: the spec splits the
-/// two forms, and only the two-argument one is claimed. ODBC's optional third
+/// `SQL_FN_STR_LOCATE_2`, not `SQL_FN_STR_LOCATE`: the spec splits the two
+/// forms and only the two-argument one is claimed. ODBC's optional third
 /// argument is a start offset, where the third argument of Trino's `strpos()`
 /// is an occurrence index, so there is nothing to rewrite it to.
 ///
-/// Deliberately absent: `LEFT`/`RIGHT`/`SPACE`/`INSERT` (no such function);
-/// `REPEAT` (Trino's `repeat` is an *array* function); `ASCII` (`codepoint()`
-/// requires exactly one character, where ODBC's `ASCII` takes the leftmost
-/// character of any string); `DIFFERENCE` (`levenshtein_distance()` is a
-/// different metric); the four `*_LENGTH` variants, which Trino does not
-/// document.
+/// Absent, each for its own reason: `LEFT`, `RIGHT`, `SPACE` and `INSERT` (no
+/// such function); `REPEAT` (Trino's `repeat` is an *array* function); `ASCII`
+/// (`codepoint()` requires exactly one character, where ODBC's `ASCII` takes
+/// the leftmost character of any string); `DIFFERENCE`
+/// (`levenshtein_distance()` is a different metric); the four `*_LENGTH`
+/// variants, which Trino does not document.
 ///
 /// `LENGTH` is claimed with one caveat: ODBC defines it as excluding trailing
 /// blanks and Trino's `length()` counts them.
@@ -781,7 +781,7 @@ pub(crate) const TRINO_STRING_FUNCTIONS: u32 = SQL_FN_STR_CONCAT
     | SQL_FN_STR_CHAR
     | SQL_FN_STR_SOUNDEX;
 
-/// `SQL_SYSTEM_FUNCTIONS` — `USERNAME` is the bare `current_user` keyword,
+/// `SQL_SYSTEM_FUNCTIONS`: `USERNAME` is the bare `current_user` keyword,
 /// `DBNAME` the bare `current_catalog`, and `IFNULL` is `coalesce(a, b)`
 /// (Trino documents no `ifnull`/`nvl`, but two-argument `coalesce` is exactly
 /// equivalent). The first two need the escape's `()` removed, which is
@@ -791,7 +791,7 @@ pub(crate) const TRINO_STRING_FUNCTIONS: u32 = SQL_FN_STR_CONCAT
 pub(crate) const TRINO_SYSTEM_FUNCTIONS: u32 =
     SQL_FN_SYS_USERNAME | SQL_FN_SYS_DBNAME | SQL_FN_SYS_IFNULL;
 
-/// `SQL_TIMEDATE_FUNCTIONS` — the names Trino spells identically, plus the
+/// `SQL_TIMEDATE_FUNCTIONS`: the names Trino spells identically, plus the
 /// rewritten ones: `CURDATE`/`CURTIME` and the three ODBC 3.x `CURRENT_*`
 /// forms become bare keywords, `TIMESTAMPADD`/`TIMESTAMPDIFF` become
 /// `date_add`/`date_diff` with the unit re-quoted, and `DAYOFWEEK` becomes an
@@ -803,8 +803,8 @@ pub(crate) const TRINO_SYSTEM_FUNCTIONS: u32 =
 /// One caveat: Trino's `week()` is ISO week numbering, so a client that
 /// trusts the ODBC convention can be off by one.
 ///
-/// Deliberately absent: `DAYNAME` and `MONTHNAME`, which Trino has no
-/// function for, only `format_datetime()` with a pattern.
+/// Absent: `DAYNAME` and `MONTHNAME`, which Trino has no function for, only
+/// `format_datetime()` with a pattern.
 /// <https://trino.io/docs/current/functions/datetime.html>
 pub(crate) const TRINO_TIMEDATE_FUNCTIONS: u32 = SQL_FN_TD_NOW
     | SQL_FN_TD_CURDATE
@@ -864,11 +864,10 @@ fn sql92_predicates(server_major: u32) -> u32 {
 /// `CORRESPONDING` on a set operation arrived in Trino 475. `UNION JOIN` has
 /// no production in Trino's grammar at any version, so it is never claimed.
 ///
-/// `NATURAL JOIN` is deliberately *not* claimed, despite being grammatically
-/// present (`SqlBase.g4` accepts it), because a live Trino 467 coordinator rejects
-/// it at analysis time with `NOT_SUPPORTED: Natural join not supported`, so
-/// grammar acceptance alone overstates capability. Confirmed against a live
-/// coordinator.
+/// `NATURAL JOIN` is *never* claimed, at any version, despite being
+/// grammatically present: `SqlBase.g4` accepts it and a live Trino 467
+/// coordinator then rejects it at analysis time with `NOT_SUPPORTED: Natural
+/// join not supported`. Grammar acceptance alone overstates capability.
 ///
 /// <https://trino.io/docs/current/sql/select.html>
 fn sql92_join_operators(server_major: u32) -> u32 {
@@ -886,31 +885,31 @@ fn sql92_join_operators(server_major: u32) -> u32 {
     operators
 }
 
+/// `SQLGetInfo` for an info type core has no [`InfoType`] variant for, given as
+/// a raw `u16`.
+///
+/// This stage runs *before* the Driver-Manager-safe default and wins outright
+/// for the types matched below (see `info_type_default_response` in
+/// `stackable-odbc-core/src/ffi/info.rs`), which is why the capability bitmaps
+/// Power BI reads to decide what it can fold live here rather than in
+/// [`get_info`]. `None` hands the type back to core.
 pub(super) fn get_info_raw(
     conn: &TrinoConnection,
     info_type: u16,
 ) -> Option<Result<InfoValue, TrinoError>> {
-    // Power BI reads these capability info types to decide which operations
-    // can be folded to SQL. Each one is a genuine `odbc_sys::InfoType`
-    // variant (odbc-sys 0.31), but this driver still matches on the raw
-    // `u16` here rather than the typed `InfoType` in `trino_get_info`,
-    // because `get_info_raw` is the dispatch stage that runs before the
-    // Driver-Manager-safe default and unconditionally wins for these types
-    // (see `info_type_default_response` in `stackable-odbc-core/src/ffi/info.rs`).
-    //
     // The scalar-function bitmaps describe Trino *equivalents*, not literal
-    // ODBC escape-sequence support in the naive sense: `SQLExecDirectW` /
-    // `SQLPrepareW` / `SQLNativeSqlW` do translate `{fn NAME(...)}` escapes
+    // ODBC escape-sequence support: `SQLExecDirectW`, `SQLPrepareW` and
+    // `SQLNativeSqlW` translate `{fn NAME(...)}` escapes
     // (`stackable_odbc_core::escape::translate_escapes`, driven by
     // `TrinoBackend::escape_dialect()`; see `crate::escape_dialect`), so
-    // `{fn ABS(x)}` becomes `ABS(x)` and succeeds, and names Trino spells
-    // differently are remapped (`UCASE`->`upper`, `LOG`->`ln`,
-    // `IFNULL`->`coalesce`, ...). A handful of advertised functions need an
-    // argument-syntax change that a bare name substitution cannot make
-    // (`LOCATE`, `CURDATE`/`CURTIME`, `TIMESTAMPADD`/`TIMESTAMPDIFF`,
-    // `USERNAME`/`DBNAME`, `DAYOFWEEK`), and are deliberately left
-    // untranslated; see the `crate::escape_dialect` module doc comment for
-    // why each one can't be fixed by renaming alone.
+    // `{fn ABS(x)}` becomes `ABS(x)` and names Trino spells differently are
+    // remapped (`UCASE` to `upper`, `LOG` to `ln`, `IFNULL` to `coalesce`).
+    //
+    // A handful need an argument-syntax change no bare name substitution can
+    // make: `LOCATE`, `CURDATE`/`CURTIME`, `TIMESTAMPADD`/`TIMESTAMPDIFF`,
+    // `USERNAME`/`DBNAME` and `DAYOFWEEK`. Each has a rewrite in
+    // `crate::escape_dialect::rewrite_scalar_fn`, and that module's doc
+    // comment says what each becomes and why renaming alone cannot do it.
     match info_type {
         SQL_AGGREGATE_FUNCTIONS => Some(Ok(InfoValue::U32(TRINO_AGGREGATE_FUNCTIONS))),
         SQL_SQL92_PREDICATES => Some(Ok(InfoValue::U32(sql92_predicates(conn.server_major)))),
@@ -925,14 +924,13 @@ pub(super) fn get_info_raw(
         // Trino supports LIKE ... ESCAPE and full outer joins.
         SQL_LIKE_ESCAPE_CLAUSE => Some(Ok(InfoValue::String("Y".into()))),
         SQL_OUTER_JOINS => Some(Ok(InfoValue::String("Y".into()))),
-        // SQL_DATABASE_NAME is deliberately absent. The spec makes it and
+        // SQL_DATABASE_NAME has no arm. The spec makes it and
         // `SQLGetConnectAttr(SQL_ATTR_CURRENT_CATALOG)` one value under two
-        // names, and core reads both from `TrinoBackend::current_catalog`,
-        // what the application set, else what the session is using, in that
-        // order for both. An arm here would answer only the info type and let
-        // the two disagree, which is the state this driver was in until core
-        // grew the hook: `SQLGetInfo` said `tpcds` while `SQLGetConnectAttr`
-        // said `""`.
+        // names, and core reads both from `TrinoBackend::current_catalog`: the
+        // session's catalog, else the connection string's. An arm here would
+        // answer only the info type and let the two disagree, so that one
+        // connection reports `tpcds` from `SQLGetInfo` and `""` from
+        // `SQLGetConnectAttr`.
         _ => common_get_info_raw::<TrinoBackend>(Some(conn), info_type).map(Ok),
     }
 }
@@ -1026,40 +1024,50 @@ const TRINO_ADVERTISED_FUNCTIONS: &[FunctionId] = &[
     FunctionId::CopyDesc,
 ];
 
-/// The functions core exports an entry point for that this driver deliberately
-/// does not advertise, each with the reason.
+/// The functions core exports an entry point for that this driver declines to
+/// advertise, each with the reason.
 ///
 /// Empty, because every entry point core exports is one this driver implements.
 /// The deprecated ODBC 2.x functions belong to the Driver Manager's mapping
-/// rather than to a 3.x driver, and core withholds them itself: they are in its
-/// `CORE_UNEXPORTED_FUNCTIONS`, with the reason recorded there, so there is no
-/// exported entry point left here to decline.
+/// rather than to a 3.x driver, and core withholds them itself in its
+/// `CORE_UNEXPORTED_FUNCTIONS`, with the reason recorded there, so no exported
+/// entry point is left here to decline.
 ///
-/// The list stays because it is the place a decision goes. Reporting a function
-/// supported is not merely optimistic: `SQLGetFunctions` is what the Windows
-/// Driver Manager builds its dispatch table from, and an application that reads
-/// the bitmap will call what it finds there. A function core starts exporting
-/// has to be advertised or refused explicitly, and this is where the refusal
-/// and its reason live.
+/// The list stays because it is where a refusal goes. `SQLGetFunctions` is what
+/// the Windows Driver Manager builds its dispatch table from, and an
+/// application reading the bitmap calls what it finds there, so a function core
+/// starts exporting has to be advertised or refused explicitly.
 ///
 /// Nothing reads it at runtime, and that is the point: `get_functions` returns
-/// [`TRINO_ADVERTISED_FUNCTIONS`] directly rather than subtracting this from
+/// [`TRINO_ADVERTISED_FUNCTIONS`] directly instead of subtracting this from
 /// `CORE_EXPORTED_FUNCTIONS`, so a function core adds is advertised only once
 /// someone says it works. What consumes it is
 /// `every_core_exported_function_is_advertised_or_withheld`, which turns
 /// "someone says so" into a build failure. `#[cfg(test)]` would compile it out
-/// of the driver, but it would also file the reasoning under test scaffolding,
-/// which is the opposite of why it is written down.
+/// of the driver and file the reasoning under test scaffolding, which is the
+/// opposite of why it is written down.
 // `allow` rather than `expect`: the lib is compiled both as a library, where
 // this is dead, and as a test target, where the partition test reads it, so
 // an expectation would go unfulfilled in one of the two and fail the build.
 #[allow(dead_code)]
 const TRINO_WITHHELD_FUNCTIONS: &[(FunctionId, &str)] = &[];
 
+/// The `SQLGetFunctions` answer: every ODBC function this driver implements.
+///
+/// [`TRINO_ADVERTISED_FUNCTIONS`] verbatim, which is what makes the list
+/// opt-in. The Windows Driver Manager builds its dispatch table from this, so a
+/// name here that core exports no entry point for hands it a null pointer.
 pub(super) fn get_functions() -> &'static [FunctionId] {
     TRINO_ADVERTISED_FUNCTIONS
 }
 
+/// The `SQLGetTypeInfo` result set: one row per Trino type, plus two ANSI
+/// aliases the Windows Driver Manager needs to find.
+///
+/// Built once behind a `OnceLock` and sorted as the spec requires, by
+/// `DATA_TYPE` then `TYPE_NAME`. An application looks a row up by `TYPE_NAME`,
+/// so every name here must be one [`trino_bare_type_name`] can produce for a
+/// real column, or the row advertises a type nothing can ever report.
 pub(super) fn get_type_info() -> &'static [TypeInfoRow] {
     trino_type_info()
 }
@@ -1071,34 +1079,30 @@ pub(super) fn get_type_info() -> &'static [TypeInfoRow] {
 /// `SQLGetTypeInfo` returns via [`get_type_info`]).
 ///
 /// Spec (`SQL_DESC_TYPE_NAME`): "Data source-dependent data type name; for
-/// example, "CHAR", "VARCHAR", "MONEY", "LONG VARBINARY", or "CHAR ( ) FOR
-/// BIT DATA"." (`SQLColumns.TYPE_NAME` is worded identically, modulo a typo
-/// in the truncated "LONG VARBINAR" example.) Every example in both spec
-/// pages is a bare name, not a parameterised declaration ("CHAR ( )" is an
-/// empty placeholder for a length, not a filled-in one), so `native` (a
-/// declaration like `"varchar(50)"`) is never returned verbatim; the caller
-/// (`execute.rs`) separately carries the declared length via
-/// `type_name_precision`/`type_name_scale`, so stripping it from the name
-/// here does not lose it.
+/// example, "CHAR", "VARCHAR", "MONEY", "LONG VARBINARY", or "CHAR ( ) FOR BIT
+/// DATA"." (`SQLColumns.TYPE_NAME` is worded identically, modulo a typo in the
+/// truncated "LONG VARBINAR" example.) Every example in both pages is a bare
+/// name, not a parameterised declaration, "CHAR ( )" being an empty placeholder
+/// for a length and not a filled-in one. So `native`, a declaration such as
+/// `"varchar(50)"`, is never returned verbatim. Nothing is lost: `execute.rs`
+/// carries the declared length separately, through `type_name_precision` and
+/// `type_name_scale`.
 ///
 /// `native` is Trino's own type-name string
-/// (`information_schema.columns.data_type`, or a query column's
-/// `Column::ty`) and `sql_type` is the `SqlDataType` the caller already
-/// computed for it. Parsing `native` via [`TrinoTypeName`] is tried first
-/// because several ODBC types share a `DATA_TYPE` with a distinctly-named
-/// sibling row (`TIME` vs. `TIME WITH TIME ZONE`; `TIMESTAMP` vs. `TIMESTAMP
-/// WITH TIME ZONE`): a reverse lookup from `sql_type` alone cannot recover
-/// which one a column actually is, only the native string can. When parsing
-/// fails, the function falls back to a deliberately chosen canonical name
-/// for `sql_type`, rather than "whichever `trino_type_info` row happens to sort first under
-/// this DATA_TYPE" (which would be `INTERVAL DAY TO SECOND`, an alphabetical
-/// accident of that table's required DATA_TYPE/TYPE_NAME sort order (see
-/// its doc comment), misnaming every compound type: ARRAY, MAP, ROW,
-/// TUPLE, `ipaddress`, and anything Trino reports that this driver has no
-/// dedicated `TrinoTypeName` variant for). Every one of those is rendered
-/// as `EXT_W_VARCHAR` text by `trino_ty_to_sql_type` (see its own doc
-/// comment), so `VARCHAR` is the honest canonical name for that DATA_TYPE,
-/// chosen deliberately below, not read off table order.
+/// (`information_schema.columns.data_type`, or a query column's `Column::ty`)
+/// and `sql_type` is the `SqlDataType` the caller already computed for it.
+/// Parsing `native` through [`TrinoTypeName`] comes first because several ODBC
+/// types share a `DATA_TYPE` with a differently named sibling row (`TIME`
+/// against `TIME WITH TIME ZONE`, `TIMESTAMP` against `TIMESTAMP WITH TIME
+/// ZONE`): only the native string can say which one a column is.
+///
+/// A failed parse falls back to a canonical name chosen here for `sql_type`,
+/// never to whichever [`trino_type_info`] row sorts first under that
+/// `DATA_TYPE`. That row is `INTERVAL DAY TO SECOND`, an accident of the
+/// table's required sort order, and it would misname every compound type:
+/// ARRAY, MAP, ROW, TUPLE, `ipaddress` and anything else with no dedicated
+/// `TrinoTypeName` variant. `trino_ty_to_sql_type` renders all of them as
+/// `EXT_W_VARCHAR` text, so `VARCHAR` is the honest name for that `DATA_TYPE`.
 pub(super) fn trino_bare_type_name(native: &str, sql_type: SqlDataType) -> String {
     if let Some(ty) = TrinoTypeName::parse(native) {
         return ty.name().to_string();
@@ -1140,7 +1144,7 @@ mod tests {
     #[test]
     fn fixed_size_type_info_rows_use_the_backend_independent_formula() {
         // Arguments are ignored by the formula for every type listed here;
-        // any value proves the point, so use deliberately absurd ones.
+        // any value proves the point, so use absurd ones.
         const IGNORED_PRECISION: MaxPrecision = MaxPrecision(-1);
         const IGNORED_SCALE: MaxScale = MaxScale(-1);
 
@@ -1390,12 +1394,12 @@ mod tests {
     }
 
     /// Asserted on the *connected* path. Several of these answers come from
-    /// capability declarations that now take a `&TrinoConnection`, so
+    /// capability declarations that take a `&TrinoConnection`, so
     /// `default_get_info` declines them without one and core substitutes its
-    /// benign pre-connect default, which is what
+    /// benign pre-connect default;
     /// `get_info_every_named_info_type_has_the_declared_shape_pre_connect`
-    /// covers. This table is about the values the driver reports to a connected
-    /// application.
+    /// covers that side. This table is about the values the driver reports to a
+    /// connected application.
     #[test]
     fn get_info_snapshot() {
         let conn = crate::backend::disconnected_trino_conn();
@@ -1602,32 +1606,27 @@ mod tests {
 
     #[test]
     fn every_type_info_row_is_reachable_via_trino_bare_type_name() {
-        // Inverse of `every_reportable_type_has_a_type_info_row` above: that
-        // test guards that every `TrinoTypeName` variant maps to *some* row;
-        // this one guards the opposite direction: that every
-        // `trino_type_info` row's TYPE_NAME can actually be *produced* by
-        // `trino_bare_type_name` for a real column, not merely advertised in
-        // the catalog. A row that fails this check reintroduces the interval
-        // bug: an application enumerating SQLGetTypeInfo would see a type
-        // advertised that no real column can ever claim, because
-        // `trino_bare_type_name` has no path that returns it.
+        // The inverse of `every_reportable_type_has_a_type_info_row` above,
+        // which guards that every `TrinoTypeName` variant maps to *some* row.
+        // This one guards that every `trino_type_info` row's TYPE_NAME can be
+        // *produced* by `trino_bare_type_name` for a real column, and not
+        // merely advertised in the catalog. A row that fails it is a type an
+        // application enumerating `SQLGetTypeInfo` can see and no real column
+        // can ever claim.
         //
-        // Reachability is checked by feeding the row's own (lowercased)
-        // TYPE_NAME back in as the native Trino type-name string; this
-        // works for every row derived from a `TrinoTypeName` variant because
+        // Reachability is checked by feeding the row's own lowercased TYPE_NAME
+        // back in as the native Trino type-name string. That works for every
+        // row derived from a `TrinoTypeName` variant, because
         // `TrinoTypeName::name()` and `TrinoTypeName::parse()` are exact
-        // case-insensitive inverses of one another (pinned per-variant by
-        // the `parse_*` tests elsewhere in this module and in
-        // `type_conversion.rs`).
+        // case-insensitive inverses, pinned per variant by the `parse_*` tests
+        // in this module and in `type_conversion.rs`.
         //
-        // Exceptions: SQL_CHAR (1) and SQL_VARCHAR (12) are ANSI-alias rows
-        // present *only* so the Windows DM/pyodbc can find a match when
-        // querying `SQLGetTypeInfo` by those legacy ANSI type codes (see
-        // their own doc comments in `trino_type_info` above).
-        // `trino_bare_type_name` never returns "SQL_CHAR"/"SQL_VARCHAR" for
-        // any real column: every text-affinity column resolves to "CHAR"
-        // or "VARCHAR" (the WCHAR-based rows) instead, so these two names
-        // are unreachable by design, not by omission.
+        // SQL_CHAR (1) and SQL_VARCHAR (12) are exceptions: ANSI-alias rows
+        // present only so the Windows DM and pyodbc find a match when they
+        // query by those legacy type codes (see their comments in
+        // `trino_type_info`). Every text-affinity column resolves to "CHAR" or
+        // "VARCHAR", the WCHAR-based rows, so these two names are unreachable
+        // by design.
         const DM_COMPAT_ONLY: &[&str] = &["SQL_CHAR", "SQL_VARCHAR"];
 
         for row in trino_type_info() {
@@ -1667,12 +1666,11 @@ mod tests {
 
     #[test]
     fn catalog_column_size_matches_max_fractional_seconds_precision_formula() {
-        // Regression pin: TIME WITH TIME
-        // ZONE/TIMESTAMP WITH TIME ZONE's COLUMN_SIZE and MAXIMUM_SCALE must
-        // reflect Trino's real, live-verified maximum fractional-seconds
-        // precision (12), not an arbitrary smaller value, and the four
-        // temporal rows must be internally consistent (same MAXIMUM_SCALE
-        // for the plain and WITH TIME ZONE variant of the same base type).
+        // TIME WITH TIME ZONE's and TIMESTAMP WITH TIME ZONE's COLUMN_SIZE
+        // and MAXIMUM_SCALE must reflect Trino's live-verified maximum
+        // fractional-seconds precision of 12, not some smaller value, and the
+        // four temporal rows must agree: the plain and WITH TIME ZONE variant
+        // of one base type share a MAXIMUM_SCALE.
         let time = find_row(TrinoTypeName::Time.name());
         let time_tz = find_row(TrinoTypeName::TimeWithTimeZone.name());
         let timestamp = find_row(TrinoTypeName::Timestamp.name());
@@ -1735,13 +1733,12 @@ mod tests {
     /// `CARGO_PKG_VERSION` at the macro's call site, not from `stackable-odbc-core`'s
     /// version at `stackable-odbc-core`'s compile time.
     ///
-    /// This test can actually catch that regression because this crate's version
-    /// differs from `stackable-odbc-core`'s (see this crate's `Cargo.toml`): if the macro
-    /// wrongly resolved against `stackable-odbc-core`, the returned string would not match
-    /// the one recomputed here from this crate's own `CARGO_PKG_VERSION`. A
-    /// driver crate whose version happened to equal `stackable-odbc-core`'s could not
-    /// distinguish the two, so the guarantee is asserted here where the versions
-    /// genuinely diverge.
+    /// The test can distinguish the two only because this crate's version
+    /// differs from `stackable-odbc-core`'s (see this crate's `Cargo.toml`): a
+    /// macro resolving against core would return a string the recomputation
+    /// here, from this crate's own `CARGO_PKG_VERSION`, does not match. A driver
+    /// crate whose version equalled core's could not tell them apart, so the
+    /// guarantee is asserted here, where the two diverge.
     #[test]
     fn driver_version_tracks_the_crate_version() {
         let (major, minor, release) =
@@ -1939,17 +1936,16 @@ mod tests {
     /// SQL that runs.
     ///
     /// Every name below needs an argument-syntax change that
-    /// `EscapeDialect::remap_scalar_fn` cannot make: it only swaps the
-    /// identifier in front of the parentheses. Each was advertised without a
-    /// translation once, and a client that read the bitmap and emitted the
-    /// escape got `FUNCTION_NOT_FOUND: \'curdate\'`,
-    /// `COLUMN_NOT_FOUND: \'sql_tsi_day\'` and the like. They are advertised
-    /// again only because `rewrite_scalar_fn` now handles each one, so this
-    /// asserts both halves together: the bit is set *and* the rewrite exists.
+    /// `EscapeDialect::remap_scalar_fn` cannot make, since it only swaps the
+    /// identifier in front of the parentheses. Each is advertised only because
+    /// `rewrite_scalar_fn` handles it, so this asserts both halves together:
+    /// the bit is set *and* the rewrite exists. Advertising one without the
+    /// other sends a client that reads the bitmap and emits the escape into
+    /// `FUNCTION_NOT_FOUND: \'curdate\'` or `COLUMN_NOT_FOUND: \'sql_tsi_day\'`.
     ///
     /// `DAYOFWEEK` is the one where the rewrite matters most. Trino has
-    /// `day_of_week()`, so a rename would have succeeded, and returned a
-    /// silently wrong, ISO-numbered day.
+    /// `day_of_week()`, so a rename would succeed and return a silently wrong,
+    /// ISO-numbered day.
     #[test]
     fn every_advertised_rewrite_has_a_translation() {
         for (bitmap, name, flag, args) in [
@@ -2013,14 +2009,14 @@ mod tests {
     }
 
     /// `POSITION` is advertised with no translation at all, and that is
-    /// correct: ODBC spells it `POSITION(exp IN exp)`, which is already
-    /// Trino\'s syntax, so the escape passes through untouched.
+    /// correct: ODBC spells it `POSITION(exp IN exp)`, which is already Trino\'s
+    /// syntax, so the escape passes through untouched.
     ///
-    /// `SQL_FN_STR_LOCATE`, the *three*-argument form, must stay
-    /// unadvertised. ODBC\'s third argument is a start offset and the third
-    /// argument of Trino\'s `strpos()` is an occurrence index, so the rewrite
-    /// declines it; advertising the bit would promise a call that then falls
-    /// through untranslated.
+    /// `SQL_FN_STR_LOCATE`, the *three*-argument form, must stay unadvertised.
+    /// ODBC\'s third argument is a start offset and the third argument of
+    /// Trino\'s `strpos()` is an occurrence index, so the rewrite declines it.
+    /// Advertising the bit would promise a call that then falls through
+    /// untranslated.
     #[test]
     fn locate_advertises_only_the_two_argument_form() {
         assert_ne!(TRINO_STRING_FUNCTIONS & SQL_FN_STR_POSITION, 0);
@@ -2068,18 +2064,15 @@ mod tests {
         assert_eq!(TRINO_TIMEDATE_FUNCTIONS & SQL_FN_TD_MONTHNAME, 0);
     }
 
-    /// Unchanged by this pass, but pinned so the reconstruction is checked:
-    /// the old comment named COUNT_DISTINCT and EVERY, which are not ODBC
-    /// flags, so the value was only right by coincidence.
+    /// Both assertions are needed, and the pairing is the point. The named-OR
+    /// checks *which* flags were selected; the raw hex checks that the flag
+    /// constants carry the values `sqlext.h` gives them. Either alone would
+    /// pass a transcription error in the other.
     ///
-    /// Both the named-OR assertion and the raw-hex assertion are deliberate,
-    /// and the pairing is why this test is worth having. They catch different
-    /// mistakes: the OR checks *which* flags were selected, the hex checks
-    /// that the flag constants themselves carry the values `sqlext.h` gives
-    /// them. Either alone would pass a transcription error in the other. This
-    /// is the one place the plan's "no spec literals in tests" rule is
-    /// deliberately set aside, because the literal *is* the independent
-    /// check.
+    /// The hex literals are the one exception to AGENTS.md's rule that a
+    /// spec-defined value is written as a named constant and never as an
+    /// integer. Here the literal *is* the independent check: naming it would
+    /// restate the constant the other assertion already uses.
     #[test]
     fn aggregate_and_value_expression_bitmaps_are_unchanged() {
         assert_eq!(

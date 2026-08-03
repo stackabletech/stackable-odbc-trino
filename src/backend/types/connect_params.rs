@@ -6,9 +6,9 @@
 //! three TLS verification modes and both certificate paths, the session
 //! controls Trino carries in headers (catalog, schema, path, time zone,
 //! locale, roles, session properties, resource estimates, client tags),
-//! spooling, proxying, retries and the auditing fields. `README.md` and
-//! `AGENTS.md` carry the same list for people who install the driver rather
-//! than work on it, so a new key means three edits.
+//! spooling, proxying, retries and the auditing fields. `README.md` carries
+//! the same list as a table, for people who install the driver rather than
+//! work on it, so a new key means two edits: this file and that table.
 //!
 //! Secrets are wrapped in `Redacted`, and the keys carrying them are declared
 //! to core in `Backend::sensitive_connect_keywords`.
@@ -24,20 +24,18 @@ use trino_rust_client::spooling::SpoolingEncoding;
 
 use super::super::TrinoError;
 
-// ---------------------------------------------------------------------------
-// Connection string parameter keys (Trino-specific)
-// ---------------------------------------------------------------------------
-
+/// Coordinator hostname. Required.
 pub(crate) const PARAM_HOST: &str = "host";
+/// Coordinator port. Required.
 pub(crate) const PARAM_PORT: &str = "port";
 /// Transport protocol: `"https"` (default) or `"http"`.
 pub(crate) const PARAM_PROTOCOL: &str = "protocol";
 /// How strictly the coordinator's TLS certificate is checked.
 ///
 /// `"true"` (default) or `"full"` verify the chain and the hostname; `"ca"`
-/// verifies the chain only; `"false"` or `"none"` verify nothing. The booleans
-/// came first and keep working; the three words are JDBC's `SSLVerification`
-/// values, so a value copied out of a JDBC URL transfers.
+/// verifies the chain only; `"false"` or `"none"` verify nothing. The three
+/// words are JDBC's `SSLVerification` values, so a value copied out of a JDBC
+/// URL transfers, and the booleans are accepted for the same setting.
 pub(crate) const PARAM_TLS_VERIFY: &str = "tlsverify";
 /// JDBC's name for [`PARAM_TLS_VERIFY`]. Setting both is an error unless they
 /// agree; see [`parse_tls_verification`].
@@ -49,14 +47,16 @@ pub(crate) const PARAM_CERTIFICATE: &str = "certificate";
 ///
 /// One file, and PEM only: `trino-rust-client` builds `reqwest` on rustls,
 /// which accepts neither PKCS#12 nor JKS, so JDBC's `SSLKeyStorePath` and
-/// `SSLKeyStoreType` have no equivalent here and the key is named for what it
-/// actually takes.
+/// `SSLKeyStoreType` have no equivalent here and the key is named for the one
+/// thing it takes.
 pub(crate) const PARAM_CLIENT_CERTIFICATE: &str = "clientcertificate";
 /// Per-request HTTP timeout in seconds. Default: 30.
 pub(crate) const PARAM_QUERY_TIMEOUT: &str = "querytimeout";
 /// ODBC-standard alias for [`PARAM_QUERY_TIMEOUT`].
 pub(crate) const PARAM_LOGIN_TIMEOUT: &str = "logintimeout";
+/// Catalog the session starts in. A `USE` statement moves it from there.
 pub(crate) const PARAM_CATALOG: &str = "catalog";
+/// Schema the session starts in, against which unqualified names resolve.
 pub(crate) const PARAM_SCHEMA: &str = "schema";
 /// Name this connection reports as Trino's query source.
 pub(crate) const PARAM_SOURCE: &str = "source";
@@ -162,26 +162,28 @@ pub(crate) const PARAM_ENCODING: &str = "encoding";
 /// the login URL the driver presents, so it is refused on a connection made with
 /// `SQL_DRIVER_NOPROMPT`. Unattended callers use [`PARAM_ACCESS_TOKEN`].
 ///
-/// `User` remains required: the client sends `X-Trino-User` on every request
-/// and cannot omit it, so making the key optional would mean inventing a value
-/// rather than leaving the header off.
+/// `User` is optional here, and omitting it leaves `X-Trino-User` off the
+/// request entirely, so Trino takes the identity from the token. A `User` that
+/// disagrees with the provider's mapping reads as an impersonation request and
+/// is refused, which is why no value is invented for it.
 pub(crate) const PARAM_EXTERNAL_AUTHENTICATION: &str = "externalauthentication";
 /// Whole budget for one interactive login, in seconds. Default
 /// [`DEFAULT_EXTERNAL_AUTH_TIMEOUT_SECS`]. JDBC's
 /// `externalAuthenticationTimeout`, which counts minutes rather than seconds.
 ///
-/// Deliberately separate from `SQL_ATTR_LOGIN_TIMEOUT`, which does **not**
-/// bound this wait: applications set login timeouts assuming a machine round
-/// trip, and a tool defaulting to 15s would otherwise abort every login while
-/// the user was still typing their password.
+/// Separate from `SQL_ATTR_LOGIN_TIMEOUT`, which does **not** bound this wait.
+/// Applications set login timeouts assuming a machine round trip, and a tool
+/// defaulting to 15s would otherwise abort every login while the user was
+/// still typing their password.
 pub(crate) const PARAM_EXTERNAL_AUTH_TIMEOUT: &str = "externalauthenticationtimeout";
 
 /// Separator between the pairs of a key-value connection-string parameter.
 ///
 /// `;` is JDBC's, and it is also the ODBC connection-string separator, so a
 /// value using it has to be `{}`-wrapped, which core's parser supports and
-/// [`parse_key_value_pairs`] documents. Matching JDBC is worth that: the value
-/// an operator already has in a JDBC URL transfers unchanged.
+/// [`parse_key_value_pairs`] documents. That is the price of matching JDBC,
+/// which lets the value an operator already has in a JDBC URL transfer
+/// unchanged.
 const PAIR_SEPARATOR: char = ';';
 
 /// Separator between a key and its value, JDBC's again.
@@ -321,11 +323,6 @@ fn selected_role(value: &str) -> SelectedRole {
     }
 }
 
-/// Parse a `"true"` / `"false"` parameter, case-insensitively.
-///
-/// Rejects anything else rather than defaulting: every boolean here turns a
-/// protection or a behaviour off, and a typo silently reading as "leave it on"
-/// is the failure mode `TlsVerify` already guards against.
 /// Resolve `TlsVerify` and its JDBC alias `SSLVerification` into one value.
 ///
 /// Both spellings accept both vocabularies, so `TlsVerify=CA` and
@@ -381,6 +378,11 @@ fn parse_tls_verification(
     }
 }
 
+/// Parse a `"true"` / `"false"` parameter, case-insensitively.
+///
+/// Rejects anything else rather than defaulting: every boolean here turns a
+/// protection or a behaviour off, and a typo silently reading as "leave it on"
+/// is the failure mode `TlsVerify` already guards against.
 fn parse_bool(key: &str, raw: &str) -> Result<bool, TrinoError> {
     match raw {
         v if v.eq_ignore_ascii_case("true") => Ok(true),
@@ -390,10 +392,6 @@ fn parse_bool(key: &str, raw: &str) -> Result<bool, TrinoError> {
         }),
     }
 }
-
-// ---------------------------------------------------------------------------
-// Typed connection parameters
-// ---------------------------------------------------------------------------
 
 /// Parsed and validated Trino connection parameters.
 #[derive(Debug)]
@@ -623,8 +621,8 @@ impl TryFrom<&ConnectParams> for TrinoConnectParams {
         // `X-Trino-User` is absent, and reads one that *disagrees* with that
         // identity as an impersonation request, so under
         // `ExternalAuthentication` a name we asked the operator to invent would
-        // be refused for their own account. `SessionUser` remains how
-        // deliberate impersonation is expressed.
+        // be refused for their own account. `SessionUser` is how impersonation
+        // is asked for explicitly.
         let user = match params.user() {
             Ok(u) => Some(u.to_string()),
             Err(_) if external_authentication => None,
@@ -765,11 +763,11 @@ impl TryFrom<&ConnectParams> for TrinoConnectParams {
             },
         };
 
-        // Rejected rather than defaulted, unlike `QueryTimeout` above. That one
-        // predates this and warns for compatibility; a new key is better off
-        // telling the operator the value never took effect, since a retry
-        // budget silently reverting to the client's default is invisible until
-        // a flaky network makes it matter.
+        // Rejected rather than defaulted, unlike `QueryTimeout` below, which
+        // warns and carries on for compatibility. Telling the operator the
+        // value never took effect is the better answer: a retry budget
+        // silently reverting to the client's default is invisible until a
+        // flaky network makes it matter.
         let max_attempts = match params.get(PARAM_MAX_ATTEMPTS) {
             None => None,
             Some(v) => match v.parse::<usize>() {
@@ -1392,8 +1390,8 @@ mod tests {
     }
 
     // JDBC spells the three modes FULL / CA / NONE. Both keys take both
-    // vocabularies, so a value copied out of a JDBC URL transfers and the
-    // booleans that came first keep working.
+    // vocabularies, so a value copied out of a JDBC URL transfers, and
+    // `true` / `false` name the same two of them.
 
     #[test]
     fn tls_verify_accepts_the_jdbc_vocabulary() {

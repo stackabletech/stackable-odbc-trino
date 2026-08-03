@@ -2,28 +2,32 @@
 """
 Folding contract test: the Power Query connector against the driver and Trino.
 
-The connector tells Power Query how to render SQL -- which constants it can
-cast, what a LIMIT clause looks like, which capabilities to assume. None of
-that is exercised by any other suite: the pyodbc, C ABI and surface tests drive
-the driver directly and never load the `.mez`, and the only documented check on
-folding is a human clicking "View Native Query" in Power BI Desktop, one step
-at a time. A connector declaration can therefore drift from what the driver
-reports or what Trino accepts, and nothing notices.
+The connector tells Power Query how to render SQL: which constants it can cast,
+what a LIMIT clause looks like, which capabilities to assume. No other suite
+exercises any of that. The pyodbc, C ABI and surface tests drive the driver
+directly and never load the `.mez`, and the only other check on folding is a
+human clicking "View Native Query" in Power BI Desktop, one step at a time. A
+connector declaration can therefore drift from what the driver reports or what
+Trino accepts, and nothing notices.
 
 This checks the two halves that are mechanically checkable:
 
 1. **The Constant visitor's keys.** Power Query looks each one up by
    `typeInfo[TYPE_NAME]`, which is the driver's own `SQLGetTypeInfo` output. A
    key that matches no TYPE_NAME can never fire, so the cast it declares is
-   dead. A TYPE_NAME with no key folds nothing -- Power Query evaluates that
+   dead. A TYPE_NAME with no key folds nothing, so Power Query evaluates that
    constant locally instead of sending it.
 
 2. **The SQL the connector emits.** Every CAST target it names has to be a type
-   Trino actually has, and the LIMIT/OFFSET form its AstVisitor builds has to
+   Trino has, and the LIMIT/OFFSET form its AstVisitor builds has to
    parse. Both are asserted by running them.
 
 Usage:
     uv run --with pyodbc python3 integration-tests/suites/test_folding_contract.py "<connection-string>"
+
+Requires a running Trino (integration-tests/setup.sh) and `pip install pyodbc`,
+normally through `uv run --with pyodbc`. Needs no compose profile: every query
+here runs against the base stack.
 
 Output is PASS / FAIL / NOTE, matching test_c_abi.py. A NOTE is a folding gap:
 legal, but it means Power Query falls back to local evaluation for that type.
@@ -81,7 +85,7 @@ def parse_constant_visitor(source):
     visitor = {}
     # The cast target is the last quoted argument of the Cast(...) call, and it
     # is always upper case. Anchoring on that distinguishes it from an earlier
-    # quoted argument -- `Cast(Quote(Date.ToText(_, "yyyy-MM-dd")), "DATE")`
+    # quoted argument. `Cast(Quote(Date.ToText(_, "yyyy-MM-dd")), "DATE")`
     # would otherwise yield the date format instead of the type.
     for key, target in re.findall(
         r'(\w+)\s*=\s*each\s+Cast\(.*?"([A-Z][A-Z ]*)"\s*\)', source
@@ -94,8 +98,8 @@ def parse_limit_clause(source):
     """Render the row-limiting clause the AstVisitor builds for skip and take.
 
     Reads the format strings *and* the order the `Text = ...` expression
-    concatenates them in, because the order is the whole point: Trino's grammar
-    is `OFFSET count LIMIT count` and rejects the reverse.
+    concatenates them in. Trino's grammar is `OFFSET count LIMIT count` and
+    rejects the reverse, so only the order proves the clause is usable.
     """
     formats = {
         name: fmt
@@ -140,7 +144,7 @@ def main():
     print("--- every Constant visitor key is a TYPE_NAME the driver reports ---")
     # Power Query looks the key up by TYPE_NAME. One that matches nothing is
     # dead config, and dead config hides the absence of the entry that should
-    # have been there -- which is how a Postgres-derived key list survives in a
+    # have been there. That is how a Postgres-derived key list survives in a
     # Trino connector.
     for key in sorted(visitor):
         check(
@@ -217,9 +221,9 @@ def main():
     # ------------------------------------------------------------------
     print("\n--- driver types with no Constant visitor entry ---")
     # Not a failure: an absent key makes Power Query evaluate that constant
-    # locally rather than fold it. It is still worth naming, because a missing
-    # entry is invisible from the connector alone -- nothing there lists the
-    # types it does not handle.
+    # locally rather than fold it. It is named because a missing entry is
+    # invisible from the connector alone: nothing there lists the types it does
+    # not handle.
     unhandled = sorted(type_names - set(visitor) - DM_COMPAT_ONLY)
     if unhandled:
         note(

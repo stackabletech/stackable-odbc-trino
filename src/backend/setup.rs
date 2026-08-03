@@ -4,20 +4,18 @@
 //! Core owns all of `ConfigDSN`: validating *fRequest*, rejecting `DRIVER=`,
 //! merging the data source's stored keywords in, calling `SQLValidDSN` and
 //! writing through `SQLWriteDSNToIni`. This module supplies the one thing that
-//! varies per driver — asking a person which keywords the data source needs.
+//! varies per driver, which is asking a person which keywords the data source
+//! needs.
 //!
 //! The dialog itself is `packaging/windows/configure-dsn.ps1`, run with
 //! `-Emit`, which prints the keywords it collected instead of writing them.
-//! That is deliberate reuse rather than convenience: the script's `$Fields`
-//! table is the single place all 34 connection-string keywords are named, and
-//! `dsn_keys_match_the_connection_string_parser` in `src/lib.rs` already fails
-//! the build if it and the parser disagree. A second dialog written in Rust
-//! would be a second list to keep in step, and nothing would check it.
+//! Reusing the script is what keeps one list of keywords: its `$Fields` table
+//! names all 34 of them, and `dsn_keys_match_the_connection_string_parser` in
+//! `src/lib.rs` fails the build if that table and the parser disagree. A
+//! second dialog written in Rust would be a second list, checked by nothing.
 //!
-//! Only the two OS calls are `#[cfg(windows)]`. The decisions — whether to
-//! prompt at all, what the exchange looks like, what an exit code means — are
-//! plain functions with unit tests that run on Linux, the same split core's own
-//! `setup` module makes.
+//! Only the two OS calls are `#[cfg(windows)]`; every decision is a plain
+//! function with unit tests that run on Linux.
 
 use std::collections::HashMap;
 
@@ -25,8 +23,9 @@ use stackable_odbc_core::setup::{ConfigRequest, SetupError};
 
 /// The dialog script, looked for beside the driver's own DLL.
 ///
-/// `install.bat` copies it there, and does so as a hard requirement rather than
-/// best-effort precisely because this path is now load-bearing.
+/// `install.bat` must copy it there, as a hard requirement rather than
+/// best-effort: without it the Administrator's **Add…** and **Configure…**
+/// buttons have no dialog to run, and every such request fails.
 ///
 /// The `cfg_attr`s below, here and on the three functions that follow, are
 /// core's own idiom for the parts of `ConfigDSN` that only Windows reaches:
@@ -44,14 +43,14 @@ const EXIT_CANCELLED: i32 = 2;
 
 /// Whether this call is allowed to put a dialog on the screen.
 ///
-/// Two things say no, and each is load-bearing:
+/// Two things say no:
 ///
 /// - **A null `hwndParent`.** The spec is explicit: "The function will not
 ///   display any dialog boxes if the handle is null." It is also what keeps
 ///   this from recursing. `configure-dsn.ps1`, run standalone, writes its data
 ///   source through `SQLConfigDataSourceW` with a null *hwndParent*, which
-///   re-enters this hook — headlessly, because of this rule, so the script is
-///   not asked to launch itself.
+///   re-enters this hook. This rule makes that re-entry headless, so the
+///   script is not asked to launch itself.
 /// - **`Remove`.** The Administrator has already asked the user to confirm the
 ///   deletion, and this driver keeps nothing outside `ODBC.INI` that a removal
 ///   would need to clean up: no cached token, no keytab. A second confirmation
@@ -72,7 +71,7 @@ fn dialog_needed(hwnd_is_null: bool, request: ConfigRequest) -> bool {
 /// The attribute map, as the dialog reads it on stdin.
 ///
 /// A pipe rather than a temp file, because a `Config` request arrives with the
-/// data source's whole stored section merged in by core — including `PWD` and
+/// data source's whole stored section merged in by core, including `PWD` and
 /// whatever else `sensitive_connect_keywords` names. Those are already in the
 /// registry unencrypted; putting them in a second place, with a filename any
 /// other process on the machine can guess, would be a new exposure rather than
@@ -80,8 +79,8 @@ fn dialog_needed(hwnd_is_null: bool, request: ConfigRequest) -> bool {
 #[cfg_attr(not(windows), allow(dead_code))]
 fn encode_attributes(attributes: &HashMap<String, String>) -> Result<String, SetupError> {
     serde_json::to_string(attributes).map_err(|e| {
-        // Deliberately no value in the message: it goes to the installer error
-        // buffer and the ODBC Administrator displays it.
+        // No value in the message: it goes to the installer error buffer and
+        // the ODBC Administrator displays it.
         SetupError::request_failed(format!(
             "could not encode the data source's keywords for the setup dialog: {e}"
         ))
@@ -187,9 +186,9 @@ mod windows {
     use super::DIALOG_SCRIPT;
 
     /// `GetModuleHandleExW` flags, from `libloaderapi.h`. Together they mean
-    /// "the module containing this address, without taking a reference" — the
-    /// reference matters, since taking one here would pin the driver DLL in
-    /// the Administrator's process for its lifetime.
+    /// "the module containing this address, without taking a reference".
+    /// Taking a reference here would pin the driver DLL in the
+    /// Administrator's process for its lifetime.
     const GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT: u32 = 0x0000_0002;
     const GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS: u32 = 0x0000_0004;
 
@@ -198,7 +197,7 @@ mod windows {
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
     // Two functions from kernel32, which is the operating system rather than a
-    // dependency — the same reason the Windows SBOM declares no import of it.
+    // dependency, the same reason the Windows SBOM declares no import of it.
     // Declaring them here rather than taking `windows-sys` keeps the driver's
     // dependency graph, and so its SBOM, unchanged by a setup dialog.
     #[link(name = "kernel32")]
@@ -211,12 +210,11 @@ mod windows {
         fn GetModuleFileNameW(h_module: *mut c_void, lp_filename: *mut u16, n_size: u32) -> u32;
     }
 
-    /// The directory holding this DLL.
+    /// The directory holding this DLL, identified from an address inside the
+    /// module. This function's own address is one.
     ///
-    /// `std::env::current_exe()` is no use here: `ConfigDSN` runs inside
-    /// `odbcad32.exe`, so it answers with the Administrator's own path. The
-    /// module has to be identified from an address inside it, and this
-    /// function's own address is one.
+    /// `std::env::current_exe()` answers with the Administrator's path, since
+    /// `ConfigDSN` runs inside `odbcad32.exe`.
     fn driver_directory() -> Result<PathBuf, SetupError> {
         let mut module: *mut c_void = std::ptr::null_mut();
         // SAFETY: the flags are the documented pair for an address lookup, the
@@ -329,7 +327,7 @@ mod tests {
 
     /// A null `hwndParent` must never prompt, for every request. The spec says
     /// so, and it is also what stops `configure-dsn.ps1`'s own
-    /// `SQLConfigDataSourceW` write — which passes a null handle — from
+    /// `SQLConfigDataSourceW` write, which passes a null handle, from
     /// re-entering this hook and launching the script a second time.
     #[test]
     fn a_null_parent_window_never_prompts() {
@@ -375,7 +373,7 @@ mod tests {
 
     /// Cancelling is `Ok(None)`, which core turns into FALSE with no installer
     /// error posted. An `Err` here would put "could not perform the operation"
-    /// in front of a user who simply changed their mind.
+    /// in front of a user who changed their mind.
     #[test]
     fn cancelling_is_not_a_failure() {
         let outcome = interpret_outcome(Some(EXIT_CANCELLED), "", "")

@@ -1,6 +1,9 @@
 # Integration tests
 
 Everything needed to run the Trino ODBC driver against a real coordinator.
+This file is the runbook. Why the stack is shaped the way it is (the `hive`
+catalog, the spooling suite, what SNI rules out) is in
+[AGENTS.md](../AGENTS.md#testing).
 
 ```bash
 ./integration-tests/setup.sh          # start the stack, generate config, build the driver
@@ -10,6 +13,10 @@ Everything needed to run the Trino ODBC driver against a real coordinator.
 
 `run-tests.sh` calls `setup.sh` itself if the stack has not been set up.
 
+The coordinator serves HTTPS on 8443 and nothing else, so every connection
+here is TLS. `Protocol=http` is a supported connection-string value with no
+coverage in this stack; its parsing is unit-tested.
+
 ## Layout
 
 | Directory | Holds |
@@ -17,7 +24,7 @@ Everything needed to run the Trino ODBC driver against a real coordinator.
 | `scripts/` | All the bash. `lib.sh` is sourced by the rest and owns the paths, the profile parsing and the readiness helpers. |
 | `stack/` | All the docker material: `compose.yaml`, the Trino config fragments, the Postgres init SQL. |
 | `suites/` | All the Python. `harness.py` is shared; every `test_*.py` is a suite. |
-| `perf/` | Profiling tooling, deliberately not named `profiling/` so it never collides with compose profiles. |
+| `perf/` | Profiling and stress tooling. `profile_stress.sh` runs `test_stress.py`'s BI-shaped queries with the driver's profiling output on, and `parse_profile.py` renders the log it writes as a per-query table. |
 | `windows/` | The Windows VM harness and its libvirt definitions. See [WINDOWS.md](windows/WINDOWS.md). |
 | `generated/` | Every produced artefact: certificates, secrets, the assembled Trino config, the ODBC ini files, `stack.env`. Gitignored, and safe to delete. |
 
@@ -41,61 +48,37 @@ Changing profiles recreates the coordinator, because its configuration is
 assembled per profile rather than mounted from the checkout. A suite whose
 profile is not active is skipped and says which profile would enable it.
 
-The `hive` catalog is in the base stack rather than behind a profile because it
-costs no container: a file metastore on a path the coordinator can write needs
-neither a metastore service nor object storage. It is the only connector Trino
-ships that accepts writes outside autocommit, which is what makes a transaction
-rollback observable, and `hive.security=sql-standard` is what fills
-`information_schema.table_privileges`.
-
-The warehouse is **not** a named volume: Docker mounts one root-owned and the
-coordinator runs as `trino`, so it lives in the container's own writable layer
-under `/tmp/hive-warehouse`. Recreating the container starts from an empty
-metastore. `scripts/seed-hive.sh` recreates the schema on every `setup.sh`,
-because `CREATE SCHEMA` needs the `admin` role that an ordinary connection does
-not hold.
-
-`keycloak` is configured, and its realm is imported from
-`stack/keycloak/realm-trino.json` by `scripts/gen-keycloak-config.sh`. `minio` and
-`minio-init` are configured, and the coordinator spools to the bucket the init
-container creates.
-
-`suites/test_spooling.py` has **no required profile**. With `spooling` active it
-drives the protocol and reads the driver's log for
-`Successfully fetched remote spooled segment`, which the client emits once per
-remote segment; without it, the same suite asserts the fallback, that a
-coordinator with no spooling manager ignores the `Encoding` key and answers
-inline. Each stack state skips the other's scenarios by name, so neither is a
-blind spot.
+Two suites need no profile and assert something in either stack state:
+`test_spooling.py` drives the spooled protocol when `spooling` is active and
+the inline fallback when it is not. `test_transactions.py` writes to the
+`hive` catalog, which is
+[part of the core stack](../AGENTS.md#the-hive-catalog-and-why-it-is-not-behind-a-profile).
 
 ## Flags
 
 | Flag | Script | Effect |
 |---|---|---|
-| `--profile <list>` | `setup.sh` | Comma or space separated, or `all` |
-| `--force-recreate` | `setup.sh` | Recreate the containers even if the profile set has not changed |
-| `--suite <substring>` | `run-tests.sh` | Run only matching suites |
+| `--profile <list>` | `setup.sh` | Comma or space separated, or `all`. `--profile=<list>` and the `PROFILES` environment variable do the same |
+| `--suite <substring>` | `run-tests.sh` | Run only the suites whose name contains the substring |
 | `--skip-build` | `run-tests.sh` | Skip the cargo build |
 | `--skip-delete` | `run-tests.sh` | Leave the stack running afterwards |
 | `--windows` | `run-tests.sh` | Also run the Windows VM suite |
 
-## The stack is HTTPS only
-
-The coordinator serves 8443 and nothing else. `Protocol=http` is still a
-supported connection-string value but has no integration coverage here; its
-parsing is unit-tested.
+`setup.sh` rejects any argument it does not recognise. `run-tests.sh` forwards
+the ones it does not recognise to `windows/windows_test.py`, so that script's
+flags can be passed straight through.
 
 ## Certificates
 
 `scripts/gen-certs.sh` builds one CA into `generated/certs/` and signs the
 coordinator, client and Keycloak leaves from it.
 
-Jetty selects the certificate on SNI and serves Trino's internal self-signed
-certificate for anything it cannot match, so a name the coordinator's
-certificate does not carry gets a *different certificate* rather than a
-hostname mismatch, and an IP address gets one every time because TLS sends no
-SNI for an IP literal. `suites/test_tls.py` documents what that rules out, and
-`windows/windows_test.py` works around it with a hosts entry in the VM.
+Jetty picks its certificate from the SNI the client sends, so a connection
+that verifies has to use a name the coordinator's certificate carries. An IP
+address sends no SNI and gets Trino's internal self-signed certificate
+instead. [AGENTS.md](../AGENTS.md#certificates) has the measured table,
+`suites/test_tls.py` records what it rules out, and `windows/windows_test.py`
+works around it with a hosts entry in the VM.
 
 ## Interactive use
 
@@ -121,10 +104,10 @@ Needs the `oauth` profile and the `trino_oauth` DSN:
 isql -3 trino_oauth -v
 ```
 
-`isql` connects through `SQLConnect`, which carries no *DriverCompletion*, so the
-driver is allowed to prompt and a real browser opens on Keycloak's login page. It
-will warn about the test CA, which is expected: `scripts/gen-certs.sh` generates
-that CA and no browser trusts it. The credentials are the `KEYCLOAK_USER` and
+`isql` connects through `SQLConnect`, which carries no *DriverCompletion*, so
+the driver is allowed to prompt and a real browser opens on Keycloak's login
+page. It will warn about the test CA, which `scripts/gen-certs.sh` generates
+and no browser trusts. The credentials are the `KEYCLOAK_USER` and
 `KEYCLOAK_PASSWORD` values in `generated/stack.env`.
 
 pyodbc cannot do this. It passes `SQL_DRIVER_NOPROMPT` unconditionally, so the

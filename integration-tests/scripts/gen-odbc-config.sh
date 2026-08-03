@@ -8,10 +8,10 @@ source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib.sh"
 # signed the coordinator's leaf.
 SERVER_CERT="$CERT_DIR/ca.crt"
 
-# Threading = 2 must match packaging/linux/install.sh; see the comment there.
-# unixODBC's default of 3 serialises a cross-thread SQLCancel behind the call it
-# was meant to interrupt, which is a configuration no user has.
-# test_integration.py's cross-thread cancel test is what notices.
+# Threading = 2 must match packaging/linux/install.sh. unixODBC's default of 3
+# serialises a cross-thread SQLCancel behind the call it was meant to interrupt.
+# See "Threading = 2 is required, not tuning" in AGENTS.md; suites/
+# test_integration.py's cross-thread cancel test is what notices a regression.
 cat > "$GENERATED/odbcinst.ini" << EOF
 [stackable_odbc_trino]
 Driver = $DRIVER_PATH
@@ -55,8 +55,8 @@ Certificate = $SERVER_CERT
 # so this is the one interactive path a person can drive by hand. A real browser
 # will warn about the test CA.
 #
-# User is deliberately absent: the identity provider supplies it, and a User
-# disagreeing with the token is refused as an impersonation attempt.
+# User is omitted. The identity provider supplies it, and a User disagreeing
+# with the token is refused as an impersonation attempt.
 Driver = stackable_odbc_trino
 Host = $TRINO_HOST
 Port = $TRINO_HTTPS_PORT
@@ -79,7 +79,7 @@ TRINO_PASSWORD=$TRINO_PASSWORD
 TRINO_CATALOG=$TRINO_CATALOG
 CA_CERT=$SERVER_CERT
 CLIENT_PEM=$CERT_DIR/client.pem
-# Keycloak, for suites/test_oauth.py. The client secret is deliberately absent:
+# Keycloak, for suites/test_oauth.py. The client secret is omitted because
 # nothing on the Python side needs it, and the coordinator gets it from the
 # assembled config.
 KEYCLOAK_ISSUER=$KEYCLOAK_ISSUER

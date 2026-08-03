@@ -45,9 +45,9 @@ OAUTH_CLIENT_ID="trino"
 OAUTH_CLIENT_SECRET="trino-test-client-secret"
 
 # MinIO and the spooling protocol, for the `spooling` profile.
-# MinIO's port is deliberately not published: under
+# MinIO's port is not published. Under
 # protocol.spooling.retrieval-mode=coordinator_proxy the client never reaches
-# object storage, only the coordinator does, over the compose network.
+# object storage; only the coordinator does, over the compose network.
 #
 # Exported, because compose.yaml interpolates these three rather than repeating
 # them: Trino gets them substituted into spooling-manager.properties and MinIO
@@ -80,7 +80,7 @@ parse_profiles() {
     raw="${raw//,/ }"
     for p in $raw; do
         if [[ "$p" == "all" ]]; then
-            # shellcheck disable=SC2206  # deliberate word splitting
+            # shellcheck disable=SC2206  # word splitting is intended here
             out=($ALL_PROFILES)
             break
         fi
@@ -94,7 +94,7 @@ parse_profiles() {
     echo "${out[*]:-}"
 }
 
-# service_running <service> — true while its container exists and is running.
+# service_running <service>. True while its container exists and is running.
 service_running() {
     local id
     id="$(compose ps -q "$1" 2>/dev/null)" || return 1
