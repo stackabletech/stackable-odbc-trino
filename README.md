@@ -132,7 +132,7 @@ The authoritative list is `src/backend/types/connect_params.rs`.
 | `Source` | No | Query source Trino records and can route on. Default `stackable-odbc-trino/<version>` |
 | `ClientTags` | No | Comma-separated Trino client tags, which select a resource group |
 | `TlsVerify` | No | `true`/`full` (default), `ca`, or `false`/`none`. Alias: `SSLVerification` |
-| `Certificate` | No | Path to a PEM CA certificate for server verification. Required by `ca` |
+| `Certificate` | No | Path to a PEM CA certificate for server verification. It becomes the only trust anchor, so the machine's CA store no longer applies. Required by `ca` |
 | `ClientCertificate` | No | Path to a PEM holding a client certificate chain and its PKCS#8 key, for mutual TLS |
 | `AccessToken` | No | JWT bearer token. Alias: `Token` |
 | `ExternalAuthentication` | No | `true` selects Trino's interactive OAuth 2.0 flow. Needs `https`, and excludes `Password` and `AccessToken` |
@@ -282,6 +282,11 @@ to the 32-bit Administrator, and both are in the Start menu under similar names.
 your coordinator's certificate does not carry the name you are connecting under,
 use `TlsVerify=ca` with `Certificate` pointing at your CA's PEM file. That still
 verifies the certificate and only relaxes the name check.
+
+`Certificate` names the trust anchor rather than adding one, so the machine's
+own CA store stops applying to that connection. A coordinator with a publicly
+issued certificate needs no `Certificate` at all; setting one that did not sign
+the coordinator's chain is refused even when the machine trusts that chain.
 
 **Only the first session property applies.** Wrap the value in braces. See
 [Values that contain a semicolon](#values-that-contain-a-semicolon).

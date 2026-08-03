@@ -1971,7 +1971,7 @@ checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
 [[package]]
 name = "stackable-odbc-core"
 version = "0.0.1"
-source = "git+https://github.com/stackabletech/stackable-odbc-core.git?branch=scaffolding#5bc04176095b0881c3cd5620d9546c3f593ef96c"
+source = "git+https://github.com/stackabletech/stackable-odbc-core.git?branch=scaffolding#afad4f67e45402142b58ef13b4455fddc2a69dfe"
 dependencies = [
  "odbc-sys",
  "snafu",
@@ -2083,7 +2083,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",
@@ -2341,7 +2341,7 @@ dependencies = [
 [[package]]
 name = "trino-rust-client"
 version = "0.11.0"
-source = "git+https://github.com/stackabletech/trino-rust-client.git?branch=stackable-main#4a835ccfe4d8332b495cbd74ee1ba48971cbc024"
+source = "git+https://github.com/stackabletech/trino-rust-client.git?branch=stackable-main#98b44b01bdcb2c38fe60d174f890286b1e39ec5e"
 dependencies = [
  "async-stream",
  "backon",
@@ -2374,7 +2374,7 @@ dependencies = [
 [[package]]
 name = "trino-rust-client-macros"
 version = "0.7.2"
-source = "git+https://github.com/stackabletech/trino-rust-client.git?branch=stackable-main#4a835ccfe4d8332b495cbd74ee1ba48971cbc024"
+source = "git+https://github.com/stackabletech/trino-rust-client.git?branch=stackable-main#98b44b01bdcb2c38fe60d174f890286b1e39ec5e"
 dependencies = [
  "proc-macro2",
  "quote",
