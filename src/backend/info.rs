@@ -581,6 +581,15 @@ pub(crate) const TRINO_SQL92_VALUE_EXPRESSIONS: u32 =
 ///
 /// ODBC's `LOG` is the natural logarithm, so it maps to Trino's `ln()`;
 /// Trino's own `log(b, x)` is base-b and is a different function.
+///
+/// `RAND` is the other name whose one-argument form means something else in
+/// Trino. ODBC's argument is a *seed* and the result is a float in `[0, 1)`;
+/// Trino's `rand(n)` returns an integer in `[0, n)`, so `{fn RAND(5)}` passed
+/// through verbatim yields a different type over a different range.
+/// [`crate::escape_dialect::rewrite_scalar_fn`] therefore drops the seed and
+/// emits a bare `random()`, which keeps ODBC's type and range and loses only
+/// reproducibility. Trino has no seeded generator to keep it with.
+///
 /// <https://trino.io/docs/current/functions/math.html>
 pub(crate) const TRINO_NUMERIC_FUNCTIONS: u32 = SQL_FN_NUM_ABS
     | SQL_FN_NUM_ACOS
@@ -767,6 +776,16 @@ pub(super) fn reserved_keywords() -> &'static [Cow<'static, str>] {
 ///
 /// `LENGTH` is claimed with one caveat: ODBC defines it as excluding trailing
 /// blanks and Trino's `length()` counts them.
+///
+/// `SOUNDEX` needs no rewrite either, and is **not** gated on `server_major`
+/// although it is the one name here that Trino has not always had: it arrived
+/// in Trino 356 (April 2021, `trinodb/trino#4022`). The version-gated bitmaps
+/// below guard `CORRESPONDING` (475), `MATCH` and `UNIQUE` (482) and `OVERLAPS`
+/// (483), which are releases a deployment plausibly predates. 356 is not: it is
+/// older than every Trino this driver has been run against, and older than the
+/// REST protocol behaviour the rest of this crate assumes. A coordinator that
+/// old has larger problems here than one unresolvable function name.
+///
 /// <https://trino.io/docs/current/functions/string.html>
 pub(crate) const TRINO_STRING_FUNCTIONS: u32 = SQL_FN_STR_CONCAT
     | SQL_FN_STR_LTRIM

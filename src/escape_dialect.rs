@@ -254,6 +254,23 @@ pub(crate) fn rewrite_scalar_fn(name: &str, args: &str) -> Option<String> {
             Some(format!("CAST({} AS {target})", parts[0]))
         }
 
+        // SQL_FN_NUM_RAND: ODBC's optional argument is a seed and the result is
+        // a float in [0, 1). Trino's `rand(n)` takes a *bound* and returns an
+        // integer in [0, n), so passing the call through verbatim answers a
+        // different type over a different range: `{fn RAND(5)}` would yield 0-4
+        // rather than a fraction. Trino has no seeded generator to rewrite the
+        // seed onto, so it is dropped and the zero-argument form emitted, which
+        // keeps the type and the range and loses only reproducibility. Silently
+        // returning the wrong distribution is the worse of the two.
+        "RAND" if parts.len() == 1 && !empty => {
+            tracing::warn!(
+                seed = parts[0],
+                "Trino has no seeded random(); {{fn RAND(seed)}} is translated to \
+                 random(), which is not reproducible"
+            );
+            Some("random()".into())
+        }
+
         // SQL_FN_TD_DAYOFWEEK: Trino's `day_of_week` is ISO-numbered
         // (1 = Monday .. 7 = Sunday) and ODBC specifies 1 = Sunday ..
         // 7 = Saturday, so the *value* needs converting, not just the name:
@@ -377,6 +394,10 @@ mod tests {
             ),
             // Value conversion, not a rename.
             ("DAYOFWEEK", "d", "((day_of_week(d) % 7) + 1)"),
+            // The seed is dropped rather than passed through: Trino reads that
+            // argument as a bound. See the arm for why losing reproducibility
+            // beats answering a different type.
+            ("RAND", "5", "random()"),
         ] {
             assert_eq!(
                 rewrite_scalar_fn(name, args).as_deref(),
@@ -482,6 +503,10 @@ mod tests {
         // Wrong arity falls through rather than producing malformed SQL.
         assert_eq!(rewrite_scalar_fn("TIMESTAMPADD", "SQL_TSI_DAY, 1"), None);
         assert_eq!(rewrite_scalar_fn("DAYOFWEEK", "a, b"), None);
+        // `{fn RAND()}` is already Trino's `rand()`, so only the seeded form
+        // needs rewriting; the bare one falls through untouched.
+        assert_eq!(rewrite_scalar_fn("RAND", ""), None);
+        assert_eq!(rewrite_scalar_fn("RAND", "a, b"), None);
         // The precision forms of CURRENT_TIME/CURRENT_TIMESTAMP pass through
         // instead: Trino accepts `CURRENT_TIMESTAMP(6)` as written.
         assert_eq!(rewrite_scalar_fn("CURRENT_TIMESTAMP", "6"), None);
