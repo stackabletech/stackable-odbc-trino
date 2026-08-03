@@ -304,6 +304,37 @@ pub(crate) fn cancelled_between_requests() -> TrinoError {
     }
 }
 
+/// An error's own text followed by every cause beneath it, joined with `: `.
+///
+/// [`TrinoError::CommunicationLinkFailure`] carries a `String` rather than a
+/// source, so whatever is not flattened here is lost: core's `Diagnostics`
+/// walks a cause chain, but only one still attached to the error it is handed.
+///
+/// Worth flattening because `reqwest::Error` names only its own layer. A
+/// refused port, a certificate signed by an authority the client does not
+/// trust, and a host that does not resolve all display as `error sending
+/// request for url (...)`, and the sentence separating them sits one or more
+/// `source()` calls further down. Without it an application holding only the
+/// diagnostic record cannot tell a TLS rejection from a coordinator that is
+/// switched off.
+///
+/// A cause whose text the message already carries is skipped, because the
+/// layers quote each other and a repeated segment lengthens the record without
+/// adding to it.
+fn flatten_causes(err: &(dyn std::error::Error + 'static)) -> String {
+    let mut text = err.to_string();
+    let mut cause = err.source();
+    while let Some(e) = cause {
+        let segment = e.to_string();
+        if !text.contains(&segment) {
+            text.push_str(": ");
+            text.push_str(&segment);
+        }
+        cause = e.source();
+    }
+    text
+}
+
 /// Classify a `trino_rust_client` error into the [`TrinoError`] variant whose
 /// SQLSTATE the failure deserves: `08S01` for a lost link, `HYT00` for a
 /// timeout, `28000` for an authentication rejection, `HY008` for a cancelled
@@ -333,7 +364,7 @@ pub(crate) fn map_trino_error(e: trino_rust_client::error::Error) -> TrinoError 
         }
         Error::HttpError(ref req_err) if req_err.is_connect() => {
             TrinoError::CommunicationLinkFailure {
-                message: format!("unable to reach Trino server: {req_err}"),
+                message: format!("unable to reach Trino server: {}", flatten_causes(req_err)),
             }
         }
         Error::HttpError(ref req_err) if req_err.is_timeout() => TrinoError::QueryTimeout {
@@ -2672,6 +2703,90 @@ mod tests {
             TrinoBackend::connection_dead(&conn),
             "a mapped link failure must be visible through SQL_ATTR_CONNECTION_DEAD"
         );
+    }
+
+    /// A refused port, a certificate the client will not trust and a host that
+    /// does not resolve all satisfy `is_connect()`, so one arm classifies all
+    /// three and the message is the only thing separating them.
+    ///
+    /// `reqwest::Error`'s own `Display` separates nothing: it reports
+    /// `error sending request for url (...)` for every one of them and leaves
+    /// the discriminating text in `source()`. An application holding nothing
+    /// but the diagnostic record, which is every Power BI user, then cannot
+    /// tell a rejected certificate from a coordinator that is switched off.
+    #[test]
+    fn a_link_failure_names_the_cause_beneath_reqwest() {
+        let mapped = map_trino_error(connect_failure());
+        let TrinoError::CommunicationLinkFailure { message } = mapped else {
+            panic!("an unreachable coordinator is a link failure, not {mapped:?}");
+        };
+        assert!(
+            message.contains("refused"),
+            "the message must name what failed beneath reqwest, got: {message}"
+        );
+    }
+
+    /// One error wrapping another, for asserting the shape of the flattening
+    /// without depending on any library's wording.
+    #[derive(Debug)]
+    struct Layer {
+        text: String,
+        source: Option<Box<Layer>>,
+    }
+
+    impl std::fmt::Display for Layer {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str(&self.text)
+        }
+    }
+
+    impl std::error::Error for Layer {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            self.source
+                .as_ref()
+                .map(|s| s.as_ref() as &(dyn std::error::Error + 'static))
+        }
+    }
+
+    /// Builds a chain from outermost to innermost.
+    fn layers(texts: &[&str]) -> Layer {
+        let mut chain: Option<Box<Layer>> = None;
+        for text in texts.iter().rev() {
+            chain = Some(Box::new(Layer {
+                text: (*text).to_owned(),
+                source: chain,
+            }));
+        }
+        *chain.expect("layers() is only called with a non-empty slice")
+    }
+
+    /// The rejection an untrusted certificate produces is worded by rustls, not
+    /// here, so what this side must guarantee is that every layer reaches the
+    /// message however deep it sits. Asserted on a synthetic chain for exactly
+    /// that reason: it holds whatever rustls decides to say.
+    #[test]
+    fn flatten_causes_reaches_every_layer() {
+        let chain = layers(&[
+            "error sending request for url (https://trino:8443/v1/statement)",
+            "client error (Connect)",
+            "invalid peer certificate: UnknownIssuer",
+        ]);
+
+        assert_eq!(
+            flatten_causes(&chain),
+            "error sending request for url (https://trino:8443/v1/statement): \
+             client error (Connect): invalid peer certificate: UnknownIssuer"
+        );
+    }
+
+    /// reqwest's layers quote the text of the layer beneath them, so a naive
+    /// walk prints the same sentence several times and buries the one line that
+    /// matters. A cause already present is dropped.
+    #[test]
+    fn flatten_causes_drops_a_cause_the_message_already_carries() {
+        let chain = layers(&["outer: inner detail", "inner detail"]);
+
+        assert_eq!(flatten_causes(&chain), "outer: inner detail");
     }
 
     /// Only a link failure counts. A server-side query rejection leaves the

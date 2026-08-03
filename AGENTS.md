@@ -254,6 +254,17 @@ server-side rejection reaches the application as its own Trino code rather than
 `0`. A variant that flattens the failure into a `String` throws both away, which
 is why the specific arms are the exception and not the pattern.
 
+`CommunicationLinkFailure` is one of those exceptions, so `flatten_causes` walks
+the reqwest error's chain into the message before the variant is built. Without
+it a refused port, a certificate signed by an authority the client does not
+trust and a host that does not resolve all reach the application as
+`error sending request for url (...)`: `is_connect()` is set for all three, and
+`reqwest::Error` names only its own layer while the sentence separating them
+sits further down `source()`. Segments already present are dropped, because the
+layers quote each other. Note that only two of those three are distinguishable
+in practice; the certificate cases collapse into one, for the SNI reason
+recorded below.
+
 The `source` is a `QueryCause`, not the client error itself, and `query_cause`
 is the one place that decides which. A transport error is kept whole; its
 `Display` is a single line. A server-side `QueryError` is reduced to
