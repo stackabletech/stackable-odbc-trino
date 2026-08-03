@@ -7,7 +7,7 @@ name: Build and Test
 #                     oauth and spooling profiles add Keycloak and MinIO, are
 #                     opt-in, and are not proposed for CI. Whether the core
 #                     stack fits a standard runner is unmeasured, and
-#                     ubuntu-latest is 4 vCPU / 16 GB, so it should be tried
+#                     ubuntu-24.04 is 4 vCPU / 16 GB, so it should be tried
 #                     rather than assumed. If it does not fit, record the
 #                     measured failure here in place of this note. Until then,
 #                     run it locally before a release. Unit tests run on every
@@ -33,6 +33,10 @@ env:
   CARGO_TERM_COLOR: always
   RUST_TOOLCHAIN_VERSION: "1.95.0"
 
+# Every job below names a runner image rather than a `-latest` alias, so an
+# image roll cannot change what a merge is gated on. The label cannot be lifted
+# into a variable: `runs-on` accepts no `env` context, and the one context that
+# would work, `vars`, holds its value in repository settings rather than here.
 jobs:
   # Formatting, clippy (which is what enforces the unwrap_used /
   # unwrap_in_result / panic denies from Cargo.toml), cargo-deny and
@@ -41,7 +45,7 @@ jobs:
   # not observe is not a gate.
   pre-commit:
     name: pre-commit
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
       # The cargo-test pre-commit hook links libodbc via odbc-sys.
@@ -49,7 +53,9 @@ jobs:
         uses: awalsh128/cache-apt-pkgs-action@acb598e5ddbc6f68a970c5da0688d2f3a9f04d05 # v1.6.0
         with:
           packages: unixodbc-dev
-          version: ubuntu-latest
+          # A cache key, not a runner label, but it tracks the runner image so
+          # that bumping the image invalidates the cached .deb files.
+          version: ubuntu-24.04
 
       - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
         with:
@@ -77,7 +83,7 @@ jobs:
 
   unit-tests:
     name: Unit Tests
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
       # odbc-sys links against libodbc/libodbcinst, so the unixODBC dev
@@ -87,7 +93,9 @@ jobs:
         uses: awalsh128/cache-apt-pkgs-action@acb598e5ddbc6f68a970c5da0688d2f3a9f04d05 # v1.6.0
         with:
           packages: unixodbc-dev
-          version: ubuntu-latest
+          # A cache key, not a runner label, but it tracks the runner image so
+          # that bumping the image invalidates the cached .deb files.
+          version: ubuntu-24.04
 
       - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
         with:
@@ -109,7 +117,7 @@ jobs:
 
   unit-tests-windows:
     name: Unit Tests (Windows)
-    runs-on: windows-latest
+    runs-on: windows-2022
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
@@ -140,7 +148,7 @@ jobs:
         with:
           key: windows-gnu-test
 
-      # The GNU target's linker. windows-latest ships MSYS2, but its mingw64
+      # The GNU target's linker. The runner image ships MSYS2, but its mingw64
       # bin directory is not on PATH by default.
       - name: Add MinGW to PATH
         run: echo "C:\msys64\mingw64\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
@@ -154,14 +162,20 @@ jobs:
       - name: Run unit tests
         run: cargo test --locked --target x86_64-pc-windows-gnu
 
-  windows-cross-compile:
-    name: Cross-compile Windows DLL
-    runs-on: ubuntu-latest
+  # Builds both shipping artifacts the way release.yaml does, and checks the two
+  # properties that are invisible in a unit test run: that the DLL exports the
+  # ODBC entry points, and that what each artifact links at load time still
+  # matches packaging/sbom-native.json. The SBOM declares native dependencies by
+  # hand, since no cargo metadata describes them, so nothing but this check keeps
+  # the declaration true.
+  release-artifacts:
+    name: Release Artifacts
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
     needs: [unit-tests]
     steps:
       - name: Install MinGW cross-compiler
-        run: sudo apt-get update && sudo apt-get install -y gcc-mingw-w64-x86-64
+        run: sudo apt-get update && sudo apt-get install -y gcc-mingw-w64-x86-64 unixodbc-dev
 
       - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
         with:
@@ -178,12 +192,29 @@ jobs:
         with:
           key: windows-gnu
 
+      - name: Build Linux shared library
+        run: cargo build --locked --release
+
       - name: Build Windows DLL
         run: cargo build --locked --target x86_64-pc-windows-gnu --release
 
       - name: Verify DLL exports
         run: |
           x86_64-w64-mingw32-objdump -p target/x86_64-pc-windows-gnu/release/stackable_odbc_trino.dll | grep -c "SQL" | xargs -I{} echo "Trino DLL: {} ODBC symbols exported"
+
+      # Two different assertions behind one flag. For the .so it compares
+      # DT_NEEDED against the sonames sbom-native.json declares, in both
+      # directions. For the .dll it asserts the mingw runtime is still linked
+      # statically: the release archive ships no runtime DLL, so an artifact
+      # that imported one would fail to load on a user's machine.
+      #
+      # Only the release binaries are checked, and only here rather than in
+      # release.yaml, because a pull request is where a dependency change can
+      # still be reverted cheaply.
+      - name: Verify declared native dependencies
+        run: |
+          ./packaging/sbom.sh --check-native target/release/libstackable_odbc_trino.so
+          ./packaging/sbom.sh --check-native target/x86_64-pc-windows-gnu/release/stackable_odbc_trino.dll
 
   # Single required check for branch protection rules.
   finished:
@@ -193,8 +224,8 @@ jobs:
       - pre-commit
       - unit-tests
       - unit-tests-windows
-      - windows-cross-compile
-    runs-on: ubuntu-latest
+      - release-artifacts
+    runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
       # Derived from needs.* rather than a hand-written list of job names: a job

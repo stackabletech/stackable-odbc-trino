@@ -1607,9 +1607,23 @@ release/release.sh minor --execute
 
 That bumps `Cargo.toml`, rewrites `CHANGELOG.md` and the version examples in
 `packaging/README.md`, commits, and pushes a signed `v<version>` tag. The tag
-triggers `.github/workflows/release.yaml`, which builds both binaries, runs
-`build-archives.sh` and publishes the GitHub Release. `release.toml` restricts
-this to `main`.
+triggers `.github/workflows/release.yaml`, which builds both binaries with
+`cargo auditable build --locked --release`, runs `build-archives.sh`, attests the
+result and publishes the GitHub Release. `release.toml` restricts this to `main`.
+
+syft and cargo-auditable are installed at pinned versions, named once in the
+workflow's `env`. Both are preconditions of packaging rather than extras:
+`sbom.sh` refuses a binary carrying no `.dep-v0` section, so a plain `cargo
+build` fails the release at the packaging step.
+
+`actions/attest-build-provenance` signs a statement that the three archives and
+`sha256sums.txt` came out of this workflow at this commit, and
+`actions/attest-sbom` binds each artifact to its CycloneDX document. Both record
+into the public transparency log, and a consumer checks one with
+`gh attestation verify <file> --repo stackabletech/stackable-odbc-trino`. This
+proves **where** an artifact was built, not who vouches for it: the binaries are
+unsigned, and the code-signing certificate that would change that is an open
+`TODO` in the workflow.
 
 Publishing to crates.io is disabled (`publish = false`) and blocked anyway while
 `stackable-odbc-core` and `trino-rust-client` are git dependencies, which
@@ -1871,8 +1885,11 @@ since syft reports `components: null` for an archive it cannot catalogue.
 #### The native fragment, and why the two platforms differ
 
 `packaging/sbom-native.json` is hand-maintained, so
-`sbom.sh --check-native <artifact>` verifies it and fails on drift. What it
-verifies differs by platform, because the platforms contribute different things:
+`sbom.sh --check-native <artifact>` verifies it and fails on drift. The
+`release-artifacts` job in `.github/workflows/build.yaml` runs it against both
+release binaries on every pull request, which is where a dependency change can
+still be reverted cheaply. What it verifies differs by platform, because the
+platforms contribute different things:
 
 | | Linux `.so` | Windows `.dll` |
 |---|---|---|
