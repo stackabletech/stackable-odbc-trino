@@ -40,11 +40,13 @@ Config_AdvancedOptions = {
 
 // SQL conformance override.
 //
-// The driver reports SQL_SC_SQL92_FULL here and 0 through SQLGetInfo, and
-// both are right for their own audience. To an ODBC application the info type
-// is a conformance claim, and Trino does not reach even Entry level: its
-// CREATE TABLE rejects PRIMARY KEY, UNIQUE, CHECK and REFERENCES, and the
-// driver reports SQL_TC_NONE where Entry level requires COMMIT/ROLLBACK. To
+// This reports SQL_SC_SQL92_FULL where the driver's own SQLGetInfo answers 0,
+// and both are right for their own audience. To an ODBC application the info
+// type is a conformance claim, and Trino does not reach even Entry level: its
+// CREATE TABLE rejects PRIMARY KEY, UNIQUE, CHECK and REFERENCES, each with a
+// SYNTAX_ERROR, and that one requirement rules the level out. Entry level's
+// other demand, COMMIT and ROLLBACK, the driver does meet: it reports
+// SQL_TC_DML, so the constraint grammar is the whole of the argument. To
 // Power Query it is the knob that unlocks SQL generation, and Microsoft's own
 // guidance is to turn it up and narrow the specifics elsewhere: "In Power
 // Query scenarios, the connector is used in a Read Only mode. Most drivers
@@ -113,7 +115,10 @@ StackableTrinoODBC.ContentsType = type function (
     optional user as (type text meta [
         Documentation.FieldCaption = "User",
         Documentation.FieldDescription =
-            "Left empty under external authentication, where the identity provider supplies it."
+            "Ignored when you sign in with a username and password, which supplies its own. "
+            & "Leave it empty under external authentication, where the identity provider "
+            & "decides the identity and a name given here is read as an impersonation request. "
+            & "Required otherwise."
     ]),
     optional protocol as (type text meta [
         Documentation.FieldCaption = "Protocol",
@@ -141,9 +146,13 @@ StackableTrinoODBC.OptionsType = type [
     optional ClientInfo = (type text meta [Documentation.FieldCaption = "Client info"]),
     optional TraceToken = (type text meta [Documentation.FieldCaption = "Trace token"]),
     optional SessionUser = (type text meta [Documentation.FieldCaption = "Session user"]),
+    // The role name is written bare. connect_params.rs renders Trino's own
+    // `ROLE{name}` wire spelling itself, so a sample carrying it would be
+    // double-wrapped into ROLE{ROLE{admin}}, and the braces would collide with
+    // connection-string syntax besides. `ALL` and `NONE` are the two keywords.
     optional Roles = (type text meta [
         Documentation.FieldCaption = "Roles",
-        Documentation.SampleValues = {"hive:ROLE{admin}"}
+        Documentation.SampleValues = {"hive:admin"}
     ]),
     optional TlsVerify = (type text meta [
         Documentation.FieldCaption = "TLS verification",
@@ -153,9 +162,16 @@ StackableTrinoODBC.OptionsType = type [
     optional ClientCertificate = (type text meta [
         Documentation.FieldCaption = "Client certificate"
     ]),
+    // Bare, without the {braces} a hand-written connection string needs around
+    // a `;`-separated value. This is the third convention for one format and
+    // the reason is the same each time: braces are connection-string escaping,
+    // and here the connection string is assembled from a record by
+    // `Odbc.DataSource`, which escapes what it serialises. The same holds for
+    // ResourceEstimates and ClientCapabilities below. README.md's "Values that
+    // contain a semicolon" covers the two hand-written cases.
     optional SessionProperties = (type text meta [
         Documentation.FieldCaption = "Session properties",
-        Documentation.SampleValues = {"query_max_run_time:10m"}
+        Documentation.SampleValues = {"query_max_run_time:10m;example.foo:bar"}
     ]),
     optional ResourceEstimates = (type text meta [
         Documentation.FieldCaption = "Resource estimates"
@@ -199,7 +215,6 @@ StackableTrinoODBCImpl = (
         // optional protocol argument out; a plaintext coordinator takes
         // protocol = "http".
         effectiveProtocol = if protocol <> null then protocol else "https",
-        effectiveUser = if user <> null then user else "trino",
 
         ConnectionString = [
             Driver = Config_DriverName,
@@ -255,12 +270,25 @@ StackableTrinoODBCImpl = (
 
         // Credentials: PowerBI supplies username/password via the
         // credential system. Map them to the ODBC connection string.
+        //
+        // Under any other credential kind the `User` argument is passed
+        // through, and an absent one is left absent rather than given a
+        // stand-in name. That is not tidiness: under ExternalAuthentication
+        // the identity provider decides who the session runs as, and Trino
+        // reads a `User` that disagrees with the token's identity as an
+        // impersonation request and refuses the connection. Inventing a name
+        // here would make the connector's own "External authentication"
+        // advanced option fail every time. connect_params.rs's
+        // PARAM_EXTERNAL_AUTHENTICATION carries the same reasoning for the
+        // driver side.
         Credential = Extension.CurrentCredential(),
         CredentialConnectionString =
             if Credential[AuthenticationKind]? = "UsernamePassword" then
                 [User = Credential[Username], Password = Credential[Password]]
+            else if user <> null then
+                [User = user]
             else
-                [User = effectiveUser],
+                [],
 
         // Build ODBC options with Trino-specific overrides.
         defaultConfig = BuildOdbcConfig(),
@@ -383,8 +411,18 @@ StackableTrinoODBCImpl = (
                         BOOLEAN = each Cast(_, "BOOLEAN"),
                         DATE = each Cast(Quote(Date.ToText(_, "yyyy-MM-dd")), "DATE"),
                         VARCHAR = each Cast(_, "VARCHAR"),
-                        TIMESTAMP = each Cast(Quote(DateTime.ToText(_, "yyyy-MM-dd HH:mm:ss.sssssss")), "TIMESTAMP"),
-                        TIME = each Cast(Quote(Time.ToText(_, "HH:mm:ss.sssssss")), "TIME")
+                        // `fffffff`, not `sssssss`: in a custom format string
+                        // `s` is the second and `f` is the fractional second,
+                        // so the latter spelling renders the second eight times
+                        // over instead of a fraction. Seven digits because an M
+                        // datetime resolves to 100ns and Trino reads the width
+                        // as the literal's precision; lower case so trailing
+                        // zeros are kept and the width stays fixed, which `F`
+                        // would not do. Trino coerces a wider literal to the
+                        // column's own precision, so an equality filter on a
+                        // `timestamp(3)` still matches.
+                        TIMESTAMP = each Cast(Quote(DateTime.ToText(_, "yyyy-MM-dd HH:mm:ss.fffffff")), "TIMESTAMP"),
+                        TIME = each Cast(Quote(Time.ToText(_, "HH:mm:ss.fffffff")), "TIME")
                     ]
                 in
                     (typeInfo, ast) => Record.FieldOrDefault(Visitor, typeInfo[TYPE_NAME], each null)(ast[Value])

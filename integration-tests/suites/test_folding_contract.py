@@ -10,7 +10,7 @@ human clicking "View Native Query" in Power BI Desktop, one step at a time. A
 connector declaration can therefore drift from what the driver reports or what
 Trino accepts, and nothing notices.
 
-This checks the two halves that are mechanically checkable:
+This checks the three halves that are mechanically checkable:
 
 1. **The Constant visitor's keys.** Power Query looks each one up by
    `typeInfo[TYPE_NAME]`, which is the driver's own `SQLGetTypeInfo` output. A
@@ -21,6 +21,14 @@ This checks the two halves that are mechanically checkable:
 2. **The SQL the connector emits.** Every CAST target it names has to be a type
    Trino has, and the LIMIT/OFFSET form its AstVisitor builds has to
    parse. Both are asserted by running them.
+
+3. **The temporal format strings.** A visitor entry for a date, time or
+   timestamp renders the value through a .NET custom format string before
+   quoting it, and that string is not checked by anything else here: a target
+   type can be valid while the literal handed to it is not. `.sssssss` looks
+   plausible and is seven seconds fields rather than a fractional second,
+   because in a custom format string `s` is the second and `f` is the fraction.
+   The formats are translated and the rendered literal is sent to Trino.
 
 Usage:
     uv run --with pyodbc python3 integration-tests/suites/test_folding_contract.py "<connection-string>"
@@ -94,6 +102,88 @@ def parse_constant_visitor(source):
     return visitor
 
 
+def parse_temporal_formats(source):
+    """Map each Constant-visitor key to the .NET format string it renders with.
+
+    Only the entries that quote a rendered value have one:
+    `Cast(Quote(DateTime.ToText(_, "<format>")), "TIMESTAMP")`.
+    """
+    return dict(
+        re.findall(
+            r'(\w+)\s*=\s*each\s+Cast\(\s*Quote\(\s*(?:Date|DateTime|Time)'
+            r'\.ToText\(\s*_\s*,\s*"([^"]+)"',
+            source,
+        )
+    )
+
+
+# The .NET custom date/time specifiers the connector is allowed to use, longest
+# first so `mm` is matched before `m` would be. Anything else is rejected rather
+# than guessed at: an unrecognised specifier is exactly the defect this looks
+# for, and silently passing it through would render it as a literal.
+NET_SPECIFIERS = [
+    ("yyyy", "%Y"),
+    ("MM", "%m"),
+    ("dd", "%d"),
+    ("HH", "%H"),
+    ("mm", "%M"),
+    ("ss", "%S"),
+]
+
+# The instant every rendered literal describes, chosen so each field is
+# distinct: a format that swapped month for minute, or seconds for the
+# fraction, produces a different string rather than an accidentally equal one.
+SAMPLE_INSTANT = {
+    "%Y": "2021",
+    "%m": "02",
+    "%d": "03",
+    "%H": "04",
+    "%M": "05",
+    "%S": "06",
+}
+SAMPLE_FRACTION = "1234567"
+
+
+def render_net_format(fmt):
+    """Render `fmt` for `SAMPLE_INSTANT`, or raise ValueError if it cannot be.
+
+    A run of `f`/`F` is the fractional second, rendered to the width asked for.
+    A run of any other letter that is not a known specifier is an error: `sss`
+    is not a wider seconds field, it is a mistake for `fff`.
+    """
+    out = []
+    i = 0
+    while i < len(fmt):
+        ch = fmt[i]
+        # The run of `ch` starting at `i`, measured on the remaining suffix.
+        run = len(fmt[i:]) - len(fmt[i:].lstrip(ch))
+        if ch in "fF":
+            if run > 7:
+                raise ValueError(f"fractional-seconds run of {run} exceeds .NET's 7 digits")
+            out.append(SAMPLE_FRACTION[:run].ljust(run, "0"))
+            i += run
+            continue
+        for token, strf in NET_SPECIFIERS:
+            if fmt.startswith(token, i):
+                # A longer run of the same letter is not the specifier: `sssssss`
+                # starts with `ss` but is not a wider seconds field, and reading
+                # it as one would hide exactly the defect this looks for.
+                if run != len(token):
+                    raise ValueError(
+                        f"{ch!r} repeated {run} times is not a specifier; "
+                        f"{token!r} is the field, and 'f' is the fractional second"
+                    )
+                out.append(SAMPLE_INSTANT[strf])
+                i += run
+                break
+        else:
+            if ch.isalpha():
+                raise ValueError(f"unrecognised format specifier {ch!r}")
+            out.append(ch)
+            i += 1
+    return "".join(out)
+
+
 def parse_limit_clause(source):
     """Render the row-limiting clause the AstVisitor builds for skip and take.
 
@@ -164,6 +254,47 @@ def main():
             check(f"CAST(... AS {target}) for key {key}", True)
         except pyodbc.Error as e:
             check(f"CAST(... AS {target}) for key {key}", False, f"  {str(e)[:90]}")
+
+    # ------------------------------------------------------------------
+    print("\n--- the temporal literals the Constant visitor renders parse ---")
+    # A valid CAST target with an unrenderable literal folds a filter into SQL
+    # Trino rejects, or worse, into one it accepts with the wrong instant. The
+    # target check above cannot see this: it substitutes its own SAMPLE literal.
+    formats = parse_temporal_formats(source)
+    check(
+        "the temporal visitor entries declare a format string",
+        len(formats) >= 3,
+        "" if len(formats) >= 3 else f"  (parsed {sorted(formats)})",
+    )
+    for key in sorted(formats):
+        target = visitor.get(key, key)
+        try:
+            literal = render_net_format(formats[key])
+        except ValueError as e:
+            check(f"{key} format {formats[key]!r} is renderable", False, f"  {e}")
+            continue
+        sql = f"SELECT CAST('{literal}' AS {target})"
+        try:
+            got = cur.execute(sql).fetchone()[0]
+            # Round-tripped, not merely accepted: Trino parses a great many
+            # malformed-looking strings, and the failure that matters is a
+            # literal that lands on a different instant.
+            rendered_back = str(got)
+            fields_present = all(
+                v in rendered_back for v in ("2021", "02", "03", "04", "05", "06")
+                if v in literal
+            )
+            check(
+                f"{key} renders {literal!r}, which CASTs to {target}",
+                fields_present,
+                "" if fields_present else f"  (Trino read it back as {rendered_back!r})",
+            )
+        except pyodbc.Error as e:
+            check(
+                f"{key} renders {literal!r}, which CASTs to {target}",
+                False,
+                f"  {str(e)[:90]}",
+            )
 
     # ------------------------------------------------------------------
     print("\n--- the row-limiting clause the AstVisitor builds parses ---")
