@@ -83,7 +83,11 @@ fn decode_page_rows(
 /// trailing character is then the comment, not the semicolon. Recognising it
 /// would mean parsing comments, which is a larger change than the case
 /// justifies.
-fn strip_trailing_semicolons(sql: &str) -> &str {
+///
+/// Shared with `backend::describe_param`, which wraps the same SQL in a
+/// `PREPARE`. Both have to strip, or a statement an application prepares and
+/// executes successfully is one `SQLDescribeParam` cannot describe.
+pub(super) fn strip_trailing_semicolons(sql: &str) -> &str {
     let mut trimmed = sql.trim_end();
     while let Some(rest) = trimmed.strip_suffix(';') {
         trimmed = rest.trim_end();

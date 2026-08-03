@@ -113,6 +113,11 @@ pub(super) fn describe_param(
         .unwrap_or_else(|poisoned| poisoned.into_inner());
 
     if cache.as_ref().is_none_or(|cached| cached.sql != sql) {
+        // Read before the round trip, because a failure inside it is what makes
+        // the answer differ. Trino carries the transaction id in a session
+        // header, so the `PREPARE` below joins whatever the application has
+        // open, and a statement error aborts the whole transaction.
+        let in_transaction = conn.in_transaction();
         match fetch_input_params(conn, sql) {
             Ok(params) => {
                 *cache = Some(CachedParams {
@@ -120,12 +125,29 @@ pub(super) fn describe_param(
                     params,
                 });
             }
-            Err(e) => {
-                // Not an error path for the application: Trino declines to
-                // prepare plenty of legitimate statements, and core's fallback
-                // is a usable answer.
+            // Outside a transaction this is not an error path for the
+            // application: Trino declines to prepare plenty of legitimate
+            // statements, and core's uniform `VARCHAR` fallback is a usable
+            // answer for a call that only sizes a buffer.
+            Err(e) if !in_transaction => {
                 tracing::debug!(%sql, error = %e, "DESCRIBE INPUT failed; leaving the parameter to core's default");
                 return Ok(None);
+            }
+            // Inside one it is. The transaction is now aborted server-side, so
+            // every later statement on this connection fails until a rollback
+            // and `SQLEndTran(SQL_COMMIT)` will refuse. Swallowing that would
+            // report success from `SQLDescribeParam` while the application's
+            // transaction had just been killed by a round trip it did not make
+            // and cannot see. The alternative, suppressing the abort, would be
+            // a lie about what Trino did.
+            Err(e) => {
+                tracing::warn!(
+                    %sql,
+                    error = %e,
+                    "DESCRIBE INPUT failed inside an open transaction, which Trino \
+                     therefore aborted; reporting it rather than falling back"
+                );
+                return Err(e);
             }
         }
     }
@@ -152,6 +174,14 @@ fn fetch_input_params(
     conn: &TrinoConnection,
     sql: &str,
 ) -> Result<Vec<ParamDescriptor>, TrinoError> {
+    // The terminator is stripped here as well as in `execute`, and for the same
+    // reason: Trino's grammar has none, so `PREPARE x FROM SELECT ? ;` is a
+    // syntax error. `exec_direct` strips it before submitting, so a statement
+    // an application prepares and executes successfully would otherwise be one
+    // this cannot describe, and inside a transaction that failure is no longer
+    // silent.
+    let sql = crate::backend::execute::strip_trailing_semicolons(sql);
+
     // `PREPARE` and `DEALLOCATE` produce no result set, so they go through
     // `Client::execute`; `query_all_rows` deserialises rows and fails on a
     // statement that declares no columns.
@@ -189,6 +219,37 @@ mod tests {
     /// and `Type` (a Trino type signature).
     fn row(position: i64, ty: &str) -> Vec<serde_json::Value> {
         vec![serde_json::json!(position), serde_json::json!(ty)]
+    }
+
+    /// The `PREPARE` this module wraps the application's SQL in has to see the
+    /// same text `exec_direct` submits. Trino's grammar has no terminator, so
+    /// `PREPARE x FROM SELECT ? ;` is a syntax error, and a statement that
+    /// prepares and executes perfectly well would be one this cannot describe.
+    ///
+    /// Asserted on the shared helper rather than by reaching a coordinator,
+    /// which `fetch_input_params` needs; the live half is
+    /// `test_describe_param.py`.
+    #[test]
+    fn the_prepared_text_carries_no_statement_terminator() {
+        use crate::backend::execute::strip_trailing_semicolons;
+
+        for (sql, expected) in [
+            ("SELECT ? ;", "SELECT ?"),
+            ("SELECT ?;", "SELECT ?"),
+            ("SELECT ? ;;  ", "SELECT ?"),
+            ("SELECT ?", "SELECT ?"),
+            // Not the trailing character, so not a terminator.
+            ("SELECT ';'", "SELECT ';'"),
+        ] {
+            assert_eq!(
+                format!(
+                    "PREPARE {DESCRIBE_PARAM_STATEMENT} FROM {}",
+                    strip_trailing_semicolons(sql)
+                ),
+                format!("PREPARE {DESCRIBE_PARAM_STATEMENT} FROM {expected}"),
+                "for {sql:?}"
+            );
+        }
     }
 
     #[test]

@@ -1021,6 +1021,52 @@ statement records the one it executed under, and `close_cursor` skips the drain
 when the connection has moved past it. The connection bumps the epoch *before*
 sending the `COMMIT`, so a `close_cursor` racing it cannot slip through.
 
+#### What the abort flag means, and what may set it
+
+`TransactionState::aborted` is a statement about *the transaction that is open
+now*. Trino aborts the whole transaction on any statement error and then refuses
+everything until a rollback, `COMMIT` included, so the driver has to know before
+`SQLEndTran` asks it to commit.
+
+Manual-commit mode is not the same as having a transaction. The mode is set by
+`SQLSetConnectAttr` and a transaction opens at the first statement that needs
+one (`ensure_transaction`, called only from `exec_direct`), so there is a window
+with the mode on and nothing begun. `note_statement_error` cannot tell the
+difference: a `TrinoStatement` holds the shared `TransactionState` and not the
+client, so it cannot ask whether one is open.
+
+`begun` therefore clears the flag whenever a transaction opens, and `end_tran`
+clears it on the path where none was. Between them the flag is unobservable
+outside the life of a transaction. Without that, a failing catalog lookup
+between `SQL_AUTOCOMMIT_OFF` and the first statement left the flag set, `ended`
+never ran to clear it, and the next transaction was born aborted: its statements
+all succeeded and the commit rolled them back with `25S03`.
+
+#### Every request joins the open transaction, including the driver's own
+
+Trino carries the transaction id in a *session* header, so once one is open
+every request the client makes joins it. That includes two the application never
+wrote: the `information_schema` queries behind the catalog functions, and the
+`PREPARE` / `DESCRIBE INPUT` / `DEALLOCATE` round trip behind
+`SQLDescribeParam`. A failure in either aborts the application's transaction.
+
+Both used to convert their failures into a success: `query_information_schema`
+turned `CATALOG_NOT_FOUND` into an empty result set, and `describe_param`
+returned `Ok(None)` so core could fall back to its uniform `VARCHAR` guess. Both
+substitutions are right outside a transaction, where the cost is nothing, and
+wrong inside one, where the call reports success while having killed the
+transaction. The symptom then arrives much later, as every subsequent statement
+failing for a reason nothing reported at the point it happened.
+
+So both are conditional on `in_transaction()`. Suppressing the abort instead was
+rejected: Trino really did abort it, and the flag would then be a lie.
+
+`describe_param` strips the trailing statement terminator for the same family of
+reasons. It wraps the application's SQL in a `PREPARE`, and Trino's grammar has
+no terminator, so without the strip a statement that `exec_direct` submits and
+runs is one `SQLDescribeParam` cannot describe, and inside a transaction that
+failure is no longer silent.
+
 #### Isolation levels are vetted by the connector, not the parser
 
 `START TRANSACTION ISOLATION LEVEL X` always parses; the failure lands on the

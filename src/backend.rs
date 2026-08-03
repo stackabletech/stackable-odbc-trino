@@ -692,8 +692,8 @@ pub struct TrinoConnection {
     pub runtime: Arc<tokio::runtime::Runtime>,
     pub client: Arc<Client>,
     /// The coordinator's version, already rendered in the ODBC `##.##.####`
-    /// form `SQL_DBMS_VER` requires. Empty when the probe failed, which the ODBC
-    /// spec's own representation of "not available".
+    /// form `SQL_DBMS_VER` requires. Empty when the probe failed, which is the
+    /// ODBC spec's own representation of "not available".
     ///
     /// Captured once at connect rather than per `SQLGetInfo` call: a Trino
     /// coordinator's version cannot change under a live connection, and
@@ -831,10 +831,35 @@ impl TransactionState {
     ///
     /// A no-op in autocommit mode, where each statement stands alone and one
     /// failure says nothing about the next.
+    ///
+    /// Manual-commit mode is not the same as "a transaction is open": one opens
+    /// at the first statement that needs it, so there is a window in which this
+    /// mode is set and nothing has begun. A failure in that window sets the flag
+    /// for a transaction that does not exist yet, which is why [`Self::begun`]
+    /// clears it. The alternative, asking whether one is open, is not available
+    /// to every caller: a [`TrinoStatement`] holds this state and not the
+    /// client.
     pub(crate) fn note_statement_error(&self) {
         if !self.autocommit() {
             self.aborted.store(true, Ordering::SeqCst);
         }
+    }
+
+    /// Record that a transaction has just been opened.
+    ///
+    /// Clears the abort flag, which is a statement about *the transaction now
+    /// open* and must not carry a verdict from before there was one.
+    ///
+    /// Without this, a failing catalog function or `DESCRIBE INPUT` in
+    /// manual-commit mode set the flag with nothing open, [`Self::ended`] never
+    /// ran to clear it, and the next transaction was born already aborted: its
+    /// statements succeeded, and `SQLEndTran(SQL_COMMIT)` then rolled it back
+    /// and reported `25S03` for a failure that predated it.
+    ///
+    /// The epoch is deliberately untouched. It tracks result sets discarded by
+    /// a transaction *ending*, and opening one discards nothing.
+    pub(crate) fn begun(&self) {
+        self.aborted.store(false, Ordering::SeqCst);
     }
 
     /// The epoch a statement executing now would record.
@@ -888,6 +913,9 @@ impl TrinoConnection {
         self.runtime
             .block_on(self.client.begin_transaction())
             .map_err(|e| map_trino_error_on(&self.liveness, e))?;
+        // A fresh transaction has not been aborted, whatever failed before it
+        // existed. See `TransactionState::begun`.
+        self.txn.begun();
         Ok(())
     }
 
@@ -1752,6 +1780,11 @@ impl Backend for TrinoBackend {
     fn end_tran(conn: &TrinoConnection, commit: bool) -> Result<(), TrinoError> {
         tracing::debug!(commit, "TrinoBackend::end_tran");
         if !conn.in_transaction() {
+            // Nothing is open, so nothing is aborted. Clearing here as well as
+            // in `ensure_transaction` keeps the flag's meaning ("the currently
+            // open transaction has been aborted") true at every point rather
+            // than only where it is read.
+            conn.txn.begun();
             return Ok(());
         }
 
@@ -1802,13 +1835,24 @@ impl Backend for TrinoBackend {
     /// Switching *to* autocommit commits what is open first, which the
     /// `SQL_ATTR_AUTOCOMMIT` page requires of a driver whose data source has
     /// no autocommit mode of its own.
+    ///
+    /// The new mode is recorded whatever that commit did, and the commit's
+    /// failure is reported afterwards. By the time [`Backend::end_tran`] can
+    /// fail it has already moved the epoch and cleared the abort flag, and in
+    /// the case that fails most often, a commit on a transaction Trino aborted,
+    /// it has also sent the rollback: the transaction is gone either way. An
+    /// early return would leave this connection in manual-commit mode with
+    /// nothing open while the application had been told the switch failed, so
+    /// the next statement would silently open a transaction nobody asked for.
     fn set_autocommit(conn: &TrinoConnection, enabled: bool) -> Result<(), TrinoError> {
         tracing::debug!(enabled, "TrinoBackend::set_autocommit");
-        if enabled && conn.in_transaction() {
-            Self::end_tran(conn, true)?;
-        }
+        let ended = if enabled && conn.in_transaction() {
+            Self::end_tran(conn, true)
+        } else {
+            Ok(())
+        };
         conn.txn.set_autocommit(enabled);
-        Ok(())
+        ended
     }
 
     /// Trino names a query only once the coordinator accepts it, so the token
@@ -3136,6 +3180,62 @@ mod tests {
         assert_eq!(p.query_timeout().as_secs(), 10);
     }
 
+    /// Refused, not defaulted. The old behaviour logged a `warn!` and used 30s,
+    /// which no application can see, so a mistyped timeout looked applied and
+    /// was not. `MaxAttempts` and `ExternalAuthenticationTimeout` both refuse,
+    /// and the argument is the same for all three.
+    #[test]
+    fn connect_rejects_an_unparseable_query_timeout() {
+        for (key, value) in [
+            ("QueryTimeout", "soon"),
+            ("QueryTimeout", "-1"),
+            ("QueryTimeout", "30s"),
+            ("LoginTimeout", "later"),
+        ] {
+            let params = ConnectParams::parse(&format!(
+                "Host=localhost;Port=8080;Protocol=http;User=test;{key}={value}"
+            ))
+            .unwrap();
+            let Err(err) = types::connect_params::TrinoConnectParams::try_from(&params) else {
+                panic!("{key}={value} must be refused");
+            };
+            let message = err.to_string();
+            assert!(
+                message.contains(&key.to_lowercase()) && message.contains(value),
+                "the error must name the key and the offending value: {message}"
+            );
+        }
+    }
+
+    /// `0` is the spec's "no timeout" rather than a mistake, and
+    /// `request_timeout` turns it into `NO_TIMEOUT`. It must not be swept up by
+    /// the rejection above.
+    #[test]
+    fn connect_accepts_a_zero_query_timeout() {
+        let params =
+            ConnectParams::parse("Host=localhost;Port=8080;Protocol=http;User=test;QueryTimeout=0")
+                .unwrap();
+        let p = types::connect_params::TrinoConnectParams::try_from(&params).unwrap();
+        assert_eq!(p.query_timeout(), Duration::ZERO);
+        assert_eq!(request_timeout(None, p.query_timeout()), NO_TIMEOUT);
+    }
+
+    /// A DSN editor that writes every keyword it knows leaves an untouched
+    /// field blank. Blank is unset, not invalid: refusing it would break data
+    /// sources this driver did not write, for a value nobody chose.
+    #[test]
+    fn connect_treats_a_blank_query_timeout_as_unset() {
+        for pair in ["QueryTimeout=", "LoginTimeout=", "QueryTimeout=   "] {
+            let params = ConnectParams::parse(&format!(
+                "Host=localhost;Port=8080;Protocol=http;User=test;{pair}"
+            ))
+            .unwrap();
+            let p = types::connect_params::TrinoConnectParams::try_from(&params)
+                .unwrap_or_else(|e| panic!("{pair:?} must parse: {e}"));
+            assert_eq!(p.query_timeout().as_secs(), 30, "for {pair:?}");
+        }
+    }
+
     #[test]
     fn validation_query_without_catalog_is_catalog_free() {
         assert_eq!(validation_query(None), "SELECT 1");
@@ -3985,6 +4085,147 @@ mod tests {
 
         assert_eq!(count_rows(&conn, table), 1, "the committed insert survives");
         exec(&conn, &cancel, &format!("DROP TABLE IF EXISTS {table}"));
+    }
+
+    /// The abort flag describes the transaction that is open *now*, so opening
+    /// one clears whatever was recorded before it existed.
+    ///
+    /// Manual-commit mode is set by `SQLSetConnectAttr` and a transaction opens
+    /// at the first statement that needs one, so there is a window with the mode
+    /// on and nothing begun. A catalog function or `DESCRIBE INPUT` failing in
+    /// that window reaches `note_statement_error`, and nothing used to clear
+    /// what it set: `ended` runs only from `end_tran`, which returns early when
+    /// nothing is open. The next transaction was then born aborted, and
+    /// committing it rolled back statements that had all succeeded.
+    #[test]
+    fn a_new_transaction_does_not_inherit_an_earlier_abort() {
+        let txn = TransactionState::default();
+        txn.set_autocommit(false);
+
+        // The window: manual-commit mode, nothing open, something fails.
+        txn.note_statement_error();
+        assert!(txn.aborted(), "the flag is set with no transaction open");
+
+        txn.begun();
+        assert!(
+            !txn.aborted(),
+            "a transaction that has just opened cannot already be aborted"
+        );
+    }
+
+    /// `end_tran` reads the flag only when a transaction is open, and clears it
+    /// on the path where none is. Together with `begun` that makes the flag
+    /// unobservable outside the life of a transaction.
+    #[test]
+    fn ending_nothing_clears_a_stale_abort() {
+        let txn = TransactionState::default();
+        txn.set_autocommit(false);
+        txn.note_statement_error();
+
+        // What `end_tran`'s early return does.
+        txn.begun();
+        assert!(!txn.aborted());
+    }
+
+    /// A real abort still survives to the commit that has to refuse. The fix
+    /// above must not have turned the flag off for the case it exists for.
+    #[test]
+    fn an_abort_inside_the_transaction_still_reaches_the_commit() {
+        let txn = TransactionState::default();
+        txn.set_autocommit(false);
+        txn.begun();
+
+        txn.note_statement_error();
+        assert!(
+            txn.aborted(),
+            "a statement failing inside the open transaction still aborts it"
+        );
+
+        txn.ended();
+        assert!(!txn.aborted(), "ending the transaction clears it");
+    }
+
+    /// Autocommit mode records nothing: each statement stands alone, so one
+    /// failure says nothing about the next.
+    #[test]
+    fn autocommit_mode_records_no_abort() {
+        let txn = TransactionState::default();
+        assert!(txn.autocommit(), "ODBC's default");
+        txn.note_statement_error();
+        assert!(!txn.aborted());
+    }
+
+    /// The whole sequence the offline tests above model, against a coordinator.
+    ///
+    /// A failure between `SQL_AUTOCOMMIT_OFF` and the first statement used to
+    /// poison the transaction that had not opened yet, so this commit rolled
+    /// back and reported `25S03` for statements that had all succeeded.
+    #[test]
+    #[ignore = "requires Trino; run in isolation: cargo test -- --ignored backend"]
+    fn a_failure_before_the_transaction_opens_does_not_doom_it() {
+        let params = ConnectParams::parse(LIVE).unwrap();
+        let conn = TrinoBackend::connect(&params).unwrap();
+        let cancel = TrinoBackend::cancel_token(&conn);
+
+        TrinoBackend::set_autocommit(&conn, false).expect("manual-commit mode is supported");
+        assert!(
+            !conn.in_transaction(),
+            "the mode alone opens nothing; the first statement does"
+        );
+
+        // The kind of failure `describe_param` and the catalog functions can
+        // produce: it reaches `statement_error`, and no transaction is open.
+        assert!(
+            query_all_rows(&conn, "SELECT * FROM no_such_catalog.s.t".to_string()).is_err(),
+            "an unresolvable catalog must fail"
+        );
+
+        execute::exec_direct(&conn, &cancel, "SELECT 1").expect("opens the transaction");
+        assert!(conn.in_transaction());
+        assert!(
+            !conn.txn.aborted(),
+            "the transaction opened after the failure and did not inherit it"
+        );
+
+        TrinoBackend::end_tran(&conn, true)
+            .expect("a transaction whose statements all succeeded must commit");
+    }
+
+    /// Switching to autocommit records the mode even when the commit it has to
+    /// make first fails, so the driver and the application do not disagree
+    /// about which mode the connection is in.
+    #[test]
+    #[ignore = "requires Trino; run in isolation: cargo test -- --ignored backend"]
+    fn switching_to_autocommit_records_the_mode_even_when_the_commit_fails() {
+        let params = ConnectParams::parse(LIVE).unwrap();
+        let conn = TrinoBackend::connect(&params).unwrap();
+        let cancel = TrinoBackend::cancel_token(&conn);
+
+        TrinoBackend::set_autocommit(&conn, false).expect("manual-commit mode is supported");
+        execute::exec_direct(&conn, &cancel, "SELECT 1").expect("opens the transaction");
+        assert!(
+            query_all_rows(&conn, "SELECT 1/0".to_string()).is_err(),
+            "division by zero must fail"
+        );
+        assert!(conn.txn.aborted());
+
+        // Trino refuses to commit an aborted transaction, so this reports the
+        // failure. The mode must still have moved: `end_tran` has already sent
+        // the rollback by the time it returns the error.
+        assert!(
+            TrinoBackend::set_autocommit(&conn, true).is_err(),
+            "committing an aborted transaction must be reported as the failure it is"
+        );
+        assert!(
+            conn.txn.autocommit(),
+            "the connection was left in manual-commit mode after being told the \
+             switch to autocommit failed; the next statement would then open a \
+             transaction the application never asked for"
+        );
+        assert!(
+            !conn.in_transaction(),
+            "the rollback end_tran sent freed the session"
+        );
     }
 
     /// Trino aborts the whole transaction on any statement error, so the

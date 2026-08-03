@@ -657,6 +657,45 @@ impl TryFrom<&ConnectParams> for TrinoConnectParams {
         )?;
         let certificate = params.get(PARAM_CERTIFICATE).map(str::to_string);
         let client_certificate = params.get(PARAM_CLIENT_CERTIFICATE).map(str::to_string);
+        // Both certificate paths are inert over plain HTTP: `connect` applies
+        // the TLS group only when the transport is secure, so neither file is
+        // opened and an unreadable or wrong-CA path goes unreported. Set
+        // alongside `Protocol=http` they are a request the driver cannot
+        // honour, and one whose silent version is dangerous: an operator who
+        // wrote `Certificate=<pem>` believes the coordinator is being verified
+        // against it, and an operator who wrote `ClientCertificate=<pem>`
+        // believes they are presenting that identity.
+        //
+        // Rejected rather than warned, matching `ProxyUser` without `Proxy`,
+        // `ExternalAuthentication` without https, and a mistyped `TimeZone`; a
+        // `tracing::warn!` is not a channel an application sees.
+        //
+        // `TlsVerify` and `SSLVerification` are deliberately *not* rejected
+        // here. They are equally inert, but harmlessly so: http is unverified
+        // whatever they say, so neither can create a false belief the protocol
+        // has not already created. They are also written unconditionally by
+        // `packaging/windows/configure-dsn.ps1`, whose Enum fields always carry
+        // their default, so every dialog-written DSN names one and rejecting it
+        // would refuse plaintext data sources the dialog itself produces.
+        if !secure {
+            let named: Vec<&str> = [
+                (PARAM_CERTIFICATE, certificate.is_some()),
+                (PARAM_CLIENT_CERTIFICATE, client_certificate.is_some()),
+            ]
+            .into_iter()
+            .filter_map(|(key, present)| present.then_some(key))
+            .collect();
+            if !named.is_empty() {
+                return Err(TrinoError::General {
+                    message: format!(
+                        "{} cannot be combined with {PARAM_PROTOCOL}=http: there is no TLS \
+                         session for it to apply to, so it would be read from nowhere and \
+                         verify nothing. Remove it, or set {PARAM_PROTOCOL}=https",
+                        named.join(" and ")
+                    ),
+                });
+            }
+        }
         // rustls only permits skipping hostname verification when the trust
         // store is supplied explicitly, which excludes the platform's own
         // roots, so `CaOnly` without a root certificate would trust nothing
@@ -763,11 +802,16 @@ impl TryFrom<&ConnectParams> for TrinoConnectParams {
             },
         };
 
-        // Rejected rather than defaulted, unlike `QueryTimeout` below, which
-        // warns and carries on for compatibility. Telling the operator the
-        // value never took effect is the better answer: a retry budget
-        // silently reverting to the client's default is invisible until a
-        // flaky network makes it matter.
+        // Rejected rather than defaulted, as every numeric key here is.
+        // Telling the operator the value never took effect is the better
+        // answer: a retry budget silently reverting to the client's default is
+        // invisible until a flaky network makes it matter.
+        //
+        // `0` differs between the three. It is refused here and for
+        // `ExternalAuthenticationTimeout`, where "never send the request" and
+        // "time out before the browser opens" are not budgets an application
+        // can have meant, and accepted for `QueryTimeout`, where the spec gives
+        // it the meaning "no timeout".
         let max_attempts = match params.get(PARAM_MAX_ATTEMPTS) {
             None => None,
             Some(v) => match v.parse::<usize>() {
@@ -784,19 +828,38 @@ impl TryFrom<&ConnectParams> for TrinoConnectParams {
                 Ok(n) => Some(n),
             },
         };
-        let query_timeout_secs: u64 = match params
+        // Rejected rather than defaulted, like `MaxAttempts` and
+        // `ExternalAuthenticationTimeout` above. A timeout that silently
+        // reverted to 30s used to be reported only through `tracing::warn!`,
+        // which is not a channel an application sees: the value looked applied
+        // and was not, and the symptom arrived much later as a query that gave
+        // up at a time nobody configured.
+        //
+        // An empty value is unset rather than invalid, which is the one
+        // concession to the ODBC-standard `LoginTimeout` spelling: a DSN editor
+        // that writes every keyword it knows leaves an untouched field blank,
+        // and refusing to connect over that would be a regression for data
+        // sources this driver did not write. `Source` treats blank the same way.
+        //
+        // `0` stays legal and is not the default: it is the spec's "no
+        // timeout", turned into a duration by `backend::request_timeout`.
+        let timeout_key = params
             .get(PARAM_QUERY_TIMEOUT)
-            .or_else(|| params.get(PARAM_LOGIN_TIMEOUT))
-        {
+            .map(|v| (PARAM_QUERY_TIMEOUT, v))
+            .or_else(|| {
+                params
+                    .get(PARAM_LOGIN_TIMEOUT)
+                    .map(|v| (PARAM_LOGIN_TIMEOUT, v))
+            })
+            .filter(|(_, v)| !v.trim().is_empty());
+        let query_timeout_secs: u64 = match timeout_key {
             None => DEFAULT_QUERY_TIMEOUT_SECS,
-            Some(v) => v.parse().unwrap_or_else(|_| {
-                tracing::warn!(
-                    "invalid query timeout {:?}, using default {}s",
-                    v,
-                    DEFAULT_QUERY_TIMEOUT_SECS
-                );
-                DEFAULT_QUERY_TIMEOUT_SECS
-            }),
+            Some((key, v)) => v.trim().parse().map_err(|_| TrinoError::General {
+                message: format!(
+                    "invalid value for {key}: {v:?}, expected a whole number of \
+                     seconds ({key}=0 disables the timeout)"
+                ),
+            })?,
         };
 
         Ok(TrinoConnectParams {
@@ -1491,6 +1554,48 @@ mod tests {
     fn protocol_https_accepted() {
         let p = parse("Host=localhost;Port=8080;User=admin;Protocol=https");
         assert!(p.secure());
+    }
+
+    /// `connect` applies the TLS group only when the transport is secure, so a
+    /// certificate named alongside `Protocol=http` is never even read from
+    /// disk. Accepting it silently tells an operator their connection is
+    /// verified against that file when nothing verifies anything.
+    #[test]
+    fn a_certificate_is_refused_over_plain_http() {
+        let base = "Host=localhost;Port=8080;User=admin;Protocol=http";
+        for key in ["Certificate", "ClientCertificate"] {
+            let err = parse_err(&format!("{base};{key}=/tmp/root.pem"));
+            let message = err.to_string();
+            assert!(
+                message.contains(&key.to_lowercase()) && message.contains("protocol"),
+                "{key} over http must be refused by a message naming it and the \
+                 protocol key: {message}"
+            );
+        }
+        // Both at once are named together rather than one at a time, so an
+        // operator fixes the connection string in one pass.
+        let err = parse_err(&format!(
+            "{base};Certificate=/tmp/root.pem;ClientCertificate=/tmp/client.pem"
+        ));
+        let message = err.to_string();
+        assert!(
+            message.contains("certificate") && message.contains("clientcertificate"),
+            "both keys must be named: {message}"
+        );
+    }
+
+    /// The verification mode is equally inert over http and equally harmless:
+    /// the protocol has already said the connection is unverified. It is also
+    /// written unconditionally by `configure-dsn.ps1`, whose Enum fields always
+    /// carry their default, so refusing it would refuse plaintext data sources
+    /// the driver's own dialog produces.
+    #[test]
+    fn the_verification_mode_is_tolerated_over_plain_http() {
+        let base = "Host=localhost;Port=8080;User=admin;Protocol=http";
+        for pair in ["TlsVerify=full", "TlsVerify=none", "SSLVerification=full"] {
+            let p = parse(&format!("{base};{pair}"));
+            assert!(!p.secure(), "{pair} must still parse over http");
+        }
     }
 
     #[test]

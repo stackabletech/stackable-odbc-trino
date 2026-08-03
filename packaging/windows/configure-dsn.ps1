@@ -555,6 +555,22 @@ function Test-Values {
             $problems += 'Verification "ca" requires a CA certificate.'
         }
     }
+    # Neither certificate is read at all over plain HTTP, and the driver refuses
+    # the combination rather than connecting unverified while a certificate path
+    # sits in the data source looking as though it applied. Caught here so the
+    # dialog says so while the fields are on screen, instead of at first connect.
+    #
+    # `tlsverify` is not checked: the driver tolerates it over http precisely
+    # because this dialog's Enum fields always write their default, so every
+    # data source it produces names one.
+    if ($Values.Contains('protocol') -and $Values['protocol'] -eq 'http') {
+        foreach ($pair in @(@('certificate', 'A CA certificate'),
+                            @('clientcertificate', 'A client certificate'))) {
+            if ($Values.Contains($pair[0]) -and $Values[$pair[0]]) {
+                $problems += "$($pair[1]) cannot be used with Transport ""http""; there is no TLS session for it to apply to."
+            }
+        }
+    }
     $problems
 }
 

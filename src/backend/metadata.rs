@@ -108,14 +108,36 @@ fn information_schema_ref(catalog: Option<&str>, table: &str) -> String {
 
 /// Run a catalog-scoped `information_schema` query, treating a missing catalog
 /// as an empty result set rather than an error.
+///
+/// Except inside a transaction. Trino carries the transaction id in a session
+/// header, so this query joins whatever the application has open, and a
+/// statement error aborts the whole transaction. Turning that into an empty
+/// result set would report success from `SQLTables` while the application's
+/// transaction had just been killed by a round trip it did not make: every
+/// later statement would fail, and `SQLEndTran(SQL_COMMIT)` would refuse, with
+/// nothing having been reported at the point it happened.
+///
+/// Outside a transaction the substitution costs nothing and is what the spec
+/// asks for: these functions filter, and a filter naming something absent
+/// selects nothing.
 fn query_information_schema(
     conn: &TrinoConnection,
     sql: String,
 ) -> Result<Vec<trino_rust_client::Row>, TrinoError> {
+    let in_transaction = conn.in_transaction();
     match query_all_rows(conn, sql) {
-        Err(e) if trino_error_code(&e) == Some(TRINO_CATALOG_NOT_FOUND) => {
+        Err(e) if trino_error_code(&e) == Some(TRINO_CATALOG_NOT_FOUND) && !in_transaction => {
             tracing::debug!("catalog not found; reporting an empty result set");
             Ok(Vec::new())
+        }
+        Err(e) if trino_error_code(&e) == Some(TRINO_CATALOG_NOT_FOUND) => {
+            tracing::warn!(
+                error = %e,
+                "the catalog does not exist, and the lookup ran inside an open \
+                 transaction, which Trino therefore aborted; reporting it rather \
+                 than substituting an empty result set"
+            );
+            Err(e)
         }
         other => other,
     }
