@@ -23,7 +23,7 @@ coverage in this stack; its parsing is unit-tested.
 |---|---|
 | `scripts/` | All the bash. `lib.sh` is sourced by the rest and owns the paths, the profile parsing and the readiness helpers. |
 | `stack/` | All the docker material: `compose.yaml`, the Trino config fragments, the Postgres init SQL. |
-| `suites/` | All the Python. `harness.py` is shared; every `test_*.py` is a suite. |
+| `suites/` | All the Python. `harness.py` is shared; every `test_*.py` is a suite; `registry.py` is the list of them, read by both runners. |
 | `perf/` | Profiling and stress tooling. `profile_stress.sh` runs `test_stress.py`'s BI-shaped queries with the driver's profiling output on, and `parse_profile.py` renders the log it writes as a per-query table. |
 | `windows/` | The Windows VM harness and its libvirt definitions. See [WINDOWS.md](windows/WINDOWS.md). |
 | `generated/` | Every produced artefact: certificates, secrets, the assembled Trino config, the ODBC ini files, `stack.env`. Gitignored, and safe to delete. |
@@ -62,11 +62,33 @@ the inline fallback when it is not. `test_transactions.py` writes to the
 | `--suite <substring>` | `run-tests.sh` | Run only the suites whose name contains the substring |
 | `--skip-build` | `run-tests.sh` | Skip the cargo build |
 | `--skip-delete` | `run-tests.sh` | Leave the stack running afterwards |
-| `--windows` | `run-tests.sh` | Also run the Windows VM suite |
+| `--windows` | `run-tests.sh` | Also run the suites on the Windows VM |
 
 `setup.sh` rejects any argument it does not recognise. `run-tests.sh` forwards
 the ones it does not recognise to `windows/windows_test.py`, so that script's
-flags can be passed straight through.
+flags can be passed straight through. `--suite` is forwarded too, so a filtered
+run filters both platforms rather than silently meaning "on Linux only".
+
+## The suite registry
+
+`suites/registry.py` is the one list of suites. `scripts/run-tests.sh` reads it
+through `registry.py --bash`, and `windows/windows_test.py` imports it. Adding a
+suite means adding an entry there, and nothing else.
+
+Each entry states the suite's script, the profile it needs, how it takes its
+configuration, whether it needs `pyodbc`, and whether it runs on Windows. A
+suite that does not run on Windows carries the reason in its own entry, and the
+runner prints it as a `SKIP`, so an unrun suite is never printable as a passing
+one. `test_harness.py` checks what can be checked without a stack: that every
+script and deployed file exists, that names are unique, and that a suite excluded
+from Windows gives a reason.
+
+What the registry deliberately does not hold is the command. The two runners
+invoke Python differently, and the four-configuration connect matrix is not the
+same on both: Linux crosses DSN names out of the generated `odbc.ini`, while
+Windows crosses a registry-registered DSN and connects by address for the
+unverified cases so that no SNI is sent. Those are two matrices that happen to
+share four labels.
 
 ## Certificates
 

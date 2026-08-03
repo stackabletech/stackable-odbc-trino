@@ -14,6 +14,7 @@ from contextlib import redirect_stdout
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+import registry  # noqa: E402
 from harness import Results, Stack  # noqa: E402
 
 
@@ -165,6 +166,103 @@ class TestStack(unittest.TestCase):
         with self.assertRaises(SystemExit) as caught:
             Stack.load("/nonexistent/stack.env")
         self.assertIn("setup.sh", str(caught.exception))
+
+    def test_driver_ref_is_the_path_when_no_name_is_given(self):
+        self.assertEqual(self.stack.driver_ref, "/tmp/libstackable_odbc_trino.so")
+
+    def test_driver_name_names_the_driver_without_moving_the_path(self):
+        """The Windows split: the Driver Manager loads by registered name,
+        while the ctypes suites still need the DLL on disk."""
+        with open(self.path, "a") as f:
+            f.write("DRIVER_NAME=stackable_odbc_trino\n")
+        stack = Stack.load(self.path)
+        self.assertEqual(stack.driver_ref, "stackable_odbc_trino")
+        self.assertEqual(stack.get("DRIVER_PATH"), "/tmp/libstackable_odbc_trino.so")
+        self.assertIn("Driver=stackable_odbc_trino;", stack.conn_str())
+
+
+class TestRegistry(unittest.TestCase):
+    """The registry is read by two runners, and a mistake in it surfaces on
+    whichever one is run next rather than here. These are the checks that do
+    not need a stack, a VM or a driver."""
+
+    def test_every_suite_script_exists(self):
+        here = os.path.dirname(os.path.abspath(__file__))
+        for suite in registry.SUITES:
+            self.assertTrue(
+                os.path.exists(os.path.join(here, suite.script)),
+                f"{suite.name}: {suite.script} does not exist",
+            )
+
+    def test_every_deploy_path_exists_and_is_repo_relative(self):
+        """A `deploy` entry is resolved against the repository root, and a path
+        that does not exist is a Windows-only failure at deploy time."""
+        for suite in registry.SUITES:
+            for rel in suite.deploy:
+                self.assertFalse(os.path.isabs(rel), f"{suite.name}: {rel} is absolute")
+                self.assertTrue(
+                    os.path.exists(os.path.join(registry.PROJECT_DIR, rel)),
+                    f"{suite.name}: {rel} does not exist",
+                )
+
+    def test_every_argv_kind_is_one_the_runners_render(self):
+        for suite in registry.SUITES:
+            self.assertIn(
+                suite.argv, ("conn", "driver+conn", "driver", "none"), suite.name,
+            )
+
+    def test_suite_names_are_unique_and_carry_no_field_separator(self):
+        """The Linux runner passes entries through a `name|profile|command`
+        line, so a `|` in a name would split into the wrong fields."""
+        names = [s.name for s in registry.SUITES]
+        self.assertEqual(len(names), len(set(names)))
+        for name in names:
+            self.assertNotIn("|", name)
+
+    def test_a_suite_not_running_on_windows_gives_a_reason(self):
+        """`windows=False` would print an empty SKIP reason, which is exactly
+        the unrun-but-looks-fine case the harness exists to prevent."""
+        for suite in registry.SUITES:
+            if not suite.runs_on_windows:
+                self.assertTrue(
+                    suite.windows_skip_reason.strip(),
+                    f"{suite.name}: skipped on Windows with no reason",
+                )
+
+    def test_linux_entries_expand_the_matrix_and_quote_their_arguments(self):
+        stack = Stack.load(_TEMP_STACK_ENV[0])
+        entries = list(registry.linux_entries(stack))
+        names = [name for name, _, _ in entries]
+        self.assertEqual(
+            len([n for n in names if n.startswith("integration (")]),
+            len(registry.LINUX_CONFIGS),
+        )
+        # The connection string carries semicolons, which an unquoted command
+        # would let the shell read as statement separators.
+        conn = [c for n, _, c in entries if n == "sql surface"][0]
+        self.assertIn("'Driver=/tmp/libstackable_odbc_trino.so;", conn)
+
+    def test_a_suite_needing_a_profile_names_one_the_stack_can_have(self):
+        for suite in registry.SUITES:
+            if suite.profile:
+                self.assertIn(suite.profile, ("oauth", "spooling", "hive"), suite.name)
+
+
+# registry.linux_entries needs a Stack, and building one needs a file. The
+# TestStack fixture is per-test, so the registry tests get their own.
+_TEMP_STACK_ENV = []
+
+
+def setUpModule():
+    fd, path = tempfile.mkstemp(suffix=".env")
+    with os.fdopen(fd, "w") as f:
+        f.write(STACK_ENV)
+    _TEMP_STACK_ENV.append(path)
+
+
+def tearDownModule():
+    for path in _TEMP_STACK_ENV:
+        os.unlink(path)
 
 
 if __name__ == "__main__":

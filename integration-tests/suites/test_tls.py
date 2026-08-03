@@ -61,7 +61,10 @@ from harness import Results, Stack  # noqa: E402
 
 R = Results("tls")
 
-# A name the coordinator's certificate carries, so Jetty selects it on SNI.
+# A name the coordinator's certificate carries, so Jetty selects it on SNI. The
+# stack states which one: `localhost` on the host, and the name mapped into the
+# VM's hosts file when this runs on Windows. An address cannot stand in, because
+# TLS sends no SNI for an IP literal.
 NAMED = "localhost"
 
 
@@ -93,7 +96,10 @@ def expect_refused(stack, label, why, **overrides):
 
 
 def main():
+    global NAMED
+
     stack = Stack.load()
+    NAMED = stack.get("TRINO_HOST", NAMED)
     ca = stack.get("CA_CERT")
     client_pem = stack.get("CLIENT_PEM")
     # A leaf signed by the same CA, so it is not itself a trust anchor and

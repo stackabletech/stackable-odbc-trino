@@ -1,19 +1,29 @@
 #!/usr/bin/env python3
 """
-Run Trino integration tests on a Windows VM over WinRM.
+Run the Trino integration suites on a Windows VM over WinRM.
 
-Builds the ODBC driver DLL, discovers the VM, deploys everything, registers
-the driver, and runs test_integration.py through the Windows Driver Manager.
-Trino must be running on the host (via integration-tests/setup.sh) before running
-this script.
+Builds the ODBC driver DLL, discovers the VM, deploys the suites, registers
+the driver, and runs everything `suites/registry.py` marks as running on
+Windows, through the Windows Driver Manager. Trino must be running on the host
+(via integration-tests/setup.sh) before running this script.
+
+Which suites those are is not decided here. `suites/registry.py` is the one
+list, shared with `scripts/run-tests.sh`, and a suite that does not run here
+carries its reason in that file. What *is* decided here is how a suite is
+invoked on the VM, and the four connect configurations, which are not the same
+four the Linux runner uses: these cross a registry-registered DSN with a
+DSN-less string, and connect by address for the unverified cases so that no SNI
+is sent.
 
 Usage:
     uv run --with pywinrm python3 integration-tests/windows/windows_test.py
     uv run --with pywinrm python3 integration-tests/windows/windows_test.py --skip-build
     uv run --with pywinrm python3 integration-tests/windows/windows_test.py --host 192.168.197.138
+    uv run --with pywinrm python3 integration-tests/windows/windows_test.py --suite tls
 
 Requires a running Trino on the host, the Windows VM, and `pip install pywinrm`.
-Needs no compose profile: the suites it deploys run against the base stack.
+A suite needing a compose profile is skipped unless the host stack was set up
+with it.
 """
 
 import argparse
@@ -32,18 +42,32 @@ TEST_DIR = SCRIPT_DIR.parent                            # integration-tests
 PROJECT_DIR = TEST_DIR.parent
 OPENSSL_CNF = SCRIPT_DIR / "openssl_legacy.cnf"
 
+sys.path.insert(0, str(TEST_DIR / "suites"))
+
+from harness import Stack  # noqa: E402
+from registry import SUITES, suite_argv  # noqa: E402
+
+# The VM mirrors the repository layout under one directory, rather than holding
+# a flat pile of files. The suites address their neighbours by relative path:
+# `test_folding_contract.py` reads `../../connector/StackableTrinoODBC.pq`, and
+# `harness.Stack` defaults to `../generated/stack.env`. Mirroring makes all of
+# that resolve on the VM exactly as it does on the host, so no suite needs a
+# Windows branch to find its own inputs.
 REMOTE_DIR = r"C:\odbc_test_trino"
+REMOTE_SUITES = rf"{REMOTE_DIR}\integration-tests\suites"
+REMOTE_GENERATED = rf"{REMOTE_DIR}\integration-tests\generated"
+REMOTE_CERTS = rf"{REMOTE_GENERATED}\certs"
+REMOTE_CA = rf"{REMOTE_CERTS}\ca.crt"
+# The DLL stays at the root rather than under a mirrored `packaging/windows/`,
+# because `configure-dsn.ps1` has to sit beside it: that is where the driver's
+# ConfigDSN looks for the script. Their adjacency is a requirement, not a
+# layout choice.
 REMOTE_DLL = rf"{REMOTE_DIR}\stackable_odbc_trino.dll"
-REMOTE_TEST = rf"{REMOTE_DIR}\test_integration.py"
-# test_integration.py imports the shared harness, so it has to travel too.
-REMOTE_HARNESS = rf"{REMOTE_DIR}\harness.py"
-# The test CA, so the VM can verify the coordinator rather than only skip it.
-REMOTE_CA = rf"{REMOTE_DIR}\ca.crt"
-# The driver's ConfigDSN runs this to display its setup dialog, and looks for it
-# beside the DLL. Deployed even though the automated configurations never open a
-# dialog: without it, the ODBC Administrator's Add... button fails on the VM,
-# and that is the one thing the harness could not otherwise be used to check.
-REMOTE_DSN_DIALOG = rf"{REMOTE_DIR}\configure-dsn.ps1"
+REMOTE_LOG = rf"{REMOTE_DIR}\stackable_odbc_trino.log"
+
+# Written on the host, served to the VM, and kept for inspection: a failing
+# suite that read the wrong host or certificate is diagnosed from this file.
+HOST_VM_STACK_ENV = TEST_DIR / "generated" / "windows-stack.env"
 
 DRIVER_NAME = "stackable_odbc_trino"
 DSN_NAME = "test_trino"
@@ -77,7 +101,9 @@ def main():
         build_dll(args.target)
 
     dll_path = resolve_dll_path(args.target)
-    test_path = TEST_DIR / "suites" / "test_integration.py"
+    host_stack = Stack.load()
+    trino_host = args.trino_host or args.gateway
+    vm_stack = write_vm_stack_env(host_stack)
 
     host = args.host or discover_vm_ip(args.vm_network)
 
@@ -101,85 +127,94 @@ def main():
     # Wait for VM setup to complete (Python, pyodbc installed).
     wait_for_setup(session)
 
-    # Create remote directory
-    session.run_ps(rf"New-Item -ItemType Directory -Force -Path {REMOTE_DIR} | Out-Null")
-
-    # Serve files via HTTP and have the VM download them.
-    print("=== Deploying files via HTTP ===")
-    harness_path = TEST_DIR / "suites" / "harness.py"
-    ca_path = TEST_DIR / "generated" / "certs" / "ca.crt"
-    dialog_path = PROJECT_DIR / "packaging" / "windows" / "configure-dsn.ps1"
-    for required in (harness_path, ca_path):
-        if not required.exists():
-            print(f"ERROR: {required} is missing; run ./integration-tests/setup.sh",
-                  file=sys.stderr)
-            sys.exit(1)
-    files_to_serve = {
-        dll_path.name: dll_path,
-        "test_integration.py": test_path,
-        "harness.py": harness_path,
-        "ca.crt": ca_path,
-        "configure-dsn.ps1": dialog_path,
-    }
-    with http_file_server(files_to_serve) as port:
-        base_url = f"http://{args.gateway}:{port}"
-        download_ps = (
-            f'$ProgressPreference = "SilentlyContinue"; '
-            f'Invoke-WebRequest -Uri "{base_url}/{dll_path.name}" '
-            f'-OutFile "{REMOTE_DLL}"; '
-            f'Invoke-WebRequest -Uri "{base_url}/test_integration.py" '
-            f'-OutFile "{REMOTE_TEST}"; '
-            f'Invoke-WebRequest -Uri "{base_url}/harness.py" '
-            f'-OutFile "{REMOTE_HARNESS}"; '
-            f'Invoke-WebRequest -Uri "{base_url}/ca.crt" '
-            f'-OutFile "{REMOTE_CA}"; '
-            f'Invoke-WebRequest -Uri "{base_url}/configure-dsn.ps1" '
-            f'-OutFile "{REMOTE_DSN_DIALOG}"'
-        )
-        r = session.run_ps(download_ps)
-        if r.status_code != 0:
-            stderr = r.std_err.decode()
-            print(f"ERROR: file download failed:\n{stderr}", file=sys.stderr)
-            sys.exit(1)
-    print(f"  DLL: {dll_path.stat().st_size / 1024:.0f} KB")
-    print(f"  test_integration.py: {test_path.stat().st_size / 1024:.0f} KB")
+    deploy(session, args.gateway, dll_path)
 
     print("=== Registering ODBC driver ===")
     register_driver(session)
 
-    trino_host = args.trino_host or args.gateway
     map_trino_hostname(session, trino_host)
 
-    # Four configurations, matching the Linux run: DSN and DSN-less crossed
-    # with verified and unverified TLS. The verified ones connect by
-    # TRINO_VM_HOSTNAME so that SNI is sent; the unverified ones use the
-    # address directly, which is what an operator who has not set up a name
-    # would do.
-    verified_extra = f"Certificate={REMOTE_CA}"
+    run_suites(session, args, vm_stack, trino_host)
+
+
+def run_suites(session, args, vm_stack, trino_host):
+    """Run every suite the registry marks as running on Windows.
+
+    A failure records rather than aborts. Aborting on the first one hid every
+    later suite and configuration entirely, so a single flaky case cost the
+    whole run's information.
+    """
+    # The DSN-less verified string every non-matrix suite runs against, the
+    # counterpart of the Linux runner's CONN_HTTPS. Built from the VM's own
+    # stack.env, so it cannot disagree with what the suites reading that file
+    # will connect with.
+    conn_verified = vm_stack.conn_str()
+    driver = vm_stack.get("DRIVER_PATH")
+    profiles = vm_stack.profiles
+
+    failed, skipped = [], []
+
+    for suite in SUITES:
+        if args.suite and args.suite not in suite.name:
+            continue
+        if not suite.runs_on_windows:
+            print(f"SKIP  {suite.name}: {suite.windows_skip_reason}")
+            skipped.append(suite.name)
+            continue
+        if suite.profile and suite.profile not in profiles:
+            print(f"SKIP  {suite.name}: profile '{suite.profile}' is not active "
+                  f"(setup.sh --profile {suite.profile})")
+            skipped.append(suite.name)
+            continue
+
+        if suite.matrix:
+            failed += run_matrix(session, suite, vm_stack, driver, trino_host)
+        else:
+            print(f"=== Running {suite.name} ===")
+            argv = suite_argv(suite, driver, conn_verified)
+            if run_remote(session, suite.script, argv) != 0:
+                failed.append(suite.name)
+
+    print("")
+    print("=== Windows summary ===")
+    if skipped:
+        for name in skipped:
+            print(f"  SKIP  {name}")
+    if failed:
+        for name in failed:
+            print(f"  FAIL  {name}")
+        print(f"{len(failed)} suite run(s) failed")
+        sys.exit(1)
+    print("all selected suites passed")
+
+
+def run_matrix(session, suite, vm_stack, driver, trino_host):
+    """Run one suite over the four Windows connect configurations.
+
+    DSN and DSN-less crossed with verified and unverified TLS. The verified
+    ones connect by TRINO_VM_HOSTNAME so that SNI is sent; the unverified ones
+    use the address directly, which is what an operator who has not set up a
+    name would do, and which no verification could accept.
+
+    The DSN configurations re-register `DSN_NAME` in between, so the order here
+    is load bearing and this stays a sequence rather than a table.
+    """
     failed = []
 
     def run_config(label, conn_str):
-        """Run one configuration, recording rather than aborting on failure.
+        name = f"{suite.name} ({label})"
+        print(f"=== Running {name} ===")
+        if run_remote(session, suite.script, suite_argv(suite, driver, conn_str)) != 0:
+            failed.append(name)
 
-        Aborting on the first failure hid the other three configurations
-        entirely, so a single flaky case cost the whole run's information.
-        """
-        print(f"=== Running integration tests ({label}) ===")
-        if run_tests(session, conn_str) != 0:
-            failed.append(label)
-
-    run_config("DSN-less, verified TLS", (
-        f"Driver={DRIVER_NAME};Host={TRINO_VM_HOSTNAME};Port=8443;"
-        f"User=admin;Password=admin;Protocol=https;Catalog=tpcds;{verified_extra}"
-    ))
-    run_config("DSN-less, TlsVerify=false", (
-        f"Driver={DRIVER_NAME};Host={trino_host};Port=8443;"
-        f"User=admin;Password=admin;Protocol=https;TlsVerify=false;Catalog=tpcds"
+    run_config("DSN-less, verified TLS", vm_stack.conn_str())
+    run_config("DSN-less, TlsVerify=false", vm_stack.conn_str(
+        Host=trino_host, TlsVerify="false", Certificate=None,
     ))
 
     print("=== Registering DSN (verified TLS) ===")
     register_dsn(session, TRINO_VM_HOSTNAME, protocol="https", port=8443,
-                 extra=verified_extra)
+                 extra=f"Certificate={REMOTE_CA}")
     run_config("DSN, verified TLS", f"DSN={DSN_NAME}")
 
     print("=== Registering DSN (TlsVerify=false) ===")
@@ -187,14 +222,114 @@ def main():
                  extra="TlsVerify=false")
     run_config("DSN, TlsVerify=false", f"DSN={DSN_NAME}")
 
-    print("")
-    print("=== Windows summary ===")
-    if failed:
-        for label in failed:
-            print(f"  FAIL  {label}")
-        print(f"{len(failed)} of 4 configurations failed")
+    return failed
+
+
+def write_vm_stack_env(host_stack) -> Stack:
+    """Write the VM's `stack.env` and return it parsed.
+
+    The suites that read `stack.env` rather than taking a connection string
+    (tls, spooling, transactions) were unrunnable on Windows for want of this
+    file alone: the host's names the driver's `.so`, a `localhost` the VM is
+    not, and certificate paths under the user's home directory.
+
+    Everything that is a property of the *stack* is copied from the host's
+    file, so a credential or a port stays stated in one place. Only what the VM
+    sees differently is rewritten.
+    """
+    values = {
+        # Two keys where the host needs one. The Windows Driver Manager loads a
+        # driver by its registered name, while the ctypes suites want the DLL's
+        # path; on Linux one string serves both. See `Stack.driver_ref`.
+        "DRIVER_NAME": DRIVER_NAME,
+        "DRIVER_PATH": REMOTE_DLL,
+        # The name mapped into the VM's hosts file, not the host's `localhost`.
+        # It is also a name the coordinator's certificate carries, so TLS sends
+        # an SNI Jetty can match.
+        "TRINO_HOST": TRINO_VM_HOSTNAME,
+        "TRINO_HTTPS_PORT": host_stack.get("TRINO_HTTPS_PORT"),
+        "TRINO_USER": host_stack.get("TRINO_USER"),
+        "TRINO_PASSWORD": host_stack.get("TRINO_PASSWORD"),
+        "TRINO_CATALOG": host_stack.get("TRINO_CATALOG"),
+        "CA_CERT": rf"{REMOTE_CERTS}\ca.crt",
+        "CLIENT_PEM": rf"{REMOTE_CERTS}\client.pem",
+        # The profiles are the host stack's, because that is the coordinator the
+        # VM connects to. A suite gated on one is gated on the same one here.
+        "PROFILES": ",".join(host_stack.profiles),
+    }
+    HOST_VM_STACK_ENV.parent.mkdir(parents=True, exist_ok=True)
+    with open(HOST_VM_STACK_ENV, "w", encoding="utf-8") as f:
+        f.write("# generated by windows/windows_test.py, do not edit\n")
+        f.write("# the VM's view of the stack; the host's is generated/stack.env\n")
+        for key, value in values.items():
+            f.write(f"{key}={value}\n")
+    return Stack.load(str(HOST_VM_STACK_ENV))
+
+
+def deploy(session, gateway: str, dll_path: Path):
+    """Serve the suites over HTTP and have the VM download them.
+
+    The file map is keyed by repository-relative path and the VM recreates that
+    layout, which is what lets a suite find the connector source or the
+    certificates by the same relative path it uses on the host.
+    """
+    print("=== Deploying files via HTTP ===")
+    files = {
+        "stackable_odbc_trino.dll": dll_path,
+        # Deployed even though the automated configurations never open a
+        # dialog: without it the ODBC Administrator's Add... button fails on
+        # the VM, and that is the one thing the harness could not otherwise be
+        # used to check.
+        "configure-dsn.ps1": PROJECT_DIR / "packaging" / "windows" / "configure-dsn.ps1",
+        # The test CA, so the VM can verify the coordinator rather than only
+        # skip it. Needed by every configuration, not by any one suite.
+        "integration-tests/generated/certs/ca.crt":
+            TEST_DIR / "generated" / "certs" / "ca.crt",
+        # The VM's own view of the stack, which is what the suites reading
+        # stack.env rather than taking a connection string work from.
+        "integration-tests/generated/stack.env": HOST_VM_STACK_ENV,
+    }
+    # The whole suites directory, not the scripts the registry selects. The
+    # suites import shared modules from beside themselves (`harness`, and
+    # `odbc_abi` for the two ctypes suites), and deploying a computed list meant
+    # a new shared module was a deployment failure on the VM and nowhere else.
+    # They are a few hundred kilobytes in total, so nothing is bought by
+    # deploying fewer of them.
+    for script in sorted((TEST_DIR / "suites").glob("*.py")):
+        files[f"integration-tests/suites/{script.name}"] = script
+    for suite in SUITES:
+        if suite.runs_on_windows:
+            for rel in suite.deploy:
+                files[rel] = PROJECT_DIR / rel
+
+    missing = [str(p) for p in files.values() if not p.exists()]
+    if missing:
+        print("ERROR: missing files; run ./integration-tests/setup.sh\n  "
+              + "\n  ".join(missing), file=sys.stderr)
         sys.exit(1)
-    print("all 4 configurations passed")
+
+    with http_file_server(files) as port:
+        base_url = f"http://{gateway}:{port}"
+        # A PowerShell loop rather than one Invoke-WebRequest per file: the
+        # command line is sent over WinRM, and a couple of dozen of them
+        # spelled out reliably exceeded what it would carry.
+        names = ", ".join(f"'{name}'" for name in files)
+        # .Replace rather than -replace, so that neither side is a regex. A
+        # path separator is not a pattern, and -replace would make the
+        # substitution depend on .NET replacement-pattern rules.
+        r = session.run_ps(
+            f'$ProgressPreference = "SilentlyContinue"; '
+            f'foreach ($f in @({names})) {{ '
+            f'  $dest = Join-Path "{REMOTE_DIR}" $f.Replace("/", "\\"); '
+            f'  New-Item -ItemType Directory -Force -Path (Split-Path $dest) | Out-Null; '
+            f'  Invoke-WebRequest -Uri "{base_url}/$f" -OutFile $dest; '
+            f'}}'
+        )
+        if r.status_code != 0:
+            print(f"ERROR: file download failed:\n{r.std_err.decode()}", file=sys.stderr)
+            sys.exit(1)
+
+    print(f"  {len(files)} files, DLL {dll_path.stat().st_size / 1024:.0f} KB")
 
 
 def map_trino_hostname(session, gateway: str):
@@ -267,6 +402,11 @@ def parse_args():
         "--trino-host",
         default=None,
         help="Trino host as seen from the VM (default: same as --gateway)",
+    )
+    p.add_argument(
+        "--suite",
+        default="",
+        help="only run suites whose name contains this string",
     )
     return p.parse_args()
 
@@ -397,13 +537,25 @@ def wait_for_setup(session):
     sys.exit(1)
 
 
-def run_tests(session, conn_str: str) -> int:
-    """Run test_integration.py on the VM and return the exit code."""
+def ps_quote(value: str) -> str:
+    """Quote a value as a PowerShell single-quoted string.
+
+    Connection strings carry semicolons and backslashes, both of which a
+    double-quoted PowerShell string would interpret. Single quotes are literal
+    throughout, and a literal single quote is written by doubling it.
+    """
+    escaped = value.replace("'", "''")
+    return f"'{escaped}'"
+
+
+def run_remote(session, script: str, argv) -> int:
+    """Run one suite on the VM and return its exit code."""
+    args = " ".join(ps_quote(a) for a in argv)
     # Enable driver-side debug logging and DM tracing.
     r = session.run_ps(
         f'$env:ODBC_LOG_LEVEL = "debug"; '
-        f'$env:ODBC_LOG_FILE = "{REMOTE_DIR}\\stackable_odbc_trino.log"; '
-        f'& {REMOTE_PYTHON} {REMOTE_TEST} "{conn_str}"'
+        f'$env:ODBC_LOG_FILE = "{REMOTE_LOG}"; '
+        f'& {REMOTE_PYTHON} "{REMOTE_SUITES}\\{script}" {args}'
     )
     stdout = r.std_out.decode("utf-8", errors="replace")
     print(stdout, end="")
@@ -413,18 +565,15 @@ def run_tests(session, conn_str: str) -> int:
         if "CLIXML" not in stderr:
             print(stderr, end="", file=sys.stderr)
 
-    # Retrieve driver trace log.
-    for logfile in ["stackable_odbc_trino.log"]:
-        logpath = rf"{REMOTE_DIR}\{logfile}"
-        lr = session.run_ps(
-            f'if (Test-Path "{logpath}") {{ Get-Content "{logpath}" -Tail 200 }}'
-        )
-        log_content = lr.std_out.decode("utf-8", errors="replace").strip()
-        if log_content:
-            print(f"\n=== {logfile} (last 200 lines) ===")
-            print(log_content)
-        # Clear for next run.
-        session.run_ps(f'Remove-Item -Force -ErrorAction SilentlyContinue "{logpath}"')
+    # Retrieve the driver trace log, then clear it for the next run.
+    lr = session.run_ps(
+        f'if (Test-Path "{REMOTE_LOG}") {{ Get-Content "{REMOTE_LOG}" -Tail 200 }}'
+    )
+    log_content = lr.std_out.decode("utf-8", errors="replace").strip()
+    if log_content:
+        print("\n=== stackable_odbc_trino.log (last 200 lines) ===")
+        print(log_content)
+    session.run_ps(f'Remove-Item -Force -ErrorAction SilentlyContinue "{REMOTE_LOG}"')
 
     return r.status_code
 

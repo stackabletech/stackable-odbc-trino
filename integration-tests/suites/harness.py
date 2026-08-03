@@ -125,11 +125,23 @@ class Stack:
     def has_profile(self, name):
         return name in self.profiles
 
+    @property
+    def driver_ref(self):
+        """What `Driver=` in a connection string names.
+
+        On Linux a Driver Manager accepts the library path, so `DRIVER_PATH`
+        serves both this and the ctypes suites that dlopen the file. On Windows
+        the two are different strings: the Driver Manager wants the name the
+        driver is registered under, and only the ctypes suites want the DLL's
+        path. `DRIVER_NAME` carries the former where they differ.
+        """
+        return self.get("DRIVER_NAME") or self.get("DRIVER_PATH")
+
     def conn_str(self, **overrides):
         """A DSN-less connection string. An override of `None` removes the key,
         which is how a suite tests, say, connecting with no `Password`."""
         params = {
-            "Driver": self.get("DRIVER_PATH"),
+            "Driver": self.driver_ref,
             "Host": self.get("TRINO_HOST"),
             "Port": self.get("TRINO_HTTPS_PORT"),
             "User": self.get("TRINO_USER"),

@@ -70,55 +70,22 @@ if [[ "$SKIP_BUILD" == false ]]; then
     (cd "$PROJECT_DIR" && cargo build)
 fi
 
-# --- Linux: pyodbc integration tests (4 configs, matching Windows) ---
-# Built from stack.env rather than written out here, so a port, a credential
-# or a certificate path is stated in exactly one place. The four configurations
-# are DSN and DSN-less crossed with verified and unverified TLS. The
-# HTTP/HTTPS axis went with the plaintext listener.
-stack_conn() {
-    python3 - "$@" <<'PYEOF'
-import os, sys
-sys.path.insert(0, os.path.join(os.environ["TEST_DIR"], "suites"))
-from harness import Stack
-overrides = dict(a.split("=", 1) for a in sys.argv[1:])
-for k, v in overrides.items():
-    if v == "":
-        overrides[k] = None
-print(Stack.load(os.environ["STACK_ENV"]).conn_str(**overrides))
-PYEOF
-}
-export TEST_DIR STACK_ENV
-
-CONN_HTTPS="$(stack_conn)"
-CONN_HTTPS_NOVERIFY="$(stack_conn TlsVerify=false Certificate=)"
-
 # --- the suite registry ---
-# Each entry is  name|required profile|command. An empty profile means the core
+# Read from suites/registry.py, which windows/windows_test.py reads too, so a
+# suite is added in one place rather than in one runner and not the other.
+#
+# Each line is  name|required profile|command. An empty profile means the core
 # stack. A suite whose profile is not active is SKIPPED and says which profile
 # would enable it: an unrun suite must never be printable as a passing one.
-SUITES=(
-  "integration (DSN-less, verified TLS)||uv run --with pyodbc python3 $TEST_DIR/suites/test_integration.py '$CONN_HTTPS'"
-  "integration (DSN-less, TlsVerify=false)||uv run --with pyodbc python3 $TEST_DIR/suites/test_integration.py '$CONN_HTTPS_NOVERIFY'"
-  "integration (DSN, verified TLS)||uv run --with pyodbc python3 $TEST_DIR/suites/test_integration.py 'DSN=trino_https'"
-  "integration (DSN, TlsVerify=false)||uv run --with pyodbc python3 $TEST_DIR/suites/test_integration.py 'DSN=trino_https_verify_false'"
-  "harness unit tests||python3 $TEST_DIR/suites/test_harness.py"
-  "sql surface||uv run --with pyodbc python3 $TEST_DIR/suites/test_sql_surface.py '$CONN_HTTPS'"
-  "folding contract||uv run --with pyodbc python3 $TEST_DIR/suites/test_folding_contract.py '$CONN_HTTPS'"
-  "tls||uv run --with pyodbc python3 $TEST_DIR/suites/test_tls.py"
-  "raw C ABI||python3 $TEST_DIR/suites/test_c_abi.py '$DRIVER_PATH' '$CONN_HTTPS'"
-  "type matrix||python3 $TEST_DIR/suites/test_type_matrix.py '$DRIVER_PATH' '$CONN_HTTPS'"
-  # No required profile: with `spooling` active it drives the spooled protocol,
-  # and without it asserts the fallback a coordinator with no spooling manager
-  # produces. Both are real assertions, so neither stack state is a blind spot.
-  "spooling||uv run --with pyodbc python3 $TEST_DIR/suites/test_spooling.py"
-  # No required profile either: the hive catalog it writes to is in the base
-  # stack, because a file metastore costs no container.
-  "transactions||uv run --with pyodbc python3 $TEST_DIR/suites/test_transactions.py"
-  # ctypes rather than pyodbc, and no connection string: pyodbc passes
-  # SQL_DRIVER_NOPROMPT unconditionally, which core reads as forbidding the
-  # prompt an interactive login needs, so this suite builds its own.
-  "oauth|oauth|python3 $TEST_DIR/suites/test_oauth.py '$DRIVER_PATH'"
-)
+# Connection strings are built from stack.env, so a port, a credential or a
+# certificate path is stated in exactly one place.
+export TEST_DIR STACK_ENV
+
+mapfile -t SUITES < <(python3 "$TEST_DIR/suites/registry.py" --bash)
+if [[ ${#SUITES[@]} -eq 0 ]]; then
+    echo "ERROR: suites/registry.py listed no suites" >&2
+    exit 1
+fi
 
 failed_suites=()
 skipped_suites=()
@@ -164,6 +131,11 @@ fi
 # unreachable behind a Linux failure.
 if [[ "$RUN_WINDOWS" == true ]]; then
     echo "=== Running windows (VM) ==="
+    # The filter applies to both runners: they read one registry, so --suite
+    # naming a suite must not silently mean "on Linux only".
+    if [[ -n "$SUITE_FILTER" ]]; then
+        WINDOWS_EXTRA_ARGS+=(--suite "$SUITE_FILTER")
+    fi
     if ! uv run --with pywinrm python3 "$TEST_DIR/windows/windows_test.py" "${WINDOWS_EXTRA_ARGS[@]+"${WINDOWS_EXTRA_ARGS[@]}"}"; then
         failed_suites+=("windows (VM)")
     fi

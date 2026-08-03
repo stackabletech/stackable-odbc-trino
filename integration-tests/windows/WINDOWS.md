@@ -1,9 +1,17 @@
 # Windows testing
 
-`suites/test_integration.py`, driven through the Windows ODBC Driver Manager
-over WinRM, plus a GUI check on the driver's setup dialog. The target is a
+The suites in `suites/`, driven through the Windows ODBC Driver Manager over
+WinRM, plus a GUI check on the driver's setup dialog. The target is a
 disposable Windows Server VM on a host-only libvirt network, created by the
 Ansible playbook in `vm/`.
+
+Which suites run is decided by [`suites/registry.py`](../suites/registry.py),
+the same list `scripts/run-tests.sh` reads, so a suite is added once. A suite
+that does not run here says why in its entry, and the run prints it as a `SKIP`.
+Today that is `test_harness.py`, which tests platform-independent Python and
+reaches neither the driver nor a Driver Manager, and `test_oauth.py`, which
+needs an `odbc32.dll` branch for its Driver Manager scenario and a Keycloak
+issuer the VM resolves to the host.
 
 The VM's credentials are `Administrator` / `Asdf1234`, the defaults in
 `windows_test.py` and `dsn_dialog_test.py`. They are not a secret: the machine
@@ -30,10 +38,42 @@ Then run from the Linux host. `uv` installs `pywinrm` itself:
 uv run --with pywinrm python3 integration-tests/windows/windows_test.py
 ```
 
-The suite runs once per configuration, over four: DSN and DSN-less crossed
-with verified and unverified TLS. All four are HTTPS on port 8443, because the
-stack serves nothing else. Each configuration records its own result, so the
-run reports on all four and ends with a summary.
+`test_integration.py` runs once per connect configuration, over four: DSN and
+DSN-less crossed with verified and unverified TLS. All four are HTTPS on port
+8443, because the stack serves nothing else. Every other suite runs once,
+against the verified DSN-less configuration. Each run records its own result,
+so one failure never hides the rest, and the script ends with a summary.
+
+### What the VM gets
+
+The VM mirrors the repository layout under `C:\odbc_test_trino`, rather than
+holding a flat pile of files, because the suites address their neighbours by
+relative path: `test_folding_contract.py` reads
+`../../connector/StackableTrinoODBC.pq`, and `harness.Stack` defaults to
+`../generated/stack.env`. Mirroring makes those resolve on the VM as they do on
+the host, so no suite needs a Windows branch to find its own inputs.
+
+```text
+C:\odbc_test_trino\
+  stackable_odbc_trino.dll        the driver
+  configure-dsn.ps1               beside the DLL, where ConfigDSN looks for it
+  connector\                      what the folding contract suite parses
+  integration-tests\suites\       every .py from suites/
+  integration-tests\generated\    stack.env and certs\
+```
+
+`integration-tests\generated\stack.env` is the VM's own view of the stack,
+written by `windows_test.py` and kept on the host as
+`generated/windows-stack.env` for inspection. It carries the same keys
+`scripts/gen-odbc-config.sh` writes, with the paths and the host the VM sees,
+which is what lets the suites that read `stack.env` rather than taking a
+connection string (`test_tls.py`, `test_spooling.py`, `test_transactions.py`)
+run here at all. It carries one key the host's does not: `DRIVER_NAME`, because
+the Windows Driver Manager loads a driver by its registered name while the
+ctypes suites want the DLL's path, and on Linux one string serves both.
+
+The compose profiles are the host stack's, since that is the coordinator the VM
+connects to. A suite gated on a profile is gated on the same one here.
 
 **Do not diagnose a Windows failure without rebuilding the DLL first.**
 `--skip-build` reuses whatever sits in `target/x86_64-pc-windows-gnu/release/`,
@@ -52,6 +92,7 @@ which can predate the feature under test by days.
 | `--user`, `--password` | `Administrator`, `Asdf1234` | WinRM credentials |
 | `--gateway <ip>` | `$ODBC_TEST_HOST_GATEWAY`, else `192.168.197.1` | The host-only gateway the VM reaches the host on. `scripts/gen-certs.sh` reads the same environment variable, so the coordinator's certificate covers the address the VM connects to |
 | `--trino-host <address>` | the same as `--gateway` | Where the VM reaches Trino. The name `trino` is mapped to it in the VM's hosts file |
+| `--suite <substring>` | unset | Run only the suites whose name contains the substring. `run-tests.sh --suite` forwards to this |
 
 The verified configurations connect to `trino` rather than to an address. TLS
 sends no SNI for an IP literal, and Jetty then serves Trino's internal
@@ -66,6 +107,12 @@ what an operator who has not set up a name would do.
 `TrinoBackend::configure_dsn`. Every other suite reaches the driver through a
 connection, and both `odbcconf` and `configure-dsn.ps1` call
 `SQLConfigDataSource` with a null *hwndParent*, so they take the headless path.
+
+**It is not in the registry, and that is deliberate.** Every registered suite
+is a Python file deployed to the VM and run there over WinRM. This one runs on
+the *host*, driving `virsh screenshot` against the VM's framebuffer, because
+WinRM lands in session 0 and session 0 has no desktop to photograph. Giving it
+an entry would mean the registry described two unrelated things.
 
 Run `windows_test.py` first. It deploys the DLL and `configure-dsn.ps1`, which
 the driver looks for beside it.
@@ -373,12 +420,20 @@ then:
 $c = New-Object System.Data.Odbc.OdbcConnection("DSN=MyTrino"); $c.Open(); Write-Host "Connected: $($c.State)"; $c.Close()
 ```
 
-### Running test_integration.py manually
+### Running a suite manually
 
-The harness deploys `test_integration.py`, `harness.py` and the test CA to
-`C:\odbc_test_trino`. To run the suite without the wrapper script, from a
-PowerShell session on the VM:
+The harness deploys every suite, the test CA and the VM's `stack.env`; see
+[What the VM gets](#what-the-vm-gets) for the layout. To run one without the
+wrapper script, from a PowerShell session on the VM:
 
 ```powershell
-& "C:\Program Files\Python312\python.exe" C:\odbc_test_trino\test_integration.py "Driver=stackable_odbc_trino;Host=<trino-host>;Port=8443;User=admin;Password=admin;Protocol=https;TlsVerify=false;Catalog=tpcds"
+cd C:\odbc_test_trino\integration-tests\suites
+& "C:\Program Files\Python312\python.exe" .\test_integration.py "Driver=stackable_odbc_trino;Host=<trino-host>;Port=8443;User=admin;Password=admin;Protocol=https;TlsVerify=false;Catalog=tpcds"
+```
+
+The suites that take no connection string read the deployed `stack.env`
+instead, so they need no argument at all:
+
+```powershell
+& "C:\Program Files\Python312\python.exe" .\test_tls.py
 ```
