@@ -71,8 +71,14 @@ DIALECT_RS = os.path.join(PROJECT_DIR, "src", "escape_dialect.rs")
 CALLS = {
     # --- strings ---------------------------------------------------------
     "SQL_FN_STR_CONCAT": ("{fn CONCAT('ab', 'cd')}", "abcd"),
-    "SQL_FN_STR_LTRIM": ("{fn LTRIM('  ab')}", "ab"),
-    "SQL_FN_STR_LENGTH": ("{fn LENGTH('abc')}", 3),
+    # Rewritten to the two-argument `ltrim`, because ODBC removes *blanks* and
+    # Trino's one-argument form removes every kind of whitespace. The leading
+    # tab has to survive; a pass-through would eat it and answer "ab".
+    "SQL_FN_STR_LTRIM": ("{fn LTRIM('  ' || chr(9) || 'ab')}", "\tab"),
+    # Rewritten to `length(rtrim(x, ' '))`: ODBC counts characters "excluding
+    # trailing blanks" and Trino's `length` counts them. The trailing spaces
+    # are the discriminator, and a pass-through answers 6.
+    "SQL_FN_STR_LENGTH": ("{fn LENGTH('abc   ')}", 3),
     # Renamed to `lower`.
     "SQL_FN_STR_LCASE": ("{fn LCASE('AbC')}", "abc"),
     # Renamed to `upper`.
@@ -83,7 +89,8 @@ CALLS = {
     # Already Trino's syntax, so this proves the escape is left alone.
     "SQL_FN_STR_POSITION": ("{fn POSITION('cd' IN 'abcdef')}", 3),
     "SQL_FN_STR_REPLACE": ("{fn REPLACE('abcabc', 'b', 'X')}", "aXcaXc"),
-    "SQL_FN_STR_RTRIM": ("{fn RTRIM('ab  ')}", "ab"),
+    # The RTRIM half of the same blanks-versus-whitespace split as LTRIM above.
+    "SQL_FN_STR_RTRIM": ("{fn RTRIM('ab' || chr(9) || '  ')}", "ab\t"),
     "SQL_FN_STR_SUBSTRING": ("{fn SUBSTRING('abcdef', 2, 3)}", "bcd"),
     # Renamed to `chr`.
     "SQL_FN_STR_CHAR": ("{fn CHAR(65)}", "A"),
@@ -117,7 +124,7 @@ CALLS = {
     "SQL_FN_NUM_POWER": ("{fn POWER(2, 3)}", 8.0),
     "SQL_FN_NUM_RADIANS": ("{fn RADIANS(0)}", 0.0),
     "SQL_FN_NUM_ROUND": ("{fn ROUND(1.234, 1)}", 1.2),
-    "SQL_FN_NUM_TRUNCATE": ("{fn TRUNCATE(1.99, 1)}", 1.9),
+    "SQL_FN_NUM_TRUNCATE": ("{fn TRUNCATE(CAST(1.99 AS DOUBLE), 1)}", 1.9),
     # --- system ----------------------------------------------------------
     # Both lose their parentheses: Trino takes them as bare SQL-92 keywords.
     "SQL_FN_SYS_USERNAME": ("{fn USERNAME()}", None),
@@ -403,6 +410,32 @@ def main():
             R.ok(f"{call} -> {targets[keyword]}")
         except pyodbc.Error as e:
             R.bad(f"{call} -> {targets[keyword]}", str(e)[:110])
+
+    # ------------------------------------------------------------------
+    print("\n--- {fn TRUNCATE} keeps the argument's type ---")
+    # Trino's two-argument `truncate` is decimal-only, so the escape scales into
+    # the single-argument form. ODBC requires TRUNCATE to return "the same data
+    # type as the input parameters", which holds only because the scale factor
+    # is an integer literal: `power(10, d)` is double-valued and would drag
+    # decimal and real to double. Asserted on `typeof`, because the value alone
+    # cannot tell the two rewrites apart.
+    for source, want_type in [
+        ("CAST(1.99 AS DECIMAL(3,2))", "decimal"),
+        ("CAST(1.99 AS DOUBLE)", "double"),
+        ("CAST(1.99 AS REAL)", "real"),
+    ]:
+        for digits in (1, 0, -1):
+            call = f"{{fn TRUNCATE({source}, {digits})}}"
+            try:
+                got = scalar(cur, f"typeof(({call}))")
+                ok = str(got).startswith(want_type)
+                R.check(
+                    f"{call} -> {want_type}",
+                    ok,
+                    "" if ok else f"  (got {got!r}, so the scale factor widened it)",
+                )
+            except pyodbc.Error as e:
+                R.bad(f"{call} -> {want_type}", str(e)[:110])
 
     # ------------------------------------------------------------------
     print("\n--- the {d} {t} {ts} literal escapes ---")

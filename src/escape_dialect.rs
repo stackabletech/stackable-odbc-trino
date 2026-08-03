@@ -17,8 +17,10 @@
 //!   capability but not on the syntax: `LOCATE(a, b)` → `position(a IN b)`,
 //!   the `CURDATE`/`USERNAME` family → bare keywords with the `()` removed,
 //!   `TIMESTAMPADD(SQL_TSI_DAY, ...)` → `date_add('day', ...)` with the unit
-//!   re-quoted, and `DAYOFWEEK` → an expression converting Trino's ISO day
-//!   numbering to ODBC's.
+//!   re-quoted, `DAYOFWEEK` → an expression converting Trino's ISO day
+//!   numbering to ODBC's, `LENGTH`/`LTRIM`/`RTRIM` → the two-argument trims
+//!   that take ODBC's "blanks" literally, and `TRUNCATE` → scaled arithmetic,
+//!   because Trino's two-argument form is declared over `decimal` alone.
 //!
 //! Everything else passes through unchanged (`None`). `POSITION` needs no
 //! hook, because ODBC spells it `POSITION(exp IN exp)`, which is already
@@ -210,6 +212,30 @@ pub(crate) fn rewrite_scalar_fn(name: &str, args: &str) -> Option<String> {
         // advertised while `SQL_FN_STR_LOCATE_2` is.
         "LOCATE" if parts.len() == 2 => Some(format!("position({} IN {})", parts[0], parts[1])),
 
+        // SQL_FN_STR_LENGTH / SQL_FN_STR_LTRIM / SQL_FN_STR_RTRIM all turn on
+        // ODBC's word "blanks", which means the space character and nothing
+        // else. Trino reads the same three operations as whitespace-wide, so
+        // each needs the trimmed set pinned to a literal space rather than the
+        // name passed through:
+        //
+        // - LENGTH is specified as "the number of characters in string_exp,
+        //   excluding trailing blanks", while Trino's `length` counts them.
+        //   Measured against a coordinator, `length(CAST('ab' AS char(5)))` is
+        //   5 where ODBC asks for 2, and `length('abc   ')` is 6 where ODBC
+        //   asks for 3. The gap is not confined to padded `char(n)`: any value
+        //   carrying trailing spaces is counted wrong.
+        // - LTRIM and RTRIM are specified as removing leading and trailing
+        //   *blanks*. Trino's one-argument `ltrim`/`rtrim` remove every kind of
+        //   trailing whitespace, so a tab or a newline is eaten from data ODBC
+        //   says to keep.
+        //
+        // The two-argument forms take the exact set, so `rtrim(x, ' ')` trims
+        // spaces and preserves a trailing tab. They are NULL-safe, matching the
+        // pass-through they replace.
+        "LENGTH" if parts.len() == 1 => Some(format!("length(rtrim({}, ' '))", parts[0])),
+        "LTRIM" if parts.len() == 1 => Some(format!("ltrim({}, ' ')", parts[0])),
+        "RTRIM" if parts.len() == 1 => Some(format!("rtrim({}, ' ')", parts[0])),
+
         // SQL_FN_TD_CURDATE / CURTIME and the three ODBC 3.x CURRENT_* forms.
         // Trino takes these as bare SQL-92 keywords, so the whole escape,
         // trailing `()` included, has to go. This is what `remap_scalar_fn`
@@ -271,6 +297,21 @@ pub(crate) fn rewrite_scalar_fn(name: &str, args: &str) -> Option<String> {
             Some("random()".into())
         }
 
+        // SQL_FN_NUM_TRUNCATE: ODBC's TRUNCATE takes a `numeric_exp`, which the
+        // appendix defines as covering SQL_FLOAT, SQL_REAL and SQL_DOUBLE among
+        // others, but Trino's two-argument `truncate` is declared over `decimal`
+        // alone. `truncate(CAST(1.99 AS DOUBLE), 1)` does not resolve at all: it
+        // fails FUNCTION_NOT_FOUND with "Expected: truncate(decimal(p,s), ...)".
+        // Passing the call through therefore works for a decimal column and
+        // fails outright for a double or real one, which is exactly the claim
+        // this module's header says an advertised bit must not make.
+        //
+        // Scaling by a power of ten reaches the single-argument `truncate`,
+        // which Trino does define over double and real, so the rewrite covers
+        // the whole numeric domain. See [`rewrite_truncate`] for how the scale
+        // factor is chosen, which is what decides the result's type.
+        "TRUNCATE" if parts.len() == 2 => Some(rewrite_truncate(parts[0], parts[1])),
+
         // SQL_FN_TD_DAYOFWEEK: Trino's `day_of_week` is ISO-numbered
         // (1 = Monday .. 7 = Sunday) and ODBC specifies 1 = Sunday ..
         // 7 = Saturday, so the *value* needs converting, not just the name:
@@ -279,6 +320,52 @@ pub(crate) fn rewrite_scalar_fn(name: &str, args: &str) -> Option<String> {
         "DAYOFWEEK" if parts.len() == 1 => Some(format!("((day_of_week({}) % 7) + 1)", parts[0])),
 
         _ => None,
+    }
+}
+
+/// Largest `|d|` that still scales by an integer literal: 10^18 fits in a
+/// Trino `bigint`, 10^19 does not.
+const TRUNCATE_LITERAL_SCALE_LIMIT: i32 = 18;
+
+/// The body of the `SQL_FN_NUM_TRUNCATE` rewrite: `{fn TRUNCATE(value, digits)}`
+/// scaled into the single-argument `truncate` Trino defines over every numeric
+/// type.
+///
+/// ODBC says TRUNCATE "returns values of the same data type as the input
+/// parameters", and which scale factor is used decides whether that holds.
+/// `power(10, d)` is double-valued, so it drags a decimal or real argument to
+/// double. An integer literal does not: Trino promotes `decimal * bigint` to
+/// decimal and `real * bigint` to real, so the argument's own type survives the
+/// round trip. Measured against a coordinator, `truncate(CAST(1.99 AS
+/// DECIMAL(3,2)) * 10) / 10` is an exact `decimal` 1.9 and the same expression
+/// over a `real` stays `real`, where the `power` form answers `double` for
+/// both. The decimal's scale does widen, because Trino's decimal division adds
+/// scale, but the type an application reads from `SQLDescribeCol` is still
+/// SQL_DECIMAL and the value is still exact.
+///
+/// A literal `digits` is therefore scaled by `10^|d|` written out in full, with
+/// the sign choosing multiply-then-divide or divide-then-multiply so a negative
+/// `d` zeroes digits to the left of the point, as ODBC specifies. `d == 0` needs
+/// no scaling at all.
+///
+/// Anything else falls back to `power`. That covers `digits` given as a column
+/// or a parameter marker, which is legal ODBC and cannot be folded here, and
+/// `|d| > 18`, where the literal would exceed `bigint`. Those calls widen to
+/// double, which stays the better of the two deviations: a widened numeric type
+/// is something an application can still read and work with, where the
+/// unrewritten call leaves it FUNCTION_NOT_FOUND and nothing at all.
+fn rewrite_truncate(value: &str, digits: &str) -> String {
+    match digits.trim().parse::<i32>() {
+        Ok(0) => format!("truncate({value})"),
+        Ok(d) if (1..=TRUNCATE_LITERAL_SCALE_LIMIT).contains(&d) => {
+            let scale = 10i64.pow(d as u32);
+            format!("(truncate({value} * {scale}) / {scale})")
+        }
+        Ok(d) if (-TRUNCATE_LITERAL_SCALE_LIMIT..0).contains(&d) => {
+            let scale = 10i64.pow(d.unsigned_abs());
+            format!("(truncate({value} / {scale}) * {scale})")
+        }
+        _ => format!("(truncate({value} * power(10, {digits})) / power(10, {digits}))"),
     }
 }
 
@@ -510,6 +597,77 @@ mod tests {
         // The precision forms of CURRENT_TIME/CURRENT_TIMESTAMP pass through
         // instead: Trino accepts `CURRENT_TIMESTAMP(6)` as written.
         assert_eq!(rewrite_scalar_fn("CURRENT_TIMESTAMP", "6"), None);
+        // ODBC's "blanks" is the space alone, so all three pin the trimmed set
+        // rather than taking Trino's whitespace-wide default.
+        assert_eq!(
+            rewrite_scalar_fn("LENGTH", "x").as_deref(),
+            Some("length(rtrim(x, ' '))")
+        );
+        assert_eq!(
+            rewrite_scalar_fn("LTRIM", "x").as_deref(),
+            Some("ltrim(x, ' ')")
+        );
+        assert_eq!(
+            rewrite_scalar_fn("RTRIM", "x").as_deref(),
+            Some("rtrim(x, ' ')")
+        );
+        // Only the one-argument forms ODBC defines.
+        assert_eq!(rewrite_scalar_fn("LENGTH", "x, y"), None);
+        assert_eq!(rewrite_scalar_fn("RTRIM", "x, y"), None);
+
+        // TRUNCATE scales into the single-argument `truncate`, which Trino
+        // defines over double and real; the two-argument one is decimal-only.
+        // A literal digit count scales by an integer, which is what keeps a
+        // decimal or real argument out of double.
+        assert_eq!(
+            rewrite_scalar_fn("TRUNCATE", "x, 2").as_deref(),
+            Some("(truncate(x * 100) / 100)")
+        );
+        // A negative one zeroes digits left of the point, so it divides first.
+        assert_eq!(
+            rewrite_scalar_fn("TRUNCATE", "x, -1").as_deref(),
+            Some("(truncate(x / 10) * 10)")
+        );
+        // Nothing to scale by.
+        assert_eq!(
+            rewrite_scalar_fn("TRUNCATE", "x, 0").as_deref(),
+            Some("truncate(x)")
+        );
+        // Whitespace around the count is still a literal.
+        assert_eq!(
+            rewrite_scalar_fn("TRUNCATE", "x,  3 ").as_deref(),
+            Some("(truncate(x * 1000) / 1000)")
+        );
+        // A digit count that is not a literal is legal ODBC and cannot be
+        // folded, so it takes the `power` fallback and widens to double.
+        assert_eq!(
+            rewrite_scalar_fn("TRUNCATE", "x, d").as_deref(),
+            Some("(truncate(x * power(10, d)) / power(10, d))")
+        );
+        assert_eq!(
+            rewrite_scalar_fn("TRUNCATE", "x, ?").as_deref(),
+            Some("(truncate(x * power(10, ?)) / power(10, ?))")
+        );
+        // 10^19 exceeds bigint, so the boundary falls back too.
+        assert_eq!(
+            rewrite_scalar_fn("TRUNCATE", "x, 18").as_deref(),
+            Some("(truncate(x * 1000000000000000000) / 1000000000000000000)")
+        );
+        assert_eq!(
+            rewrite_scalar_fn("TRUNCATE", "x, 19").as_deref(),
+            Some("(truncate(x * power(10, 19)) / power(10, 19))")
+        );
+        assert_eq!(
+            rewrite_scalar_fn("TRUNCATE", "x, -18").as_deref(),
+            Some("(truncate(x / 1000000000000000000) * 1000000000000000000)")
+        );
+        assert_eq!(
+            rewrite_scalar_fn("TRUNCATE", "x, -19").as_deref(),
+            Some("(truncate(x * power(10, -19)) / power(10, -19))")
+        );
+        // ODBC has no one-argument TRUNCATE, so there is nothing to rewrite.
+        assert_eq!(rewrite_scalar_fn("TRUNCATE", "x"), None);
+
         // A function with no rewrite is remap_scalar_fn's business.
         assert_eq!(rewrite_scalar_fn("UCASE", "x"), None);
         // An ODBC type keyword with no Trino equivalent, and a value that is

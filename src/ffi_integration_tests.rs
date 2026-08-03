@@ -887,7 +887,10 @@ fn every_advertised_scalar_function_escape_runs_on_trino() {
         ("{fn ROUND(1.5, 0)}", Some("2.0")),
         ("{fn SIGN(-2)}", Some("-1")),
         ("{fn SQRT(4)}", Some("2.0E0")),
-        ("{fn TRUNCATE(1.9, 0)}", Some("1.0")),
+        // A zero digit count scales by nothing, so this is the bare
+        // single-argument `truncate` and keeps the literal's decimal type,
+        // where POWER and SQRT above are double and render in exponent form.
+        ("{fn TRUNCATE(1.9, 0)}", Some("1")),
     ];
 
     unsafe {

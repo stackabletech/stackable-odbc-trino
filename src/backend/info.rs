@@ -590,6 +590,15 @@ pub(crate) const TRINO_SQL92_VALUE_EXPRESSIONS: u32 =
 /// emits a bare `random()`, which keeps ODBC's type and range and loses only
 /// reproducibility. Trino has no seeded generator to keep it with.
 ///
+/// `TRUNCATE` is the third name whose Trino form does not cover ODBC's. Trino
+/// declares the two-argument `truncate` over `decimal` only, so a double or
+/// real argument fails FUNCTION_NOT_FOUND, while ODBC's `numeric_exp` covers
+/// SQL_FLOAT, SQL_REAL and SQL_DOUBLE. The rewrite scales by a power of ten to
+/// reach the single-argument `truncate`, which Trino does define over those
+/// types. Scaling by an integer literal keeps the argument's own type, as ODBC
+/// requires of TRUNCATE, so only a digit count this crate cannot fold, a column
+/// or a parameter marker, widens the result to double.
+///
 /// <https://trino.io/docs/current/functions/math.html>
 pub(crate) const TRINO_NUMERIC_FUNCTIONS: u32 = SQL_FN_NUM_ABS
     | SQL_FN_NUM_ACOS
@@ -774,8 +783,12 @@ pub(super) fn reserved_keywords() -> &'static [Cow<'static, str>] {
 /// (`levenshtein_distance()` is a different metric); the four `*_LENGTH`
 /// variants, which Trino does not document.
 ///
-/// `LENGTH` is claimed with one caveat: ODBC defines it as excluding trailing
-/// blanks and Trino's `length()` counts them.
+/// `LENGTH`, `LTRIM` and `RTRIM` all hinge on ODBC's word "blanks", which means
+/// the space character alone. Trino reads all three as whitespace-wide, so
+/// `length()` counts trailing spaces ODBC excludes, and the one-argument
+/// `ltrim`/`rtrim` strip trailing tabs and newlines ODBC keeps.
+/// [`crate::escape_dialect::rewrite_scalar_fn`] therefore routes each through
+/// the two-argument trim with an explicit `' '`.
 ///
 /// `SOUNDEX` needs no rewrite either, and is **not** gated on `server_major`
 /// although it is the one name here that Trino has not always had: it arrived
