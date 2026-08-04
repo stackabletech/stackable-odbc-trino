@@ -1982,7 +1982,7 @@ dependencies = [
 
 [[package]]
 name = "stackable-odbc-trino"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "base64 0.23.0",
  "chrono",

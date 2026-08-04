@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.0] — 2026-08-04
+
 First release, so this section describes what the driver offers rather than
 what changed.
 
@@ -70,4 +72,5 @@ covered by `sha256sums.txt`.
 - Only the `READ UNCOMMITTED` isolation level is offered, because it is the one
   every Trino catalog accepts.
 
-[Unreleased]: https://github.com/stackabletech/stackable-odbc-trino/commits/HEAD
+[Unreleased]: https://github.com/stackabletech/stackable-odbc-trino/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/stackabletech/stackable-odbc-trino/releases/tag/v0.1.0
