@@ -265,7 +265,7 @@ ignored, so the tool can react instead of trusting a wrong answer.
 
 ## Compatibility
 
-| | |
+| Component | Support |
 |---|---|
 | ODBC | 3.80 |
 | Platforms | Linux x86-64, Windows x86-64 |
