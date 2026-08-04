@@ -28,7 +28,7 @@ use stackable_odbc_core::{
         SQL_SQ_COMPARISON, SQL_SQ_CORRELATED_SUBQUERIES, SQL_SQ_EXISTS, SQL_SQ_IN,
         SQL_SQ_QUANTIFIED, SQL_TC_DML, SQL_TXN_READ_UNCOMMITTED, SQL_U_UNION, SQL_U_UNION_ALL,
         SpecialColumnRow, SpecialColumnsQuery, SqlState, StatisticsQuery, StatisticsRow,
-        TablePrivilegeRow, TablePrivilegesQuery, TableRow, TablesQuery, TypeInfoRow,
+        TablePrivilegeRow, TablePrivilegesQuery, TableRow, TablesQuery, TypeInfoRow, ValueWarning,
         format_odbc_version, parse_dotted_version,
     },
 };
@@ -1111,6 +1111,18 @@ pub struct TrinoStatement {
     pub(crate) raw_columns: Vec<trino_rust_client::models::Column>,
     /// Current in-memory batch of converted rows.
     pub(crate) batch: Vec<Vec<ColumnValue>>,
+    /// The `(row, column)` cells of the current batch, both zero-based, whose
+    /// conversion dropped fractional-seconds digits.
+    ///
+    /// Recorded at conversion time because that is the only point the wire text
+    /// still exists, and read by `get_data` to arm the `01S07` that
+    /// `take_value_warning` hands back. A set rather than a flag per cell: only
+    /// a `time`/`timestamp` column declared beyond nine fractional digits can
+    /// put anything in it, so it is empty for all but a few result sets, and an
+    /// empty set costs no allocation.
+    pub(crate) truncated_cells: std::collections::HashSet<(usize, usize)>,
+    /// The warning the last `get_data` armed, cleared by `take_value_warning`.
+    pub(crate) pending_value_warning: Option<ValueWarning>,
     /// Position within the current batch (0 = before first row).
     batch_cursor: usize,
     /// Set once a page fetch has failed. The result set is then unusable: the

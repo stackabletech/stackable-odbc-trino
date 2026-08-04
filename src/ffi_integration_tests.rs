@@ -5061,3 +5061,103 @@ fn setting_the_current_catalog_is_refused_rather_than_silently_ignored() {
         cleanup_injected_conn(env, conn);
     }
 }
+
+// ---------------------------------------------------------------------------
+// Backend-reported fractional truncation (01S07)
+// ---------------------------------------------------------------------------
+
+/// Trino's temporal types reach twelve fractional digits and the client
+/// advertises `PARAMETRIC_DATETIME`, so `timestamp(12)` arrives with all twelve
+/// while `ColumnValue::Timestamp` carries nine. The three that fall off are
+/// dropped inside this driver's own conversion, which core cannot observe, so
+/// the driver reports them through `StatementBackend::take_value_warning` and
+/// the read answers `SQL_SUCCESS_WITH_INFO` with `01S07`.
+#[test]
+#[serial]
+#[ignore = "requires Trino at localhost:8443; run ./integration-tests/setup.sh first"]
+fn timestamp_beyond_nanoseconds_reports_fractional_truncation() {
+    unsafe {
+        let (_env, _conn, stmt) = alloc_stmt();
+
+        assert_eq!(
+            exec_direct(
+                stmt,
+                "SELECT CAST(TIMESTAMP '2020-01-02 03:04:05.123456789012' AS timestamp(12)) AS v"
+            ),
+            SqlReturn::SUCCESS
+        );
+        assert_eq!(
+            ffi::fetch::sql_fetch::<TrinoBackend>(stmt),
+            SqlReturn::SUCCESS
+        );
+
+        let mut wbuf = [0u16; 64];
+        let mut ind: isize = 0;
+        let ret = ffi::fetch::sql_get_data::<TrinoBackend>(
+            stmt,
+            1,
+            CDataType::WChar as i16,
+            wbuf.as_mut_ptr().cast(),
+            (wbuf.len() * 2) as isize,
+            &mut ind,
+        );
+        assert_eq!(
+            ret,
+            SqlReturn::SUCCESS_WITH_INFO,
+            "the driver dropped three fractional digits, so the read is not a plain success"
+        );
+        assert_eq!(sqlstate_of(HandleType::Stmt, stmt), "01S07");
+
+        // The value still arrives, at the precision the driver can carry: the
+        // warning is not an error channel.
+        let chars = (ind / 2).max(0) as usize;
+        let text = String::from_utf16_lossy(&wbuf[..chars.min(wbuf.len())]);
+        assert!(
+            text.contains("05.123456789"),
+            "expected nine fractional digits in {text:?}"
+        );
+
+        cleanup_stmt(stmt);
+    }
+}
+
+/// The counterpart: a column declared `timestamp(12)` whose value has nothing
+/// past the ninth digit loses nothing, and must not draw the diagnostic. The
+/// warning is asked of the value, not of the column's declared scale.
+#[test]
+#[serial]
+#[ignore = "requires Trino at localhost:8443; run ./integration-tests/setup.sh first"]
+fn timestamp_within_nanoseconds_reports_no_warning() {
+    unsafe {
+        let (_env, _conn, stmt) = alloc_stmt();
+
+        assert_eq!(
+            exec_direct(
+                stmt,
+                "SELECT CAST(TIMESTAMP '2020-01-02 03:04:05.123456789000' AS timestamp(12)) AS v"
+            ),
+            SqlReturn::SUCCESS
+        );
+        assert_eq!(
+            ffi::fetch::sql_fetch::<TrinoBackend>(stmt),
+            SqlReturn::SUCCESS
+        );
+
+        let mut wbuf = [0u16; 64];
+        let mut ind: isize = 0;
+        assert_eq!(
+            ffi::fetch::sql_get_data::<TrinoBackend>(
+                stmt,
+                1,
+                CDataType::WChar as i16,
+                wbuf.as_mut_ptr().cast(),
+                (wbuf.len() * 2) as isize,
+                &mut ind,
+            ),
+            SqlReturn::SUCCESS
+        );
+        assert_eq!(sqlstate_of(HandleType::Stmt, stmt), "");
+
+        cleanup_stmt(stmt);
+    }
+}

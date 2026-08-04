@@ -2,6 +2,7 @@
 //! `execute`, plus the [`StatementBackend`] implementation that streams result
 //! rows back through the shared `stackable-odbc-core` fetch path.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Instant;
@@ -9,7 +10,7 @@ use std::time::Instant;
 use stackable_odbc_core::backend::StatementBackend;
 use stackable_odbc_core::errors::OdbcError;
 use stackable_odbc_core::types::{
-    CDataType, ColumnDescriptor, ColumnValue, ExecuteOutcome, FetchResult, SqlState,
+    CDataType, ColumnDescriptor, ColumnValue, ExecuteOutcome, FetchResult, SqlState, ValueWarning,
 };
 use trino_rust_client::{Row, TrinoTy};
 
@@ -19,25 +20,43 @@ use super::{
     map_trino_error_on,
 };
 use crate::type_conversion::{
-    TrinoTypeName, json_to_column_value, trino_ty_precision, trino_ty_scale, trino_ty_to_sql_type,
-    type_name_precision, type_name_scale,
+    TrinoTypeName, discards_fractional_seconds, json_to_column_value, trino_ty_precision,
+    trino_ty_scale, trino_ty_to_sql_type, type_name_precision, type_name_scale,
 };
 
-/// Convert decoded Trino rows into `Vec<Vec<ColumnValue>>`.
+/// Convert decoded Trino rows into `Vec<Vec<ColumnValue>>`, alongside the cells
+/// whose conversion dropped fractional-seconds digits.
 ///
 /// Takes ownership to avoid cloning every `Row`. Transport decoding happens
 /// first, in [`decode_page_rows`], which is what resolves a spooled page's
 /// segments; this is the value-level step and cannot fail.
-fn convert_rows(rows: Vec<Row>, types: &[(String, TrinoTy)]) -> Vec<Vec<ColumnValue>> {
-    rows.into_iter()
-        .map(|row| {
+///
+/// The truncation set is collected here because the wire text exists nowhere
+/// else: by the time `get_data` hands a value out, the discarded digits are
+/// gone. See [`discards_fractional_seconds`] for what counts as a loss.
+fn convert_rows(
+    rows: Vec<Row>,
+    types: &[(String, TrinoTy)],
+) -> (Vec<Vec<ColumnValue>>, HashSet<(usize, usize)>) {
+    let mut truncated = HashSet::new();
+    let batch = rows
+        .into_iter()
+        .enumerate()
+        .map(|(row_idx, row)| {
             row.into_json()
                 .into_iter()
                 .zip(types.iter())
-                .map(|(val, (_, ty))| json_to_column_value(val, ty))
+                .enumerate()
+                .map(|(col_idx, (val, (_, ty)))| {
+                    if discards_fractional_seconds(&val, ty) {
+                        truncated.insert((row_idx, col_idx));
+                    }
+                    json_to_column_value(val, ty)
+                })
                 .collect()
         })
-        .collect()
+        .collect();
+    (batch, truncated)
 }
 
 /// Decode one Trino response page into rows.
@@ -249,7 +268,7 @@ pub(super) fn exec_direct(
     let query_id = page.id;
 
     let convert_start = Instant::now();
-    let batch = {
+    let (batch, truncated_cells) = {
         let _span = tracing::info_span!("trino.convert_batch", page = page_count).entered();
         let rows = decode_page_rows(&conn.runtime, &conn.client, page.data, &kept_columns)
             .map_err(|e| conn.statement_error(e))?;
@@ -271,6 +290,8 @@ pub(super) fn exec_direct(
         trino_types,
         raw_columns: kept_columns,
         batch,
+        truncated_cells,
+        pending_value_warning: None,
         batch_cursor: 0,
         fetch_failed: false,
         next_uri,
@@ -306,6 +327,8 @@ pub(super) fn prepare(
         trino_types: Vec::new(),
         raw_columns: Vec::new(),
         batch: Vec::new(),
+        truncated_cells: HashSet::new(),
+        pending_value_warning: None,
         batch_cursor: 0,
         fetch_failed: false,
         next_uri: None,
@@ -512,6 +535,7 @@ impl TrinoStatement {
             "abandoning Trino result set after a failed page fetch"
         );
         self.batch.clear();
+        self.truncated_cells.clear();
         self.batch_cursor = 0;
         self.next_uri = None;
         self.fetch_failed = true;
@@ -543,6 +567,7 @@ impl TrinoStatement {
                 "Trino reported the query as cancelled; ending the result set"
             );
             self.batch.clear();
+            self.truncated_cells.clear();
             self.batch_cursor = 0;
             self.next_uri = None;
             return err;
@@ -645,7 +670,7 @@ impl StatementBackend for TrinoStatement {
                     tracing::info_span!("trino.convert_batch", page = self.page_count).entered();
                 decode_page_rows(runtime, client, page.data, &self.raw_columns)
             };
-            self.batch = match decoded {
+            (self.batch, self.truncated_cells) = match decoded {
                 Ok(rows) => convert_rows(rows, &self.trino_types),
                 Err(e) => {
                     let mapped = self.map_client_error(e);
@@ -687,10 +712,23 @@ impl StatementBackend for TrinoStatement {
         let col_idx = (col as usize)
             .checked_sub(1)
             .ok_or_else(column_index_must_be_positive)?;
+        // Arm the warning before the borrow of `self.batch` below, which holds
+        // for the rest of the function. Guarded on the set being empty so the
+        // usual result set, which has no column that can truncate, pays one
+        // length check per value rather than a hash.
+        self.pending_value_warning = (!self.truncated_cells.is_empty()
+            && self
+                .truncated_cells
+                .contains(&(self.batch_cursor - 1, col_idx)))
+        .then_some(ValueWarning::FractionalTruncation);
         let row = &self.batch[self.batch_cursor - 1];
         row.get(col_idx)
             .map(std::borrow::Cow::Borrowed)
             .ok_or_else(|| column_out_of_range(col, row.len()))
+    }
+
+    fn take_value_warning(&mut self) -> Option<ValueWarning> {
+        self.pending_value_warning.take()
     }
 
     fn column_count(&self) -> i16 {
@@ -765,6 +803,7 @@ impl StatementBackend for TrinoStatement {
         }
 
         self.batch.clear();
+        self.truncated_cells.clear();
         self.batch_cursor = 0;
         self.next_uri = None;
         self.query_id = None;
@@ -822,6 +861,8 @@ mod tests {
             trino_types: Vec::new(),
             raw_columns: Vec::new(),
             batch: Vec::new(),
+            truncated_cells: HashSet::new(),
+            pending_value_warning: None,
             batch_cursor: 0,
             fetch_failed: false,
             // An unreachable host: a drain that is wrongly attempted fails

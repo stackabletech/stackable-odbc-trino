@@ -682,6 +682,65 @@ fn parse_fraction_nanos(frac: &str) -> u32 {
     padded.get(..9).and_then(|s| s.parse().ok()).unwrap_or(0)
 }
 
+/// Whether converting `val` under `ty` discards fractional-seconds digits.
+///
+/// Trino's temporal types reach twelve fractional digits and the client
+/// advertises `PARAMETRIC_DATETIME`, so a `timestamp(12)` column arrives on the
+/// wire with all twelve, while `ColumnValue::Timestamp::fraction` counts
+/// nanoseconds and [`parse_fraction_nanos`] keeps nine. The three that fall off
+/// are lost inside this driver's own conversion, before a `ColumnValue` exists,
+/// which is precisely the loss core cannot see and
+/// `StatementBackend::take_value_warning` exists to report as `01S07`.
+///
+/// Asked of the wire text rather than of the column's declared scale, so that a
+/// `timestamp(12)` whose value happens to end in zeros does not draw a
+/// diagnostic for precision nothing actually dropped.
+pub(crate) fn discards_fractional_seconds(val: &Value, ty: &TrinoTy) -> bool {
+    match ty {
+        TrinoTy::Time
+        | TrinoTy::TimeWithTimeZone
+        | TrinoTy::Timestamp
+        | TrinoTy::TimestampWithTimeZone => {
+            matches!(val, Value::String(s) if fraction_exceeds_nanoseconds(s))
+        }
+        // The composite types are walked because their elements go through the
+        // same parsers: a `ROW(t timestamp(12))` truncates exactly as a bare
+        // `timestamp(12)` column does, and the warning belongs to the column the
+        // application reads.
+        TrinoTy::Option(inner) => discards_fractional_seconds(val, inner),
+        TrinoTy::Array(inner) => matches!(val, Value::Array(items)
+            if items.iter().any(|v| discards_fractional_seconds(v, inner))),
+        TrinoTy::Map(key_ty, val_ty) => matches!(val, Value::Object(map)
+        if map.iter().any(|(k, v)| {
+            discards_fractional_seconds(&Value::String(k.clone()), key_ty)
+                || discards_fractional_seconds(v, val_ty)
+        })),
+        TrinoTy::Row(fields) => matches!(val, Value::Array(items)
+            if items.iter().zip(fields.iter())
+                .any(|(v, (_name, ty))| discards_fractional_seconds(v, ty))),
+        TrinoTy::Tuple(fields) => matches!(val, Value::Array(items)
+            if items.iter().zip(fields.iter())
+                .any(|(v, ty)| discards_fractional_seconds(v, ty))),
+        _ => false,
+    }
+}
+
+/// Whether a Trino temporal literal's fractional-seconds fragment carries a
+/// non-zero digit past the ninth, the last one nanoseconds can hold.
+///
+/// The fragment is the digit run after the first `.`, which locates it in all
+/// four renderings: a bare time or timestamp ends there, a named zone follows a
+/// space, and a numeric offset is punctuated with `:` rather than `.`.
+fn fraction_exceeds_nanoseconds(text: &str) -> bool {
+    let Some((_, rest)) = text.split_once('.') else {
+        return false;
+    };
+    rest.chars()
+        .take_while(char::is_ascii_digit)
+        .skip(9)
+        .any(|c| c != '0')
+}
+
 /// Parse a Trino time string `"HH:MM:SS[.fraction][ TZ]"` into a [`ColumnValue::Time`].
 ///
 /// The timezone suffix is discarded (a bare `TIME` has no offset semantics
@@ -2702,6 +2761,94 @@ mod tests {
                 fraction: 999_000_000,
             },
         );
+    }
+
+    // --- discards_fractional_seconds ---
+
+    #[test]
+    fn twelve_digit_timestamp_is_reported_as_truncating() {
+        use serde_json::json;
+        assert!(discards_fractional_seconds(
+            &json!("2020-01-02 03:04:05.123456789012"),
+            &TrinoTy::Timestamp
+        ));
+    }
+
+    /// Trailing zeros past the ninth digit are not a loss: nothing the value
+    /// carried was dropped, so a `timestamp(12)` column full of them must stay
+    /// silent.
+    #[test]
+    fn zeros_past_the_ninth_digit_are_not_a_loss() {
+        use serde_json::json;
+        assert!(!discards_fractional_seconds(
+            &json!("2020-01-02 03:04:05.123456789000"),
+            &TrinoTy::Timestamp
+        ));
+    }
+
+    #[test]
+    fn nine_or_fewer_digits_are_not_a_loss() {
+        use serde_json::json;
+        assert!(!discards_fractional_seconds(
+            &json!("03:04:05.123456789"),
+            &TrinoTy::Time
+        ));
+        assert!(!discards_fractional_seconds(
+            &json!("03:04:05"),
+            &TrinoTy::Time
+        ));
+    }
+
+    /// A named zone follows a space and a numeric offset is punctuated with
+    /// `:`, so neither is mistaken for fractional digits.
+    #[test]
+    fn a_zone_suffix_does_not_confuse_the_fraction() {
+        use serde_json::json;
+        assert!(discards_fractional_seconds(
+            &json!("2020-01-02 03:04:05.123456789012 Europe/Berlin"),
+            &TrinoTy::TimestampWithTimeZone
+        ));
+        assert!(!discards_fractional_seconds(
+            &json!("03:04:05.123+02:00"),
+            &TrinoTy::TimeWithTimeZone
+        ));
+    }
+
+    /// A non-temporal column is never asked about, whatever its text looks
+    /// like: a `decimal` with twelve digits after the point loses nothing here.
+    #[test]
+    fn a_non_temporal_column_never_truncates_a_fraction() {
+        use serde_json::json;
+        assert!(!discards_fractional_seconds(
+            &json!("5.123456789012"),
+            &TrinoTy::Varchar
+        ));
+    }
+
+    /// The composite types are walked, because their elements go through the
+    /// same parsers.
+    #[test]
+    fn a_nested_timestamp_is_reported_through_its_container() {
+        use serde_json::json;
+        assert!(discards_fractional_seconds(
+            &json!(["2020-01-02 03:04:05.000000000001"]),
+            &TrinoTy::Array(Box::new(TrinoTy::Timestamp))
+        ));
+        assert!(!discards_fractional_seconds(
+            &json!(["2020-01-02 03:04:05.000000000"]),
+            &TrinoTy::Array(Box::new(TrinoTy::Timestamp))
+        ));
+    }
+
+    /// A nullable timestamp is the common shape for a projected column, and the
+    /// wrapper must not hide the loss.
+    #[test]
+    fn an_optional_timestamp_is_unwrapped() {
+        use serde_json::json;
+        assert!(discards_fractional_seconds(
+            &json!("2020-01-02 03:04:05.123456789012"),
+            &TrinoTy::Option(Box::new(TrinoTy::Timestamp))
+        ));
     }
 }
 
