@@ -1,0 +1,148 @@
+---
+name: Trino Integration Tests
+
+# Answers the open question in build.yaml: does the core compose stack (Trino
+# plus Postgres) fit a standard GitHub runner? ubuntu-24.04 is 4 vCPU / 16 GB,
+# and Trino alone asks for a 2 GB heap.
+#
+# Deliberately a separate workflow rather than a job in build.yaml while that
+# is unmeasured. A job there is observed by the merge queue, so a stack that
+# does not fit would block every merge; here a red run costs nothing but the
+# measurement it was added to take. Fold it into build.yaml once it has proven
+# stable, at which point `needs:` starts to matter.
+
+permissions:
+  contents: read
+
+on:
+  # Manual, plus every push to the branch this is being developed on, so the
+  # job can be iterated without opening a pull request.
+  workflow_dispatch:
+  push:
+    branches:
+      - ci/trino-integration-runner
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_TOOLCHAIN_VERSION: "1.95.0"
+
+jobs:
+  trino-integration:
+    name: Trino Integration Tests
+    runs-on: ubuntu-24.04
+    # Generous on purpose. A first run that is merely slow must be readable as
+    # a duration rather than as a timeout, because the duration is the result
+    # this workflow exists to produce.
+    timeout-minutes: 60
+    steps:
+      # unixodbc is the Driver Manager the suites load the driver through, and
+      # is a different package from the -dev libraries the build links against;
+      # both are needed here. apache2-utils supplies htpasswd, which
+      # gen-secrets.sh uses to write password.db.
+      - name: Install host dependencies
+        uses: awalsh128/cache-apt-pkgs-action@acb598e5ddbc6f68a970c5da0688d2f3a9f04d05 # v1.6.0
+        with:
+          packages: unixodbc unixodbc-dev apache2-utils
+          # A cache key, not a runner label, but it tracks the runner image so
+          # that bumping the image invalidates the cached .deb files.
+          version: ubuntu-24.04
+
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          persist-credentials: false
+
+      # setup.sh checks for these and stops if one is absent. Reported here as
+      # a list of versions instead, so a runner image that drops a tool says so
+      # in one line rather than through a dependency error 30 lines into a
+      # script.
+      - name: Report host tool versions
+        run: |
+          set -x
+          docker compose version
+          openssl version
+          # From the JDK the runner image preinstalls; gen-certs.sh needs it to
+          # write a PKCS12 that Java reads as a trust anchor.
+          keytool -help 2>&1 | head -1
+          htpasswd -h 2>&1 | head -1
+          python3 --version
+
+      # uv runs the Python suites (`uv run --with pyodbc`) and is not on the
+      # runner image. pipx is, and installing through it keeps this to one line
+      # with no action to pin.
+      - name: Install uv
+        run: pipx install uv
+
+      # Pulled explicitly, before anything else that can fail, so a Docker Hub
+      # rate limit or an image that has gone missing is reported as itself. As
+      # a `compose up` side effect it would surface as a startup timeout
+      # instead. Only the two core services: the oauth and spooling profiles
+      # are not active here, and their images would be several gigabytes of
+      # pull for containers that never start.
+      - name: Pull the stack images
+        # From the stack directory, as scripts/lib.sh's `compose` wrapper does.
+        # Compose derives the project name from the compose file's directory,
+        # and a mismatch here would leave the diagnostics step below querying a
+        # project that holds no containers.
+        working-directory: integration-tests/stack
+        run: docker compose pull postgres trino
+
+      - name: Install Rust ${{ env.RUST_TOOLCHAIN_VERSION }} toolchain
+        uses: dtolnay/rust-toolchain@b3b07ba8b418998c39fb20f53e8b695cdcc8de1b
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN_VERSION }}
+
+      # Its own key rather than the unit-test job's. The two build different
+      # profiles of the same crate and sharing one entry would have each evict
+      # the other's artefacts on every run.
+      - name: Setup Rust Cache
+        uses: Swatinem/rust-cache@98c8021b550208e191a6a3145459bfc9fb29c4c0 # v2.8.0
+        with:
+          key: integration
+
+      # Ahead of setup.sh, which builds too. Doing it here separates a
+      # compilation failure from a stack failure in the step list, and makes
+      # setup.sh's own build the incremental no-op it is designed to be.
+      - name: Build the driver
+        run: cargo build --locked
+
+      # Core stack only: no --profile, so neither Keycloak nor MinIO starts.
+      - name: Set up the Trino stack
+        run: ./integration-tests/setup.sh
+
+      # The measurement this workflow was added to take, recorded while the
+      # coordinator is up and idle. If the stack does not fit, this is the
+      # number that says so, and build.yaml's TODO asks for exactly that.
+      - name: Report resource usage after startup
+        run: |
+          free -h
+          df -h /
+          docker stats --no-stream
+
+      # --skip-build because the build already ran twice above and cargo has
+      # nothing left to do. --skip-delete so the containers survive into the
+      # log capture below; the runner is discarded either way, and a torn-down
+      # stack has no logs to explain why it failed.
+      - name: Run the integration suites
+        run: ./integration-tests/run-tests.sh --skip-build --skip-delete
+
+      # A failure here is a hypothesis about capacity, so capture what
+      # distinguishes "the runner is too small" from "the driver is wrong": the
+      # kernel's own OOM verdict, the memory left, and the coordinator's log.
+      - name: Capture diagnostics on failure
+        if: failure()
+        working-directory: integration-tests/stack
+        run: |
+          echo "=== memory ==="
+          free -h
+          echo "=== dmesg, OOM killer ==="
+          sudo dmesg | grep -i -E 'out of memory|oom-kill' || echo "no OOM kill recorded"
+          echo "=== container state ==="
+          docker compose ps -a
+          echo "=== trino log ==="
+          docker compose logs --tail=300 trino
+          echo "=== postgres log ==="
+          docker compose logs --tail=50 postgres
