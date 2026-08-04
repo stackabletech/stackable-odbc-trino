@@ -5,7 +5,10 @@
 use chrono::Datelike as _;
 use chrono::Timelike as _;
 use serde_json::Value;
-use stackable_odbc_core::types::{ColumnValue, PRECISION_UNDETERMINABLE, SqlDataType, column_size};
+use stackable_odbc_core::types::{
+    ColumnValue, Interval, NANOS_PER_DAY, NANOS_PER_HOUR, NANOS_PER_MINUTE, NANOS_PER_SECOND,
+    PRECISION_UNDETERMINABLE, SqlDataType, column_size,
+};
 use trino_rust_client::{TrinoFloat, TrinoInt, TrinoTy};
 
 /// This driver's declared maximum fractional-seconds precision for TIME,
@@ -862,7 +865,15 @@ fn parse_interval_year_month(s: &str) -> Option<ColumnValue> {
         (years, months)
     };
 
-    Some(ColumnValue::IntervalYearMonth { years, months })
+    Some(ColumnValue::IntervalYearMonth {
+        years,
+        months,
+        // Trino has one year-month interval type and it carries both fields, so
+        // the precision is always the two-field form. The narrower
+        // `Interval::Year` and `Interval::Month` have no Trino column type to
+        // come from.
+        precision: Interval::YearToMonth,
+    })
 }
 
 /// Parse Trino's `INTERVAL DAY TO SECOND` text, e.g. `"-2 03:04:05.678"`.
@@ -888,28 +899,26 @@ fn parse_interval_day_time(s: &str) -> Option<ColumnValue> {
         None => (sec_part, ""),
     };
     let sec: i64 = sec_text.parse().ok()?;
-    // Trino sends up to 6 fractional digits (microseconds); `ColumnValue::IntervalDayTime`
-    // only holds milliseconds, so this truncates to the first 3 digits. Sub-millisecond
-    // precision is lost intentionally: the ODBC SQL_INTERVAL_DAY_TO_SECOND type does not
-    // support it. Padding to 3 digits before parsing (rather than parsing the raw fragment)
-    // ensures a single-digit fraction like "5" is read as 500ms, not 5ms.
-    let ms: i64 = if frac_text.is_empty() {
-        0
-    } else {
-        let mut digits = frac_text.to_string();
-        digits.truncate(3);
-        while digits.len() < 3 {
-            digits.push('0');
-        }
-        digits.parse().ok()?
-    };
+    // `ColumnValue::IntervalDayTime` counts nanoseconds, so the fraction is kept
+    // whole. Trino renders this type with three fractional digits, its own
+    // storage being a millisecond count, but `parse_fraction_nanos` reads
+    // whatever arrives on the same "pad right, then take nine" rule the temporal
+    // parsers use, so a shorter fragment like "5" is read as 500ms rather than
+    // 5ns and a longer one does not have to be special-cased here.
+    let frac_nanos = i128::from(parse_fraction_nanos(frac_text));
 
-    let magnitude = days
-        .checked_mul(86_400_000)?
-        .checked_add(h * 3_600_000 + m * 60_000 + sec * 1_000 + ms)?;
+    let magnitude = i128::from(days)
+        .checked_mul(NANOS_PER_DAY)?
+        .checked_add(i128::from(h) * NANOS_PER_HOUR)?
+        .checked_add(i128::from(m) * NANOS_PER_MINUTE)?
+        .checked_add(i128::from(sec) * NANOS_PER_SECOND)?
+        .checked_add(frac_nanos)?;
 
     Some(ColumnValue::IntervalDayTime {
-        total_milliseconds: if negative { -magnitude } else { magnitude },
+        total_nanoseconds: if negative { -magnitude } else { magnitude },
+        // Trino has one day-time interval type and it spans all four fields, so
+        // the precision is always the widest form.
+        precision: Interval::DayToSecond,
     })
 }
 
@@ -2332,7 +2341,8 @@ mod tests {
             val,
             ColumnValue::IntervalYearMonth {
                 years: 3,
-                months: 7
+                months: 7,
+                precision: Interval::YearToMonth,
             }
         );
     }
@@ -2344,7 +2354,12 @@ mod tests {
         assert_eq!(
             val,
             ColumnValue::IntervalDayTime {
-                total_milliseconds: 2 * 86_400_000 + 3 * 3_600_000 + 4 * 60_000 + 5_000 + 678,
+                total_nanoseconds: 2 * NANOS_PER_DAY
+                    + 3 * NANOS_PER_HOUR
+                    + 4 * NANOS_PER_MINUTE
+                    + 5 * NANOS_PER_SECOND
+                    + 678_000_000,
+                precision: Interval::DayToSecond,
             }
         );
     }
@@ -2352,11 +2367,12 @@ mod tests {
     #[test]
     fn negative_interval_day_time_is_fully_negative() {
         let val = parse_interval_day_time("-2 03:04:05.678").expect("parses");
-        // -(2 days + 3h4m5.678s) = -(172800000 + 11045678) ms
+        // -(2 days + 3h4m5.678s) = -183_845_678 ms in nanoseconds.
         assert_eq!(
             val,
             ColumnValue::IntervalDayTime {
-                total_milliseconds: -183_845_678
+                total_nanoseconds: -183_845_678_000_000,
+                precision: Interval::DayToSecond,
             }
         );
     }
@@ -2369,7 +2385,8 @@ mod tests {
         assert_eq!(
             val,
             ColumnValue::IntervalDayTime {
-                total_milliseconds: -11_045_000
+                total_nanoseconds: -11_045_000_000_000,
+                precision: Interval::DayToSecond,
             }
         );
     }
@@ -2380,7 +2397,23 @@ mod tests {
         assert_eq!(
             val,
             ColumnValue::IntervalDayTime {
-                total_milliseconds: 183_845_678
+                total_nanoseconds: 183_845_678_000_000,
+                precision: Interval::DayToSecond,
+            }
+        );
+    }
+
+    /// A fraction finer than Trino's own millisecond rendering survives now that
+    /// the variant counts nanoseconds: the parser no longer truncates at three
+    /// digits.
+    #[test]
+    fn interval_day_time_keeps_sub_millisecond_digits() {
+        let val = parse_interval_day_time("0 00:00:01.234567").expect("parses");
+        assert_eq!(
+            val,
+            ColumnValue::IntervalDayTime {
+                total_nanoseconds: NANOS_PER_SECOND + 234_567_000,
+                precision: Interval::DayToSecond,
             }
         );
     }
