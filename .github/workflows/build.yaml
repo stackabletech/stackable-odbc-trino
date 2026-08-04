@@ -1,0 +1,282 @@
+---
+name: Build and Test
+
+# TODO(@maltesander): The Trino integration suite (./integration-tests/setup.sh
+#                     followed by ./integration-tests/run-tests.sh) is not run
+#                     here. The core compose stack is Trino plus Postgres; the
+#                     oauth and spooling profiles add Keycloak and MinIO, are
+#                     opt-in, and are not proposed for CI. Whether the core
+#                     stack fits a standard runner is unmeasured, and
+#                     ubuntu-24.04 is 4 vCPU / 16 GB, so it should be tried
+#                     rather than assumed. If it does not fit, record the
+#                     measured failure here in place of this note. Until then,
+#                     run it locally before a release. Unit tests run on every
+#                     PR below.
+
+permissions:
+  contents: read
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  merge_group:
+
+# Supersede in-flight runs on the same ref. Never cancel in a merge queue: a
+# cancelled merge_group run reports failure and evicts the PR from the queue.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_TOOLCHAIN_VERSION: "1.95.0"
+
+# Every job below names a runner image rather than a `-latest` alias, so an
+# image roll cannot change what a merge is gated on. The label cannot be lifted
+# into a variable: `runs-on` accepts no `env` context, and the one context that
+# would work, `vars`, holds its value in repository settings rather than here.
+jobs:
+  # Formatting, clippy (which is what enforces the unwrap_used /
+  # unwrap_in_result / panic denies from Cargo.toml), cargo-deny and
+  # cargo-sort. This lives in this workflow rather than its own because
+  # `needs:` cannot cross workflows, and a lint gate the required check does
+  # not observe is not a gate.
+  pre-commit:
+    name: pre-commit
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      # The cargo-test pre-commit hook links libodbc via odbc-sys.
+      - name: Install host dependencies
+        uses: awalsh128/cache-apt-pkgs-action@acb598e5ddbc6f68a970c5da0688d2f3a9f04d05 # v1.6.0
+        with:
+          packages: unixodbc-dev
+          # A cache key, not a runner label, but it tracks the runner image so
+          # that bumping the image invalidates the cached .deb files.
+          version: ubuntu-24.04
+
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          persist-credentials: false
+
+      - name: Install Rust ${{ env.RUST_TOOLCHAIN_VERSION }} toolchain
+        uses: dtolnay/rust-toolchain@b3b07ba8b418998c39fb20f53e8b695cdcc8de1b # 1.95.0
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN_VERSION }}
+          components: rustfmt, clippy
+
+      - name: Setup Rust Cache
+        uses: Swatinem/rust-cache@98c8021b550208e191a6a3145459bfc9fb29c4c0 # v2.8.0
+
+      - name: Install cargo-deny and cargo-sort
+        uses: taiki-e/install-action@97a5807a604e12de3a13b52d868ebecaeeea757c # v2.75.4
+        with:
+          tool: cargo-deny,cargo-sort
+
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: "3.12"
+
+      - uses: pre-commit/action@2c7b3805fd2a0fd8c1884dcaebf91fc102a13ecd # v3.0.1
+
+  unit-tests:
+    name: Unit Tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      # odbc-sys links against libodbc/libodbcinst, so the unixODBC dev
+      # libraries must be present to link the test binaries (no running Driver
+      # Manager is needed — only the libraries).
+      - name: Install host dependencies
+        uses: awalsh128/cache-apt-pkgs-action@acb598e5ddbc6f68a970c5da0688d2f3a9f04d05 # v1.6.0
+        with:
+          packages: unixodbc-dev
+          # A cache key, not a runner label, but it tracks the runner image so
+          # that bumping the image invalidates the cached .deb files.
+          version: ubuntu-24.04
+
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          persist-credentials: false
+
+      - name: Install Rust ${{ env.RUST_TOOLCHAIN_VERSION }} toolchain
+        uses: dtolnay/rust-toolchain@b3b07ba8b418998c39fb20f53e8b695cdcc8de1b
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN_VERSION }}
+
+      - name: Setup Rust Cache
+        uses: Swatinem/rust-cache@98c8021b550208e191a6a3145459bfc9fb29c4c0 # v2.8.0
+
+      # --locked so CI tests the dependency versions Cargo.lock pins, and so a
+      # Cargo.toml change without a matching lockfile update fails here instead
+      # of drifting.
+      - name: Run unit tests
+        run: cargo test --locked
+
+  unit-tests-windows:
+    name: Unit Tests (Windows)
+    runs-on: windows-2022
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          persist-credentials: false
+
+      # aws-lc-sys reaches this crate through trino-rust-client -> reqwest ->
+      # rustls, and its build script assembles x86_64 code with NASM.
+      # Installed explicitly rather than relied on from the runner image, so a
+      # future image change cannot turn this job red for a reason unrelated to
+      # the driver.
+      - name: Install NASM (required to build aws-lc-sys)
+        run: choco install nasm --no-progress -y
+
+      - name: Add NASM to PATH
+        run: echo "C:\Program Files\NASM" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+      - name: Install Rust ${{ env.RUST_TOOLCHAIN_VERSION }} toolchain
+        uses: dtolnay/rust-toolchain@b3b07ba8b418998c39fb20f53e8b695cdcc8de1b
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN_VERSION }}
+          targets: x86_64-pc-windows-gnu
+
+      # A separate cache key: the Linux job's artefacts are a different target
+      # triple and sharing the key would thrash both.
+      - name: Setup Rust Cache
+        uses: Swatinem/rust-cache@98c8021b550208e191a6a3145459bfc9fb29c4c0 # v2.8.0
+        with:
+          key: windows-gnu-test
+
+      # The GNU target's linker. The runner image ships MSYS2, but its mingw64
+      # bin directory is not on PATH by default.
+      - name: Add MinGW to PATH
+        run: echo "C:\msys64\mingw64\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+      # `--target x86_64-pc-windows-gnu`, not the runner's default MSVC triple.
+      # That is the target release.yaml builds and packaging/build-archives.sh
+      # ships, and a suite passing against a toolchain nobody receives is only
+      # evidence about that toolchain. odbc-sys links odbc32, which comes with
+      # the Windows SDK already on the runner, so there is no equivalent of the
+      # unixodbc-dev install the Linux jobs need.
+      - name: Run unit tests
+        run: cargo test --locked --target x86_64-pc-windows-gnu
+
+  # Builds both shipping artifacts the way release.yaml does, and checks the two
+  # properties that are invisible in a unit test run: that the DLL exports the
+  # ODBC entry points, and that what each artifact links at load time still
+  # matches packaging/sbom-native.json. The SBOM declares native dependencies by
+  # hand, since no cargo metadata describes them, so nothing but this check keeps
+  # the declaration true.
+  release-artifacts:
+    name: Release Artifacts
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    needs: [unit-tests]
+    steps:
+      - name: Install MinGW cross-compiler
+        run: sudo apt-get update && sudo apt-get install -y gcc-mingw-w64-x86-64 unixodbc-dev
+
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          persist-credentials: false
+
+      - name: Install Rust ${{ env.RUST_TOOLCHAIN_VERSION }} toolchain
+        uses: dtolnay/rust-toolchain@b3b07ba8b418998c39fb20f53e8b695cdcc8de1b
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN_VERSION }}
+          targets: x86_64-pc-windows-gnu
+
+      - name: Setup Rust Cache
+        uses: Swatinem/rust-cache@98c8021b550208e191a6a3145459bfc9fb29c4c0 # v2.8.0
+        with:
+          key: windows-gnu
+
+      - name: Build Linux shared library
+        run: cargo build --locked --release
+
+      - name: Build Windows DLL
+        run: cargo build --locked --target x86_64-pc-windows-gnu --release
+
+      # Named symbols and a floor, not a printed count. The count alone used to
+      # be piped into `xargs echo`, whose exit status is what the step was
+      # graded on, so a DLL exporting nothing at all passed. The Driver Manager
+      # resolves these by name, and a missing one is a load failure on a user's
+      # machine that no unit test can see.
+      #
+      # ConfigDSNW is in the list because it is the only Windows-only export:
+      # core builds it nowhere else, and it is what the ODBC Administrator's
+      # Add.../Configure... buttons call. The Linux .so has 60 of these; the DLL
+      # has 61.
+      - name: Verify DLL exports
+        run: |
+          DLL=target/x86_64-pc-windows-gnu/release/stackable_odbc_trino.dll
+          EXPORTS=$(x86_64-w64-mingw32-objdump -p "$DLL" \
+            | awk '/Export Address Table/,/Ordinal base/' \
+            | grep -oE '\b(SQL|Config)[A-Za-z]+\b' | sort -u)
+          echo "$EXPORTS" | tr '\n' ' '; echo
+
+          missing=""
+          for sym in SQLAllocHandle SQLFreeHandle SQLDriverConnectW SQLConnectW \
+                     SQLBrowseConnectW SQLDisconnect SQLPrepareW SQLExecute \
+                     SQLExecDirectW SQLBindParameter SQLDescribeParam SQLFetch \
+                     SQLGetData SQLNumResultCols SQLDescribeColW SQLGetInfoW \
+                     SQLGetTypeInfoW SQLGetDiagRecW SQLTablesW SQLColumnsW \
+                     SQLEndTran SQLCancel ConfigDSNW; do
+            grep -qx "$sym" <<< "$EXPORTS" || missing="$missing $sym"
+          done
+          if [ -n "$missing" ]; then
+            echo "::error::the DLL does not export:$missing"
+            exit 1
+          fi
+
+          # A floor as well as the named set, so a wholesale regression in
+          # core's forward_ffi! is caught even if these particular names survive.
+          count=$(echo "$EXPORTS" | grep -c .)
+          if [ "$count" -lt 55 ]; then
+            echo "::error::only $count ODBC symbols exported; expected at least 55"
+            exit 1
+          fi
+          echo "Trino DLL: $count ODBC symbols exported, all required names present"
+
+      # Two different assertions behind one flag. For the .so it compares
+      # DT_NEEDED against the sonames sbom-native.json declares, in both
+      # directions. For the .dll it asserts the mingw runtime is still linked
+      # statically: the release archive ships no runtime DLL, so an artifact
+      # that imported one would fail to load on a user's machine.
+      #
+      # Only the release binaries are checked, and only here rather than in
+      # release.yaml, because a pull request is where a dependency change can
+      # still be reverted cheaply.
+      - name: Verify declared native dependencies
+        run: |
+          ./packaging/sbom.sh --check-native target/release/libstackable_odbc_trino.so
+          ./packaging/sbom.sh --check-native target/x86_64-pc-windows-gnu/release/stackable_odbc_trino.dll
+
+  # Single required check for branch protection rules.
+  finished:
+    name: Finished Build and Test
+    if: always()
+    needs:
+      - pre-commit
+      - unit-tests
+      - unit-tests-windows
+      - release-artifacts
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      # Derived from needs.* rather than a hand-written list of job names: a job
+      # added to `needs` above but forgotten here would otherwise be silently
+      # non-blocking, which is exactly how the lint gate came to sit in a
+      # workflow this check never observed.
+      - name: Check job results
+        env:
+          RESULTS: ${{ join(needs.*.result, ' ') }}
+        run: |
+          for result in $RESULTS; do
+            if [[ "$result" != "success" ]]; then
+              echo "One or more jobs did not succeed: $RESULTS"
+              exit 1
+            fi
+          done
+          echo "All jobs passed: $RESULTS"

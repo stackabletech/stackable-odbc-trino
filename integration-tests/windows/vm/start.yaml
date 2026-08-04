@@ -1,0 +1,148 @@
+- name: Create VM and install Windows
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    libvirt_uri: qemu:///system
+    install_iso_windows: "{{ lookup('env', 'WINDOWS_ISO') }}"
+
+    vm_name: stackable-odbc-test
+    vm_memory_mib: 4096
+    vm_vcpus: 8
+    vm_disk_name: stackable-odbc-test.qcow2
+    vm_disk_pool: default
+    vm_disk_size_gib: 30
+    vm_disk_format: qcow2
+
+    vm_network_hostnet_name: stackable-odbc-test-hostnet
+    vm_network_hostnet_subnet: 192.168.197.0/24
+    vm_network_internet_name: stackable-odbc-test-internet
+    vm_network_internet_subnet: 192.168.196.0/24
+
+    install_iso_virtio_win_url: https://fedorapeople.org/groups/virt/virtio-win/direct-downloads/archive-virtio/virtio-win-0.1.248-1/virtio-win-0.1.248.iso
+    install_iso_virtio_win_checksum: sha256:d5b5739cf297f0538d263e30678d5a09bba470a7c6bcbd8dff74e44153f16549
+    install_iso_virtio_win: "{{ lookup('first_found', 'target') }}/virtio-win.iso"
+
+  tasks:
+    - name: Create target folder
+      ansible.builtin.file:
+        path: target
+        state: directory
+
+    - name: Find Windows ISO
+      ansible.builtin.stat:
+        path: "{{ install_iso_windows }}"
+        get_checksum: false
+      register: install_iso_windows_stat
+
+    - name: Complain about missing Windows ISO
+      ansible.builtin.fail:
+        msg: >-
+          Windows ISO not found. Set the WINDOWS_ISO environment variable to
+          the path of your Windows Server 2022 evaluation ISO, e.g.:
+          export WINDOWS_ISO=~/Downloads/SERVER_EVAL_x64FRE_en-us.iso
+          Download from https://www.microsoft.com/en-us/evalcenter/evaluate-windows-server-2022
+      when: install_iso_windows == '' or not install_iso_windows_stat.stat.exists
+
+    - name: Download virtio-win drivers
+      ansible.builtin.get_url:
+        dest: "{{ install_iso_virtio_win }}"
+        url: "{{ install_iso_virtio_win_url }}"
+        checksum: "{{ install_iso_virtio_win_checksum }}"
+
+    - name: Create VM Network
+      community.libvirt.virt_net:
+        name: "{{ vm_network_hostnet_name }}"
+        command: define
+        xml: "{{ lookup('template', 'templates/windows-vm-network.xml.j2') }}"
+        uri: "{{ libvirt_uri }}"
+
+    - name: Start VM Network
+      community.libvirt.virt_net:
+        name: "{{ vm_network_hostnet_name }}"
+        state: active
+        uri: "{{ libvirt_uri }}"
+
+    - name: Create VM Network (Internet)
+      community.libvirt.virt_net:
+        name: "{{ vm_network_internet_name }}"
+        command: define
+        xml: "{{ lookup('template', 'templates/windows-vm-network-internet.xml.j2') }}"
+        uri: "{{ libvirt_uri }}"
+
+    - name: Start VM Network (Internet)
+      community.libvirt.virt_net:
+        name: "{{ vm_network_internet_name }}"
+        state: active
+        uri: "{{ libvirt_uri }}"
+
+    - name: Create VM
+      community.libvirt.virt:
+        command: define
+        xml: "{{ lookup('template', 'templates/windows-vm.xml.j2') }}"
+        mutate_flags:
+          - ADD_UUID
+          - ADD_MAC_ADDRESSES
+        uri: "{{ libvirt_uri }}"
+
+    - name: Check if VM Volume already exists
+      ansible.builtin.command:
+        cmd: virsh --connect "{{ libvirt_uri }}" vol-info --pool "{{ vm_disk_pool }}" --vol "{{ vm_disk_name }}"
+      register: result_check_vm_disk
+      failed_when: false
+      changed_when: result_check_vm_disk.rc != 0
+
+    - name: Create VM Volume
+      when: result_check_vm_disk is changed
+      ansible.builtin.command:
+        cmd: virsh --connect "{{ libvirt_uri }}" vol-create --pool "{{ vm_disk_pool }}" --file /dev/stdin
+        stdin: "{{ lookup('template', 'templates/windows-vm-volume.xml.j2') }}"
+
+    - name: Start VM
+      community.libvirt.virt:
+        name: "{{ vm_name }}"
+        state: running
+        uri: "{{ libvirt_uri }}"
+
+- name: Wait for Windows to finish installing
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    libvirt_uri: qemu:///system
+    vm_name: stackable-odbc-test
+    vm_network_hostnet_name: stackable-odbc-test-hostnet
+  tasks:
+    - name: Wait for QEMU guest agent
+      ansible.builtin.command:
+        cmd: virsh --connect "{{ libvirt_uri }}" qemu-agent-command "{{ vm_name }}" '{"execute":"guest-ping"}'
+      register: guest_ping
+      until: guest_ping.rc == 0
+      retries: 120
+      delay: 15
+      changed_when: false
+
+    - name: Get VM IP from DHCP leases
+      ansible.builtin.command:
+        cmd: virsh --connect "{{ libvirt_uri }}" net-dhcp-leases "{{ vm_network_hostnet_name }}"
+      register: dhcp_leases
+      changed_when: false
+
+    - name: Extract VM IP
+      ansible.builtin.set_fact:
+        vm_ip: "{{ dhcp_leases.stdout | regex_search('ipv4\\s+(\\d+\\.\\d+\\.\\d+\\.\\d+)/', '\\1') | first }}"
+
+    - name: Wait for WinRM
+      ansible.builtin.wait_for:
+        host: "{{ vm_ip }}"
+        port: 5985
+        timeout: 1800
+        delay: 10
+
+    - name: VM is ready
+      ansible.builtin.debug:
+        msg: >-
+          Windows VM ready at {{ vm_ip }}.
+          Note: FirstLogonCommands (Python, pyodbc) may still be running.
+          The test script waits for setup to complete automatically.
+          Run tests with: uv run --with pywinrm python3 integration-tests/windows/windows_test.py

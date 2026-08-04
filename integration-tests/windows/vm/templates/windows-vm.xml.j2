@@ -1,0 +1,99 @@
+<domain type="kvm">
+  <name>{{ vm_name }}</name>
+  <metadata>
+    <libosinfo:libosinfo xmlns:libosinfo="http://libosinfo.org/xmlns/libvirt/domain/1.0">
+      <libosinfo:os id="http://microsoft.com/win/2k22"/>
+    </libosinfo:libosinfo>
+  </metadata>
+  <memory unit="MiB">{{ vm_memory_mib }}</memory>
+  <currentMemory unit="MiB">{{ vm_memory_mib }}</currentMemory>
+  <vcpu placement="static">{{ vm_vcpus }}</vcpu>
+  <os
+    {# EFI seems to vary more between distributions, and makes Windows always do the "press any key to install" prompt #}
+    {# firmware="efi" #}>
+    <type arch="x86_64" machine="pc-q35-8.0">hvm</type>
+  </os>
+  <features>
+    <acpi/>
+    <apic/>
+    <hyperv mode="custom">
+      <relaxed state="on"/>
+      <vapic state="on"/>
+      <spinlocks state="on" retries="8191"/>
+    </hyperv>
+    <vmport state="off"/>
+  </features>
+  <cpu mode="host-passthrough" check="none" migratable="on"/>
+  {# Our unattended install config reconfigures Windows to read UTC time from RTC #}
+  <clock offset="utc">
+    <timer name="rtc" tickpolicy="catchup"/>
+    <timer name="pit" tickpolicy="delay"/>
+    <timer name="hpet" present="no"/>
+    <timer name="hypervclock" present="yes"/>
+  </clock>
+  <devices>
+    <disk type="volume" device="disk">
+      <driver name="qemu" type="{{ vm_disk_format }}" discard="unmap"/>
+      <source pool="{{ vm_disk_pool }}" volume="{{ vm_disk_name }}"/>
+      <target dev="sda" bus="scsi"/>
+      <boot order="1"/>
+    </disk>
+    <disk type="file" device="cdrom">
+      <driver name="qemu" type="raw"/>
+      <source file="{{ install_iso_windows }}"/>
+      <target dev="sdb" bus="sata"/>
+      <readonly/>
+      <boot order="2"/>
+    </disk>
+    <disk type="file" device="cdrom">
+      <driver name="qemu" type="raw"/>
+      <source file="{{ install_iso_virtio_win }}"/>
+      <target dev="sdc" bus="sata"/>
+      <readonly/>
+    </disk>
+    {# Windows seems to ignore unattended install configs on USB drives #}
+    <disk type="dir" device="floppy">
+      <driver name="qemu" type="fat"/>
+      <source dir="{{ playbook_dir }}/files/windows-install-config"/>
+      <target dev="fda"/>
+      <readonly/>
+    </disk>
+    <controller type="scsi" index="0" model="virtio-scsi"/>
+    <!-- Docker/Kind does not route traffic into libvirt NAT networks properly, so configure a host-only network -->
+    <interface type="network">
+      <source network="{{ vm_network_hostnet_name }}"/>
+      <model type="virtio"/>
+      <alias name="ua-net-hostnet"/>
+    </interface>
+    <!-- Routed networks require extra configuration to provide internet access, so provide a NATed secondary network interface instead -->
+    <interface type="network">
+      <source network="{{ vm_network_internet_name }}"/>
+      <model type="virtio"/>
+      <alias name="ua-net-internet"/>
+    </interface>
+    <serial type="pty"/>
+    <console type="pty">
+      <target type="serial" port="0"/>
+    </console>
+    <channel type="spicevmc">
+      <target type="virtio" name="com.redhat.spice.0"/>
+    </channel>
+    <channel type="unix">
+      <target type="virtio" name="org.qemu.guest_agent.0"/>
+    </channel>
+    <input type="tablet" bus="usb"/>
+    <input type="mouse" bus="ps2"/>
+    <input type="keyboard" bus="ps2"/>
+    <graphics type="spice" autoport="yes">
+      <listen type="address"/>
+      <image compression="off"/>
+    </graphics>
+    <video>
+      <model type="qxl" ram="65536" vram="65536" vgamem="16384" heads="1" primary="yes"/>
+    </video>
+    <redirdev bus="usb" type="spicevmc"/>
+    <redirdev bus="usb" type="spicevmc"/>
+    <watchdog model="itco" action="reset"/>
+    <memballoon model="virtio"/>
+  </devices>
+</domain>

@@ -1,0 +1,29 @@
+debug/
+target/
+**/*.rs.bk
+.worktrees/
+
+.idea/
+*.iws
+*.iml
+.vscode/
+
+# Generated via ctags -R.
+tags
+
+# Local agent working notes (SDD reports); never part of the shipped tree
+.superpowers/
+
+# Power Query connector build output
+connector/bin/
+
+# Release packaging output
+packaging/dist/
+
+# Python bytecode from the test scripts
+__pycache__/
+*.pyc
+
+# Local cargo overrides, e.g. a [patch] pointing core at a sibling checkout.
+# See CONTRIBUTING.md. Never committed: it would redirect everyone else's build.
+.cargo/

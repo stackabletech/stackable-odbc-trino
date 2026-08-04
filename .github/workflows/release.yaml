@@ -1,0 +1,256 @@
+---
+name: Release
+
+on:
+  push:
+    tags:
+      # The tag format cargo-release produces; see release.toml.
+      - "v*"
+  workflow_dispatch:
+
+# Read at the top level; the two jobs that need more grant it to themselves.
+# Attestation needs an OIDC token, and only the publishing job writes.
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_TOOLCHAIN_VERSION: "1.95.0"
+  # Both pinned rather than floating. packaging/test-sbom.sh asserts the shape of
+  # what syft emits and how cargo-auditable's .dep-v0 section reads, so a release
+  # of either that changes that shape has to be adopted deliberately and
+  # re-verified, not picked up silently on the next tag push.
+  SYFT_VERSION: "v1.50.0"
+  CARGO_AUDITABLE_VERSION: "0.7.5"
+
+# Every job below names a runner image rather than a `-latest` alias, so an
+# image roll cannot change what a tagged release is built against. See
+# build.yaml for why the label is repeated rather than named once.
+jobs:
+  verify-version:
+    name: Verify tag matches Cargo.toml
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.extract.outputs.version }}
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          persist-credentials: false
+
+      - id: extract
+        name: Compare tag and Cargo.toml version
+        run: |
+          TAG="${GITHUB_REF#refs/tags/}"
+          TAG_VERSION="${TAG#v}"
+          CARGO_VERSION=$(grep -m1 '^version = ' Cargo.toml | sed -E 's/version = "(.+)"/\1/')
+          if [ "$TAG_VERSION" != "$CARGO_VERSION" ]; then
+            echo "::error::Tag $TAG says version $TAG_VERSION but Cargo.toml has $CARGO_VERSION"
+            exit 1
+          fi
+          echo "version=$CARGO_VERSION" >> "$GITHUB_OUTPUT"
+          echo "Verified: releasing stackable-odbc-trino $CARGO_VERSION"
+
+  build-and-package:
+    name: Build and package release archives
+    runs-on: ubuntu-24.04
+    needs: [verify-version]
+    # id-token and attestations are what actions/attest-* exchange for a
+    # Sigstore signing certificate; contents stays read, since this job
+    # publishes nothing.
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - name: Install host dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y unixodbc-dev gcc-mingw-w64-x86-64 zip
+
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          persist-credentials: false
+
+      - name: Install Rust ${{ env.RUST_TOOLCHAIN_VERSION }} toolchain
+        uses: dtolnay/rust-toolchain@b3b07ba8b418998c39fb20f53e8b695cdcc8de1b
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN_VERSION }}
+          targets: x86_64-pc-windows-gnu
+
+      - name: Setup Rust Cache
+        uses: Swatinem/rust-cache@98c8021b550208e191a6a3145459bfc9fb29c4c0 # v2.8.0
+        with:
+          key: release
+
+      # packaging/sbom.sh reads the .dep-v0 section cargo-auditable embeds, and
+      # refuses an artifact without one. Both tools are therefore preconditions
+      # of packaging, not optional extras.
+      - name: Install cargo-auditable
+        uses: taiki-e/install-action@97a5807a604e12de3a13b52d868ebecaeeea757c # v2.75.4
+        with:
+          tool: cargo-auditable@${{ env.CARGO_AUDITABLE_VERSION }}
+
+      - name: Install syft
+        uses: anchore/sbom-action/download-syft@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+        with:
+          syft-version: ${{ env.SYFT_VERSION }}
+
+      # `cargo auditable build`, not `cargo build`: the plain form links the same
+      # code but embeds no dependency graph, and the SBOM then lists a handful of
+      # components instead of the whole tree.
+      #
+      # --locked so the released binary is built from the versions Cargo.lock
+      # pins. The SBOM describes what was linked, so an unlocked build would
+      # produce an accurate document about an unintended dependency set.
+      - name: Build Linux release binary
+        run: cargo auditable build --locked --release
+
+      - name: Build Windows release binary (cross)
+        run: cargo auditable build --locked --release --target x86_64-pc-windows-gnu
+
+      - name: Assemble release archives
+        env:
+          VERSION: ${{ needs.verify-version.outputs.version }}
+        run: ./packaging/build-archives.sh
+
+      - name: Sanity-check archive contents
+        env:
+          VERSION: ${{ needs.verify-version.outputs.version }}
+        run: |
+          DIST=packaging/dist
+          LINUX="$DIST/stackable-odbc-trino-${VERSION}-linux-x64.tar.gz"
+          WINDOWS="$DIST/stackable-odbc-trino-${VERSION}-windows-x64.zip"
+          MEZ="$DIST/StackableTrinoODBC-${VERSION}.mez"
+
+          echo "--- Linux archive ---"
+          tar -tzf "$LINUX"
+          for f in libstackable_odbc_trino.so install.sh uninstall.sh README.md LICENSE \
+                   libstackable_odbc_trino.so.cdx.json; do
+            tar -tzf "$LINUX" | grep -qx "./$f" || { echo "::error::missing $f in linux archive"; exit 1; }
+          done
+          # Asserted absent, not merely unlisted. Power BI Desktop is
+          # Windows-only, so the connector ships in the zip and as a standalone
+          # asset; README.md spent a release claiming the tarball carried it
+          # too, and a check that only looks for missing files cannot catch a
+          # promise about a file that was never there.
+          if tar -tzf "$LINUX" | grep -q '\.mez$'; then
+            echo "::error::the linux archive carries a .mez; README.md says it does not"
+            exit 1
+          fi
+
+          echo "--- Windows archive ---"
+          unzip -l "$WINDOWS"
+          # configure-dsn.ps1 is checked because install.bat refuses to run
+          # without it: it is the ODBC Administrator's Add.../Configure... dialog.
+          for f in stackable_odbc_trino.dll StackableTrinoODBC.mez install.bat uninstall.bat \
+                   configure-dsn.ps1 README.md LICENSE \
+                   stackable_odbc_trino.dll.cdx.json StackableTrinoODBC.mez.cdx.json; do
+            unzip -l "$WINDOWS" | grep -q " $f\$" || { echo "::error::missing $f in windows archive"; exit 1; }
+          done
+
+          echo "--- Standalone .mez ---"
+          test -f "$MEZ" || { echo "::error::missing standalone .mez"; exit 1; }
+          unzip -l "$MEZ" | grep -q 'StackableTrinoODBC.pq' || { echo "::error::.mez missing StackableTrinoODBC.pq"; exit 1; }
+
+          echo "Archive sanity check passed."
+
+      # TODO(@maltesander): The published binaries are unsigned. Authenticode for
+      #                     stackable_odbc_trino.dll and `MakePQX sign` for the
+      #                     .mez both need a code-signing certificate, which has
+      #                     not been bought. Until then Windows SmartScreen warns
+      #                     on the installer and Power BI refuses the connector
+      #                     unless the user lowers its security level. The
+      #                     attestations below are a different guarantee: they
+      #                     prove where an artifact was built, not who vouches
+      #                     for it, and no operating system consults them.
+
+      # Signs a statement that these files came out of this workflow, at this
+      # commit, and records it in the public transparency log. Verified with
+      # `gh attestation verify <file> --repo stackabletech/stackable-odbc-trino`.
+      # sha256sums.txt is included so the SBOM assets, which it covers, are
+      # reachable from an attested file.
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
+        with:
+          subject-path: |
+            packaging/dist/*.tar.gz
+            packaging/dist/*.zip
+            packaging/dist/*.mez
+            packaging/dist/sha256sums.txt
+
+      # One call per artifact, because each binds exactly one SBOM to one
+      # subject. The CycloneDX document is the one attested; the SPDX one beside
+      # it is a conversion of the same data for consumers that need that format.
+      - name: Attest SBOM for the Linux archive
+        uses: actions/attest-sbom@c604332985a26aa8cf1bdc465b92731239ec6b9e # v4.1.0
+        with:
+          subject-path: packaging/dist/stackable-odbc-trino-${{ needs.verify-version.outputs.version }}-linux-x64.tar.gz
+          sbom-path: packaging/dist/stackable-odbc-trino-${{ needs.verify-version.outputs.version }}-linux-x64.cdx.json
+
+      - name: Attest SBOM for the Windows archive
+        uses: actions/attest-sbom@c604332985a26aa8cf1bdc465b92731239ec6b9e # v4.1.0
+        with:
+          subject-path: packaging/dist/stackable-odbc-trino-${{ needs.verify-version.outputs.version }}-windows-x64.zip
+          sbom-path: packaging/dist/stackable-odbc-trino-${{ needs.verify-version.outputs.version }}-windows-x64.cdx.json
+
+      - name: Attest SBOM for the standalone connector
+        uses: actions/attest-sbom@c604332985a26aa8cf1bdc465b92731239ec6b9e # v4.1.0
+        with:
+          subject-path: packaging/dist/StackableTrinoODBC-${{ needs.verify-version.outputs.version }}.mez
+          sbom-path: packaging/dist/StackableTrinoODBC-${{ needs.verify-version.outputs.version }}.cdx.json
+
+      - name: Upload archives as workflow artifacts
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: release-archives
+          path: packaging/dist/*
+          retention-days: 7
+
+  publish-release:
+    name: Publish GitHub Release
+    runs-on: ubuntu-24.04
+    needs: [verify-version, build-and-package]
+    # The only job that writes, and it writes exactly one thing: the release.
+    permissions:
+      contents: write
+    steps:
+      - name: Download archives
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: release-archives
+          path: dist
+
+      - name: Determine prerelease flag
+        id: prerelease
+        env:
+          VERSION: ${{ needs.verify-version.outputs.version }}
+        run: |
+          if [[ "$VERSION" == *-* ]]; then
+            echo "flag=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "flag=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@72f2c25fcb47643c292f7107632f7a47c1df5cd8 # v2.3.2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: stackable-odbc-trino ${{ needs.verify-version.outputs.version }}
+          generate_release_notes: true
+          prerelease: ${{ steps.prerelease.outputs.flag }}
+          # Each archive already carries its own CycloneDX SBOM, so an offline
+          # install has one. The six standalone documents are here for whoever
+          # needs to read an SBOM without downloading and unpacking a release,
+          # and in SPDX as well as CycloneDX because tools take one or the other.
+          # sha256sums.txt covers every file listed above it.
+          files: |
+            dist/stackable-odbc-trino-${{ needs.verify-version.outputs.version }}-linux-x64.tar.gz
+            dist/stackable-odbc-trino-${{ needs.verify-version.outputs.version }}-windows-x64.zip
+            dist/StackableTrinoODBC-${{ needs.verify-version.outputs.version }}.mez
+            dist/stackable-odbc-trino-${{ needs.verify-version.outputs.version }}-linux-x64.cdx.json
+            dist/stackable-odbc-trino-${{ needs.verify-version.outputs.version }}-linux-x64.spdx.json
+            dist/stackable-odbc-trino-${{ needs.verify-version.outputs.version }}-windows-x64.cdx.json
+            dist/stackable-odbc-trino-${{ needs.verify-version.outputs.version }}-windows-x64.spdx.json
+            dist/StackableTrinoODBC-${{ needs.verify-version.outputs.version }}.cdx.json
+            dist/StackableTrinoODBC-${{ needs.verify-version.outputs.version }}.spdx.json
+            dist/sha256sums.txt

@@ -1,0 +1,61 @@
+[package]
+name = "stackable-odbc-trino"
+version = "0.0.1"
+edition = "2024"
+rust-version = "1.95.0"
+authors = ["Stackable GmbH <info@stackable.tech>"]
+license = "Apache-2.0"
+description = "ODBC driver for Trino, built on the stackable-odbc-core framework."
+repository = "https://github.com/stackabletech/stackable-odbc-trino"
+readme = "README.md"
+keywords = ["odbc", "trino", "driver", "ffi", "sql"]
+categories = ["database", "external-ffi-bindings", "api-bindings"]
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+base64 = "0.23"
+chrono = { version = "0.4", default-features = false }
+chrono-tz = "0.10"
+open = "5"
+serde_json = "1"
+snafu = "0.9"
+# TODO: switch to a crates.io version dep once stackable-odbc-core is published.
+# `deny.toml` allows this repository by name, and `cargo publish` stays blocked
+# until then. Pinned to a tag rather than a branch, so bumping core is a
+# reviewable edit to this line instead of whatever the branch happens to point
+# at. To build against a local checkout, use a `[patch]` in your own
+# `.cargo/config.toml` rather than editing this line; see CONTRIBUTING.md.
+stackable-odbc-core = { git = "https://github.com/stackabletech/stackable-odbc-core.git", tag = "v0.1.0" }
+# `time` is needed directly by `query_all_rows_within`, which bounds the login
+# round trip with `tokio::time::timeout`. It resolves without being declared,
+# because reqwest enables it, but a direct use must not rely on another crate's
+# feature selection staying put.
+tokio = { version = "1.51", features = ["rt", "macros", "time"] }
+tracing = "0.1"
+# TODO: switch back to a crates.io version dep once the fork's changes are
+# released upstream.
+trino-rust-client = { git = "https://github.com/stackabletech/trino-rust-client.git", branch = "stackable-main", features = [
+  "spooling",
+] }
+
+[dev-dependencies]
+criterion = { version = "0.8", features = ["html_reports"] }
+proptest = "1"
+serial_test = "4"
+# The `test-support` feature gates core's `conformance` and `test_support`
+# modules: the info-type shape checks and the connection-injection hooks the
+# offline FFI tests need. It is default-off because it is test code, so it is
+# enabled here rather than on the [dependencies] entry above -- that keeps it
+# out of the shipped cdylib.
+stackable-odbc-core = { git = "https://github.com/stackabletech/stackable-odbc-core.git", tag = "v0.1.0", features = ["test-support"] }
+
+[lints.clippy]
+unwrap_in_result = "deny"
+unwrap_used = "deny"
+panic = "deny"
+
+[[bench]]
+name = "fetch_trino"
+harness = false

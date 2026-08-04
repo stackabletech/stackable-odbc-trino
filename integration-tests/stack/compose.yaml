@@ -1,0 +1,116 @@
+services:
+  postgres:
+    image: postgres:17
+    environment:
+      POSTGRES_DB: testdb
+      POSTGRES_USER: trino
+      POSTGRES_PASSWORD: trino
+    volumes:
+      - ./postgres/init.sql:/docker-entrypoint-initdb.d/init.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U trino -d testdb"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  trino:
+    # Pinned, never `latest`. The floor is 466: the spooling protocol the
+    # spooling profile needs did not exist before it.
+    image: trinodb/trino:483
+    ports:
+      - "8443:8443"
+    volumes:
+      # Assembled by scripts/gen-trino-config.sh from stack/trino/ fragments,
+      # per active profile. Never mount stack/trino/base directly: compose
+      # profiles select services, not file contents.
+      - ../generated/trino:/etc/trino:ro
+      # Secrets mount at /etc/trino-secrets, NOT inside /etc/trino. Nesting a
+      # bind mount inside another one makes Docker create the mount point on
+      # the *host*, inside the mounted directory and owned by root, which is
+      # where the stray password.db and tls/ entries came from.
+      - ../generated/certs:/etc/trino-secrets/tls:ro
+      - ../generated/password.db:/etc/trino-secrets/password.db:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      # -k because curl inside the container has no reason to hold this CA, and
+      # this is a liveness probe, not a TLS test. test_tls.py verifies the
+      # certificate.
+      test: ["CMD", "curl", "-fsk", "https://localhost:8443/v1/info"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 30s
+
+  # --- profiled services ---
+  # These exist so `parse_profiles`' known list and compose agree. Configuring
+  # a new one means replacing both its image and its command, pinned to an
+  # explicit tag.
+
+  keycloak:
+    profiles: [oauth]
+    image: quay.io/keycloak/keycloak:26.0
+    command: ["start-dev", "--import-realm"]
+    ports:
+      # 8444 on the host; Trino holds 8443. Inside the container Keycloak
+      # listens on its own default 8443, which is the backchannel URL Trino
+      # reaches it by.
+      - "8444:8443"
+    environment:
+      # Not `admin`: that is the realm user's name, and the two are easy to
+      # confuse when reading a log.
+      KC_BOOTSTRAP_ADMIN_USERNAME: kcadmin
+      KC_BOOTSTRAP_ADMIN_PASSWORD: kcadmin
+      # Every generated URL, including the `iss` claim, derives from this. It is
+      # the browser-facing form, because the browser runs on the host and the
+      # coordinator is given explicit backchannel URLs instead.
+      #
+      # KC_HOSTNAME_BACKCHANNEL_DYNAMIC is deliberately unset. It would derive
+      # the issuer from each request's own host, so a token minted through
+      # keycloak:8443 would carry a different `iss` from the one Trino is
+      # configured with.
+      KC_HOSTNAME: https://localhost:8444
+      KC_HTTP_ENABLED: "false"
+      KC_HTTPS_CERTIFICATE_FILE: /etc/keycloak-certs/keycloak.crt
+      KC_HTTPS_CERTIFICATE_KEY_FILE: /etc/keycloak-certs/keycloak.key
+    volumes:
+      - ../generated/certs:/etc/keycloak-certs:ro
+      - ../generated/keycloak:/opt/keycloak/data/import:ro
+    # No healthcheck: the image carries neither curl nor a shell to build a
+    # probe with. setup.sh waits from the host for the discovery document, which
+    # is what the stack actually depends on.
+
+  minio:
+    profiles: [spooling]
+    image: quay.io/minio/minio:RELEASE.2025-04-22T22-12-26Z
+    command: ["server", "/data"]
+    environment:
+      # Interpolated from scripts/lib.sh, which is the single source; the
+      # defaults keep this file parseable outside the harness.
+      MINIO_ROOT_USER: ${MINIO_ACCESS_KEY:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_SECRET_KEY:-minioadmin}
+    # No published port. Under retrieval-mode=coordinator_proxy the client never
+    # reaches object storage, only the coordinator does, over this network, so
+    # publishing would buy nothing and could collide. The realistic `storage`
+    # mode would need both a published port and `127.0.0.1 minio` in the host's
+    # own /etc/hosts, because the pre-signed URI names this service.
+
+  minio-init:
+    profiles: [spooling]
+    image: quay.io/minio/mc:RELEASE.2025-04-16T18-13-26Z
+    depends_on:
+      minio:
+        condition: service_started
+    # A retry loop rather than a healthcheck on minio: the server image is not
+    # guaranteed to carry a probe binary, and `mc alias set` succeeding is the
+    # condition that actually matters. Trino does not create the bucket.
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        until mc alias set spool http://minio:9000 \
+            "${MINIO_ACCESS_KEY:-minioadmin}" "${MINIO_SECRET_KEY:-minioadmin}"; do
+          echo "waiting for minio..."; sleep 1
+        done
+        mc mb --ignore-existing "spool/${SPOOLING_BUCKET:-spooling}"
+        mc ls spool/

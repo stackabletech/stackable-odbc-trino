@@ -1,0 +1,53 @@
+# Cargo deny configuration for stackable-odbc-trino
+# Based on operator-rs conventions.
+# Run: cargo deny check
+
+[graph]
+targets = [
+    { triple = "x86_64-unknown-linux-gnu" },
+    { triple = "aarch64-unknown-linux-gnu" },
+    { triple = "x86_64-pc-windows-gnu" },
+]
+
+[advisories]
+yanked = "deny"
+ignore = [
+    # https://rustsec.org/advisories/RUSTSEC-2024-0436
+    # The "paste" crate is no longer maintained. Transitive dependency via
+    # trino-rust-client. No direct usage in our code, minimal impact.
+    # Same ignore as operator-rs.
+    "RUSTSEC-2024-0436",
+]
+
+[bans]
+multiple-versions = "allow"
+
+[licenses]
+unused-allowed-license = "allow"
+confidence-threshold = 1.0
+allow = [
+    "Apache-2.0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "CC0-1.0",
+    "ISC",
+    "MIT",
+    "MPL-2.0",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "Zlib",
+    "Unlicense",
+]
+private = { ignore = true }
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+# Two Stackable repositories are allowed, each with a TODO on its dependency in
+# Cargo.toml: the Trino client is taken from Stackable's fork until its changes
+# are released upstream, and stackable-odbc-core is taken from git until it is
+# published to crates.io. Any other git dependency still fails the gate.
+allow-git = [
+  "https://github.com/stackabletech/stackable-odbc-core.git",
+  "https://github.com/stackabletech/trino-rust-client.git",
+]
