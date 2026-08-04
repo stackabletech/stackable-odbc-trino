@@ -1,17 +1,11 @@
 ---
 name: Build and Test
 
-# TODO(@maltesander): The Trino integration suite (./integration-tests/setup.sh
-#                     followed by ./integration-tests/run-tests.sh) is not run
-#                     here. The core compose stack is Trino plus Postgres; the
-#                     oauth and spooling profiles add Keycloak and MinIO, are
-#                     opt-in, and are not proposed for CI. Whether the core
-#                     stack fits a standard runner is unmeasured, and
-#                     ubuntu-24.04 is 4 vCPU / 16 GB, so it should be tried
-#                     rather than assumed. If it does not fit, record the
-#                     measured failure here in place of this note. Until then,
-#                     run it locally before a release. Unit tests run on every
-#                     PR below.
+# The Trino integration suite runs here, in the integration-tests job below.
+# The stack fits a standard runner with room to spare: on ubuntu-24.04
+# (4 vCPU / 16 GB) the coordinator idles at 871 MiB and the host keeps 13 GiB
+# of 15 GiB free, so the job needs no reduced logging, no image cache and no
+# tuning. The oauth profile stays out, because its login needs a browser.
 
 permissions:
   contents: read
@@ -253,6 +247,121 @@ jobs:
           ./packaging/sbom.sh --check-native target/release/libstackable_odbc_trino.so
           ./packaging/sbom.sh --check-native target/x86_64-pc-windows-gnu/release/stackable_odbc_trino.dll
 
+  # The Trino compose stack, once per profile. Measured on ubuntu-24.04 before
+  # this job was added: the coordinator idles at 871 MiB of 15.6 GiB with 13 GiB
+  # left, and the whole job takes under five minutes, so the runner is nowhere
+  # near its limits and no load reduction is configured.
+  #
+  # The matrix is over stack configurations, not over tests. suites/test_spooling.py
+  # takes no required profile: with `spooling` active it drives the spooled
+  # protocol, and without it asserts the fallback a coordinator with no spooling
+  # manager produces. One profile therefore covers one branch of it, and running
+  # both is what covers the pair. The legs are independent, hence fail-fast:
+  # false, since knowing only that "one of them broke" would mean running it
+  # again to learn which.
+  #
+  # `oauth` is not here. It needs a browser to complete an interactive login,
+  # which is why suites/registry.py marks that suite for the Windows VM runner.
+  integration-tests:
+    name: Integration Tests (${{ matrix.profile || 'core' }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        profile: ["", "spooling"]
+    env:
+      # setup.sh reads this, and writes it into generated/stack.env, which
+      # run-tests.sh sources. One value therefore decides both the stack that
+      # starts and the suites that are considered active, so the two cannot
+      # disagree about which profile is running.
+      PROFILES: ${{ matrix.profile }}
+    steps:
+      # unixodbc is the Driver Manager the suites load the driver through, and
+      # is a different package from the -dev libraries the build links against;
+      # both are needed here. apache2-utils supplies htpasswd, which
+      # gen-secrets.sh uses to write password.db. openssl, keytool and
+      # docker compose come with the runner image.
+      - name: Install host dependencies
+        uses: awalsh128/cache-apt-pkgs-action@acb598e5ddbc6f68a970c5da0688d2f3a9f04d05 # v1.6.0
+        with:
+          packages: unixodbc unixodbc-dev apache2-utils
+          # A cache key, not a runner label, but it tracks the runner image so
+          # that bumping the image invalidates the cached .deb files.
+          version: ubuntu-24.04
+
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          persist-credentials: false
+
+      # uv runs the Python suites (`uv run --with pyodbc`) and is not on the
+      # runner image. pipx is, and installing through it keeps this to one line
+      # with no action to pin.
+      - name: Install uv
+        run: pipx install uv
+
+      # Explicit, and before anything else that can fail, so a Docker Hub rate
+      # limit or a missing tag is reported as itself rather than as a startup
+      # timeout several minutes later. No service names: `pull` takes the
+      # active profiles into account, so the spooling leg picks up MinIO
+      # (+89 MiB) and the core leg does not pull it at all.
+      - name: Pull the stack images
+        # From the stack directory, as scripts/lib.sh's `compose` wrapper does.
+        # Compose derives the project name from the compose file's directory,
+        # and a mismatch here would leave the diagnostics step below querying a
+        # project that holds no containers.
+        working-directory: integration-tests/stack
+        env:
+          COMPOSE_PROFILES: ${{ matrix.profile }}
+        run: docker compose pull
+
+      - name: Install Rust ${{ env.RUST_TOOLCHAIN_VERSION }} toolchain
+        uses: dtolnay/rust-toolchain@b3b07ba8b418998c39fb20f53e8b695cdcc8de1b
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN_VERSION }}
+
+      # Shared across the matrix legs rather than keyed per profile: both build
+      # the identical debug binary, and a per-leg key would double the cache
+      # for no benefit and evict entries the other jobs here still want.
+      - name: Setup Rust Cache
+        uses: Swatinem/rust-cache@98c8021b550208e191a6a3145459bfc9fb29c4c0 # v2.8.0
+        with:
+          key: integration
+
+      # Ahead of setup.sh, which builds too. Doing it here separates a
+      # compilation failure from a stack failure in the step list, and makes
+      # setup.sh's own build the incremental no-op it is designed to be.
+      - name: Build the driver
+        run: cargo build --locked
+
+      - name: Set up the Trino stack
+        run: ./integration-tests/setup.sh
+
+      - name: Run the integration suites
+        # --skip-build because the build above left cargo nothing to do.
+        # --skip-delete so the containers survive run-tests.sh's teardown trap
+        # into the log capture below; the runner is discarded either way, and a
+        # torn-down stack has no logs to explain why it failed.
+        run: ./integration-tests/run-tests.sh --skip-build --skip-delete
+
+      # A stack failure and a driver failure look alike in a red job, so
+      # capture what separates them: the kernel's own OOM verdict, the memory
+      # left, and the container logs.
+      - name: Capture diagnostics on failure
+        if: failure()
+        working-directory: integration-tests/stack
+        env:
+          COMPOSE_PROFILES: ${{ matrix.profile }}
+        run: |
+          echo "=== memory ==="
+          free -h
+          echo "=== dmesg, OOM killer ==="
+          sudo dmesg | grep -i -E 'out of memory|oom-kill' || echo "no OOM kill recorded"
+          echo "=== container state ==="
+          docker compose ps -a
+          echo "=== logs ==="
+          docker compose logs --tail=300
+
   # Single required check for branch protection rules.
   finished:
     name: Finished Build and Test
@@ -262,6 +371,7 @@ jobs:
       - unit-tests
       - unit-tests-windows
       - release-artifacts
+      - integration-tests
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
