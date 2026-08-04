@@ -27,7 +27,7 @@ analytics tools cannot talk to Trino directly, but nearly all of them speak
 ODBC.
 
 This is the ODBC driver for Trino. Install it, and Power BI, Excel, Tableau,
-DBeaver, `isql` and Python's `pyodbc` can query Trino like any other database.
+`isql` and Python's `pyodbc` can query Trino like any other database.
 Linux and Windows are both first-class targets.
 
 ## Quick start
@@ -79,6 +79,8 @@ proper entry in the **Get Data** dialog instead of the generic ODBC one.
 3. Restart Power BI Desktop. **Stackable Trino** now appears under **Get Data**.
 
 ### Your first query
+
+Assuming a Trino instance is reachable on the given host and port:
 
 ```python
 import pyodbc
@@ -185,6 +187,16 @@ SessionProperties=query_max_run_time:10m;example.foo:bar
 Braces in a DSN fail the connection outright, so the mistake is at least loud in
 that direction. The Windows dialog handles both cases for you.
 
+The Power BI connector is different again. In Power Query's Advanced Editor the
+options are fields of a record — the square brackets in the call below — and
+`Odbc.DataSource` builds the connection string from that record, escaping the
+values itself. Write the value bare, as in a DSN, and add no braces:
+
+```text
+StackableTrinoODBC.Contents("trino.example.com", 8443, "hive", null, "me", null,
+    [SessionProperties = "query_max_run_time:10m;example.foo:bar"])
+```
+
 ## What you get
 
 - **Sign in the way your company already does.** Username and password, a bearer
@@ -219,10 +231,13 @@ that direction. The Windows dialog handles both cases for you.
   thing, and the driver rolls back and tells you the commit did not happen
   rather than reporting a success that threw your writes away.
 
-- **Power BI does the work in Trino, not on your laptop.** The bundled connector
-  pushes filters, joins, grouping and row limits down into the SQL it sends, so
-  a report over a billion-row table asks Trino for the answer instead of
-  dragging the table across the network first. DirectQuery is supported.
+- **Power BI can leave the work in Trino.** In DirectQuery mode the bundled
+  connector turns report interactions into SQL, pushing filters, joins,
+  grouping and row limits down to Trino, so a report over a billion-row table
+  asks Trino for the answer instead of dragging the table across the network
+  first. In Import mode that folding still applies to the steps in the Power
+  Query editor at refresh time, but the result is then loaded into the local
+  model and everything after that happens on your machine.
 
 - **Big results can skip the coordinator.** Setting `Encoding=json+zstd` turns
   on Trino's spooling protocol, where large results travel through object
@@ -256,7 +271,7 @@ ignored, so the tool can react instead of trusting a wrong answer.
 | Platforms | Linux x86-64, Windows x86-64 |
 | Driver Managers | unixODBC, and the Windows Driver Manager |
 | Trino | tested against 483 |
-| Tested with | Power BI Desktop, `pyodbc`, `isql`, DBeaver |
+| Tested with | Power BI Desktop, `pyodbc`, `isql` |
 
 Older Trino versions are likely to work, since the driver uses the stable REST
 protocol, but 483 is what the test suite runs against.
