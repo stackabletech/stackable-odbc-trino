@@ -62,17 +62,12 @@ search = "\\[Unreleased\\]: https://github.com/stackabletech/stackable-odbc-trin
 replace = "[Unreleased]: https://github.com/stackabletech/stackable-odbc-trino/compare/v{{version}}...HEAD\n[{{version}}]: https://github.com/stackabletech/stackable-odbc-trino/releases/tag/v{{version}}"
 min = 0
 
-[[pre-release-replacements]]
-file = "packaging/README.md"
-search = "VERSION=[0-9]+\\.[0-9]+\\.[0-9]+"
-replace = "VERSION={{version}}"
-exactly = 1
-
-[[pre-release-replacements]]
-file = "packaging/README.md"
-search = "stackable-odbc-trino-[0-9]+\\.[0-9]+\\.[0-9]+-linux-x64\\.tar\\.gz"
-replace = "stackable-odbc-trino-{{version}}-linux-x64.tar.gz"
-exactly = 1
+# packaging/README.md has no rule, deliberately. It carries no release version:
+# the build command takes its version from Cargo.toml, and the artefact names it
+# lists use a `<version>` placeholder because they document a naming scheme
+# rather than one release. The only version literals left in that file pin syft
+# and cargo-auditable, which track their own upstreams and must survive a
+# release untouched.
 
 # Bumping it here rather than in connector/build.sh keeps the checked-in file
 # truthful: a .mez built from a working tree reports the same version as the

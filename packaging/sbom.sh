@@ -122,8 +122,8 @@ require_audit_section() {
     echo "  It was built with plain cargo, so the dependency graph is not in it" >&2
     echo "  and the SBOM would list only a few components. Rebuild with:" >&2
     case "$artifact" in
-      *.dll) echo "    cargo auditable build --release --target x86_64-pc-windows-gnu" >&2 ;;
-      *)     echo "    cargo auditable build --release" >&2 ;;
+      *.dll) echo "    cargo auditable build --locked --release --target x86_64-pc-windows-gnu" >&2 ;;
+      *)     echo "    cargo auditable build --locked --release" >&2 ;;
     esac
     exit 1
   fi

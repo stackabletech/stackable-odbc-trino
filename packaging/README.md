@@ -225,17 +225,29 @@ compiler and the unixODBC development libraries first, following
 From the **repository root**:
 
 ```bash
-# One-time: the Windows cross-compilation target and the SBOM tooling
+# One-time: the Windows cross-compilation target and the SBOM tooling.
+# Both tools are version-pinned to what .github/workflows/release.yaml installs,
+# because packaging/test-sbom.sh asserts the shape of what syft emits and how
+# cargo-auditable's .dep-v0 section reads. A different version of either can
+# produce a different SBOM from the same binary.
 rustup target add x86_64-pc-windows-gnu
-cargo install cargo-auditable
-# syft: see https://github.com/anchore/syft for install options
+cargo install cargo-auditable@0.7.5
+# syft v1.50.0: see https://github.com/anchore/syft for install options
 
-# Build the Linux and Windows binaries
-cargo auditable build --release
-cargo auditable build --release --target x86_64-pc-windows-gnu
+# Build the Linux and Windows binaries.
+# --locked, as release.yaml uses: it builds against the versions Cargo.lock
+# pins, so the SBOM describes the dependency set that ships rather than
+# whatever resolved today.
+cargo auditable build --locked --release
+cargo auditable build --locked --release --target x86_64-pc-windows-gnu
 
-# Package into release archives (replace the version as appropriate)
-VERSION=0.0.1 ./packaging/build-archives.sh
+# Package into release archives. The version comes from Cargo.toml, which is
+# also what the DLL's version resource and the connector's .pq carry, so there
+# is nothing to pass and nothing to keep in step. Setting VERSION to anything
+# other than that version is refused rather than producing an archive whose name
+# disagrees with the driver inside it. To release a new version, bump all three
+# together with release/release.sh.
+./packaging/build-archives.sh
 ```
 
 `cargo auditable` is required, not a preference: it embeds the dependency list

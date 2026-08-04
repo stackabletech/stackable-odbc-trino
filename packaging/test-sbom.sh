@@ -21,9 +21,51 @@ check() {
   fi
 }
 
+# The purl sbom.sh should emit for a git-sourced package, built from what
+# Cargo.lock actually resolved.
+#
+# Derived rather than written out as a literal, because both git dependencies
+# move: the fork tracks a branch, and core's tag is bumped per release. A
+# hardcoded commit turns every routine bump into a failure of this suite, which
+# is what happened. The fork's rev moved and the literal here did not, so the
+# check reported a defect that was only a stale expectation.
+#
+# This still asserts the real property. The commit comes from the lockfile, not
+# from the SBOM, so a purl naming a branch name, a truncated rev or the wrong
+# package fails exactly as before.
+locked_git_purl() {
+  awk -v want="$1" '
+    /^\[\[package\]\]/ { pkg = ""; ver = ""; next }
+    /^name = /    { pkg = $3; gsub(/"/, "", pkg); next }
+    /^version = / { ver = $3; gsub(/"/, "", ver); next }
+    /^source = "git\+/ {
+      if (pkg != want) next
+      src = $0; sub(/^source = "/, "", src); sub(/"$/, "", src)
+      repo = src; sub(/^git\+/, "", repo); sub(/[?#].*$/, "", repo)
+      rev = src; sub(/^.*#/, "", rev)
+      printf "pkg:cargo/%s@%s?vcs_url=git+%s@%s\n", pkg, ver, repo, rev
+      exit
+    }
+  ' "$REPO_ROOT/Cargo.lock"
+}
+
+FORK_PURL="$(locked_git_purl trino-rust-client)"
+CORE_PURL="$(locked_git_purl stackable-odbc-core)"
+
+# Aborts rather than running on. An empty expectation compares equal to nothing
+# the SBOM emits, so the checks below would still fail, but they would blame
+# the SBOM for a lockfile the helper could not read. Once either dependency
+# moves to crates.io, delete its checks rather than letting this fire.
+for named in "trino-rust-client=$FORK_PURL" "stackable-odbc-core=$CORE_PURL"; do
+  if [ -z "${named#*=}" ]; then
+    echo "ERROR: Cargo.lock records no git source for ${named%%=*}." >&2
+    exit 1
+  fi
+done
+
 if [ ! -f "$SO" ]; then
   echo "Building the release artifact with cargo auditable..."
-  (cd "$REPO_ROOT" && cargo auditable build --release)
+  (cd "$REPO_ROOT" && cargo auditable build --locked --release)
 fi
 
 "$REPO_ROOT/packaging/sbom.sh" "$SO" "$WORK"
@@ -45,7 +87,7 @@ check "no bare pkg:cargo purl on a git or path dep" \
 
 check "the fork purl names an immutable commit" \
   "$(jq -r '.components[] | select(.name == "trino-rust-client") | .purl' "$SBOM")" \
-  "pkg:cargo/trino-rust-client@0.11.0?vcs_url=git+https://github.com/stackabletech/trino-rust-client.git@4a835ccfe4d8332b495cbd74ee1ba48971cbc024"
+  "$FORK_PURL"
 
 check "syft cpe23 noise is stripped" \
   "$(jq '[.components[].properties[]? | select(.name | startswith("syft:cpe23"))] | length' "$SBOM")" "0"
@@ -89,12 +131,12 @@ check "the only path-sourced component is the root package" \
              | .name] | join(",")' "$SBOM")" \
   "stackable-odbc-trino"
 
-# Core is pinned by branch, so its commit moves with every core change. Assert
-# the shape rather than the value: a resolved 40-character commit, never the
-# branch name, or the purl would name whatever that branch points at today.
+# Core is pinned by tag, and the purl must still name the commit that tag
+# resolved to rather than the tag itself: a tag can be moved, so a purl carrying
+# `@v0.1.0` would not identify the source the artifact was built from.
 check "core's purl names an immutable commit" \
-  "$(jq -r '[.components[] | select(.name == "stackable-odbc-core")
-             | select(.purl | test("\\?vcs_url=git\\+https://github\\.com/stackabletech/stackable-odbc-core\\.git@[0-9a-f]{40}$"))] | length' "$SBOM")" "1"
+  "$(jq -r '.components[] | select(.name == "stackable-odbc-core") | .purl' "$SBOM")" \
+  "$CORE_PURL"
 
 # --- SPDX ------------------------------------------------------------------
 # SPDX is converted from the enriched CycloneDX rather than generated afresh, so
@@ -106,7 +148,7 @@ check "SPDX carries the enriched licenses" \
 
 check "SPDX carries the fork's vcs_url purl" \
   "$(jq -r '[.packages[] | select(.name == "trino-rust-client") | .externalRefs[]? | select(.referenceType == "purl") | .referenceLocator] | first' "$SPDX")" \
-  "pkg:cargo/trino-rust-client@0.11.0?vcs_url=git+https://github.com/stackabletech/trino-rust-client.git@4a835ccfe4d8332b495cbd74ee1ba48971cbc024"
+  "$FORK_PURL"
 
 check "SPDX carries the native component" \
   "$(jq '[.packages[] | select(.name == "unixodbc")] | length' "$SPDX")" "1"
@@ -166,7 +208,7 @@ if [ -f "$DLL" ]; then
   check "Windows: the artifact is the SBOM subject" \
     "$(jq -r '.metadata.component.name' "$WSBOM")" "stackable_odbc_trino.dll"
 else
-  echo "SKIP  Windows checks: DLL not built (cargo auditable build --release --target x86_64-pc-windows-gnu)"
+  echo "SKIP  Windows checks: DLL not built (cargo auditable build --locked --release --target x86_64-pc-windows-gnu)"
 fi
 
 # --- the .mez ---------------------------------------------------------------

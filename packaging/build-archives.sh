@@ -2,7 +2,10 @@
 # Assemble release archives for stackable-odbc-trino.
 #
 # Preconditions:
-#   - $VERSION environment variable set (e.g. "1.0.0-beta.1")
+#   - $VERSION unset, or set to the version in Cargo.toml. It defaults to that
+#     version, so a local build needs no argument; release.yaml sets it from the
+#     release tag, which its verify-version job has already checked against
+#     Cargo.toml.
 #   - target/release/libstackable_odbc_trino.so exists
 #   - target/x86_64-pc-windows-gnu/release/stackable_odbc_trino.dll exists
 #   - both built with `cargo auditable`, which embeds the .dep-v0 section the
@@ -20,8 +23,6 @@
 # offline or air-gapped install has it without going back to the release page.
 set -euo pipefail
 
-: "${VERSION:?VERSION environment variable must be set}"
-
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DIST_DIR="$REPO_ROOT/packaging/dist"
 LINUX_SO="$REPO_ROOT/target/release/libstackable_odbc_trino.so"
@@ -32,15 +33,38 @@ CONNECTOR_DIR="$REPO_ROOT/connector"
 MEZ_SOURCE="$CONNECTOR_DIR/bin/StackableTrinoODBC.mez"
 
 if [ ! -f "$LINUX_SO" ]; then
-  echo "ERROR: $LINUX_SO not found. Run 'cargo auditable build --release' first." >&2
+  echo "ERROR: $LINUX_SO not found. Run 'cargo auditable build --locked --release' first." >&2
   exit 1
 fi
 if [ ! -f "$WINDOWS_DLL" ]; then
-  echo "ERROR: $WINDOWS_DLL not found. Run 'cargo auditable build --release --target x86_64-pc-windows-gnu' first." >&2
+  echo "ERROR: $WINDOWS_DLL not found. Run 'cargo auditable build --locked --release --target x86_64-pc-windows-gnu' first." >&2
   exit 1
 fi
 if [ ! -f "$LICENSE_FILE" ]; then
   echo "ERROR: LICENSE file not found at $LICENSE_FILE" >&2
+  exit 1
+fi
+
+# $VERSION names the archives; the crate version is what build.rs compiled into
+# the DLL's VERSIONINFO resource and what the .pq carries. Nothing links the
+# two, so without this an archive called 0.1.0 can hold a DLL the ODBC Data
+# Source Administrator lists as 0.0.1, and the mismatch is invisible until
+# someone reads a bug report.
+#
+# The crate version is therefore the default rather than something to be typed:
+# it is the only value that can be correct, so requiring it as an argument only
+# creates the chance of getting it wrong. release.yaml still passes $VERSION
+# explicitly, from a tag its verify-version job has already compared against
+# Cargo.toml, and that agreeing value is checked here rather than assumed.
+CRATE_VERSION="$(cargo metadata --no-deps --format-version 1 --manifest-path "$REPO_ROOT/Cargo.toml" | jq -r '.packages[0].version')"
+VERSION="${VERSION:-$CRATE_VERSION}"
+if [ "$VERSION" != "$CRATE_VERSION" ]; then
+  echo "ERROR: VERSION=$VERSION but Cargo.toml declares $CRATE_VERSION." >&2
+  echo "  The archives would be named $VERSION while the DLL's version resource" >&2
+  echo "  and connector/StackableTrinoODBC.pq both report $CRATE_VERSION." >&2
+  echo "  Release with 'release/release.sh <patch|minor|major> --execute', which" >&2
+  echo "  bumps all three together, or leave VERSION unset to package the tree" >&2
+  echo "  as it stands." >&2
   exit 1
 fi
 
