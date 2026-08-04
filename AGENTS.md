@@ -78,15 +78,15 @@ This matters for correctness beyond fetching. Core infers cursor state from
 it is published to crates.io:
 
 ```toml
-stackable-odbc-core = { git = "https://github.com/stackabletech/stackable-odbc-core.git", branch = "scaffolding" }
+stackable-odbc-core = { git = "https://github.com/stackabletech/stackable-odbc-core.git", tag = "v0.1.0" }
 ```
 
 `Cargo.toml` carries a matching `TODO`, and `deny.toml` allows the repository by
-name so that any *other* git dependency still fails `cargo deny`. Cargo resolves
-it on a runner like any other dependency, and `Cargo.lock` pins the commit, so
-the build is reproducible even though the branch moves. `cargo publish` still
-cannot run: crates.io accepts no git dependency, which is what the `TODO`
-clears.
+name so that any *other* git dependency still fails `cargo deny`. The reference
+is a tag, not a branch, so which core a build takes is stated in `Cargo.toml`
+and moving to a newer core is a reviewable one-line edit; `Cargo.lock` pins the
+commit the tag resolved to. `cargo publish` still cannot run: crates.io accepts
+no git dependency, which is what the `TODO` clears.
 
 To build against a local core checkout, put a `[patch]` in your own
 `.cargo/config.toml` rather than editing `Cargo.toml`, so the override cannot be
