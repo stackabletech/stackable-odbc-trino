@@ -2,6 +2,9 @@ target
 corpus
 artifacts
 coverage
+# `-jobs=N` writes one of these per worker into whatever directory the run
+# started from.
+fuzz-*.log
 # Untracked, matching stackable-odbc-core's fuzz workspace. These targets are
 # never published and CI resolves them fresh, so pinning here would only add a
 # second lockfile for Renovate to carry.
