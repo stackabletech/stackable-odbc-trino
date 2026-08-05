@@ -1,0 +1,140 @@
+name: Bug report
+description: The driver behaves differently from the ODBC spec, from its own documentation, or from what Trino answers.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        This repository holds the Trino-specific half of the driver: the
+        connection string, the SQL and type mapping, the catalog functions and
+        the error mapping. Everything generic about being an ODBC driver
+        (handle management, UTF-16 marshalling, diagnostic records, the
+        exported C entry points) lives in
+        [`stackable-odbc-core`](https://github.com/stackabletech/stackable-odbc-core).
+
+        If you are not sure which side a problem falls on, file it here and say
+        so. Please do not report security vulnerabilities in an issue, see
+        [SECURITY.md](https://github.com/stackabletech/stackable-odbc-trino/blob/main/SECURITY.md).
+
+  - type: dropdown
+    id: component
+    attributes:
+      label: Component
+      options:
+        - The ODBC driver
+        - The Power BI custom connector (.mez)
+        - The Windows installer or the DSN dialog
+        - The Linux installer
+        - Not sure
+    validations:
+      required: true
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What the driver did, and what you expected instead.
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: How to reproduce
+      description: >
+        The ODBC calls or the application steps that lead to it, in order, with
+        the arguments that matter. If a statement is involved, include the SQL
+        as the application sends it, and what Trino answers when the same
+        statement is run through the Trino CLI. That comparison separates a
+        driver defect from Trino's own behaviour faster than anything else.
+      placeholder: |
+        SQLExecDirectW(stmt, L"SELECT * FROM tpch.tiny.nation", SQL_NTS)  -> SQL_SUCCESS
+        SQLFetch(stmt)                                                   -> SQL_ERROR, expected SQL_SUCCESS
+    validations:
+      required: true
+
+  - type: input
+    id: sqlstate
+    attributes:
+      label: SQLSTATE and message
+      description: >
+        From `SQLGetDiagRecW`, if the call returned `SQL_ERROR` or
+        `SQL_SUCCESS_WITH_INFO`. A wrong SQLSTATE is itself a bug worth
+        reporting, even when the call otherwise does the right thing.
+      placeholder: "42S02, Table 'tpch.tiny.nations' does not exist"
+
+  - type: textarea
+    id: connection-string
+    attributes:
+      label: Connection string or DSN
+      description: >
+        With the password and any token removed. Several defects turn out to be
+        one key, so the keys in use are usually part of the answer. For example
+        `Driver=stackable_odbc_trino;Host=trino.example.com;Port=8443;User=me;TlsVerify=ca`.
+      render: text
+
+  - type: input
+    id: version
+    attributes:
+      label: Driver version
+      description: The release you installed, or the commit if you built from source.
+      placeholder: "0.1.0"
+    validations:
+      required: true
+
+  - type: input
+    id: trino-version
+    attributes:
+      label: Trino version
+      description: >
+        The coordinator version, from `SELECT version()`. Also say which
+        catalog and connector the failing query touches, if it touches one.
+      placeholder: "476, iceberg catalog"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: driver-manager
+    attributes:
+      label: Driver Manager
+      description: >
+        The Windows Driver Manager is considerably stricter than unixODBC, and
+        several behaviours differ between them.
+      options:
+        - unixODBC
+        - Windows Driver Manager
+        - Other / not sure
+    validations:
+      required: true
+
+  - type: input
+    id: platform
+    attributes:
+      label: Platform and application
+      description: OS and architecture, and the tool that drives the driver.
+      placeholder: "Windows 11 x86_64, Power BI Desktop 2.14 / Ubuntu 24.04 x86_64, pyodbc 5.1"
+    validations:
+      required: true
+
+  - type: input
+    id: spec-reference
+    attributes:
+      label: Spec reference
+      description: >
+        Link to the function's page on Microsoft Learn, and quote the row or
+        sentence you think is not being honoured. Optional, but it is what
+        makes a report immediately actionable. Pay attention to whether the row
+        carries a `(DM)` marker, which means the Driver Manager owes it rather
+        than the driver.
+      placeholder: "https://learn.microsoft.com/en-us/sql/odbc/reference/syntax/sqlgetinfo-function"
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Driver log
+      description: >
+        Set `ODBC_LOG_LEVEL=debug` and `ODBC_LOG_FILE=/path/to/log`, reproduce,
+        and attach the relevant part. **Check it before posting.** The
+        connection string appears in it: passwords are redacted, but hostnames,
+        usernames and every other parameter are not.
+      render: text
