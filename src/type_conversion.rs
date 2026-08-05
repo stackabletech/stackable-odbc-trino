@@ -814,7 +814,12 @@ fn parse_trino_time_with_tz(s: &str) -> Option<ColumnValue> {
     let mut op = offset_body.splitn(2, ':');
     let oh: i32 = op.next()?.parse().ok()?;
     let om: i32 = op.next().unwrap_or("0").parse().ok()?;
-    shift_time(time_part, sign * (oh * 60 + om))
+    // Checked, because both fields are free-form text: `i32::MAX` parses
+    // happily and only the multiply reveals it is not an offset. Returning
+    // `None` keeps the value as text, which is what every other unparseable
+    // temporal string here already does.
+    let offset_minutes = oh.checked_mul(60)?.checked_add(om)?.checked_mul(sign)?;
+    shift_time(time_part, offset_minutes)
 }
 
 /// Shift `HH:MM:SS[.f]` by `offset_minutes`, wrapping within the day.
@@ -837,7 +842,12 @@ fn shift_time(time_part: &str, offset_minutes: i32) -> Option<ColumnValue> {
     let second: i32 = sf.next()?.parse().ok()?;
     let fraction = sf.next().map(parse_fraction_nanos).unwrap_or(0);
 
-    let total = hour * 60 + minute - offset_minutes;
+    // Checked for the same reason as the offset above: `hour` and `minute` are
+    // whatever the text held, not values already bounded by a clock.
+    let total = hour
+        .checked_mul(60)?
+        .checked_add(minute)?
+        .checked_sub(offset_minutes)?;
     let wrapped = total.rem_euclid(24 * 60);
 
     Some(ColumnValue::Time {
@@ -2308,6 +2318,55 @@ mod tests {
                 second: 15,
                 fraction: 123_456_000,
             }
+        );
+    }
+
+    #[test]
+    fn time_with_timezone_offset_too_large_to_be_an_offset_stays_text() {
+        // Found by the `json_value` fuzz target. The offset fields are
+        // free-form text, so a value far outside any real zone parses as an
+        // `i32` and only overflows when converted to minutes. Release builds
+        // carry no overflow checks, so an unchecked multiply here reports a
+        // *different* time instead of declining the value.
+        assert_eq!(parse_trino_time_with_tz("00:00:00+949378864"), None);
+        assert_eq!(
+            json_to_column_value(
+                Value::String("+999\0\0\0\0+00949378864".into()),
+                &TrinoTy::Option(Box::new(TrinoTy::TimeWithTimeZone)),
+            ),
+            ColumnValue::String("+999\0\0\0\0+00949378864".into())
+        );
+    }
+
+    #[test]
+    fn time_with_timezone_hour_field_too_large_stays_text() {
+        // The same class one frame down, in `shift_time`: the time-of-day hour
+        // is text too, so `hour * 60` overflows before the offset is ever
+        // applied.
+        assert_eq!(parse_trino_time_with_tz("2147483647:00:00+01:00"), None);
+    }
+
+    #[test]
+    fn time_with_timezone_real_offsets_still_parse() {
+        // The checked arithmetic must not narrow what a valid offset can be:
+        // the widest zones in use are +14:00 and -12:00.
+        assert_eq!(
+            parse_trino_time_with_tz("13:14:15+14:00"),
+            Some(ColumnValue::Time {
+                hour: 23,
+                minute: 14,
+                second: 15,
+                fraction: 0,
+            })
+        );
+        assert_eq!(
+            parse_trino_time_with_tz("13:14:15-12:00"),
+            Some(ColumnValue::Time {
+                hour: 1,
+                minute: 14,
+                second: 15,
+                fraction: 0,
+            })
         );
     }
 

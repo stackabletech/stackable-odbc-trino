@@ -18,6 +18,11 @@ mod backend;
 mod escape_dialect;
 mod type_conversion;
 
+/// The entry points the fuzz targets in `fuzz/` drive. Behind the default-off
+/// `fuzzing` feature: see `Cargo.toml`.
+#[cfg(feature = "fuzzing")]
+pub mod fuzz_api;
+
 pub use backend::TrinoBackend;
 
 stackable_odbc_core::forward_ffi!(crate::backend::TrinoBackend);

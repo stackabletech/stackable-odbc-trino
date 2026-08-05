@@ -138,7 +138,7 @@ pub(crate) mod info;
 mod info;
 mod metadata;
 mod params;
-mod types;
+pub(crate) mod types;
 
 /// The interval units Trino's `date_add` / `date_diff` accept, reported for
 /// both `SQL_TIMEDATE_ADD_INTERVALS` and `SQL_TIMEDATE_DIFF_INTERVALS`.
