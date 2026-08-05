@@ -56,6 +56,9 @@ echo "=== Assembling the Keycloak realm ==="
 echo "=== Assembling Trino config ==="
 "$SCRIPT_DIR/gen-trino-config.sh"
 
+# After every generator, before anything is mounted.
+make_mounts_readable
+
 echo "=== Starting the stack ==="
 # A profile change must recreate the coordinator. Compose would start the new
 # service and leave trino running on its already-assembled config, so

@@ -128,14 +128,24 @@ unsafe fn alloc_stmt() -> (*mut c_void, *mut c_void, *mut c_void) {
 /// says nothing useful on its own, and the SQLSTATE plus the server's message
 /// is the difference between "the query was rejected" and a guess.
 unsafe fn diag_message(stmt: *mut c_void) -> String {
+    unsafe { handle_diag_message(HandleType::Stmt, stmt) }
+}
+
+/// The same, for a connection handle. A failed connect leaves its diagnostic
+/// on the Dbc, and there is no statement to ask.
+unsafe fn conn_diag_message(conn: *mut c_void) -> String {
+    unsafe { handle_diag_message(HandleType::Dbc, conn) }
+}
+
+unsafe fn handle_diag_message(handle_type: HandleType, handle: *mut c_void) -> String {
     let mut state = [0u16; 6];
     let mut msg = [0u16; 1024];
     let mut msg_len: i16 = 0;
     let mut native: i32 = 0;
     let ret = unsafe {
         ffi::diag::sql_get_diag_rec_w::<TrinoBackend>(
-            HandleType::Stmt as i16,
-            stmt,
+            handle_type as i16,
+            handle,
             1,
             state.as_mut_ptr(),
             &mut native,
@@ -187,7 +197,17 @@ unsafe fn alloc_handles() -> (*mut c_void, *mut c_void, *mut c_void) {
 
 /// Helper: connect to Trino at localhost:8443.
 unsafe fn connect_trino(conn: *mut c_void) -> SqlReturn {
-    let wide: Vec<u16> = CONN_STR.encode_utf16().collect();
+    // The terminator is part of the buffer, because the length argument below
+    // is SQL_NTS: that tells the driver the string is null-terminated and to
+    // find the end itself. Without it the driver reads past this Vec until it
+    // meets a zero somewhere in the heap, which appends whatever bytes follow
+    // to the last key in the connection string. It is the allocator's leftovers
+    // that decide, so the same code connects or reports a certificate path that
+    // does not exist depending on what ran before it.
+    //
+    // Every other wide buffer in this file passes an explicit length instead,
+    // and needs no terminator.
+    let wide: Vec<u16> = CONN_STR.encode_utf16().chain(std::iter::once(0)).collect();
     unsafe {
         ffi::connect::sql_driver_connect_w::<TrinoBackend>(
             conn,
@@ -695,7 +715,13 @@ unsafe fn get_i64_col(stmt: *mut c_void, col: u16) -> i64 {
 fn connect_and_disconnect_lifecycle() {
     unsafe {
         let (env, conn, stmt) = alloc_handles();
-        assert_eq!(connect_trino(conn), SqlReturn::SUCCESS, "connect failed");
+        let ret = connect_trino(conn);
+        assert_eq!(
+            ret,
+            SqlReturn::SUCCESS,
+            "connect failed: {}",
+            conn_diag_message(conn)
+        );
         assert_eq!(
             exec_direct(stmt, "SELECT 1"),
             SqlReturn::SUCCESS,

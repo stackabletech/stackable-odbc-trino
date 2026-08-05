@@ -66,6 +66,42 @@ ALL_PROFILES="oauth spooling"
 
 mkdir -p "$GENERATED"
 
+# Everything under generated/ that a container reads, made readable by the uid
+# that reads it. Call once after the generators have run and before `compose
+# up`, rather than chmod-ing after each write: the mount list is what decides
+# who needs read access, so one rule next to the compose wrapper is checkable
+# against compose.yaml, and a new generator cannot forget it.
+#
+# Two independent reasons a bind-mounted file is unreadable in the container:
+#
+#   - Mode 0600 from openssl, which sets it explicitly for keys and for
+#     `pkcs12 -export`. Both Trino and Keycloak run as uid 1000, so this only
+#     works where the invoking user is also uid 1000. On a GitHub runner
+#     (uid 1001) the coordinator exits during Guice with
+#     "keystore.p12 (Permission denied)".
+#   - The invoking umask, which every other generated file inherits. At the
+#     common 002 or 022 these land 0664 or 0644 and nothing is noticed; at 077
+#     the entire Trino config directory is unreadable too.
+#
+# `a+rX` adds read for all and execute only where it is already set, so it
+# opens directories for traversal without marking regular files executable, and
+# it never removes an existing permission. The private keys are not listed:
+# only the host reads those, and they keep their 0600.
+#
+# Nothing here is a secret. The store password is `changeit`, checked in beside
+# the config, and this CA signs for nothing outside the test stack.
+make_mounts_readable() {
+    chmod a+rX "$GENERATED" "$CERT_DIR"
+    chmod -R a+rX "$GENERATED/trino"
+    chmod a+r "$GENERATED/password.db"
+    chmod a+r "$CERT_DIR/keystore.p12" "$CERT_DIR/truststore.p12"
+    # Only present with the oauth profile, and mounted only then.
+    if [[ -d "$GENERATED/keycloak" ]]; then
+        chmod -R a+rX "$GENERATED/keycloak"
+        chmod a+r "$CERT_DIR/keycloak.crt" "$CERT_DIR/keycloak.key"
+    fi
+}
+
 # `docker compose` with the right file, from the right directory: compose
 # resolves relative volume paths against the compose file's own directory.
 compose() {
