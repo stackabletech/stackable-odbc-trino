@@ -300,11 +300,18 @@ jobs:
       - name: Install uv
         run: pipx install uv
 
-      # Explicit, and before anything else that can fail, so a Docker Hub rate
-      # limit or a missing tag is reported as itself rather than as a startup
-      # timeout several minutes later. No service names: `pull` takes the
-      # active profiles into account, so the spooling leg picks up MinIO
-      # (+89 MiB) and the core leg does not pull it at all.
+      # Explicit, and before anything else that can fail, so a rate limit or a
+      # missing tag is reported as itself rather than as a startup timeout
+      # several minutes later. No service names: `pull` takes the active
+      # profiles into account, so the spooling leg picks up MinIO (+89 MiB) and
+      # the core leg does not pull it at all.
+      #
+      # The retry wraps the whole pull because the daemon's own retry budget is
+      # per layer: once a single layer exhausts it, the pull fails and takes
+      # every other image with it. Layers that did arrive stay in the local
+      # content store, so a second attempt refetches only what is missing and
+      # costs seconds. The spooling leg is the one that reaches quay.io for
+      # MinIO, and that is where the dropped connections have been seen.
       - name: Pull the stack images
         # From the stack directory, as scripts/lib.sh's `compose` wrapper does.
         # Compose derives the project name from the compose file's directory,
@@ -313,7 +320,34 @@ jobs:
         working-directory: integration-tests/stack
         env:
           COMPOSE_PROFILES: ${{ matrix.profile }}
-        run: docker compose pull
+        run: |
+          set -o pipefail
+          log="$RUNNER_TEMP/pull.log"
+
+          for attempt in 1 2 3; do
+            if docker compose pull 2>&1 | tee "$log"; then
+              exit 0
+            fi
+
+            # Neither of these improves by asking again. A registry counts a
+            # rate limit over hours, and a name it does not serve is a mistake
+            # in the compose file, so both are reported as themselves instead
+            # of spending two more attempts to reach the same answer.
+            if grep -qiE 'toomanyrequests|rate limit' "$log"; then
+              echo "::error::registry rate limit reached; the pull was not retried"
+              exit 1
+            fi
+            if grep -qiE 'manifest unknown|name unknown|repository does not exist|unauthorized|denied' "$log"; then
+              echo "::error::a registry refused an image name or tag; the pull was not retried"
+              exit 1
+            fi
+
+            echo "::warning::pull attempt $attempt failed on a transient error"
+            sleep $((attempt * 15))
+          done
+
+          echo "::error::the stack images could not be pulled in three attempts"
+          exit 1
 
       - name: Install Rust ${{ env.RUST_TOOLCHAIN_VERSION }} toolchain
         uses: dtolnay/rust-toolchain@b3b07ba8b418998c39fb20f53e8b695cdcc8de1b
