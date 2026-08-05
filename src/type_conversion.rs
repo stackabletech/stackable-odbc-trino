@@ -529,17 +529,33 @@ fn strip_precision_param(name: &str) -> String {
 }
 
 /// Extract the first numeric parameter from a type string like `"varchar(100)"` or `"decimal(10,2)"`.
+///
+/// `name.get(..)` rather than `name[..]`, for the same reason
+/// [`parse_fraction_nanos`] uses it: the two ends are located independently, by
+/// `find` and `rfind`, so nothing about a caller-supplied string guarantees the
+/// opening parenthesis precedes the closing one, and indexing a reversed range
+/// panics where `get` returns `None`. Both callers currently gate on
+/// [`TrinoTypeName::parse`], which no reversed-parenthesis name survives, so
+/// this is what keeps that gate from being load-bearing rather than a fix for
+/// a reachable defect.
 fn parse_precision_param(name: &str) -> Option<i32> {
     let start = name.find('(')?;
     let end = name.rfind(')')?;
-    name[start + 1..end].split(',').next()?.trim().parse().ok()
+    name.get(start + 1..end)?
+        .split(',')
+        .next()?
+        .trim()
+        .parse()
+        .ok()
 }
 
 /// Extract the second numeric parameter from a type string like `"decimal(10,2)"`.
+///
+/// `get` rather than indexing, for the reason [`parse_precision_param`] gives.
 fn parse_scale_param(name: &str) -> Option<i32> {
     let start = name.find('(')?;
     let end = name.rfind(')')?;
-    let mut parts = name[start + 1..end].split(',');
+    let mut parts = name.get(start + 1..end)?.split(',');
     parts.next()?;
     parts.next()?.trim().parse().ok()
 }
@@ -1710,6 +1726,33 @@ mod tests {
         assert_eq!(type_name_precision("varchar(50)"), Some(50));
         assert_eq!(type_name_precision("decimal(10,2)"), Some(10));
         assert_eq!(type_name_scale("decimal(10,2)"), Some(2));
+    }
+
+    #[test]
+    fn param_parsers_decline_reversed_parentheses() {
+        // Called directly, because the public entry points cannot deliver this
+        // shape: `type_name_precision` and `type_name_scale` both gate on
+        // `TrinoTypeName::parse`, and a name whose `)` precedes its `(` leaves
+        // that `)` in the base name the gate matches on, so the gate rejects it
+        // first. That makes these two the only place the ordering can be
+        // asserted, and it is worth asserting: `find`/`rfind` locate the ends
+        // independently, and the gate is not their contract.
+        assert_eq!(parse_precision_param(")("), None);
+        assert_eq!(parse_scale_param(")("), None);
+        assert_eq!(parse_precision_param("decimal)10,2("), None);
+        assert_eq!(parse_scale_param("decimal)10,2("), None);
+    }
+
+    #[test]
+    fn param_parsers_read_well_formed_arguments() {
+        // The `get` guard must not change what a real signature yields.
+        assert_eq!(parse_precision_param("varchar(50)"), Some(50));
+        assert_eq!(parse_precision_param("decimal(10,2)"), Some(10));
+        assert_eq!(parse_scale_param("decimal(10,2)"), Some(2));
+        // An empty argument list, and a scale that is not there at all: both
+        // already returned `None` by way of the parse failing.
+        assert_eq!(parse_precision_param("varchar()"), None);
+        assert_eq!(parse_scale_param("varchar(50)"), None);
     }
 
     // --- TrinoTypeName::parse: precision-argument-in-the-middle ---
