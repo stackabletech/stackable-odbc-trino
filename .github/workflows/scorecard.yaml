@@ -32,7 +32,7 @@ jobs:
       contents: read
       actions: read
     steps:
-      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
@@ -44,6 +44,6 @@ jobs:
           publish_results: true
 
       - name: Upload results to code scanning
-        uses: github/codeql-action/upload-sarif@a2983b8bed1923f44751c5c43237f479442827b3 # v3.37.4
+        uses: github/codeql-action/upload-sarif@404bd795832c959ffb8efae2b1b4cc1aafc82058 # v3.37.6
         with:
           sarif_file: results.sarif

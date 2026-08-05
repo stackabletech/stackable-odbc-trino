@@ -7,16 +7,34 @@ on:
     - cron: '15 4 * * *'
   workflow_dispatch:
 
+# rustsec/audit-check reports findings by opening a GitHub issue, and records a
+# check run. With contents:read alone it cannot do either, so a new advisory
+# would fail silently and the job's green status would mean nothing.
 permissions:
   contents: read
+  issues: write
+  checks: write
 
 jobs:
   audit:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+
+      # rustsec/audit-check looks for `cargo-audit` on PATH and falls back to a
+      # bare `cargo install cargo-audit` when it is missing. That fallback
+      # passes no `--locked`, so it resolves cargo-audit's dependencies fresh
+      # and pulls in whatever versions are current, several of which now
+      # require a newer rustc than the 1.95.0 that rust-toolchain.toml pins for
+      # this repository. Installing a prebuilt binary first satisfies the PATH
+      # lookup, so the action never compiles cargo-audit and the pin no longer
+      # constrains a tool that only ever reads Cargo.lock.
+      - name: Install cargo-audit
+        uses: taiki-e/install-action@cb33e69fad06166ca28a42b2575e4dadabf62ee8 # v2.85.8
+        with:
+          tool: cargo-audit
 
       # This `token` is the action's own input, not checkout's: audit-check
       # needs it to post the advisory annotations onto the run.
