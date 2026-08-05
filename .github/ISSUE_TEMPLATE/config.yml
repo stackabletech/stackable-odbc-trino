@@ -1,0 +1,11 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Question or discussion
+    url: https://github.com/orgs/stackabletech/discussions
+    about: For usage questions and anything that is not yet a specific defect.
+  - name: Community chat
+    url: https://discord.gg/7kZ3BNnCAF
+    about: Stackable's Discord, for a faster back-and-forth.
+  - name: Report a security vulnerability
+    url: https://github.com/stackabletech/stackable-odbc-trino/security/advisories/new
+    about: Please report vulnerabilities privately rather than in an issue.
