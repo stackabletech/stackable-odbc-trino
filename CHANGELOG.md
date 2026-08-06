@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.1] — 2026-08-06
+
 ### Fixed
 
 A `TIME WITH TIME ZONE` value whose offset or hour field lies far outside a real
@@ -88,5 +90,6 @@ covered by `sha256sums.txt`.
 - Only the `READ UNCOMMITTED` isolation level is offered, because it is the one
   every Trino catalog accepts.
 
-[Unreleased]: https://github.com/stackabletech/stackable-odbc-trino/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/stackabletech/stackable-odbc-trino/compare/v0.1.1...HEAD
+[0.1.1]: https://github.com/stackabletech/stackable-odbc-trino/releases/tag/v0.1.1
 [0.1.0]: https://github.com/stackabletech/stackable-odbc-trino/releases/tag/v0.1.0
