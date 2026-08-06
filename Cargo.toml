@@ -14,6 +14,15 @@ categories = ["database", "external-ffi-bindings", "api-bindings"]
 [lib]
 crate-type = ["cdylib", "rlib"]
 
+[features]
+# Exposes the `fuzz_api` module, which re-exports the private entry points the
+# targets in `fuzz/` drive.
+#
+# Default-off because it is test scaffolding: the modules it widens are private
+# on purpose, and a shipped driver has no reason to carry a second, unsupported
+# way into its parsers. `fuzz/Cargo.toml` enables it; nothing else should.
+fuzzing = []
+
 [dependencies]
 base64 = "0.23"
 chrono = { version = "0.4", default-features = false }

@@ -529,17 +529,33 @@ fn strip_precision_param(name: &str) -> String {
 }
 
 /// Extract the first numeric parameter from a type string like `"varchar(100)"` or `"decimal(10,2)"`.
+///
+/// `name.get(..)` rather than `name[..]`, for the same reason
+/// [`parse_fraction_nanos`] uses it: the two ends are located independently, by
+/// `find` and `rfind`, so nothing about a caller-supplied string guarantees the
+/// opening parenthesis precedes the closing one, and indexing a reversed range
+/// panics where `get` returns `None`. Both callers currently gate on
+/// [`TrinoTypeName::parse`], which no reversed-parenthesis name survives, so
+/// this is what keeps that gate from being load-bearing rather than a fix for
+/// a reachable defect.
 fn parse_precision_param(name: &str) -> Option<i32> {
     let start = name.find('(')?;
     let end = name.rfind(')')?;
-    name[start + 1..end].split(',').next()?.trim().parse().ok()
+    name.get(start + 1..end)?
+        .split(',')
+        .next()?
+        .trim()
+        .parse()
+        .ok()
 }
 
 /// Extract the second numeric parameter from a type string like `"decimal(10,2)"`.
+///
+/// `get` rather than indexing, for the reason [`parse_precision_param`] gives.
 fn parse_scale_param(name: &str) -> Option<i32> {
     let start = name.find('(')?;
     let end = name.rfind(')')?;
-    let mut parts = name[start + 1..end].split(',');
+    let mut parts = name.get(start + 1..end)?.split(',');
     parts.next()?;
     parts.next()?.trim().parse().ok()
 }
@@ -814,7 +830,12 @@ fn parse_trino_time_with_tz(s: &str) -> Option<ColumnValue> {
     let mut op = offset_body.splitn(2, ':');
     let oh: i32 = op.next()?.parse().ok()?;
     let om: i32 = op.next().unwrap_or("0").parse().ok()?;
-    shift_time(time_part, sign * (oh * 60 + om))
+    // Checked, because both fields are free-form text: `i32::MAX` parses
+    // happily and only the multiply reveals it is not an offset. Returning
+    // `None` keeps the value as text, which is what every other unparseable
+    // temporal string here already does.
+    let offset_minutes = oh.checked_mul(60)?.checked_add(om)?.checked_mul(sign)?;
+    shift_time(time_part, offset_minutes)
 }
 
 /// Shift `HH:MM:SS[.f]` by `offset_minutes`, wrapping within the day.
@@ -837,7 +858,12 @@ fn shift_time(time_part: &str, offset_minutes: i32) -> Option<ColumnValue> {
     let second: i32 = sf.next()?.parse().ok()?;
     let fraction = sf.next().map(parse_fraction_nanos).unwrap_or(0);
 
-    let total = hour * 60 + minute - offset_minutes;
+    // Checked for the same reason as the offset above: `hour` and `minute` are
+    // whatever the text held, not values already bounded by a clock.
+    let total = hour
+        .checked_mul(60)?
+        .checked_add(minute)?
+        .checked_sub(offset_minutes)?;
     let wrapped = total.rem_euclid(24 * 60);
 
     Some(ColumnValue::Time {
@@ -1702,6 +1728,33 @@ mod tests {
         assert_eq!(type_name_scale("decimal(10,2)"), Some(2));
     }
 
+    #[test]
+    fn param_parsers_decline_reversed_parentheses() {
+        // Called directly, because the public entry points cannot deliver this
+        // shape: `type_name_precision` and `type_name_scale` both gate on
+        // `TrinoTypeName::parse`, and a name whose `)` precedes its `(` leaves
+        // that `)` in the base name the gate matches on, so the gate rejects it
+        // first. That makes these two the only place the ordering can be
+        // asserted, and it is worth asserting: `find`/`rfind` locate the ends
+        // independently, and the gate is not their contract.
+        assert_eq!(parse_precision_param(")("), None);
+        assert_eq!(parse_scale_param(")("), None);
+        assert_eq!(parse_precision_param("decimal)10,2("), None);
+        assert_eq!(parse_scale_param("decimal)10,2("), None);
+    }
+
+    #[test]
+    fn param_parsers_read_well_formed_arguments() {
+        // The `get` guard must not change what a real signature yields.
+        assert_eq!(parse_precision_param("varchar(50)"), Some(50));
+        assert_eq!(parse_precision_param("decimal(10,2)"), Some(10));
+        assert_eq!(parse_scale_param("decimal(10,2)"), Some(2));
+        // An empty argument list, and a scale that is not there at all: both
+        // already returned `None` by way of the parse failing.
+        assert_eq!(parse_precision_param("varchar()"), None);
+        assert_eq!(parse_scale_param("varchar(50)"), None);
+    }
+
     // --- TrinoTypeName::parse: precision-argument-in-the-middle ---
     //
     // `TrinoTypeName::parse` must not truncate at the first `(`: that would
@@ -2308,6 +2361,55 @@ mod tests {
                 second: 15,
                 fraction: 123_456_000,
             }
+        );
+    }
+
+    #[test]
+    fn time_with_timezone_offset_too_large_to_be_an_offset_stays_text() {
+        // Found by the `json_value` fuzz target. The offset fields are
+        // free-form text, so a value far outside any real zone parses as an
+        // `i32` and only overflows when converted to minutes. Release builds
+        // carry no overflow checks, so an unchecked multiply here reports a
+        // *different* time instead of declining the value.
+        assert_eq!(parse_trino_time_with_tz("00:00:00+949378864"), None);
+        assert_eq!(
+            json_to_column_value(
+                Value::String("+999\0\0\0\0+00949378864".into()),
+                &TrinoTy::Option(Box::new(TrinoTy::TimeWithTimeZone)),
+            ),
+            ColumnValue::String("+999\0\0\0\0+00949378864".into())
+        );
+    }
+
+    #[test]
+    fn time_with_timezone_hour_field_too_large_stays_text() {
+        // The same class one frame down, in `shift_time`: the time-of-day hour
+        // is text too, so `hour * 60` overflows before the offset is ever
+        // applied.
+        assert_eq!(parse_trino_time_with_tz("2147483647:00:00+01:00"), None);
+    }
+
+    #[test]
+    fn time_with_timezone_real_offsets_still_parse() {
+        // The checked arithmetic must not narrow what a valid offset can be:
+        // the widest zones in use are +14:00 and -12:00.
+        assert_eq!(
+            parse_trino_time_with_tz("13:14:15+14:00"),
+            Some(ColumnValue::Time {
+                hour: 23,
+                minute: 14,
+                second: 15,
+                fraction: 0,
+            })
+        );
+        assert_eq!(
+            parse_trino_time_with_tz("13:14:15-12:00"),
+            Some(ColumnValue::Time {
+                hour: 1,
+                minute: 14,
+                second: 15,
+                fraction: 0,
+            })
         );
     }
 

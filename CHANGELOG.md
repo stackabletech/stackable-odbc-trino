@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+A `TIME WITH TIME ZONE` value whose offset or hour field lies far outside a real
+clock is now kept as text instead of being converted with wrapped arithmetic.
+Both fields arrive as free-form text, so a number that no zone or clock could
+hold still parses as an `i32`, and the conversion to minutes overflowed. Release
+builds carry no overflow checks, so the driver reported a different time rather
+than declining the value.
+
+### Added
+
+Fuzz targets for this driver's own parsers, in `fuzz/`: the JSON-to-value read
+path, the Trino type-signature parsers, ODBC escape translation under the Trino
+dialect, and the connection-string value parsing. They run as an
+AddressSanitizer smoke test in CI. See `fuzz/README.md`.
+
 ## [0.1.0] — 2026-08-04
 
 First release, so this section describes what the driver offers rather than

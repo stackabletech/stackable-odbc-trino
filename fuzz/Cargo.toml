@@ -1,0 +1,50 @@
+[package]
+name = "stackable-odbc-trino-fuzz"
+version = "0.0.1"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+# Own workspace: keeps `cargo fuzz` from resolving against the parent workspace
+# (which pins a stable toolchain; libFuzzer needs nightly).
+[workspace]
+
+[[bin]]
+name = "json_value"
+path = "fuzz_targets/json_value.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "type_name"
+path = "fuzz_targets/type_name.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "escape"
+path = "fuzz_targets/escape.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "connect_params"
+path = "fuzz_targets/connect_params.rs"
+test = false
+doc = false
+bench = false
+
+[dependencies]
+arbitrary = { version = "1", features = ["derive"] }
+libfuzzer-sys = "0.4"
+serde_json = "1"
+stackable-odbc-trino = { path = "..", features = ["fuzzing"] }
+# Needed to name `TrinoTy` when building the declared type for a fuzzed value.
+# Kept in step with the root `Cargo.toml` entry: a different revision here
+# would resolve to a second copy of the crate and the types would not match.
+trino-rust-client = { git = "https://github.com/stackabletech/trino-rust-client.git", branch = "stackable-main" }
