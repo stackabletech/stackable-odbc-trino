@@ -25,7 +25,7 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
-  RUST_TOOLCHAIN_VERSION: "1.95.0"
+  RUST_TOOLCHAIN_VERSION: "1.97.1"
 
 # Every job below names a runner image rather than a `-latest` alias, so an
 # image roll cannot change what a merge is gated on. The label cannot be lifted
