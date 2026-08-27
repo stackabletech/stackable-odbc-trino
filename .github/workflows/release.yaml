@@ -15,7 +15,7 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
-  RUST_TOOLCHAIN_VERSION: "1.95.0"
+  RUST_TOOLCHAIN_VERSION: "1.97.1"
   # Both pinned rather than floating. packaging/test-sbom.sh asserts the shape of
   # what syft emits and how cargo-auditable's .dep-v0 section reads, so a release
   # of either that changes that shape has to be adopted deliberately and
