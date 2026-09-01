@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+The SBOMs now name their manufacturer, describe their subject and connect it to
+the dependency graph. `metadata.manufacturer` carries the organisation and its
+URL, `metadata.component` carries the version, description and licence, and the
+subject declares a dependency on the root crate so a consumer walking the graph
+from it reaches every component, the natively linked ones included. All of it is
+read from `Cargo.toml`, which gains a `homepage` for the manufacturer URL.
+
+Every `bom-ref` is now the component's own purl. Syft derived them from the
+purls it first saw, so they kept the bare `pkg:cargo` form for the git and path
+dependencies whose purls enrichment had rewritten, leaving the document
+contradicting itself. The rewrite also gives the natively linked components a
+`bom-ref`, which is what lets the graph reference them at all.
+
+The SPDX documents now name the artifact they describe. They were named
+`unknown` and described an unnamed placeholder package that syft's converter
+synthesises; that placeholder is removed and its edges moved onto the artifact's
+own package, which also leaves every remaining package carrying a declared
+licence.
+
 ## [0.1.1] — 2026-08-06
 
 ### Fixed
