@@ -5,7 +5,7 @@
 // instead of TOP N, double-quote identifiers instead of square brackets, and
 // CAST instead of CONVERT.
 //
-[Version = "0.1.1"]
+[Version = "0.1.2"]
 section StackableTrinoODBC;
 
 // ---------------------------------------------------------------------------
