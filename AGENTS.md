@@ -1918,6 +1918,18 @@ the enrichment and the native fragment reach both formats from one
 implementation and cannot drift apart. CycloneDX is what ships inside the
 archive; SPDX exists for procurement processes that ask for it by name.
 
+The conversion needs one correction afterwards. Syft names the SPDX document
+`unknown`, and rather than describing the CycloneDX subject it invents an
+unnamed `SPDXRef-DocumentRoot-` package, points the document's `DESCRIBES` at
+that and hangs every real package off it with `CONTAINS`. The result validates
+against SPDX 2.3 but does not say what it describes, and the placeholder is the
+one package carrying neither a name nor a licence. `syft convert` takes no
+source name, so `write_spdx` deletes the placeholder, moves its edges onto the
+subject's own package and names the document and its namespace after the
+artifact. The subject is matched **by name**, since the SPDXID syft derives is
+its own; a miss fails the script rather than producing a document that describes
+a package which is not there.
+
 `build-archives.sh` generates all three artifacts' SBOMs, puts the CycloneDX one
 into each staging directory so it travels inside the archive, publishes both
 formats per artifact as release assets under versioned names, and writes
@@ -1952,6 +1964,39 @@ ELF artifact yields one of type `file`, while the PE artifact yields that plus a
 second of type `application`. Every real component has a purl, the crates from
 enrichment and the native ones from the fragment alike.
 
+Finalize also builds the part of the dependency graph syft cannot know.
+
+**Every `bom-ref` becomes the component's own purl**, and the graph is rewritten
+to match. Syft derives a bom-ref from the purl it first saw, so enrichment's
+rewrites never reach it: a git dependency keeps a bare
+`pkg:cargo/trino-rust-client@0.11.0` ref beside a purl carrying the resolved
+commit, and the path-sourced root package keeps a `pkg:cargo` ref beside a
+`pkg:generic` purl. That leaves the document contradicting itself, and the bare
+string is exactly what enrichment exists to remove. Since bom-refs must be
+unique, `sbom.sh` fails on a purl collision rather than merging two components
+into one node.
+
+That rewrite is also what gives the **native components** a bom-ref. They arrive
+from the fragment with a purl and nothing else, so before it nothing in the
+graph could reference them and they sat in the component list unreachable.
+
+**The subject then depends on the root crate and on the native components.**
+Syft describes the crate graph beneath `stackable-odbc-trino` but has nothing to
+say about the binary that graph was compiled into, and cargo cannot place what
+the toolchain links, so without those edges `metadata.component` is an isolated
+node and a consumer walking the graph from the subject reaches nothing.
+`sbom.sh` fails if the root crate is not among the artifact's components, since
+that means the binary and `Cargo.toml` are out of step.
+
+**Everything the document says about its subject and its own origin is read from
+`Cargo.toml`**, so the manifest is the single place any of it is edited:
+`version`, `description` and `license` become the subject's, and
+`metadata.manufacturer` is built from `authors[0]`, whose `Name <email>` form is
+trimmed to the name, plus `homepage` as the URL array CycloneDX expects. A field
+missing from the manifest fails `sbom.sh` by name rather than shipping a null,
+which is how a document ends up understating what it describes. `homepage`
+exists in `Cargo.toml` for this reason and is commented as such.
+
 #### The `.mez` takes a different path
 
 The Power Query connector is M source in a zip. Syft finds nothing in it and
@@ -1959,8 +2004,11 @@ there is no cargo graph to enrich, so `sbom.sh` recognises the extension and
 builds the document directly: the connector is the subject, its version read
 from the `[Version = "..."]` in `StackableTrinoODBC.pq`, and the component list
 is **empty**. That is the honest answer rather than a gap, because the connector
-has no third-party dependencies. Running it through the pipeline instead fails,
-since syft reports `components: null` for an archive it cannot catalogue.
+has no third-party dependencies, and it says so explicitly with a `dependsOn: []`
+on the subject rather than by omitting the graph. The manufacturer comes from
+`Cargo.toml` the same way it does for the binaries. Running it through the
+pipeline instead fails, since syft reports `components: null` for an archive it
+cannot catalogue.
 
 #### The native fragment, and why the two platforms differ
 

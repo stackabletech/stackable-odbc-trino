@@ -129,6 +129,52 @@ require_audit_section() {
   fi
 }
 
+# Convert the finished CycloneDX to SPDX and repoint the result at its subject.
+#
+# Syft's converter names the document "unknown", and rather than describing the
+# CycloneDX subject it invents an unnamed `SPDXRef-DocumentRoot-` package,
+# points the document's DESCRIBES at that, and hangs every real package off it
+# with CONTAINS. The document that reaches a procurement reviewer therefore does
+# not say what it describes, and the placeholder shows up as the one package
+# carrying no name and no licence. `syft convert` takes no source name, so
+# there is no flag for it.
+#
+# Deleting the placeholder and moving its edges onto the real subject package is
+# what such a flag would do. The one edge that becomes a self-reference, the
+# placeholder's CONTAINS of the subject, is dropped.
+write_spdx() {
+  local cdx="$1" out="$2" raw="$2.raw" subject subj
+
+  subject="$(jq -r '.metadata.component.name' "$cdx")"
+  syft convert "$cdx" -o spdx-json="$raw" --quiet
+
+  # Matched by name, which is the only thing the converter carries across from
+  # metadata.component: the SPDXID it derives is its own. A miss means syft
+  # changed how it maps the subject, and a document describing a package that
+  # is not there is worse than one describing nothing.
+  subj="$(jq -r --arg s "$subject" \
+    '[ .packages[] | select(.name == $s) | .SPDXID ] | first // empty' "$raw")"
+  if [ -z "$subj" ]; then
+    echo "ERROR: the SPDX conversion of $cdx carries no package named" >&2
+    echo "  $subject, so the document cannot be pointed at its subject." >&2
+    exit 1
+  fi
+
+  jq --arg subject "$subject" --arg subj "$subj" '
+    ([ .packages[] | select(.SPDXID | startswith("SPDXRef-DocumentRoot-")) | .SPDXID ]
+     | first) as $root
+    | .name = $subject
+    | .documentNamespace |= sub("/unknown-source-type/unknown-"; "/\($subject)-")
+    | .documentDescribes = [ $subj ]
+    | .packages |= map(select(.SPDXID != $root))
+    | .relationships |= (
+        map(if .spdxElementId      == $root then .spdxElementId      = $subj else . end
+          | if .relatedSpdxElement == $root then .relatedSpdxElement = $subj else . end)
+        | map(select(.spdxElementId != .relatedSpdxElement)))' "$raw" > "$out"
+
+  rm -f "$raw"
+}
+
 # The Power Query connector is M source in a zip. Syft finds nothing in it and
 # there is no cargo graph to enrich, so its document is built directly rather
 # than run through the pipeline. An empty component list is the honest answer:
@@ -147,13 +193,16 @@ build_mez_sbom() {
 
   jq -n --arg name "$BASENAME" --arg sha "$sha" --arg version "$version" \
         --arg serial "$serial" --arg rustc "$(rustc --version)" \
+        --argjson mfg "$MANUFACTURER" \
   '{
     bomFormat: "CycloneDX",
     specVersion: "1.7",
     serialNumber: $serial,
     version: 1,
     metadata: {
+      manufacturer: $mfg,
       component: {
+        "bom-ref": $name,
         type: "application",
         name: $name,
         version: $version,
@@ -163,14 +212,50 @@ build_mez_sbom() {
       },
       properties: [ { name: "stackable:rustc-version", value: $rustc } ]
     },
-    components: []
+    components: [],
+    dependencies: [ { ref: $name, dependsOn: [] } ]
   }' > "$OUT"
 
-  syft convert "$OUT" -o spdx-json="$OUT_SPDX" --quiet
+  write_spdx "$OUT" "$OUT_SPDX"
 
   echo "Wrote $OUT"
   echo "Wrote $OUT_SPDX"
 }
+
+# Everything the document says about its subject and about its own origin comes
+# from `Cargo.toml`, so the manifest is the single place any of it is edited.
+# The manufacturer is the crate's author organisation: `authors` carries it as
+# `Name <email>`, and CycloneDX wants the name alone, with `url` as an array.
+ROOT_PKG="$(cargo metadata --locked --no-deps --format-version 1 \
+              --manifest-path "$REPO_ROOT/Cargo.toml" \
+            | jq -c --arg manifest "$REPO_ROOT/Cargo.toml" \
+                '.packages[] | select(.manifest_path == $manifest)
+                 | { name, version, description, license,
+                     manufacturer: {
+                       name: (.authors[0] // "" | sub(" *<[^>]*>$"; "")),
+                       url: [ .homepage // empty ]
+                     } }')"
+
+# A field missing from the manifest would ship as a null or an empty string
+# rather than as a visible failure, which is how an SBOM ends up understating
+# what it describes. Name the manifest key, since that is what has to be fixed.
+require_root_field() {
+  local path="$1" key="$2" value
+  value="$(jq -r "$path // empty" <<<"$ROOT_PKG")"
+  if [ -z "$value" ] || [ "$value" = "[]" ]; then
+    echo "ERROR: Cargo.toml declares no $key for the root package." >&2
+    echo "  metadata.component or metadata.manufacturer would ship without it." >&2
+    exit 1
+  fi
+}
+
+require_root_field '.version' 'version'
+require_root_field '.description' 'description'
+require_root_field '.license' 'license'
+require_root_field '.manufacturer.name' 'authors'
+require_root_field '.manufacturer.url | join("")' 'homepage'
+
+MANUFACTURER="$(jq -c '.manufacturer' <<<"$ROOT_PKG")"
 
 if [ "${BASENAME##*.}" = "mez" ]; then
   build_mez_sbom "$ARTIFACT"
@@ -266,26 +351,96 @@ fi
 ARTIFACT_SHA="$(sha256sum "$ARTIFACT" | cut -d' ' -f1)"
 RUSTC_VERSION="$(rustc --version)"
 
+# Every bom-ref becomes the component's own purl, and the dependency graph is
+# rewritten to match.
+#
+# Syft derives a bom-ref from the purl it first saw, so enrichment's rewrites
+# never reach it: a git dependency keeps a bare `pkg:cargo/name@version` ref
+# beside a purl carrying `?vcs_url=`, and the path-sourced root package keeps a
+# `pkg:cargo` ref beside a `pkg:generic` purl. That leaves the document
+# contradicting itself, and the bare `pkg:cargo` string is exactly what
+# enrichment exists to remove: a scanner reading it resolves the upstream crate
+# rather than what shipped.
+#
+# It also gives the native components a bom-ref. They come from the fragment
+# with a purl and nothing else, so nothing in the graph could reference them.
+#
+# bom-refs must be unique within a document, so a purl collision would silently
+# merge two components into one node. Only the components that survive finalize
+# are considered: syft's own self-entries carry no purl and are dropped there,
+# and the PE artifact yields two of them.
+if [ "$(jq '[.components[] | select((.purl // "") != "") | .purl]
+            | (length - (unique | length))' "$AUGMENTED")" -ne 0 ]; then
+  echo "ERROR: two components share a purl, which cannot be used as a bom-ref:" >&2
+  jq -r '[.components[] | select((.purl // "") != "") | .purl]
+         | group_by(.) | map(select(length > 1)[0]) | .[]' \
+    "$AUGMENTED" | sed 's/^/    /' >&2
+  exit 1
+fi
+
+# The artifact is a build of the root crate, so the document's subject depends
+# on it and, transitively, on everything syft already wired up beneath it.
+# Without this edge the subject is an isolated node and a consumer walking the
+# graph from metadata.component reaches nothing.
+ROOT_REF="$(jq -r --argjson root "$ROOT_PKG" \
+  '[ .components[]
+     | select(.name == $root.name and .version == $root.version)
+     | .purl ] | first // empty' "$AUGMENTED")"
+
+if [ -z "$ROOT_REF" ]; then
+  echo "ERROR: the root package is not among the artifact's components." >&2
+  echo "  Expected $(jq -r '"\(.name)@\(.version)"' <<<"$ROOT_PKG") from the" >&2
+  echo "  .dep-v0 section. The artifact and Cargo.toml are out of step: rebuild" >&2
+  echo "  with cargo auditable before generating the SBOM." >&2
+  exit 1
+fi
+
+# The native components are linked by the toolchain, not by the crate graph, so
+# cargo cannot place them and they would otherwise sit in the component list
+# unreachable from the subject. The artifact is what links them, so that is
+# where they hang.
+NATIVE_REFS="$(jq -c --arg key "$NATIVE_KEY" '[ (.[$key] // [])[].purl ]' "$SBOM_NATIVE")"
+
 jq --arg name "$BASENAME" \
    --arg sha "$ARTIFACT_SHA" \
    --arg rustc "$RUSTC_VERSION" \
+   --argjson mfg "$MANUFACTURER" \
+   --arg rootref "$ROOT_REF" \
+   --argjson root "$ROOT_PKG" \
+   --argjson nativerefs "$NATIVE_REFS" \
    '
    .components |= map(select((.purl // "") != ""))
+   | ([ .components[] | select(has("bom-ref")) | { key: ."bom-ref", value: .purl } ]
+      | from_entries) as $rename
+   | .components |= map(."bom-ref" = .purl)
+   | .dependencies |= (map(
+         .ref = ($rename[.ref] // .ref)
+       | .dependsOn = ((.dependsOn // []) | map($rename[.] // .))))
+   | .metadata.manufacturer = $mfg
    | .metadata.component = {
+       "bom-ref": $name,
        type: "library",
        name: $name,
+       version: $root.version,
+       description: $root.description,
+       licenses: (if ($root.license | test(" OR | AND |/"))
+                  then [ { expression: $root.license } ]
+                  else [ { license: { id: $root.license } } ] end),
        hashes: [ { alg: "SHA-256", content: $sha } ]
      }
    | .metadata.properties = ((.metadata.properties // []) + [
        { name: "stackable:rustc-version", value: $rustc }
-     ])' "$AUGMENTED" > "$OUT"
+     ])
+   | .dependencies = ((.dependencies // [])
+                      + [ { ref: $name, dependsOn: ([ $rootref ] + $nativerefs) } ])' \
+   "$AUGMENTED" > "$OUT"
 
 # --- convert ---------------------------------------------------------------
 # SPDX is converted from the finished CycloneDX rather than generated afresh, so
 # the enrichment and the native fragment reach both formats from one
 # implementation and cannot drift apart. Some procurement processes ask for SPDX
 # by name; CycloneDX is what ships inside the archive.
-syft convert "$OUT" -o spdx-json="$OUT_SPDX" --quiet
+write_spdx "$OUT" "$OUT_SPDX"
 
 rm -f "$RAW" "$LOOKUP" "$ENRICHED" "$AUGMENTED"
 

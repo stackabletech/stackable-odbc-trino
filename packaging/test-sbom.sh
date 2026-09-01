@@ -112,6 +112,67 @@ check "the artifact is the SBOM subject" \
 check "the subject carries a sha256" \
   "$(jq -r '.metadata.component.hashes[]? | select(.alg == "SHA-256") | .content' "$SBOM" | tr -d '\n' | wc -c)" "64"
 
+# The subject's identity, its licence and the manufacturer all come from
+# Cargo.toml, so these compare against the manifest rather than against
+# literals. A field dropped from the manifest fails sbom.sh outright; these
+# catch the quieter case of the wiring reading the wrong key.
+MANIFEST="$(cargo metadata --locked --no-deps --format-version 1 \
+              --manifest-path "$REPO_ROOT/Cargo.toml" \
+            | jq -c --arg m "$REPO_ROOT/Cargo.toml" \
+                '.packages[] | select(.manifest_path == $m)')"
+
+check "the subject carries the crate version" \
+  "$(jq -r '.metadata.component.version' "$SBOM")" \
+  "$(jq -r '.version' <<<"$MANIFEST")"
+
+check "the subject carries the crate description" \
+  "$(jq -r '.metadata.component.description' "$SBOM")" \
+  "$(jq -r '.description' <<<"$MANIFEST")"
+
+check "the subject carries the crate licence" \
+  "$(jq -r '.metadata.component.licenses[0].license.id' "$SBOM")" \
+  "$(jq -r '.license' <<<"$MANIFEST")"
+
+check "the manufacturer is the crate's author organisation" \
+  "$(jq -r '.metadata.manufacturer.name' "$SBOM")" \
+  "$(jq -r '.authors[0] | sub(" *<[^>]*>$"; "")' <<<"$MANIFEST")"
+
+check "the manufacturer url is the crate homepage" \
+  "$(jq -r '.metadata.manufacturer.url | join(",")' "$SBOM")" \
+  "$(jq -r '.homepage' <<<"$MANIFEST")"
+
+# dependsOn names a bom-ref, and a ref matching no component leaves a dangling
+# edge that a graph walker silently drops.
+check "no dependency edge dangles" \
+  "$(jq '([.components[]."bom-ref"] + [.metadata.component."bom-ref"]) as $refs
+         | [.dependencies[] | (.ref, (.dependsOn // [])[])]
+         | map(select(IN($refs[]) | not)) | length' "$SBOM")" "0"
+
+# Syft derives a bom-ref from the purl it first saw, so without the rewrite the
+# two disagree wherever enrichment changed a purl, and the ref keeps the bare
+# `pkg:cargo` string enrichment exists to remove.
+check "every bom-ref is the component's own purl" \
+  "$(jq '[.components[] | select(."bom-ref" != .purl)] | length' "$SBOM")" "0"
+
+check "no bom-ref carries a bare pkg:cargo purl on a git or path dep" \
+  "$(jq '[.components[]
+          | select(.name == "trino-rust-client" or .name == "stackable-odbc-core"
+                   or .name == "stackable-odbc-trino")
+          | select(."bom-ref" | test("^pkg:cargo/[^?]*$"))] | length' "$SBOM")" "0"
+
+# The native components arrive from the fragment with a purl and nothing else,
+# so before the rewrite nothing in the graph could reference them.
+check "the subject depends on the root crate and the native components" \
+  "$(jq -r --arg ref "$(jq -r '.metadata.component."bom-ref"' "$SBOM")" \
+       '[.dependencies[] | select(.ref == $ref) | .dependsOn[]] | sort | join(",")' "$SBOM")" \
+  "pkg:generic/stackable-odbc-trino@$(jq -r '.version' <<<"$MANIFEST"),pkg:generic/unixodbc@$(jq -r '.linux[0].version' "$REPO_ROOT/packaging/sbom-native.json")"
+
+# A component nothing depends on is in the list but not in the graph, which is
+# how the native ones sat before they had a bom-ref.
+check "no component is orphaned from the graph" \
+  "$(jq '([.dependencies[] | (.dependsOn // [])[]] | unique) as $ref
+         | [.components[] | select(."bom-ref" | IN($ref[]) | not)] | length' "$SBOM")" "0"
+
 check "no absolute build path leaks" \
   "$(jq -r '[.. | strings | select(startswith("/home/") or startswith("/build/"))] | length' "$SBOM")" "0"
 
@@ -143,8 +204,27 @@ check "core's purl names an immutable commit" \
 # the enrichment reaches both formats from one implementation. These assert the
 # conversion carries it across.
 
+# Every package carries a declared licence: the components from enrichment, the
+# native one from the fragment, and the subject from the manifest. The only
+# package that ever lacked one was syft's unnamed document root, which the
+# repointing removes.
 check "SPDX carries the enriched licenses" \
-  "$(jq '[.packages[] | select((.licenseDeclared // "NOASSERTION") == "NOASSERTION")] | length' "$SPDX")" "2"
+  "$(jq '[.packages[] | select((.licenseDeclared // "NOASSERTION") == "NOASSERTION")] | length' "$SPDX")" "0"
+
+check "SPDX carries the subject's licence and version" \
+  "$(jq -r '.packages[] | select(.name == "libstackable_odbc_trino.so")
+            | [.versionInfo, .licenseDeclared] | join("|")' "$SPDX")" \
+  "$(jq -r '[.version, .license] | join("|")' <<<"$MANIFEST")"
+
+# The subject's dependency edges have to survive the conversion too, or the
+# SPDX document describes an artifact that contains nothing. Compared against
+# the SPDXIDs syft derived rather than a pattern, since those ids are its own.
+check "SPDX carries the subject's dependencies" \
+  "$(jq -r --arg id "$(jq -r '.packages[] | select(.name == "libstackable_odbc_trino.so") | .SPDXID' "$SPDX")" \
+       '[.relationships[]
+         | select(.relationshipType == "DEPENDENCY_OF" and .relatedSpdxElement == $id)
+         | .spdxElementId] | sort | join(",")' "$SPDX")" \
+  "$(jq -r '[.packages[] | select(.name == "stackable-odbc-trino" or .name == "unixodbc") | .SPDXID] | sort | join(",")' "$SPDX")"
 
 check "SPDX carries the fork's vcs_url purl" \
   "$(jq -r '[.packages[] | select(.name == "trino-rust-client") | .externalRefs[]? | select(.referenceType == "purl") | .referenceLocator] | first' "$SPDX")" \
@@ -155,6 +235,37 @@ check "SPDX carries the native component" \
 
 check "SPDX leaks no build path" \
   "$(jq '[.. | strings | select(startswith("/home/") or startswith("/build/"))] | length' "$SPDX")" "0"
+
+# Syft's converter leaves the document named "unknown" and describing an
+# unnamed placeholder package rather than the subject. These assert the
+# repointing: the document names the artifact, describes the artifact's own
+# package, and no placeholder survives.
+check "SPDX names the artifact" \
+  "$(jq -r '.name' "$SPDX")" "libstackable_odbc_trino.so"
+
+check "SPDX describes the artifact's package" \
+  "$(jq -r '.documentDescribes | join(",")' "$SPDX")" \
+  "$(jq -r '.packages[] | select(.name == "libstackable_odbc_trino.so") | .SPDXID' "$SPDX")"
+
+check "SPDX keeps no unnamed placeholder package" \
+  "$(jq '[.packages[] | select((.name // "") == "" or (.SPDXID | startswith("SPDXRef-DocumentRoot-")))] | length' "$SPDX")" "0"
+
+check "SPDX namespace names the artifact" \
+  "$(jq -r '.documentNamespace | test("unknown") | not' "$SPDX")" "true"
+
+# Moving the placeholder's edges onto the subject must not leave an edge
+# pointing at a package that is no longer there, nor a package pointing at
+# itself.
+check "no SPDX relationship dangles or self-references" \
+  "$(jq '([.packages[].SPDXID] + ["SPDXRef-DOCUMENT"]) as $ids
+         | [.relationships[]
+            | select((.spdxElementId | IN($ids[]) | not)
+                     or (.relatedSpdxElement | IN($ids[]) | not)
+                     or (.spdxElementId == .relatedSpdxElement))] | length' "$SPDX")" "0"
+
+check "SPDX keeps every component after the repointing" \
+  "$(jq '.packages | length' "$SPDX")" \
+  "$(jq '(.components | length) + 1' "$SBOM")"
 
 # --- --check-native --------------------------------------------------------
 
@@ -207,6 +318,50 @@ if [ -f "$DLL" ]; then
 
   check "Windows: the artifact is the SBOM subject" \
     "$(jq -r '.metadata.component.name' "$WSBOM")" "stackable_odbc_trino.dll"
+
+  check "Windows: the subject carries the manifest's identity" \
+    "$(jq -r '[.metadata.component | .version, .description, .licenses[0].license.id,
+               (.["bom-ref"] | length > 0)] | join("|")' "$WSBOM")" \
+    "$(jq -r '[.version, .description, .license, true] | join("|")' <<<"$MANIFEST")"
+
+  check "Windows: the manufacturer comes from the manifest" \
+    "$(jq -r '[.metadata.manufacturer.name, (.metadata.manufacturer.url | join(","))] | join("|")' "$WSBOM")" \
+    "$(jq -r '[(.authors[0] | sub(" *<[^>]*>$"; "")), .homepage] | join("|")' <<<"$MANIFEST")"
+
+  check "Windows: every bom-ref is the component's own purl" \
+    "$(jq '[.components[] | select(."bom-ref" != .purl)] | length' "$WSBOM")" "0"
+
+  check "Windows: the subject depends on the root crate and both native components" \
+    "$(jq -r --arg ref "$(jq -r '.metadata.component."bom-ref"' "$WSBOM")" \
+         '[.dependencies[] | select(.ref == $ref) | .dependsOn[]] | sort | join(",")' "$WSBOM")" \
+    "$(jq -r --arg v "$(jq -r '.version' <<<"$MANIFEST")" \
+         '[ "pkg:generic/stackable-odbc-trino@\($v)" ] + [ .windows[].purl ] | sort | join(",")' \
+         "$REPO_ROOT/packaging/sbom-native.json")"
+
+  check "Windows: no component is orphaned from the graph" \
+    "$(jq '([.dependencies[] | (.dependsOn // [])[]] | unique) as $ref
+           | [.components[] | select(."bom-ref" | IN($ref[]) | not)] | length' "$WSBOM")" "0"
+
+  check "Windows: no dependency edge dangles" \
+    "$(jq '([.components[]."bom-ref"] + [.metadata.component."bom-ref"]) as $refs
+           | [.dependencies[] | (.ref, (.dependsOn // [])[])]
+           | map(select(IN($refs[]) | not)) | length' "$WSBOM")" "0"
+
+  WSPDX="$WORK/stackable_odbc_trino.dll.spdx.json"
+
+  check "Windows: SPDX names and describes the artifact" \
+    "$(jq -r '[.name, (.documentDescribes | join(","))] | join("|")' "$WSPDX")" \
+    "stackable_odbc_trino.dll|$(jq -r '.packages[] | select(.name == "stackable_odbc_trino.dll") | .SPDXID' "$WSPDX")"
+
+  check "Windows: SPDX keeps no unnamed placeholder package" \
+    "$(jq '[.packages[] | select((.name // "") == "" or (.SPDXID | startswith("SPDXRef-DocumentRoot-")))] | length' "$WSPDX")" "0"
+
+  check "Windows: no SPDX relationship dangles or self-references" \
+    "$(jq '([.packages[].SPDXID] + ["SPDXRef-DOCUMENT"]) as $ids
+           | [.relationships[]
+              | select((.spdxElementId | IN($ids[]) | not)
+                       or (.relatedSpdxElement | IN($ids[]) | not)
+                       or (.spdxElementId == .relatedSpdxElement))] | length' "$WSPDX")" "0"
 else
   echo "SKIP  Windows checks: DLL not built (cargo auditable build --locked --release --target x86_64-pc-windows-gnu)"
 fi
@@ -240,9 +395,28 @@ if [ -f "$MEZ" ]; then
     "$(jq -r '.metadata.component.version' "$MSBOM")" \
     "$(grep -oE '\[Version = "[^"]+"\]' "$REPO_ROOT/connector/StackableTrinoODBC.pq" | head -1 | sed -E 's/.*"(.*)".*/\1/')"
 
+  check "mez: the manufacturer comes from the manifest" \
+    "$(jq -r '[.metadata.manufacturer.name, (.metadata.manufacturer.url | join(","))] | join("|")' "$MSBOM")" \
+    "$(jq -r '[(.authors[0] | sub(" *<[^>]*>$"; "")), .homepage] | join("|")' <<<"$MANIFEST")"
+
   # Zero is the honest answer, not a gap: the connector is pure M with no
-  # third-party dependencies.
+  # third-party dependencies. Stating that as an explicit empty `dependsOn` is
+  # what distinguishes it from a document that never described the graph.
   check "mez: no components" "$(jq '.components | length' "$MSBOM")" "0"
+
+  check "mez: the subject declares an empty dependency list" \
+    "$(jq -r --arg ref "$(jq -r '.metadata.component."bom-ref"' "$MSBOM")" \
+         '[.dependencies[] | select(.ref == $ref) | (.dependsOn | length)] | join(",")' "$MSBOM")" "0"
+
+  # The connector's document has two packages before the repointing and one
+  # after, so it exercises the branch where the placeholder's only CONTAINS is
+  # the self-edge that gets dropped.
+  check "mez: SPDX names and describes the connector" \
+    "$(jq -r '[.name, (.documentDescribes | join(","))] | join("|")' "$MSPDX")" \
+    "StackableTrinoODBC.mez|$(jq -r '.packages[] | select(.name == "StackableTrinoODBC.mez") | .SPDXID' "$MSPDX")"
+
+  check "mez: SPDX keeps only the connector's package" \
+    "$(jq -r '[.packages[].name] | join(",")' "$MSPDX")" "StackableTrinoODBC.mez"
 
   check "mez: no build path leaks" \
     "$(jq '[.. | strings | select(startswith("/home/") or startswith("/build/"))] | length' "$MSBOM")" "0"
