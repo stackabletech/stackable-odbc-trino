@@ -38,7 +38,10 @@ snafu = "0.9"
 # reviewable edit to this line instead of whatever the branch happens to point
 # at. To build against a local checkout, use a `[patch]` in your own
 # `.cargo/config.toml` rather than editing this line; see CONTRIBUTING.md.
-stackable-odbc-core = { git = "https://github.com/stackabletech/stackable-odbc-core.git", tag = "v0.1.0" }
+# TEMPORARY: pinned to the core commit adding `TypeInfoRow::with_preferred`
+# until a core release containing it is tagged; switch both entries back to
+# that tag before merging.
+stackable-odbc-core = { git = "https://github.com/stackabletech/stackable-odbc-core.git", rev = "23f055e451cde6b842ad117f5c8a16957abe113f" }
 # `time` is needed directly by `query_all_rows_within`, which bounds the login
 # round trip with `tokio::time::timeout`. It resolves without being declared,
 # because reqwest enables it, but a direct use must not rely on another crate's
@@ -60,7 +63,7 @@ serial_test = "4"
 # offline FFI tests need. It is default-off because it is test code, so it is
 # enabled here rather than on the [dependencies] entry above -- that keeps it
 # out of the shipped cdylib.
-stackable-odbc-core = { git = "https://github.com/stackabletech/stackable-odbc-core.git", tag = "v0.1.0", features = ["test-support"] }
+stackable-odbc-core = { git = "https://github.com/stackabletech/stackable-odbc-core.git", rev = "23f055e451cde6b842ad117f5c8a16957abe113f", features = ["test-support"] }
 
 [lints.clippy]
 unwrap_in_result = "deny"

@@ -85,12 +85,12 @@ const TRINO_TZ_TIMESTAMP_SPACE_LEN: i32 = 1;
 /// COLUMN_SIZE must never be a literal copied from the per-column path (or
 /// vice versa).
 ///
-/// Rows are sorted by DATA_TYPE ascending (as signed i16, so ODBC extension
-/// types with negative codes sort first), then by TYPE_NAME ascending within
-/// an equal DATA_TYPE, per the SQLGetTypeInfo spec's "ordered by DATA_TYPE and
-/// then ... TYPE_NAME" requirement. This invariant is asserted directly by
-/// `type_info_rows_sorted_by_data_type_then_type_name` below; keep new rows
-/// in the correct sorted position rather than appending them.
+/// Core orders the result set itself (DATA_TYPE, then the row marked
+/// `with_preferred`, then TYPE_NAME; see
+/// `stackable_odbc_core::ffi::info::sql_get_type_info`), so rows are grouped
+/// here for reading, not for the spec. Every DATA_TYPE shared by several rows
+/// marks its closest match, as `every_shared_data_type_has_one_preferred_row`
+/// asserts.
 fn trino_type_info() -> &'static [TypeInfoRow] {
     static ROWS: OnceLock<Vec<TypeInfoRow>> = OnceLock::new();
     ROWS.get_or_init(|| {
@@ -148,6 +148,8 @@ fn trino_type_info() -> &'static [TypeInfoRow] {
                     MaxScale(0),
                 ))
                 .with_literal_affixes(Some("'"), Some("'")),
+            // The closest match for SQL_WVARCHAR, so core orders it first
+            // among the types this driver renders as text.
             TypeInfoRow::new(TrinoTypeName::Varchar.name(), SqlDataType::EXT_W_VARCHAR)
                 .with_column_size(catalog_column_size(
                     SqlDataType::EXT_W_VARCHAR,
@@ -156,7 +158,8 @@ fn trino_type_info() -> &'static [TypeInfoRow] {
                 ))
                 .with_literal_affixes(Some("'"), Some("'"))
                 .with_create_params(Some("max length"))
-                .with_case_sensitive(true),
+                .with_case_sensitive(true)
+                .with_preferred(true),
             TypeInfoRow::new(TrinoTypeName::Char.name(), SqlDataType::EXT_W_CHAR)
                 .with_column_size(catalog_column_size(
                     SqlDataType::EXT_W_CHAR,
@@ -289,7 +292,8 @@ fn trino_type_info() -> &'static [TypeInfoRow] {
                 .with_literal_affixes(Some("TIME '"), Some("'"))
                 .with_create_params(Some("precision"))
                 .with_scale_range(Some(0), Some(MAX_FRACTIONAL_SECONDS_PRECISION))
-                .with_verbose_type(SqlDataType::DATETIME.0, Some(SQL_CODE_TIME)),
+                .with_verbose_type(SqlDataType::DATETIME.0, Some(SQL_CODE_TIME))
+                .with_preferred(true),
             // TIME WITH TIME ZONE shares plain TIME's DATA_TYPE (see
             // TrinoTypeName::sql_type) and still needs its own row: an
             // application looking SQLGetTypeInfo up by TYPE_NAME, to build a
@@ -317,7 +321,8 @@ fn trino_type_info() -> &'static [TypeInfoRow] {
                 .with_literal_affixes(Some("TIMESTAMP '"), Some("'"))
                 .with_create_params(Some("precision"))
                 .with_scale_range(Some(0), Some(MAX_FRACTIONAL_SECONDS_PRECISION))
-                .with_verbose_type(SqlDataType::DATETIME.0, Some(SQL_CODE_TIMESTAMP)),
+                .with_verbose_type(SqlDataType::DATETIME.0, Some(SQL_CODE_TIMESTAMP))
+                .with_preferred(true),
             // TIMESTAMP WITH TIME ZONE shares plain TIMESTAMP's DATA_TYPE,
             // for the reason TIME WITH TIME ZONE above gives.
             TypeInfoRow::new(
@@ -1147,8 +1152,9 @@ pub(super) fn get_type_info() -> &'static [TypeInfoRow] {
 ///
 /// A failed parse falls back to a canonical name chosen here for `sql_type`,
 /// never to whichever [`trino_type_info`] row sorts first under that
-/// `DATA_TYPE`. That row is `INTERVAL DAY TO SECOND`, an accident of the
-/// table's required sort order, and it would misname every compound type:
+/// `DATA_TYPE`. That is a positional pick, not a deliberate one (before core
+/// ranked preferred rows it was `INTERVAL DAY TO SECOND`), and it would
+/// misname every compound type:
 /// ARRAY, MAP, ROW, TUPLE, `ipaddress` and anything else with no dedicated
 /// `TrinoTypeName` variant. `trino_ty_to_sql_type` renders all of them as
 /// `EXT_W_VARCHAR` text, so `VARCHAR` is the honest name for that `DATA_TYPE`.
@@ -1747,35 +1753,39 @@ mod tests {
             .unwrap_or_else(|| panic!("no SQLGetTypeInfo row for {type_name:?}"))
     }
 
+    /// Core orders the result set (DATA_TYPE, preferred row, TYPE_NAME), so the
+    /// declaration order here no longer matters. What does matter is that every
+    /// DATA_TYPE shared by several rows names its closest match: unmarked, the
+    /// alphabetically first row leads, and for SQL_WVARCHAR that was
+    /// `INTERVAL DAY TO SECOND`, which Power Query then used as the CAST
+    /// target for every varchar column.
     #[test]
-    fn type_info_rows_sorted_by_data_type_then_type_name() {
-        // Spec (SQLGetTypeInfo): "ordered by DATA_TYPE and then ... TYPE_NAME,
-        // both ascending." DATA_TYPE is a signed i16 (negative for ODBC
-        // extension types), so the comparison must not treat it as unsigned.
-        // This walks adjacent pairs rather than asserting a fixed sequence,
-        // so it keeps holding as rows are added or reordered.
-        for pair in trino_type_info().windows(2) {
-            let (prev, next) = (&pair[0], &pair[1]);
-            assert!(
-                prev.data_type().0 <= next.data_type().0,
-                "trino_type_info() not sorted by DATA_TYPE: {:?} (DATA_TYPE={}) \
-                 appears before {:?} (DATA_TYPE={})",
-                prev.type_name(),
-                prev.data_type().0,
-                next.type_name(),
-                next.data_type().0
-            );
-            if prev.data_type() == next.data_type() {
-                assert!(
-                    prev.type_name() <= next.type_name(),
-                    "rows sharing DATA_TYPE={} not sorted by TYPE_NAME: {:?} appears \
-                     before {:?}",
-                    prev.data_type().0,
-                    prev.type_name(),
-                    next.type_name()
-                );
-            }
-        }
+    fn every_shared_data_type_has_one_preferred_row() {
+        let issues =
+            stackable_odbc_core::conformance::type_info_preference_issues(trino_type_info());
+        assert!(
+            issues.is_empty(),
+            "SQLGetTypeInfo preference markers: {issues:#?}"
+        );
+    }
+
+    /// The specific choices, not just their count: the plain type is the
+    /// closest match for each ODBC type it shares with Trino variants.
+    #[test]
+    fn preferred_rows_are_the_plain_types() {
+        let preferred: Vec<(i16, &str)> = trino_type_info()
+            .iter()
+            .filter(|r| r.preferred())
+            .map(|r| (r.data_type().0, r.type_name()))
+            .collect();
+        assert_eq!(
+            preferred,
+            vec![
+                (SqlDataType::EXT_W_VARCHAR.0, TrinoTypeName::Varchar.name()),
+                (SqlDataType::TIME.0, TrinoTypeName::Time.name()),
+                (SqlDataType::TIMESTAMP.0, TrinoTypeName::Timestamp.name()),
+            ]
+        );
     }
 
     /// `driver_version!()` must resolve `SQL_DRIVER_VER` from *this* crate's

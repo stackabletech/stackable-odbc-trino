@@ -611,6 +611,59 @@ fn get_info_groups_that_constrain_each_other_agree() {
     }
 }
 
+/// What Power Query sees: `SQLGetTypeInfo(DATA_TYPE)` through core's real
+/// entry point, first row's TYPE_NAME. A shared DATA_TYPE must lead with the
+/// plain type, never a variant such as `INTERVAL DAY TO SECOND` that merely
+/// sorts first. Needs no server: `get_type_info` reads a static table.
+#[test]
+#[serial]
+fn get_type_info_leads_each_shared_data_type_with_the_plain_type() {
+    unsafe {
+        let (env, conn) = alloc_conn_with_injected_trino_connection();
+        for (data_type, expected) in [
+            (SqlDataType::EXT_W_VARCHAR, "VARCHAR"),
+            (SqlDataType::TIME, "TIME"),
+            (SqlDataType::TIMESTAMP, "TIMESTAMP"),
+        ] {
+            let mut stmt: *mut c_void = std::ptr::null_mut();
+            assert_eq!(
+                ffi::handle::sql_alloc_handle::<TrinoBackend>(
+                    HandleType::Stmt as i16,
+                    conn,
+                    &mut stmt
+                ),
+                SqlReturn::SUCCESS
+            );
+            assert_eq!(
+                ffi::info::sql_get_type_info::<TrinoBackend>(stmt, data_type.0),
+                SqlReturn::SUCCESS,
+                "SQLGetTypeInfo({data_type:?})"
+            );
+            assert_eq!(
+                ffi::fetch::sql_fetch::<TrinoBackend>(stmt),
+                SqlReturn::SUCCESS
+            );
+            let mut buf = [0u16; 64];
+            let mut ind: isize = 0;
+            assert_eq!(
+                ffi::fetch::sql_get_data::<TrinoBackend>(
+                    stmt,
+                    1,
+                    CDataType::WChar as i16,
+                    buf.as_mut_ptr().cast(),
+                    std::mem::size_of_val(&buf) as isize,
+                    &mut ind,
+                ),
+                SqlReturn::SUCCESS
+            );
+            let name = String::from_utf16(&buf[..(ind as usize / 2)]).expect("UTF-16 TYPE_NAME");
+            assert_eq!(name, expected, "first SQLGetTypeInfo row for {data_type:?}");
+            let _ = ffi::handle::sql_free_handle::<TrinoBackend>(HandleType::Stmt as i16, stmt);
+        }
+        cleanup_injected_conn(env, conn);
+    }
+}
+
 /// Property 2: no genuine `SQL_CONVERT_*` code ever returns 0 through
 /// `TrinoBackend`: per `AGENTS.md`, a `0` conversion bitmap is what makes
 /// the Windows Driver Manager block `SQLGetData` with `HYC00`.

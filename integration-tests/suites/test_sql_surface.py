@@ -289,6 +289,20 @@ def main():
         cur.getTypeInfo().fetchall() or
         (_ for _ in ()).throw(AssertionError("no type info"))))
 
+    def type_info_leads_wvarchar_with_varchar():
+        """Power Query takes the first SQLGetTypeInfo row for a DATA_TYPE as its
+        CAST target. For SQL_WVARCHAR that must be VARCHAR, not one of the
+        Trino types the driver also renders as text (INTERVAL DAY TO SECOND
+        sorted first before core ranked a preferred row).
+        """
+        SQL_WVARCHAR = -9  # as in test_describe_param.py
+        first = cur.getTypeInfo(SQL_WVARCHAR).fetchone()
+        assert first is not None, "no SQL_WVARCHAR rows"
+        assert first[0] == "VARCHAR", f"first SQL_WVARCHAR row is {first[0]!r}"
+
+    R.run("SQLGetTypeInfo leads SQL_WVARCHAR with VARCHAR",
+        type_info_leads_wvarchar_with_varchar)
+
     def datetime_columns_report_the_verbose_type():
         """SQLColumns and SQLGetTypeInfo must not disagree about a datetime.
 
