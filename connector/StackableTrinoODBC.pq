@@ -307,10 +307,10 @@ StackableTrinoODBCImpl = (
             SupportsTop = false
         ],
 
-        // Nothing is overridden. An override here silently wins over
-        // SQLGetInfoW and cannot be corrected by fixing the driver, so the
-        // record is reserved for what the driver gets wrong, and this group it
-        // answers honestly: SQL_SQL92_PREDICATES, SQL_AGGREGATE_FUNCTIONS,
+        // One entry is overridden, SQL_CONVERT_TIME, below. An override here
+        // silently wins over SQLGetInfoW and cannot be corrected by fixing the
+        // driver, so the record is otherwise reserved for what the driver gets
+        // wrong, and this group it answers honestly: SQL_SQL92_PREDICATES, SQL_AGGREGATE_FUNCTIONS,
         // SQL_SQL92_RELATIONAL_JOIN_OPERATORS, SQL_SQL92_VALUE_EXPRESSIONS and
         // SQL_IDENTIFIER_QUOTE_CHAR.
         //
@@ -327,7 +327,22 @@ StackableTrinoODBCImpl = (
         // Nothing Power Query generates is lost: comparison, IN,
         // LIKE, BETWEEN, IS NULL, EXISTS and the four join types are all in
         // the driver's ungated set.
-        SQLGetInfo = defaultConfig[SQLGetInfo],
+        //
+        // SQL_CONVERT_TIME is the driver's answer (every SQL_CVT_* bit) minus
+        // SQL_CVT_TIMESTAMP, and that is a deliberate misreport: Trino can
+        // cast TIME to TIMESTAMP. It anchors the time on the current date, as
+        // ODBC's own conversion tables do ("SQL to C: Time", footnote [c]),
+        // while Power BI folds a time slicer to
+        // `cast(col as TIMESTAMP) = CAST('1899-12-30 hh:mm:ss' as TIMESTAMP)`,
+        // anchoring on its own base date. That filter ran and silently matched
+        // no row. Without the bit, Power BI refuses the fold and says so ("We
+        // couldn't fold the expression to the data source"), which is the
+        // honest outcome for a filter Trino cannot evaluate the way Power BI
+        // means it. test_folding_contract.py pins the value to the driver's
+        // answer and checks Trino's anchor is still the current date.
+        SQLGetInfo = defaultConfig[SQLGetInfo] & [
+            SQL_CONVERT_TIME = 0x01FDFFFF
+        ],
 
         SQLColumns = (catalogName, schemaName, tableName, columnName, source) =>
             source,

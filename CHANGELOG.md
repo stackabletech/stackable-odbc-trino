@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- The Power BI connector reports that Trino cannot convert `TIME` to
+  `TIMESTAMP` (`SQL_CONVERT_TIME` without `SQL_CVT_TIMESTAMP`). A DirectQuery
+  slicer on a time column folded to a comparison against Power BI's base date,
+  30 December 1899, while Trino anchors a cast time on the current date, so the
+  report silently showed no rows. Power BI now refuses that fold with a visible
+  error instead. The README describes a view-based workaround.
+
 ### Fixed
 
 - `INTERVAL YEAR TO MONTH` and `INTERVAL DAY TO SECOND` columns read as text now

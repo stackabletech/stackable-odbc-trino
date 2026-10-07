@@ -74,6 +74,10 @@ SAMPLE = {
 # as a folding gap misreports a gap that cannot exist.
 DM_COMPAT_ONLY = {"SQL_CHAR", "SQL_VARCHAR"}
 
+# SQL_CVT_* bits (sqlext.h): every defined conversion target, and TIMESTAMP's.
+SQL_CVT_ALL = 0x01FFFFFF
+SQL_CVT_TIMESTAMP = 0x00020000
+
 
 def check(label, ok, detail=""):
     R.check(f"{label}{detail}", ok)
@@ -403,6 +407,41 @@ def main():
         "Config_UseParameterBindings leaves SQLBindParameter enabled",
         bindings_on,
         "" if bindings_on else "  (set false, which disables a function the driver declares)",
+    )
+
+    # ------------------------------------------------------------------
+    print("\n--- TIME -> TIMESTAMP is withheld, so Power BI cannot fold it ---")
+    # A Power BI slicer on a time column folds to
+    # `cast("col" as TIMESTAMP) = CAST('1899-12-30 hh:mm:ss' as TIMESTAMP)`,
+    # anchoring the time on Power BI's base date. Trino's cast, like ODBC's own
+    # conversion tables ("SQL to C: Time" footnote [c]), uses the current date,
+    # so the filter silently matched nothing. Withholding SQL_CVT_TIMESTAMP
+    # from SQL_CONVERT_TIME makes Power BI refuse the fold with a visible error
+    # instead (measured in Power BI Desktop, 2026-10-07). The override is a
+    # deliberate misreport, so it must stay exactly "the driver's answer minus
+    # that one bit" and must be revisited if Trino's anchor ever changes.
+    override = re.search(r"SQL_CONVERT_TIME\s*=\s*(0x[0-9A-Fa-f]+|\d+)", source)
+    check(
+        "the connector overrides SQL_CONVERT_TIME",
+        override is not None,
+        "" if override else "  (no SQL_CONVERT_TIME entry in the SQLGetInfo record)",
+    )
+    if override:
+        declared = int(override.group(1), 0)
+        driver_answer = conn.getinfo(pyodbc.SQL_CONVERT_TIME) & SQL_CVT_ALL
+        expected = driver_answer & ~SQL_CVT_TIMESTAMP
+        check(
+            "SQL_CONVERT_TIME is the driver's answer without SQL_CVT_TIMESTAMP",
+            declared == expected,
+            f"  (declared {declared:#010x}, expected {expected:#010x})",
+        )
+    anchored_today = cur.execute(
+        "SELECT CAST(CAST(TIME '14:30:00' AS TIMESTAMP) AS DATE) = current_date"
+    ).fetchone()[0]
+    check(
+        "Trino still anchors TIME -> TIMESTAMP on the current date",
+        bool(anchored_today),
+        "" if anchored_today else "  (it no longer does: revisit the SQL_CONVERT_TIME override)",
     )
 
     # ------------------------------------------------------------------

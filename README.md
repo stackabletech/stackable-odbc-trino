@@ -259,6 +259,19 @@ ignored, so the tool can react instead of trusting a wrong answer.
   somewhere you never asked for. Set `Catalog` when you connect.
 - **Row and field size limits are not faked.** Trino can only limit a result set
   through `LIMIT` in the SQL you wrote.
+- **Power BI cannot filter on a time column in DirectQuery.** Picking a value
+  in a slicer on a `time` column fails with "We couldn't fold the expression to
+  the data source". Power BI would filter by casting the column to a timestamp
+  and comparing it with that time on 30 December 1899, while Trino, like ODBC
+  itself, puts a cast time on today's date, so the filter could never match.
+  The connector declares the cast unsupported so you see an error instead of an
+  empty report. To slice on a time of day, expose it as text in a Trino view,
+  for example `CAST(col_time AS VARCHAR) AS col_time_text`, and slice on that
+  column. Selecting "(Blank)" still works. Users who cannot create views can
+  switch the table to Import mode, where the slicer filters Power BI's own copy
+  of the data. That copy is only as fresh as its last refresh, and Power BI
+  treats a blank time as equal to midnight, so selecting 12:00:00 AM also shows
+  rows without a time.
 - **One isolation level.** Trino catalogs disagree about which levels they
   accept, so the driver offers the one they all support and refuses the rest up
   front, rather than letting a query fail later for a reason nobody can see.

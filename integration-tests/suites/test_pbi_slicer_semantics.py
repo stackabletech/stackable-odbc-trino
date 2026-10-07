@@ -60,11 +60,14 @@ TEMPLATES = {
     "col_interval_ym": lambda v: (
         f"cast(\"col_interval_ym\" as VARCHAR) = CAST('{text(v)}' as VARCHAR)"
     ),
-    # Power BI anchors a time of day on its base date, 1899-12-30.
-    "col_time": lambda v: (
-        f"cast(\"col_time\" as TIMESTAMP) = "
-        f"CAST('1899-12-30 {v:%H:%M:%S}.{fraction7(v)}' as TIMESTAMP)"
-    ),
+    # Power BI anchors a time of day on its base date, 1899-12-30, and folds
+    # `cast("col_time" as TIMESTAMP) = CAST('1899-12-30 hh:mm:ss' as TIMESTAMP)`.
+    # Trino's cast uses the current date, as ODBC's conversion tables do, so
+    # that filter can never match. The connector therefore withholds
+    # SQL_CVT_TIMESTAMP from SQL_CONVERT_TIME and Power BI refuses the fold with
+    # a visible error; test_folding_contract.py checks that. Only "(Blank)" is
+    # checked here.
+    "col_time": None,
     "col_timestamptz": lambda v: (
         f"\"col_timestamptz\" = CAST('{v:%Y-%m-%d %H:%M:%S}.{fraction7(v)}' as TIMESTAMP)"
     ),
@@ -81,6 +84,8 @@ def check_zone(conn_str, zone_label):
         for _, x in pairs:
             if x is not None and x not in values:
                 values.append(x)
+        if template is None:
+            values = []
         for v in values:
             expected = sum(1 for _, x in pairs if x == v)
             where = template(v)
