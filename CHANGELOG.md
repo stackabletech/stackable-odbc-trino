@@ -25,6 +25,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `SQLGetTypeInfo` lists the plain type first among the rows that share a
+  `DATA_TYPE`: `VARCHAR` for `SQL_WVARCHAR`, `TIME` for `SQL_TYPE_TIME` and
+  `TIMESTAMP` for `SQL_TYPE_TIMESTAMP`, as the spec's "how closely the data type
+  maps" ordering requires. The rows were sorted by name, so `SQL_WVARCHAR` led
+  with `INTERVAL DAY TO SECOND`, and Power Query, which takes the first row as
+  its `CAST` target, folded a DirectQuery slicer on a text column into
+  `CAST(... AS INTERVAL DAY TO SECOND)`, which Trino rejected.
+- The Power BI connector quotes text constants and doubles any `'` in them.
+  Power Query hands the constant over unquoted, so a slicer value folded into
+  `CAST(hello world as VARCHAR)` and failed. Together with the `SQLGetTypeInfo`
+  fix above this makes DirectQuery slicers on text columns work, so the driver
+  and the connector have to be upgraded together.
 - `INTERVAL YEAR TO MONTH` and `INTERVAL DAY TO SECOND` columns read as text now
   return Trino's own rendering, the same text `CAST(... AS VARCHAR)` produces
   (`-1-0`, `0 00:00:00.500`). They were parsed into fields and re-rendered
