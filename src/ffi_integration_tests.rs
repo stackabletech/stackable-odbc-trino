@@ -33,8 +33,8 @@ use stackable_odbc_core::odbc_sys;
 use stackable_odbc_core::test_support::{attach_connection, detach_connection};
 use stackable_odbc_core::types::{
     AttrOdbcVersion, CDataType, Desc, EnvironmentAttribute, HandleType, HeaderDiagnosticIdentifier,
-    InfoType, ParamType, SQL_AUTOCOMMIT_OFF, SQL_AUTOCOMMIT_ON, SQL_FETCH_BOOKMARK, SQL_IC_LOWER,
-    SQL_INDEX_UNIQUE, SQL_LOCK_NO_CHANGE, SQL_NTS, SQL_NULL_DATA, SQL_PARAM_ERROR,
+    InfoType, Interval, ParamType, SQL_AUTOCOMMIT_OFF, SQL_AUTOCOMMIT_ON, SQL_FETCH_BOOKMARK,
+    SQL_IC_LOWER, SQL_INDEX_UNIQUE, SQL_LOCK_NO_CHANGE, SQL_NTS, SQL_NULL_DATA, SQL_PARAM_ERROR,
     SQL_PARAM_SUCCESS, SQL_POSITION, SQL_QUICK, SqlDataType, SqlReturn, StatementAttribute,
     expected_kind,
 };
@@ -1658,9 +1658,10 @@ fn interval_year_month_returns_wchar() {
             ffi::fetch::sql_fetch::<TrinoBackend>(stmt),
             SqlReturn::SUCCESS
         );
-        let s = fetch_wchar(stmt);
-        assert!(s.contains('3'), "expected '3' in {s:?}");
-        assert!(s.contains('7'), "expected '7' in {s:?}");
+        // Trino's own rendering, unchanged: Power BI folds a slicer on this
+        // column to `cast(col as VARCHAR) = '<shown>'`, which only matches if
+        // the shown text is what that CAST produces.
+        assert_eq!(fetch_wchar(stmt), "3-7");
         cleanup_stmt(stmt);
     }
 }
@@ -1679,8 +1680,113 @@ fn interval_day_time_returns_wchar() {
             ffi::fetch::sql_fetch::<TrinoBackend>(stmt),
             SqlReturn::SUCCESS
         );
-        let s = fetch_wchar(stmt);
-        assert!(s.contains('2'), "expected '2' in {s:?}");
+        assert_eq!(fetch_wchar(stmt), "2 03:04:05.678");
+        cleanup_stmt(stmt);
+    }
+}
+
+/// The values the Power BI slicer view (`seed-hive.sh`) holds, whose re-rendered
+/// text (`-1-00`, `0 00:00:00.5`) differed from Trino's and so selected no rows.
+#[test]
+#[serial]
+#[ignore = "requires Trino at localhost:8443; run ./integration-tests/setup.sh first"]
+fn intervals_are_delivered_as_trinos_cast_to_varchar_text() {
+    for expr in [
+        "INTERVAL '-1' YEAR",
+        "INTERVAL '3' MONTH",
+        "INTERVAL '-1' DAY",
+        "INTERVAL '0.5' SECOND",
+        "INTERVAL '1' DAY + INTERVAL '30' MINUTE",
+    ] {
+        unsafe {
+            let (_env, _conn, stmt) = alloc_stmt();
+            assert_eq!(
+                exec_direct(stmt, &format!("SELECT {expr}, CAST({expr} AS VARCHAR)")),
+                SqlReturn::SUCCESS
+            );
+            assert_eq!(
+                ffi::fetch::sql_fetch::<TrinoBackend>(stmt),
+                SqlReturn::SUCCESS
+            );
+            let cast = get_wchar_col(stmt, 2);
+            assert_eq!(get_wchar_col(stmt, 1), cast, "{expr}");
+            cleanup_stmt(stmt);
+        }
+    }
+}
+
+/// Read column 1 into a `SQL_INTERVAL_STRUCT` as `target`.
+unsafe fn fetch_interval(stmt: *mut c_void, target: CDataType) -> odbc_sys::IntervalStruct {
+    let mut out = odbc_sys::IntervalStruct {
+        interval_type: 0,
+        interval_sign: 0,
+        interval_value: odbc_sys::IntervalUnion {
+            day_second: odbc_sys::DaySecond::default(),
+        },
+    };
+    let mut ind: isize = 0;
+    let ret = unsafe {
+        ffi::fetch::sql_get_data::<TrinoBackend>(
+            stmt,
+            1,
+            target as i16,
+            (&raw mut out).cast(),
+            size_of::<odbc_sys::IntervalStruct>() as isize,
+            &mut ind,
+        )
+    };
+    assert_eq!(ret, SqlReturn::SUCCESS, "sql_get_data as {target:?} failed");
+    out
+}
+
+/// Delivering interval columns as text must not cost an application the
+/// `SQL_C_INTERVAL_*` C types: core converts the text, per the spec's
+/// "SQL to C: Character" table.
+#[test]
+#[serial]
+#[ignore = "requires Trino at localhost:8443; run ./integration-tests/setup.sh first"]
+fn interval_year_month_reads_as_sql_c_interval_year_to_month() {
+    unsafe {
+        let (_env, _conn, stmt) = alloc_stmt();
+        assert_eq!(
+            exec_direct(stmt, "SELECT INTERVAL '-3-7' YEAR TO MONTH"),
+            SqlReturn::SUCCESS
+        );
+        assert_eq!(
+            ffi::fetch::sql_fetch::<TrinoBackend>(stmt),
+            SqlReturn::SUCCESS
+        );
+        let got = fetch_interval(stmt, CDataType::IntervalYearToMonth);
+        assert_eq!(got.interval_type, Interval::YearToMonth as i32);
+        assert_eq!(got.interval_sign, 1, "SQL_TRUE: negative");
+        let ym = got.interval_value.year_month;
+        assert_eq!((ym.year, ym.month), (3, 7));
+        cleanup_stmt(stmt);
+    }
+}
+
+#[test]
+#[serial]
+#[ignore = "requires Trino at localhost:8443; run ./integration-tests/setup.sh first"]
+fn interval_day_time_reads_as_sql_c_interval_day_to_second() {
+    unsafe {
+        let (_env, _conn, stmt) = alloc_stmt();
+        assert_eq!(
+            exec_direct(stmt, "SELECT INTERVAL '2 03:04:05' DAY TO SECOND"),
+            SqlReturn::SUCCESS
+        );
+        assert_eq!(
+            ffi::fetch::sql_fetch::<TrinoBackend>(stmt),
+            SqlReturn::SUCCESS
+        );
+        let got = fetch_interval(stmt, CDataType::IntervalDayToSecond);
+        assert_eq!(got.interval_type, Interval::DayToSecond as i32);
+        assert_eq!(got.interval_sign, 0);
+        let ds = got.interval_value.day_second;
+        assert_eq!(
+            (ds.day, ds.hour, ds.minute, ds.second, ds.fraction),
+            (2, 3, 4, 5, 0)
+        );
         cleanup_stmt(stmt);
     }
 }

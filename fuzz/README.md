@@ -20,8 +20,8 @@ one: a value a coordinator legitimately sent must fail safe, and where a
 release build has no overflow checks the same defect returns a wrong answer
 instead of an error.
 
-- `json_value` covers `json_to_column_value` and the dozen temporal, interval
-  and decimal scanners under it. This is the half of the read path core does
+- `json_value` covers `json_to_column_value` and the temporal and decimal
+  scanners under it. This is the half of the read path core does
   not see: core fuzzes `write_column_value`, which turns the resulting
   `ColumnValue` into the caller's buffer, and nothing covered the step that
   produces it.

@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- `INTERVAL YEAR TO MONTH` and `INTERVAL DAY TO SECOND` columns read as text now
+  return Trino's own rendering, the same text `CAST(... AS VARCHAR)` produces
+  (`-1-0`, `0 00:00:00.500`). They were parsed into fields and re-rendered
+  (`-1-00`, `0 00:00:00.5`), so a Power BI DirectQuery slicer on an interval
+  column, which folds to `cast(col as VARCHAR) = '<shown value>'`, silently
+  selected no rows. Reading these columns as `SQL_C_INTERVAL_*` still works:
+  stackable-odbc-core now converts interval text to those C types.
+
 ## [0.1.2] — 2026-09-01
 
 ### Changed

@@ -1971,7 +1971,7 @@ checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
 [[package]]
 name = "stackable-odbc-core"
 version = "0.1.0"
-source = "git+https://github.com/stackabletech/stackable-odbc-core.git?rev=23f055e451cde6b842ad117f5c8a16957abe113f#23f055e451cde6b842ad117f5c8a16957abe113f"
+source = "git+https://github.com/stackabletech/stackable-odbc-core.git?rev=b37ca99433b15b2646e98594a6571719acc2a8fa#b37ca99433b15b2646e98594a6571719acc2a8fa"
 dependencies = [
  "odbc-sys",
  "snafu",

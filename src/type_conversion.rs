@@ -5,10 +5,7 @@
 use chrono::Datelike as _;
 use chrono::Timelike as _;
 use serde_json::Value;
-use stackable_odbc_core::types::{
-    ColumnValue, Interval, NANOS_PER_DAY, NANOS_PER_HOUR, NANOS_PER_MINUTE, NANOS_PER_SECOND,
-    PRECISION_UNDETERMINABLE, SqlDataType, column_size,
-};
+use stackable_odbc_core::types::{ColumnValue, PRECISION_UNDETERMINABLE, SqlDataType, column_size};
 use trino_rust_client::{TrinoFloat, TrinoInt, TrinoTy};
 
 /// This driver's declared maximum fractional-seconds precision for TIME,
@@ -925,88 +922,6 @@ fn parse_trino_timestamp(s: &str) -> Option<ColumnValue> {
     })
 }
 
-/// Parse a Trino INTERVAL YEAR TO MONTH string "Y-M" into years and months.
-///
-/// The sign prefixes the whole interval, not just the year component: Trino
-/// serialises a negative interval as `"-Y-M"`. Parsing the leading `-` once
-/// (rather than relying on `i32::parse` to see it on the first token) and
-/// applying it to both fields keeps the two in agreement: a split
-/// representation must not let one field be negative while the other is
-/// positive.
-fn parse_interval_year_month(s: &str) -> Option<ColumnValue> {
-    let t = s.trim();
-    let (negative, body) = match t.strip_prefix('-') {
-        Some(rest) => (true, rest),
-        None => (false, t),
-    };
-
-    let mut parts = body.splitn(2, '-');
-    let years: i32 = parts.next()?.trim().parse().ok()?;
-    let months: i32 = parts.next()?.trim().parse().ok()?;
-
-    let (years, months) = if negative {
-        (years.checked_neg()?, months.checked_neg()?)
-    } else {
-        (years, months)
-    };
-
-    Some(ColumnValue::IntervalYearMonth {
-        years,
-        months,
-        // Trino has one year-month interval type and it carries both fields, so
-        // the precision is always the two-field form. The narrower
-        // `Interval::Year` and `Interval::Month` have no Trino column type to
-        // come from.
-        precision: Interval::YearToMonth,
-    })
-}
-
-/// Parse Trino's `INTERVAL DAY TO SECOND` text, e.g. `"-2 03:04:05.678"`.
-///
-/// The sign prefixes the whole interval, not just the day component.
-fn parse_interval_day_time(s: &str) -> Option<ColumnValue> {
-    let t = s.trim();
-    let (negative, body) = match t.strip_prefix('-') {
-        Some(rest) => (true, rest),
-        None => (false, t),
-    };
-
-    let mut outer = body.splitn(2, ' ');
-    let days: i64 = outer.next()?.trim().parse().ok()?;
-    let time_part = outer.next()?.trim();
-
-    let mut tp = time_part.splitn(3, ':');
-    let h: i64 = tp.next()?.parse().ok()?;
-    let m: i64 = tp.next()?.parse().ok()?;
-    let sec_part = tp.next()?;
-    let (sec_text, frac_text) = match sec_part.split_once('.') {
-        Some((sec, frac)) => (sec, frac),
-        None => (sec_part, ""),
-    };
-    let sec: i64 = sec_text.parse().ok()?;
-    // `ColumnValue::IntervalDayTime` counts nanoseconds, so the fraction is kept
-    // whole. Trino renders this type with three fractional digits, its own
-    // storage being a millisecond count, but `parse_fraction_nanos` reads
-    // whatever arrives on the same "pad right, then take nine" rule the temporal
-    // parsers use, so a shorter fragment like "5" is read as 500ms rather than
-    // 5ns and a longer one does not have to be special-cased here.
-    let frac_nanos = i128::from(parse_fraction_nanos(frac_text));
-
-    let magnitude = i128::from(days)
-        .checked_mul(NANOS_PER_DAY)?
-        .checked_add(i128::from(h) * NANOS_PER_HOUR)?
-        .checked_add(i128::from(m) * NANOS_PER_MINUTE)?
-        .checked_add(i128::from(sec) * NANOS_PER_SECOND)?
-        .checked_add(frac_nanos)?;
-
-    Some(ColumnValue::IntervalDayTime {
-        total_nanoseconds: if negative { -magnitude } else { magnitude },
-        // Trino has one day-time interval type and it spans all four fields, so
-        // the precision is always the widest form.
-        precision: Interval::DayToSecond,
-    })
-}
-
 /// Parse a Trino TIMESTAMP WITH TIME ZONE string and convert to UTC.
 ///
 /// Trino REST API format: `"YYYY-MM-DD HH:MM:SS.fraction TIMEZONE"` where
@@ -1272,26 +1187,17 @@ pub fn json_to_column_value(val: Value, ty: &TrinoTy) -> ColumnValue {
             Value::String(s) => ColumnValue::Json(s),
             other => ColumnValue::Json(other.to_string()),
         },
-        TrinoTy::IntervalYearToMonth => {
-            if let Value::String(ref s) = val {
-                parse_interval_year_month(s).unwrap_or_else(|| {
-                    tracing::warn!(raw = s, "failed to parse Trino INTERVAL YEAR TO MONTH");
-                    ColumnValue::String(s.clone())
-                })
-            } else {
-                ColumnValue::String(val.to_string())
-            }
-        }
-        TrinoTy::IntervalDayToSecond => {
-            if let Value::String(ref s) = val {
-                parse_interval_day_time(s).unwrap_or_else(|| {
-                    tracing::warn!(raw = s, "failed to parse Trino INTERVAL DAY TO SECOND");
-                    ColumnValue::String(s.clone())
-                })
-            } else {
-                ColumnValue::String(val.to_string())
-            }
-        }
+        // Intervals are delivered as Trino's own text, not parsed into fields.
+        // Power BI folds a slicer on an interval column to
+        // `cast(col as VARCHAR) = '<shown value>'`, so the shown text must be
+        // exactly what Trino's CAST renders (`-1-0`, `0 00:00:00.500`); core's
+        // rendering of structured fields (`-1-00`, `0 00:00:00.5`) matched no
+        // row. Core still converts this text to the SQL_C_INTERVAL_* types, per
+        // the spec's "SQL to C: Character" table.
+        TrinoTy::IntervalYearToMonth | TrinoTy::IntervalDayToSecond => match val {
+            Value::String(s) => ColumnValue::String(s),
+            other => ColumnValue::String(other.to_string()),
+        },
         // VARBINARY arrives as a base64-encoded string in the REST API payload.
         TrinoTy::VarBinary => {
             if let Value::String(ref s) = val {
@@ -2494,89 +2400,37 @@ mod tests {
         assert_eq!(val, ColumnValue::Json(r#"{"a":1}"#.to_string()));
     }
 
+    /// An interval column is delivered as Trino's own text, unchanged.
+    ///
+    /// Power BI folds a slicer on an interval column to
+    /// `cast(col as VARCHAR) = '<shown value>'`, so the text an application is
+    /// shown must be exactly what Trino's `CAST(... AS VARCHAR)` produces, or
+    /// the filter silently selects nothing. Trino renders `INTERVAL '-1' YEAR`
+    /// as `-1-0`; a parse into structured fields re-rendered by core gave
+    /// `-1-00`.
     #[test]
-    fn interval_year_month_parses_correctly() {
+    fn interval_year_month_is_delivered_as_trinos_text() {
         use serde_json::json;
-        let val = json_to_column_value(json!("3-7"), &TrinoTy::IntervalYearToMonth);
-        assert_eq!(
-            val,
-            ColumnValue::IntervalYearMonth {
-                years: 3,
-                months: 7,
-                precision: Interval::YearToMonth,
-            }
-        );
+        for raw in ["3-7", "-1-0", "0-3"] {
+            let val = json_to_column_value(json!(raw), &TrinoTy::IntervalYearToMonth);
+            assert_eq!(val, ColumnValue::String(raw.to_string()), "{raw}");
+        }
     }
 
+    /// The day-time counterpart: `INTERVAL '0.5' SECOND` is `0 00:00:00.500`
+    /// in Trino, which core's re-rendering turned into `0 00:00:00.5`.
     #[test]
-    fn interval_day_time_parses_correctly() {
+    fn interval_day_time_is_delivered_as_trinos_text() {
         use serde_json::json;
-        let val = json_to_column_value(json!("2 03:04:05.678"), &TrinoTy::IntervalDayToSecond);
-        assert_eq!(
-            val,
-            ColumnValue::IntervalDayTime {
-                total_nanoseconds: 2 * NANOS_PER_DAY
-                    + 3 * NANOS_PER_HOUR
-                    + 4 * NANOS_PER_MINUTE
-                    + 5 * NANOS_PER_SECOND
-                    + 678_000_000,
-                precision: Interval::DayToSecond,
-            }
-        );
-    }
-
-    #[test]
-    fn negative_interval_day_time_is_fully_negative() {
-        let val = parse_interval_day_time("-2 03:04:05.678").expect("parses");
-        // -(2 days + 3h4m5.678s) = -183_845_678 ms in nanoseconds.
-        assert_eq!(
-            val,
-            ColumnValue::IntervalDayTime {
-                total_nanoseconds: -183_845_678_000_000,
-                precision: Interval::DayToSecond,
-            }
-        );
-    }
-
-    #[test]
-    fn negative_zero_day_interval_keeps_its_sign() {
-        // "-0 03:04:05" must keep its sign: parsing the sign only off `days`
-        // loses it entirely, because "-0".parse::<i64>() is 0.
-        let val = parse_interval_day_time("-0 03:04:05").expect("parses");
-        assert_eq!(
-            val,
-            ColumnValue::IntervalDayTime {
-                total_nanoseconds: -11_045_000_000_000,
-                precision: Interval::DayToSecond,
-            }
-        );
-    }
-
-    #[test]
-    fn positive_interval_day_time_is_unchanged() {
-        let val = parse_interval_day_time("2 03:04:05.678").expect("parses");
-        assert_eq!(
-            val,
-            ColumnValue::IntervalDayTime {
-                total_nanoseconds: 183_845_678_000_000,
-                precision: Interval::DayToSecond,
-            }
-        );
-    }
-
-    /// A fraction finer than Trino's own millisecond rendering survives now that
-    /// the variant counts nanoseconds: the parser no longer truncates at three
-    /// digits.
-    #[test]
-    fn interval_day_time_keeps_sub_millisecond_digits() {
-        let val = parse_interval_day_time("0 00:00:01.234567").expect("parses");
-        assert_eq!(
-            val,
-            ColumnValue::IntervalDayTime {
-                total_nanoseconds: NANOS_PER_SECOND + 234_567_000,
-                precision: Interval::DayToSecond,
-            }
-        );
+        for raw in [
+            "2 03:04:05.678",
+            "-1 00:00:00.000",
+            "-0 03:04:05.000",
+            "0 00:00:00.500",
+        ] {
+            let val = json_to_column_value(json!(raw), &TrinoTy::IntervalDayToSecond);
+            assert_eq!(val, ColumnValue::String(raw.to_string()), "{raw}");
+        }
     }
 
     /// Numeric offset +05:30: 10:30 local = 05:00 UTC (subtract 5h30m).
