@@ -58,10 +58,13 @@ trino_run "CREATE SCHEMA IF NOT EXISTS hive.$HIVE_SCHEMA" admin
 trino_run "CREATE OR REPLACE VIEW hive.$HIVE_SCHEMA.interval_test AS
 SELECT id, col_varchar, col_integer,
        col_date, col_time, col_timestamp, col_timestamptz,
-       CASE id WHEN 5 THEN INTERVAL '1' DAY
+       CASE id WHEN 1 THEN INTERVAL '0.5' SECOND
+               WHEN 5 THEN INTERVAL '1' DAY
                WHEN 6 THEN INTERVAL '2' HOUR
-               WHEN 7 THEN INTERVAL '1' DAY + INTERVAL '30' MINUTE END AS col_interval_ds,
+               WHEN 7 THEN INTERVAL '1' DAY + INTERVAL '30' MINUTE
+               WHEN 8 THEN INTERVAL '-1' DAY END AS col_interval_ds,
        CASE id WHEN 5 THEN INTERVAL '1' YEAR
-               WHEN 6 THEN INTERVAL '3' MONTH END AS col_interval_ym
+               WHEN 6 THEN INTERVAL '3' MONTH
+               WHEN 8 THEN INTERVAL '-1' YEAR END AS col_interval_ym
 FROM postgresql.public.types_test" admin
 echo "Seeded hive.$HIVE_SCHEMA and hive.$HIVE_SCHEMA.interval_test"

@@ -109,6 +109,7 @@ SUITES = [
         # the connector travels with it.
         deploy=("connector/StackableTrinoODBC.pq",),
     ),
+    Suite("pbi slicer semantics", "test_pbi_slicer_semantics.py"),
     Suite(
         "tls", "test_tls.py", argv="none",
         # keycloak.crt is a leaf signed by the same CA, used as a trust anchor
