@@ -117,6 +117,39 @@ def parse_temporal_formats(source):
     )
 
 
+def parse_text_entries(source):
+    """Map each Constant-visitor key that casts to VARCHAR to its whole body.
+
+    `VARCHAR = each Cast(Quote(Text.Replace(_, "'", "''")), "VARCHAR")` yields
+    `{"VARCHAR": 'Cast(Quote(Text.Replace(_, "\\'", "\\'\\'")), "VARCHAR")'}`.
+    """
+    return dict(
+        re.findall(r'(\w+)\s*=\s*each\s+(Cast\(.*?"VARCHAR"\s*\))', source)
+    )
+
+
+def render_text_constant(body, value):
+    """The SQL a text visitor entry produces for `value`.
+
+    Power Query hands the visitor the bare text, not a quoted literal: verified
+    in Power BI Desktop on 2026-10-07, where the entry `Cast(_, "VARCHAR")`
+    produced `CAST(hello world as VARCHAR)`. So the entry has to quote the value
+    itself, and double any single quote inside it, or a value such as `O'Brien`
+    ends the literal early. This mirrors exactly those two steps, read off the
+    entry's body, so the check below fails for an entry that skips either.
+    """
+    quoted = "Quote(" in body
+    escaped = re.search(r"""Text\.Replace\(\s*_\s*,\s*"'"\s*,\s*"''"\s*\)""", body)
+    text = value.replace("'", "''") if escaped else value
+    return f"'{text}'" if quoted else text
+
+
+# Slicer values a text constant must survive. The first three are what Power BI
+# sent from `postgresql.public.types_test.col_varchar` on 2026-10-07 (the empty
+# string included); the apostrophe is the one that needs escaping.
+TEXT_SAMPLES = ["hello world", "日本語テスト 🎉🦀 café résumé", "", "O'Brien"]
+
+
 # The .NET custom date/time specifiers the connector is allowed to use, longest
 # first so `mm` is matched before `m` would be. Anything else is rejected rather
 # than guessed at: an unrecognised specifier is exactly the defect this looks
@@ -295,6 +328,29 @@ def main():
                 False,
                 f"  {str(e)[:90]}",
             )
+
+    # ------------------------------------------------------------------
+    print("\n--- the text literals the Constant visitor renders round-trip ---")
+    # A slicer on a text column folds into `"col" = <constant>`, and the
+    # constant is whatever this entry renders. Unquoted, every value but NULL
+    # is a syntax error; quoted but unescaped, an apostrophe ends the literal.
+    # Round-tripped through Trino rather than pattern-matched, because what
+    # matters is the value Trino compares against.
+    text_entries = parse_text_entries(source)
+    check(
+        "the Constant visitor has a VARCHAR entry",
+        bool(text_entries),
+        "" if text_entries else "  (none parsed)",
+    )
+    for key in sorted(text_entries):
+        for value in TEXT_SAMPLES:
+            literal = render_text_constant(text_entries[key], value)
+            label = f"{key} renders {value!r} as {literal!r}, which CASTs back to it"
+            try:
+                got = cur.execute(f"SELECT CAST({literal} AS VARCHAR)").fetchone()[0]
+                check(label, got == value, "" if got == value else f"  (got {got!r})")
+            except pyodbc.Error as e:
+                check(label, False, f"  {str(e)[:90]}")
 
     # ------------------------------------------------------------------
     print("\n--- the row-limiting clause the AstVisitor builds parses ---")

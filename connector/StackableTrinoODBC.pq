@@ -394,12 +394,16 @@ StackableTrinoODBCImpl = (
                     //             rendering it as Trino's `X'..'` literal
                     //             cannot be verified without Power BI Desktop.
                     //
+                    // Power Query hands a text-valued constant to the visitor
+                    // bare, not quoted: confirmed in Power BI Desktop on
+                    // 2026-10-07, where `Cast(_, "VARCHAR")` folded a slicer
+                    // into `CAST(hello world as VARCHAR)`. A text entry therefore
+                    // quotes the value itself and doubles any single quote in
+                    // it, or `O'Brien` ends the literal early.
+                    //
                     // TODO: add UUID, JSON, TIME WITH TIME ZONE and TIMESTAMP
-                    // WITH TIME ZONE. Each has a valid Trino cast, but the
-                    // rendering turns on whether Power Query hands a
-                    // text-valued constant to the visitor already quoted, which
-                    // the VARCHAR entry below also rests on. Confirm that in
-                    // Power BI Desktop, then add all four.
+                    // WITH TIME ZONE, now that the quoting question above is
+                    // settled. Each has a valid Trino cast.
                     Visitor = [
                         DECIMAL = each Cast(_, "DECIMAL"),
                         INTEGER = each Cast(_, "INTEGER"),
@@ -410,7 +414,7 @@ StackableTrinoODBCImpl = (
                         DOUBLE = each Cast(_, "DOUBLE PRECISION"),
                         BOOLEAN = each Cast(_, "BOOLEAN"),
                         DATE = each Cast(Quote(Date.ToText(_, "yyyy-MM-dd")), "DATE"),
-                        VARCHAR = each Cast(_, "VARCHAR"),
+                        VARCHAR = each Cast(Quote(Text.Replace(_, "'", "''")), "VARCHAR"),
                         // `fffffff`, not `sssssss`: in a custom format string
                         // `s` is the second and `f` is the fractional second,
                         // so the latter spelling renders the second eight times

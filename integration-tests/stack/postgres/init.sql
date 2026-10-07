@@ -81,6 +81,15 @@ INSERT INTO types_test VALUES (
     '{"unicode": "日本語"}'
 );
 
+-- Rows 5-8: ordinary text values, so a Power BI slicer on col_varchar offers
+-- more than the edge cases above. `O'Brien` checks that the connector's
+-- Constant visitor escapes a single quote in a folded filter literal.
+INSERT INTO types_test (id, col_varchar, col_integer) VALUES
+    (5, 'apple', 10),
+    (6, 'banana', 20),
+    (7, 'cherry', 30),
+    (8, 'O''Brien', 40);
+
 -- ---------------------------------------------------------------------------
 -- public schema: relational tables for PK/FK/index testing
 -- ---------------------------------------------------------------------------
