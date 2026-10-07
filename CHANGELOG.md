@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- `timestamp with time zone` values are delivered as wall time in the session
+  time zone instead of in UTC: `TimeZone=` when set, otherwise the
+  coordinator's default, and whatever a later `SET TIME ZONE` chose. Power BI
+  folds the value it showed back as a plain `TIMESTAMP` literal, which Trino
+  reads in the session zone, so a DirectQuery slicer on such a column only
+  selected its rows in a UTC session. Applications reading these columns see
+  different values unless the session is UTC.
 - The Power BI connector reports that Trino cannot convert `TIME` to
   `TIMESTAMP` (`SQL_CONVERT_TIME` without `SQL_CVT_TIMESTAMP`). A DirectQuery
   slicer on a time column folded to a comparison against Power BI's base date,

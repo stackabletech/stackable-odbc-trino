@@ -24,6 +24,7 @@ Requires a running Trino (integration-tests/setup.sh), whose seed-hive.sh create
 `hive.tx.interval_test` view this reads. Needs no compose profile.
 """
 
+import datetime
 import os
 import sys
 
@@ -105,11 +106,38 @@ def check_zone(conn_str, zone_label):
     conn.close()
 
 
+def check_dst_overlap(conn_str):
+    """Pin what a slicer does with a value in the autumn overlap hour.
+
+    The driver delivers both instants of 2025-10-26 02:30 in Europe/Berlin as the
+    same wall time, because an instant has only one. Reading the folded literal
+    back, Trino has to pick one of the two instants and picks the later (CET)
+    one, so the earlier (CEST) row cannot be selected. That is Trino's reading of
+    an ambiguous local time, not the driver's, and this records it.
+    """
+    print("\n--- DST overlap, Europe/Berlin ---")
+    conn = pyodbc.connect(conn_str + ";TimeZone=Europe/Berlin", autocommit=True)
+    cur = conn.cursor()
+    rows = ("(VALUES (1, from_iso8601_timestamp('2025-10-26T00:30:00Z')), "
+            "(2, from_iso8601_timestamp('2025-10-26T01:30:00Z'))) t(id, ts)")
+    shown = [v for _, v in cur.execute(f"SELECT id, ts FROM {rows} ORDER BY id").fetchall()]
+    want = datetime.datetime(2025, 10, 26, 2, 30)
+    R.check("both overlap instants are shown as 02:30", shown == [want, want],
+            "" if shown == [want, want] else f"shown {shown}")
+    where = "ts = CAST('2025-10-26 02:30:00.0000000' as TIMESTAMP)"
+    ids = [r[0] for r in cur.execute(f"SELECT id FROM {rows} WHERE {where} ORDER BY id")]
+    R.check("the folded 02:30 selects only the later (CET) instant", ids == [2],
+            "" if ids == [2] else f"selected ids {ids}")
+    cur.close()
+    conn.close()
+
+
 def main():
     conn_str = sys.argv[1] if len(sys.argv) > 1 else Stack.load().conn_str()
     print(f"=== pbi slicer semantics ===\nview: {VIEW}")
     check_zone(conn_str, "server default")
     check_zone(conn_str + ";TimeZone=Europe/Berlin", "Europe/Berlin")
+    check_dst_overlap(conn_str)
     return R.summary()
 
 

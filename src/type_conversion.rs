@@ -922,16 +922,68 @@ fn parse_trino_timestamp(s: &str) -> Option<ColumnValue> {
     })
 }
 
-/// Parse a Trino TIMESTAMP WITH TIME ZONE string and convert to UTC.
+/// The session time zone, in which timestamp-with-time-zone values are
+/// delivered.
+///
+/// Trino reports it from `current_timezone()` either as an IANA name (`UTC`,
+/// `Europe/Berlin`) or, after `SET TIME ZONE '+05:30'`, as a fixed offset, so
+/// both forms are kept.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum SessionZone {
+    Named(chrono_tz::Tz),
+    Fixed(chrono::FixedOffset),
+}
+
+impl SessionZone {
+    pub const UTC: SessionZone = SessionZone::Named(chrono_tz::Tz::UTC);
+
+    /// Read a zone the way Trino names one: an IANA name, or `±hh:mm`.
+    pub fn parse(s: &str) -> Option<Self> {
+        let s = s.trim();
+        let sign = match s.as_bytes().first()? {
+            b'+' => 1,
+            b'-' => -1,
+            _ => return s.parse().ok().map(SessionZone::Named),
+        };
+        let (h, m) = s[1..].split_once(':')?;
+        if h.len() != 2 || m.len() != 2 {
+            return None;
+        }
+        let (h, m): (i32, i32) = (h.parse().ok()?, m.parse().ok()?);
+        if h > 18 || m > 59 {
+            return None;
+        }
+        chrono::FixedOffset::east_opt(sign * (h * 3600 + m * 60)).map(SessionZone::Fixed)
+    }
+
+    /// The wall time in this zone at the instant `utc`.
+    ///
+    /// Unambiguous: every instant has exactly one wall time, including the two
+    /// instants of an autumn overlap hour, which share one.
+    fn wall_time(self, utc: chrono::NaiveDateTime) -> chrono::NaiveDateTime {
+        use chrono::TimeZone as _;
+        match self {
+            SessionZone::Named(tz) => tz.from_utc_datetime(&utc).naive_local(),
+            SessionZone::Fixed(offset) => offset.from_utc_datetime(&utc).naive_local(),
+        }
+    }
+}
+
+/// Parse a Trino TIMESTAMP WITH TIME ZONE string and deliver it as wall time
+/// in the session time zone.
 ///
 /// Trino REST API format: `"YYYY-MM-DD HH:MM:SS.fraction TIMEZONE"` where
 /// TIMEZONE is either a numeric offset (`+05:30`, `-08:00`) or a named IANA
-/// zone (`UTC`, `America/New_York`, `Europe/Berlin`).
+/// zone (`UTC`, `America/New_York`, `Europe/Berlin`). That zone fixes the
+/// instant; `session` decides how it is shown.
 ///
-/// Returns `ColumnValue::Timestamp` with UTC-converted fields, matching the
-/// official Trino ODBC driver's behaviour. The timezone information is consumed
-/// during conversion: `SQL_TIMESTAMP_STRUCT` has no timezone field.
-fn parse_trino_timestamp_tz(s: &str) -> Option<ColumnValue> {
+/// `SQL_TIMESTAMP_STRUCT` has no time zone field, so one zone has to be chosen,
+/// and the session's is the one Trino itself uses for a plain `TIMESTAMP`. A
+/// Power BI slicer folds the value it showed back as exactly such a literal
+/// (`"col" = CAST('2025-06-15 14:30:00' as TIMESTAMP)`), and Trino compares it
+/// with the column after reading it in the session zone. Delivering UTC made
+/// that filter match only in a UTC session.
+fn parse_trino_timestamp_tz(s: &str, session: SessionZone) -> Option<ColumnValue> {
     let last_space = s.rfind(' ')?;
     let datetime_part = &s[..last_space];
     let tz_part = s[last_space + 1..].trim();
@@ -990,15 +1042,17 @@ fn parse_trino_timestamp_tz(s: &str) -> Option<ColumnValue> {
             .naive_utc()
     };
 
-    // Fraction (sub-second nanoseconds) is preserved as-is: UTC conversion
-    // only shifts hours/minutes/seconds, never sub-second precision.
+    let local = session.wall_time(utc_ndt);
+
+    // Fraction (sub-second nanoseconds) is preserved as-is: a zone change only
+    // shifts hours/minutes/seconds, never sub-second precision.
     Some(ColumnValue::Timestamp {
-        year: i16::try_from(utc_ndt.date().year()).ok()?,
-        month: utc_ndt.date().month() as u16,
-        day: utc_ndt.date().day() as u16,
-        hour: utc_ndt.time().hour() as u16,
-        minute: utc_ndt.time().minute() as u16,
-        second: utc_ndt.time().second() as u16,
+        year: i16::try_from(local.date().year()).ok()?,
+        month: local.date().month() as u16,
+        day: local.date().day() as u16,
+        hour: local.time().hour() as u16,
+        minute: local.time().minute() as u16,
+        second: local.time().second() as u16,
         fraction,
     })
 }
@@ -1047,7 +1101,10 @@ fn json_as_text(val: &Value) -> String {
 }
 
 /// Convert a JSON value from Trino to an ODBC ColumnValue, guided by the column type.
-pub fn json_to_column_value(val: Value, ty: &TrinoTy) -> ColumnValue {
+///
+/// `session` is the session time zone, in which a timestamp-with-time-zone value
+/// is delivered (see [`parse_trino_timestamp_tz`]).
+pub fn json_to_column_value(val: Value, ty: &TrinoTy, session: SessionZone) -> ColumnValue {
     if val.is_null() {
         return ColumnValue::Null;
     }
@@ -1162,13 +1219,14 @@ pub fn json_to_column_value(val: Value, ty: &TrinoTy) -> ColumnValue {
                 ColumnValue::String(val.to_string())
             }
         }
-        // TIMESTAMP WITH TIME ZONE: parse and convert to UTC via chrono-tz.
-        // Trino sends named zones (UTC, America/New_York, CET) or numeric
-        // offsets (+05:30, -08:00); the column type in the REST API metadata
-        // determines which parser is called, not the string content.
+        // TIMESTAMP WITH TIME ZONE: parse, then deliver in the session time
+        // zone via chrono-tz. Trino sends named zones (UTC, America/New_York,
+        // CET) or numeric offsets (+05:30, -08:00); the column type in the REST
+        // API metadata determines which parser is called, not the string
+        // content.
         TrinoTy::TimestampWithTimeZone => {
             if let Value::String(ref s) = val {
-                parse_trino_timestamp_tz(s).unwrap_or_else(|| {
+                parse_trino_timestamp_tz(s, session).unwrap_or_else(|| {
                     tracing::warn!(
                         raw = s,
                         "failed to parse Trino TIMESTAMP WITH TIME ZONE string"
@@ -1213,7 +1271,7 @@ pub fn json_to_column_value(val: Value, ty: &TrinoTy) -> ColumnValue {
             if let Value::Array(items) = val {
                 let vals = items
                     .into_iter()
-                    .map(|v| json_to_column_value(v, inner_ty))
+                    .map(|v| json_to_column_value(v, inner_ty, session))
                     .collect();
                 ColumnValue::Array(vals)
             } else {
@@ -1225,8 +1283,8 @@ pub fn json_to_column_value(val: Value, ty: &TrinoTy) -> ColumnValue {
                 let pairs = map
                     .into_iter()
                     .map(|(k, v)| {
-                        let key_col = json_to_column_value(Value::String(k), key_ty);
-                        let val_col = json_to_column_value(v, val_ty);
+                        let key_col = json_to_column_value(Value::String(k), key_ty, session);
+                        let val_col = json_to_column_value(v, val_ty, session);
                         (key_col, val_col)
                     })
                     .collect();
@@ -1240,7 +1298,7 @@ pub fn json_to_column_value(val: Value, ty: &TrinoTy) -> ColumnValue {
                 let vals = items
                     .into_iter()
                     .zip(fields.iter())
-                    .map(|(v, (_name, ty))| json_to_column_value(v, ty))
+                    .map(|(v, (_name, ty))| json_to_column_value(v, ty, session))
                     .collect();
                 ColumnValue::Row(vals)
             } else {
@@ -1252,7 +1310,7 @@ pub fn json_to_column_value(val: Value, ty: &TrinoTy) -> ColumnValue {
                 let vals = items
                     .into_iter()
                     .zip(fields.iter())
-                    .map(|(v, ty)| json_to_column_value(v, ty))
+                    .map(|(v, ty)| json_to_column_value(v, ty, session))
                     .collect();
                 ColumnValue::Row(vals)
             } else {
@@ -1260,7 +1318,7 @@ pub fn json_to_column_value(val: Value, ty: &TrinoTy) -> ColumnValue {
             }
         }
         // Nullable wrapper: delegate to the inner type (null already handled above)
-        TrinoTy::Option(inner) => json_to_column_value(val, inner),
+        TrinoTy::Option(inner) => json_to_column_value(val, inner, session),
         _ => match val {
             Value::String(s) => ColumnValue::String(s),
             other => ColumnValue::String(other.to_string()),
@@ -1271,6 +1329,120 @@ pub fn json_to_column_value(val: Value, ty: &TrinoTy) -> ColumnValue {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Convert in a UTC session, which is what every test below that does not
+    /// name a session zone is about.
+    fn convert(val: Value, ty: &TrinoTy) -> ColumnValue {
+        json_to_column_value(val, ty, SessionZone::UTC)
+    }
+
+    fn timestamp(
+        (year, month, day): (i16, u16, u16),
+        (hour, minute, second): (u16, u16, u16),
+        fraction: u32,
+    ) -> ColumnValue {
+        ColumnValue::Timestamp {
+            year,
+            month,
+            day,
+            hour,
+            minute,
+            second,
+            fraction,
+        }
+    }
+
+    fn tz_in(raw: &str, zone: &str) -> ColumnValue {
+        json_to_column_value(
+            Value::String(raw.into()),
+            &TrinoTy::TimestampWithTimeZone,
+            SessionZone::parse(zone).expect("a zone Trino reports"),
+        )
+    }
+
+    /// A timestamp-with-time-zone value is delivered as wall time in the
+    /// session time zone. Power BI folds the value it was shown back as a
+    /// plain `TIMESTAMP` literal, which Trino reads in the session zone; the
+    /// two only agree if the shown value is already in that zone.
+    #[test]
+    fn timestamp_tz_is_delivered_in_the_session_zone() {
+        // Summer: CEST, UTC+2.
+        assert_eq!(
+            tz_in("2025-06-15 12:30:00.000000 UTC", "Europe/Berlin"),
+            timestamp((2025, 6, 15), (14, 30, 0), 0)
+        );
+        // Winter: CET, UTC+1.
+        assert_eq!(
+            tz_in("2025-01-15 12:30:00.000000 UTC", "Europe/Berlin"),
+            timestamp((2025, 1, 15), (13, 30, 0), 0)
+        );
+        // A UTC session keeps UTC.
+        assert_eq!(
+            tz_in("2025-06-15 12:30:00.000000 UTC", "UTC"),
+            timestamp((2025, 6, 15), (12, 30, 0), 0)
+        );
+    }
+
+    /// The value's own zone and the session's are independent: the instant is
+    /// fixed by the first and rendered in the second, across a date boundary.
+    #[test]
+    fn timestamp_tz_moves_from_its_own_zone_to_the_session_zone() {
+        // 20:21:22.123 EDT (UTC-4) = 00:21:22.123 UTC = 01:21:22.123 CET.
+        assert_eq!(
+            tz_in("2025-03-10 20:21:22.123 America/New_York", "Europe/Berlin"),
+            timestamp((2025, 3, 11), (1, 21, 22), 123_000_000)
+        );
+    }
+
+    /// Trino reports a fixed-offset session zone as `+05:30` from
+    /// `current_timezone()` after `SET TIME ZONE '+05:30'`.
+    #[test]
+    fn timestamp_tz_is_delivered_in_a_fixed_offset_session_zone() {
+        assert_eq!(
+            tz_in("2025-06-15 12:30:00.000000 UTC", "+05:30"),
+            timestamp((2025, 6, 15), (18, 0, 0), 0)
+        );
+        assert_eq!(
+            tz_in("2025-06-15 12:30:00.000000 UTC", "-08:00"),
+            timestamp((2025, 6, 15), (4, 30, 0), 0)
+        );
+    }
+
+    /// Both instants of the autumn overlap hour render as the same wall time:
+    /// an instant has exactly one wall time, so this direction is unambiguous.
+    /// The ambiguity is Trino's, reading the folded literal back, and it picks
+    /// the later instant (measured on Trino 483); a value in the first 02:30
+    /// hour therefore cannot be selected by a Power BI slicer.
+    #[test]
+    fn both_instants_of_the_dst_overlap_render_as_the_same_wall_time() {
+        for utc in [
+            "2025-10-26 00:30:00.000000 UTC",
+            "2025-10-26 01:30:00.000000 UTC",
+        ] {
+            assert_eq!(
+                tz_in(utc, "Europe/Berlin"),
+                timestamp((2025, 10, 26), (2, 30, 0), 0),
+                "{utc}"
+            );
+        }
+    }
+
+    #[test]
+    fn session_zone_parses_what_current_timezone_reports() {
+        for name in [
+            "UTC",
+            "Europe/Berlin",
+            "America/New_York",
+            "+05:30",
+            "-08:00",
+            "+00:00",
+        ] {
+            assert!(SessionZone::parse(name).is_some(), "{name}");
+        }
+        for bad in ["", "Europe/Berlim", "+5", "+25:00", "05:30"] {
+            assert_eq!(SessionZone::parse(bad), None, "{bad:?}");
+        }
+    }
 
     #[test]
     fn bigint_maps_to_ext_big_int() {
@@ -1309,7 +1481,7 @@ mod tests {
         // base64("\xDE\xAD\xBE\xEF") == "3q2+7w=="
         let val = Value::String("3q2+7w==".to_string());
         assert_eq!(
-            json_to_column_value(val, &TrinoTy::VarBinary),
+            convert(val, &TrinoTy::VarBinary),
             ColumnValue::Bytes(vec![0xDE, 0xAD, 0xBE, 0xEF])
         );
     }
@@ -1318,7 +1490,7 @@ mod tests {
     fn varbinary_empty_decodes_to_empty_bytes() {
         let val = Value::String(String::new());
         assert_eq!(
-            json_to_column_value(val, &TrinoTy::VarBinary),
+            convert(val, &TrinoTy::VarBinary),
             ColumnValue::Bytes(Vec::new())
         );
     }
@@ -1327,17 +1499,14 @@ mod tests {
     fn varbinary_invalid_base64_falls_back_to_string() {
         let val = Value::String("not!valid!base64".to_string());
         assert_eq!(
-            json_to_column_value(val, &TrinoTy::VarBinary),
+            convert(val, &TrinoTy::VarBinary),
             ColumnValue::String("not!valid!base64".to_string())
         );
     }
 
     #[test]
     fn varbinary_null_maps_to_null() {
-        assert_eq!(
-            json_to_column_value(Value::Null, &TrinoTy::VarBinary),
-            ColumnValue::Null
-        );
+        assert_eq!(convert(Value::Null, &TrinoTy::VarBinary), ColumnValue::Null);
     }
 
     #[test]
@@ -1383,16 +1552,13 @@ mod tests {
 
     #[test]
     fn json_null_returns_column_null() {
-        assert_eq!(
-            json_to_column_value(Value::Null, &TrinoTy::Varchar),
-            ColumnValue::Null
-        );
+        assert_eq!(convert(Value::Null, &TrinoTy::Varchar), ColumnValue::Null);
     }
 
     #[test]
     fn json_string_returns_column_string() {
         assert_eq!(
-            json_to_column_value(Value::String("hello".into()), &TrinoTy::Varchar),
+            convert(Value::String("hello".into()), &TrinoTy::Varchar),
             ColumnValue::String("hello".into())
         );
     }
@@ -1400,7 +1566,7 @@ mod tests {
     #[test]
     fn json_number_bigint_returns_i64() {
         assert_eq!(
-            json_to_column_value(serde_json::json!(42), &TrinoTy::TrinoInt(TrinoInt::I64)),
+            convert(serde_json::json!(42), &TrinoTy::TrinoInt(TrinoInt::I64)),
             ColumnValue::I64(42)
         );
     }
@@ -1410,7 +1576,7 @@ mod tests {
     #[test]
     fn out_of_range_integer_for_declared_type_is_an_error_not_a_wrap() {
         // Server declared INTEGER but sent a value that does not fit i32.
-        let val = json_to_column_value(
+        let val = convert(
             serde_json::json!(4_294_967_296i64),
             &TrinoTy::TrinoInt(TrinoInt::I32),
         );
@@ -1421,13 +1587,13 @@ mod tests {
 
     #[test]
     fn in_range_integer_still_converts() {
-        let val = json_to_column_value(serde_json::json!(42i64), &TrinoTy::TrinoInt(TrinoInt::I32));
+        let val = convert(serde_json::json!(42i64), &TrinoTy::TrinoInt(TrinoInt::I32));
         assert_eq!(val, ColumnValue::I32(42));
     }
 
     #[test]
     fn out_of_range_i16_falls_back_to_text() {
-        let val = json_to_column_value(
+        let val = convert(
             serde_json::json!(70_000i64),
             &TrinoTy::TrinoInt(TrinoInt::I16),
         );
@@ -1436,13 +1602,13 @@ mod tests {
 
     #[test]
     fn out_of_range_i8_falls_back_to_text() {
-        let val = json_to_column_value(serde_json::json!(200i64), &TrinoTy::TrinoInt(TrinoInt::I8));
+        let val = convert(serde_json::json!(200i64), &TrinoTy::TrinoInt(TrinoInt::I8));
         assert_eq!(val, ColumnValue::String("200".to_string()));
     }
 
     #[test]
     fn negative_out_of_range_integer_falls_back_to_text() {
-        let val = json_to_column_value(
+        let val = convert(
             serde_json::json!(-2_147_483_649i64),
             &TrinoTy::TrinoInt(TrinoInt::I32),
         );
@@ -1451,7 +1617,7 @@ mod tests {
 
     #[test]
     fn out_of_range_float_for_real_is_not_infinity() {
-        let val = json_to_column_value(
+        let val = convert(
             serde_json::json!(1e300f64),
             &TrinoTy::TrinoFloat(TrinoFloat::F32),
         );
@@ -1473,7 +1639,7 @@ mod tests {
             ("Infinity", f64::INFINITY),
             ("-Infinity", f64::NEG_INFINITY),
         ] {
-            let val = json_to_column_value(
+            let val = convert(
                 serde_json::json!(raw),
                 &TrinoTy::TrinoFloat(TrinoFloat::F64),
             );
@@ -1497,7 +1663,7 @@ mod tests {
             ("Infinity", f32::INFINITY),
             ("-Infinity", f32::NEG_INFINITY),
         ] {
-            let val = json_to_column_value(
+            let val = convert(
                 serde_json::json!(raw),
                 &TrinoTy::TrinoFloat(TrinoFloat::F32),
             );
@@ -1521,7 +1687,7 @@ mod tests {
     /// text two literal quote marks it never sent.
     #[test]
     fn unparseable_float_string_falls_back_without_json_quotes() {
-        let val = json_to_column_value(
+        let val = convert(
             serde_json::json!("abc"),
             &TrinoTy::TrinoFloat(TrinoFloat::F64),
         );
@@ -1530,7 +1696,7 @@ mod tests {
 
     #[test]
     fn in_range_float_for_real_still_converts() {
-        let val = json_to_column_value(
+        let val = convert(
             serde_json::json!(3.5f64),
             &TrinoTy::TrinoFloat(TrinoFloat::F32),
         );
@@ -1551,7 +1717,7 @@ mod tests {
     #[test]
     fn json_bool_returns_column_bool() {
         assert_eq!(
-            json_to_column_value(Value::Bool(true), &TrinoTy::Boolean),
+            convert(Value::Bool(true), &TrinoTy::Boolean),
             ColumnValue::Bool(true)
         );
     }
@@ -2031,7 +2197,7 @@ mod tests {
     #[test]
     fn option_i64_non_null_converts_as_i64() {
         assert_eq!(
-            json_to_column_value(
+            convert(
                 serde_json::json!(99),
                 &TrinoTy::Option(Box::new(TrinoTy::TrinoInt(TrinoInt::I64)))
             ),
@@ -2042,7 +2208,7 @@ mod tests {
     #[test]
     fn option_i64_null_returns_null() {
         assert_eq!(
-            json_to_column_value(
+            convert(
                 Value::Null,
                 &TrinoTy::Option(Box::new(TrinoTy::TrinoInt(TrinoInt::I64)))
             ),
@@ -2055,7 +2221,7 @@ mod tests {
     #[test]
     fn date_string_parses_to_column_date() {
         assert_eq!(
-            json_to_column_value(Value::String("1998-01-14".into()), &TrinoTy::Date),
+            convert(Value::String("1998-01-14".into()), &TrinoTy::Date),
             ColumnValue::Date {
                 year: 1998,
                 month: 1,
@@ -2075,7 +2241,7 @@ mod tests {
     #[test]
     fn a_date_before_1_ce_parses_to_column_date() {
         assert_eq!(
-            json_to_column_value(Value::String("-0001-01-01".into()), &TrinoTy::Date),
+            convert(Value::String("-0001-01-01".into()), &TrinoTy::Date),
             ColumnValue::Date {
                 year: -1,
                 month: 1,
@@ -2091,7 +2257,7 @@ mod tests {
     #[test]
     fn a_timestamp_before_1_ce_parses_to_column_timestamp() {
         assert_eq!(
-            json_to_column_value(
+            convert(
                 Value::String("-0001-01-01 12:34:56.789".into()),
                 &TrinoTy::Timestamp
             ),
@@ -2113,8 +2279,8 @@ mod tests {
     #[test]
     fn dates_and_timestamps_read_the_same_years() {
         for year in ["-4713", "-0001", "0000", "0001", "1970", "9999"] {
-            let date = json_to_column_value(Value::String(format!("{year}-06-15")), &TrinoTy::Date);
-            let timestamp = json_to_column_value(
+            let date = convert(Value::String(format!("{year}-06-15")), &TrinoTy::Date);
+            let timestamp = convert(
                 Value::String(format!("{year}-06-15 00:00:00")),
                 &TrinoTy::Timestamp,
             );
@@ -2131,7 +2297,7 @@ mod tests {
     #[test]
     fn year_zero_parses_to_column_date() {
         assert_eq!(
-            json_to_column_value(Value::String("0000-01-01".into()), &TrinoTy::Date),
+            convert(Value::String("0000-01-01".into()), &TrinoTy::Date),
             ColumnValue::Date {
                 year: 0,
                 month: 1,
@@ -2146,7 +2312,7 @@ mod tests {
     #[test]
     fn a_year_beyond_the_date_struct_falls_back_to_text() {
         assert!(matches!(
-            json_to_column_value(Value::String("+99999-01-01".into()), &TrinoTy::Date),
+            convert(Value::String("+99999-01-01".into()), &TrinoTy::Date),
             ColumnValue::String(_)
         ));
     }
@@ -2154,7 +2320,7 @@ mod tests {
     #[test]
     fn time_string_parses_to_column_time() {
         assert_eq!(
-            json_to_column_value(Value::String("13:14:15".into()), &TrinoTy::Time),
+            convert(Value::String("13:14:15".into()), &TrinoTy::Time),
             ColumnValue::Time {
                 hour: 13,
                 minute: 14,
@@ -2169,7 +2335,7 @@ mod tests {
         // The fraction is kept, not discarded: SQL_TIME_STRUCT cannot carry
         // it, but the SQL_C_CHAR/SQL_C_WCHAR string rendering can.
         assert_eq!(
-            json_to_column_value(Value::String("09:05:03.336".into()), &TrinoTy::Time),
+            convert(Value::String("09:05:03.336".into()), &TrinoTy::Time),
             ColumnValue::Time {
                 hour: 9,
                 minute: 5,
@@ -2182,7 +2348,7 @@ mod tests {
     #[test]
     fn time_with_timezone_parses_correctly() {
         assert_eq!(
-            json_to_column_value(
+            convert(
                 Value::String("13:14:15.000 UTC".into()),
                 &TrinoTy::TimeWithTimeZone
             ),
@@ -2279,7 +2445,7 @@ mod tests {
         // *different* time instead of declining the value.
         assert_eq!(parse_trino_time_with_tz("00:00:00+949378864"), None);
         assert_eq!(
-            json_to_column_value(
+            convert(
                 Value::String("+999\0\0\0\0+00949378864".into()),
                 &TrinoTy::Option(Box::new(TrinoTy::TimeWithTimeZone)),
             ),
@@ -2322,7 +2488,7 @@ mod tests {
     #[test]
     fn timestamp_string_parses_to_column_timestamp() {
         assert_eq!(
-            json_to_column_value(
+            convert(
                 Value::String("1998-01-14 13:14:15".into()),
                 &TrinoTy::Timestamp
             ),
@@ -2341,7 +2507,7 @@ mod tests {
     #[test]
     fn timestamp_with_millis_converts_fraction_to_nanoseconds() {
         assert_eq!(
-            json_to_column_value(
+            convert(
                 Value::String("1998-01-14 13:14:15.123".into()),
                 &TrinoTy::Timestamp
             ),
@@ -2360,7 +2526,7 @@ mod tests {
     /// UTC is a no-op conversion: fields should pass through unchanged.
     #[test]
     fn timestamp_with_named_timezone_converts_to_utc() {
-        let val = json_to_column_value(
+        let val = convert(
             Value::String("1998-01-14 13:14:15.000 UTC".into()),
             &TrinoTy::TimestampWithTimeZone,
         );
@@ -2380,23 +2546,20 @@ mod tests {
 
     #[test]
     fn date_null_returns_null() {
-        assert_eq!(
-            json_to_column_value(Value::Null, &TrinoTy::Date),
-            ColumnValue::Null
-        );
+        assert_eq!(convert(Value::Null, &TrinoTy::Date), ColumnValue::Null);
     }
 
     #[test]
     fn decimal_maps_to_decimal_variant() {
         use serde_json::json;
-        let val = json_to_column_value(json!("123.456"), &TrinoTy::Decimal(6, 3));
+        let val = convert(json!("123.456"), &TrinoTy::Decimal(6, 3));
         assert_eq!(val, ColumnValue::Decimal("123.456".to_string()));
     }
 
     #[test]
     fn json_ty_maps_to_json_variant() {
         use serde_json::json;
-        let val = json_to_column_value(json!(r#"{"a":1}"#), &TrinoTy::Json);
+        let val = convert(json!(r#"{"a":1}"#), &TrinoTy::Json);
         assert_eq!(val, ColumnValue::Json(r#"{"a":1}"#.to_string()));
     }
 
@@ -2412,7 +2575,7 @@ mod tests {
     fn interval_year_month_is_delivered_as_trinos_text() {
         use serde_json::json;
         for raw in ["3-7", "-1-0", "0-3"] {
-            let val = json_to_column_value(json!(raw), &TrinoTy::IntervalYearToMonth);
+            let val = convert(json!(raw), &TrinoTy::IntervalYearToMonth);
             assert_eq!(val, ColumnValue::String(raw.to_string()), "{raw}");
         }
     }
@@ -2428,7 +2591,7 @@ mod tests {
             "-0 03:04:05.000",
             "0 00:00:00.500",
         ] {
-            let val = json_to_column_value(json!(raw), &TrinoTy::IntervalDayToSecond);
+            let val = convert(json!(raw), &TrinoTy::IntervalDayToSecond);
             assert_eq!(val, ColumnValue::String(raw.to_string()), "{raw}");
         }
     }
@@ -2436,7 +2599,7 @@ mod tests {
     /// Numeric offset +05:30: 10:30 local = 05:00 UTC (subtract 5h30m).
     #[test]
     fn timestamp_with_tz_numeric_offset_converts_to_utc() {
-        let val = json_to_column_value(
+        let val = convert(
             Value::String("2024-03-15 10:30:00.000 +05:30".into()),
             &TrinoTy::TimestampWithTimeZone,
         );
@@ -2456,7 +2619,7 @@ mod tests {
 
     #[test]
     fn timestamp_tz_named_utc_converts_to_utc_timestamp() {
-        let val = json_to_column_value(
+        let val = convert(
             Value::String("2020-05-05 22:00:00.000 UTC".into()),
             &TrinoTy::TimestampWithTimeZone,
         );
@@ -2478,7 +2641,7 @@ mod tests {
     fn timestamp_tz_named_zone_converts_to_utc() {
         // America/New_York in March 2025 is EDT (UTC-4).
         // 20:21:22 EDT = 2025-03-11 00:21:22 UTC (date rolls forward).
-        let val = json_to_column_value(
+        let val = convert(
             Value::String("2025-03-10 20:21:22.123 America/New_York".into()),
             &TrinoTy::TimestampWithTimeZone,
         );
@@ -2500,7 +2663,7 @@ mod tests {
     fn timestamp_tz_numeric_offset_converts_to_utc() {
         // +05:30 means wall clock is 5h30m ahead of UTC.
         // 10:30:00 +05:30 = 05:00:00 UTC (same day).
-        let val = json_to_column_value(
+        let val = convert(
             Value::String("2024-03-15 10:30:00.000 +05:30".into()),
             &TrinoTy::TimestampWithTimeZone,
         );
@@ -2521,7 +2684,7 @@ mod tests {
     #[test]
     fn timestamp_tz_negative_offset_converts_to_utc() {
         // -08:00: 16:00:00 PST = 2024-12-16 00:00:00 UTC (date rolls forward).
-        let val = json_to_column_value(
+        let val = convert(
             Value::String("2024-12-15 16:00:00.000 -08:00".into()),
             &TrinoTy::TimestampWithTimeZone,
         );
@@ -2543,7 +2706,7 @@ mod tests {
     fn timestamp_tz_dst_winter_converts_correctly() {
         // America/New_York in December is EST (UTC-5).
         // 23:00:00 EST = 2025-01-02 04:00:00 UTC.
-        let val = json_to_column_value(
+        let val = convert(
             Value::String("2025-01-01 23:00:00.000 America/New_York".into()),
             &TrinoTy::TimestampWithTimeZone,
         );
@@ -2567,7 +2730,7 @@ mod tests {
     fn timestamp_tz_posix_abbreviation_cet_converts_to_utc() {
         // CET (Central European Time) = UTC+1.
         // 15:00:00 CET = 14:00:00 UTC.
-        let val = json_to_column_value(
+        let val = convert(
             Value::String("2025-01-15 15:00:00.000 CET".into()),
             &TrinoTy::TimestampWithTimeZone,
         );
@@ -2590,7 +2753,7 @@ mod tests {
     /// a winter date so the expected result matches CET.
     #[test]
     fn timestamp_tz_europe_berlin_winter_converts_to_utc() {
-        let val = json_to_column_value(
+        let val = convert(
             Value::String("2025-01-15 15:00:00.000 Europe/Berlin".into()),
             &TrinoTy::TimestampWithTimeZone,
         );
@@ -2613,7 +2776,7 @@ mod tests {
     fn timestamp_tz_europe_berlin_summer_converts_to_utc() {
         // 2025-07-15 is in CEST (UTC+2).
         // 15:00:00 CEST = 13:00:00 UTC.
-        let val = json_to_column_value(
+        let val = convert(
             Value::String("2025-07-15 15:00:00.000 Europe/Berlin".into()),
             &TrinoTy::TimestampWithTimeZone,
         );
@@ -2636,7 +2799,7 @@ mod tests {
     #[test]
     fn timestamp_tz_hour_only_numeric_offset() {
         // +05 = +05:00. 10:00:00 +05:00 = 05:00:00 UTC.
-        let val = json_to_column_value(
+        let val = convert(
             Value::String("2024-06-01 10:00:00.000 +05".into()),
             &TrinoTy::TimestampWithTimeZone,
         );
@@ -2657,7 +2820,7 @@ mod tests {
     /// Zero offset (+00:00) is equivalent to UTC.
     #[test]
     fn timestamp_tz_zero_numeric_offset() {
-        let val = json_to_column_value(
+        let val = convert(
             Value::String("2024-06-01 10:00:00.000 +00:00".into()),
             &TrinoTy::TimestampWithTimeZone,
         );
@@ -2679,7 +2842,7 @@ mod tests {
     /// `TrinoTy::Timestamp`, and no UTC conversion applies to it.
     #[test]
     fn timestamp_no_tz_is_unaffected_by_tz_changes() {
-        let val = json_to_column_value(
+        let val = convert(
             Value::String("2025-06-15 09:30:45.678".into()),
             &TrinoTy::Timestamp,
         );
@@ -2701,7 +2864,7 @@ mod tests {
     #[test]
     fn timestamp_tz_preserves_fraction_through_conversion() {
         // 10:30:00.999 +05:30 = 05:00:00.999 UTC; fraction stays 999ms.
-        let val = json_to_column_value(
+        let val = convert(
             Value::String("2024-03-15 10:30:00.999 +05:30".into()),
             &TrinoTy::TimestampWithTimeZone,
         );

@@ -12,6 +12,8 @@ use std::time::Duration;
 
 use snafu::Snafu;
 use stackable_odbc_core::types::QueryTimeout;
+
+use crate::type_conversion::SessionZone;
 use stackable_odbc_core::{
     backend::Backend,
     errors::OdbcError,
@@ -126,6 +128,36 @@ fn session_user_name(
         .or(user)
         .unwrap_or_default()
         .to_string()
+}
+
+/// Trino's session property for a `SET TIME ZONE`, which the coordinator
+/// returns as `X-Trino-Set-Session` and clears again on `SET TIME ZONE LOCAL`
+/// (`SetTimeZoneTask.java`, `SystemSessionProperties.TIME_ZONE_ID`).
+const TIME_ZONE_ID_PROPERTY: &str = "time_zone_id";
+
+/// The session time zone a statement's timestamp-with-time-zone values are
+/// delivered in.
+///
+/// In the order Trino itself applies them: a `SET TIME ZONE` in force
+/// (`time_zone_id`), else `TimeZone=` (sent as `X-Trino-Time-Zone`), else the
+/// coordinator's default, read at connect. A `time_zone_id` this driver cannot
+/// read falls through rather than failing the fetch.
+fn effective_session_zone(
+    time_zone_id: Option<&str>,
+    configured: Option<SessionZone>,
+    server_default: SessionZone,
+) -> SessionZone {
+    let set = time_zone_id.and_then(|id| {
+        let zone = SessionZone::parse(id);
+        if zone.is_none() {
+            tracing::warn!(
+                time_zone_id = id,
+                "unrecognised session time zone; ignoring it"
+            );
+        }
+        zone
+    });
+    set.or(configured).unwrap_or(server_default)
 }
 // `pub(crate)` only under `cfg(test)`: the FFI integration tests
 // (`ffi_integration_tests.rs`, a sibling of this module under `lib.rs`) need to
@@ -608,7 +640,10 @@ fn connection_failed(e: TrinoError) -> TrinoError {
 /// two are read into the result independently rather than through a shared
 /// early return.
 fn probe_session(conn: &TrinoConnection) -> SessionProbe {
-    let rows = match query_all_rows(conn, "SELECT version(), current_user".to_string()) {
+    let rows = match query_all_rows(
+        conn,
+        "SELECT version(), current_user, current_timezone()".to_string(),
+    ) {
         Ok(rows) => rows,
         Err(e) => {
             tracing::warn!(error = %e, "could not read the Trino server version and session user");
@@ -621,6 +656,7 @@ fn probe_session(conn: &TrinoConnection) -> SessionProbe {
 
     let mut probe = SessionProbe {
         user: column(1).map(str::to_string),
+        time_zone: column(2).and_then(SessionZone::parse),
         ..SessionProbe::default()
     };
     if probe.user.is_none() {
@@ -666,6 +702,10 @@ struct SessionProbe {
     server_major: u32,
     /// Trino's `current_user`, for `SQL_USER_NAME`.
     user: Option<String>,
+    /// Trino's `current_timezone()`: the session zone before any
+    /// `SET TIME ZONE`, which is `TimeZone=` when given and the coordinator's
+    /// default otherwise.
+    time_zone: Option<SessionZone>,
 }
 
 /// The Trino [`stackable_odbc_core::backend::Backend`] implementation.
@@ -711,6 +751,11 @@ pub struct TrinoConnection {
     /// off. Understating capability is the safe direction: a BI tool folds
     /// less than it could, rather than emitting SQL the server rejects.
     pub server_major: u32,
+    /// `TimeZone=` from the connection string, sent as `X-Trino-Time-Zone`.
+    pub configured_time_zone: Option<SessionZone>,
+    /// The session zone `current_timezone()` reported at connect, or UTC when
+    /// the probe failed. Without `TimeZone=` this is the coordinator's default.
+    pub server_time_zone: SessionZone,
     /// The `DSN` the application connected with, for `SQL_DATA_SOURCE_NAME`.
     ///
     /// Empty when the connection string named no DSN, which is the one case the
@@ -892,6 +937,23 @@ impl TrinoConnection {
             .is_active()
     }
 
+    /// The session time zone for a statement about to run.
+    ///
+    /// Read per statement, because `SET TIME ZONE` changes it after connect and
+    /// the client only records that as a session property. See
+    /// [`effective_session_zone`] for the order of the sources.
+    pub(crate) fn session_zone(&self) -> SessionZone {
+        let snapshot = self.runtime.block_on(self.client.session_snapshot());
+        effective_session_zone(
+            snapshot
+                .properties
+                .get(TIME_ZONE_ID_PROPERTY)
+                .map(String::as_str),
+            self.configured_time_zone,
+            self.server_time_zone,
+        )
+    }
+
     /// Open a transaction if manual-commit mode wants one and none is open.
     ///
     /// Called from the statement paths rather than from
@@ -1054,6 +1116,8 @@ pub(crate) fn disconnected_trino_conn_with_catalog(catalog: Option<&str>) -> Tri
         // leave behind if `fetch_server_version` could not reach a coordinator.
         dbms_version: String::new(),
         server_major: 0,
+        configured_time_zone: None,
+        server_time_zone: SessionZone::UTC,
         // The three identity strings, matching the client built above rather
         // than left empty: `TrinoBackend::connect` derives the first two
         // without reaching the coordinator, so a fabricated connection that
@@ -1103,6 +1167,9 @@ pub struct TrinoStatement {
     pub(crate) columns: Vec<ColumnDescriptor>,
     /// Column types from Trino (needed for converting subsequent pages).
     trino_types: Vec<(String, trino_rust_client::TrinoTy)>,
+    /// The session time zone at execution, which every page of this result
+    /// set is converted in, so one result set never mixes two zones.
+    session_zone: SessionZone,
     /// Trino's own column metadata for the result set, kept because a spooled
     /// segment is decoded against it and Trino sends it on one page only.
     ///
@@ -1723,6 +1790,8 @@ impl Backend for TrinoBackend {
             client: Arc::new(client),
             dbms_version: String::new(),
             server_major: 0,
+            configured_time_zone: p.time_zone().map(SessionZone::Named),
+            server_time_zone: SessionZone::UTC,
             // Core supplies the DSN on both connection entry points, so this is
             // the whole of `SQL_DATA_SOURCE_NAME`: absent means the application
             // connected by driver rather than by DSN, which is the case the
@@ -1742,6 +1811,9 @@ impl Backend for TrinoBackend {
         let probe = probe_session(&conn);
         conn.dbms_version = probe.dbms_version;
         conn.server_major = probe.server_major;
+        if let Some(zone) = probe.time_zone {
+            conn.server_time_zone = zone;
+        }
         conn.user_name = session_user_name(probe.user.as_deref(), p.session_user(), p.user());
         Ok(conn)
     }
@@ -3055,6 +3127,45 @@ mod tests {
     #[test]
     fn user_name_is_empty_when_nothing_can_name_the_user() {
         assert_eq!(session_user_name(None, None, None), "");
+    }
+
+    fn zone(name: &str) -> SessionZone {
+        SessionZone::parse(name).expect("a zone Trino reports")
+    }
+
+    /// `SET TIME ZONE` changes the session after connect, and Trino reports it
+    /// as the `time_zone_id` session property, so it wins over both
+    /// connect-time sources.
+    #[test]
+    fn a_set_time_zone_wins_over_the_connection_string_and_the_server() {
+        assert_eq!(
+            effective_session_zone(Some("+05:30"), Some(zone("Europe/Berlin")), zone("UTC")),
+            zone("+05:30")
+        );
+    }
+
+    /// `TimeZone=` is sent as `X-Trino-Time-Zone`, so it is the session's zone
+    /// until a `SET TIME ZONE`; the server default applies only without it.
+    #[test]
+    fn the_connection_string_zone_wins_over_the_server_default() {
+        assert_eq!(
+            effective_session_zone(None, Some(zone("Europe/Berlin")), zone("UTC")),
+            zone("Europe/Berlin")
+        );
+        assert_eq!(
+            effective_session_zone(None, None, zone("America/New_York")),
+            zone("America/New_York")
+        );
+    }
+
+    /// A `time_zone_id` this driver cannot read is not a reason to fail a
+    /// fetch: the next source is used, and the mismatch is logged.
+    #[test]
+    fn an_unreadable_time_zone_id_falls_back() {
+        assert_eq!(
+            effective_session_zone(Some("Mars/Olympus"), None, zone("UTC")),
+            zone("UTC")
+        );
     }
 
     #[test]

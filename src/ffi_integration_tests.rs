@@ -197,6 +197,12 @@ unsafe fn alloc_handles() -> (*mut c_void, *mut c_void, *mut c_void) {
 
 /// Helper: connect to Trino at localhost:8443.
 unsafe fn connect_trino(conn: *mut c_void) -> SqlReturn {
+    unsafe { connect_trino_with(conn, "") }
+}
+
+/// [`connect_trino`] with `extra` appended to the connection string, e.g.
+/// `";TimeZone=Europe/Berlin"`.
+unsafe fn connect_trino_with(conn: *mut c_void, extra: &str) -> SqlReturn {
     // The terminator is part of the buffer, because the length argument below
     // is SQL_NTS: that tells the driver the string is null-terminated and to
     // find the end itself. Without it the driver reads past this Vec until it
@@ -207,7 +213,10 @@ unsafe fn connect_trino(conn: *mut c_void) -> SqlReturn {
     //
     // Every other wide buffer in this file passes an explicit length instead,
     // and needs no terminator.
-    let wide: Vec<u16> = CONN_STR.encode_utf16().chain(std::iter::once(0)).collect();
+    let wide: Vec<u16> = format!("{CONN_STR}{extra}")
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
     unsafe {
         ffi::connect::sql_driver_connect_w::<TrinoBackend>(
             conn,
@@ -1815,6 +1824,9 @@ fn timestamp_with_tz_returns_wchar() {
 #[serial]
 #[ignore = "requires Trino at localhost:8443; run ./integration-tests/setup.sh first"]
 fn timestamp_with_named_tz_returns_utc_via_get_data() {
+    // UTC because the shared connection sets no `TimeZone=` and the test
+    // stack's coordinator defaults to UTC: values are delivered in the session
+    // zone (see `timestamptz_is_delivered_in_the_session_time_zone`).
     unsafe {
         let (_env, _conn, stmt) = alloc_stmt();
         // America/New_York in March 2025 is EDT (UTC-4).
@@ -1857,6 +1869,148 @@ fn timestamp_with_named_tz_returns_utc_via_get_data() {
         assert_eq!(ts.fraction, 123_000_000, "fraction (nanoseconds)");
 
         cleanup_stmt(stmt);
+    }
+}
+
+/// Column `col` read as a `SQL_TIMESTAMP_STRUCT`.
+unsafe fn get_timestamp_col(stmt: *mut c_void, col: u16) -> odbc_sys::Timestamp {
+    let mut ts = odbc_sys::Timestamp::default();
+    let mut ind: isize = 0;
+    let ret = unsafe {
+        ffi::fetch::sql_get_data::<TrinoBackend>(
+            stmt,
+            col,
+            CDataType::TypeTimestamp as i16,
+            (&raw mut ts).cast(),
+            std::mem::size_of::<odbc_sys::Timestamp>() as isize,
+            &mut ind,
+        )
+    };
+    assert_eq!(
+        ret,
+        SqlReturn::SUCCESS,
+        "sql_get_data(TypeTimestamp) on column {col}"
+    );
+    ts
+}
+
+/// Run `sql` to completion in its own statement on `conn`.
+unsafe fn run_on(conn: *mut c_void, sql: &str) {
+    unsafe {
+        let mut stmt: *mut c_void = std::ptr::null_mut();
+        assert_eq!(
+            ffi::handle::sql_alloc_handle::<TrinoBackend>(HandleType::Stmt as i16, conn, &mut stmt),
+            SqlReturn::SUCCESS
+        );
+        assert_eq!(
+            exec_direct(stmt, sql),
+            SqlReturn::SUCCESS,
+            "{sql}: {}",
+            diag_message(stmt)
+        );
+        cleanup_stmt(stmt);
+    }
+}
+
+/// Assert that a timestamp-with-time-zone value arrives as the wall time Trino
+/// itself gives it in the session zone, and return that zone's name.
+///
+/// The oracle is Trino's own `at_timezone(x, current_timezone())` cast to a
+/// plain `TIMESTAMP`: the wall time a Power BI literal folded back from the
+/// delivered value is compared against.
+unsafe fn assert_delivered_in_session_zone(conn: *mut c_void, label: &str) -> String {
+    unsafe {
+        let mut stmt: *mut c_void = std::ptr::null_mut();
+        assert_eq!(
+            ffi::handle::sql_alloc_handle::<TrinoBackend>(HandleType::Stmt as i16, conn, &mut stmt),
+            SqlReturn::SUCCESS
+        );
+        assert_eq!(
+            exec_direct(
+                stmt,
+                "SELECT x, CAST(at_timezone(x, current_timezone()) AS TIMESTAMP(3)), \
+                 current_timezone() \
+                 FROM (VALUES TIMESTAMP '2025-03-10 20:21:22.123 America/New_York') t(x)"
+            ),
+            SqlReturn::SUCCESS,
+            "{label}: {}",
+            diag_message(stmt)
+        );
+        assert_eq!(
+            ffi::fetch::sql_fetch::<TrinoBackend>(stmt),
+            SqlReturn::SUCCESS
+        );
+        let delivered = get_timestamp_col(stmt, 1);
+        let trinos_wall_time = get_timestamp_col(stmt, 2);
+        let zone = get_wchar_col(stmt, 3);
+        assert_eq!(delivered, trinos_wall_time, "{label}: session zone {zone}");
+        cleanup_stmt(stmt);
+        zone
+    }
+}
+
+/// The session zone comes from `TimeZone=` when it is given, and from the
+/// coordinator otherwise.
+#[test]
+#[serial]
+#[ignore = "requires Trino at localhost:8443; run ./integration-tests/setup.sh first"]
+fn timestamptz_is_delivered_in_the_session_time_zone() {
+    for (extra, want) in [
+        ("", None),
+        (";TimeZone=Europe/Berlin", Some("Europe/Berlin")),
+        (";TimeZone=America/New_York", Some("America/New_York")),
+    ] {
+        unsafe {
+            let (env, conn, stmt) = alloc_handles();
+            assert_eq!(
+                connect_trino_with(conn, extra),
+                SqlReturn::SUCCESS,
+                "{extra}: {}",
+                conn_diag_message(conn)
+            );
+            let zone = assert_delivered_in_session_zone(conn, extra);
+            if let Some(want) = want {
+                assert_eq!(zone, want, "{extra}");
+            }
+            cleanup(env, conn, stmt);
+        }
+    }
+}
+
+/// `SET TIME ZONE` changes the zone of the statements after it, and
+/// `SET TIME ZONE LOCAL` changes it back, without reconnecting.
+#[test]
+#[serial]
+#[ignore = "requires Trino at localhost:8443; run ./integration-tests/setup.sh first"]
+fn set_time_zone_moves_later_statements_into_the_new_zone() {
+    unsafe {
+        let (env, conn, stmt) = alloc_handles();
+        assert_eq!(
+            connect_trino_with(conn, ";TimeZone=Europe/Berlin"),
+            SqlReturn::SUCCESS,
+            "{}",
+            conn_diag_message(conn)
+        );
+        assert_eq!(
+            assert_delivered_in_session_zone(conn, "connected"),
+            "Europe/Berlin"
+        );
+
+        run_on(conn, "SET TIME ZONE '+05:30'");
+        assert_eq!(
+            assert_delivered_in_session_zone(conn, "after +05:30"),
+            "+05:30"
+        );
+
+        run_on(conn, "SET TIME ZONE 'America/New_York'");
+        assert_eq!(
+            assert_delivered_in_session_zone(conn, "after America/New_York"),
+            "America/New_York"
+        );
+
+        run_on(conn, "SET TIME ZONE LOCAL");
+        assert_delivered_in_session_zone(conn, "after LOCAL");
+        cleanup(env, conn, stmt);
     }
 }
 

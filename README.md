@@ -148,7 +148,7 @@ The authoritative list is `src/backend/types/connect_params.rs`.
 | `Roles` | No | Authorisation role per catalog, `{catalog:role;catalog2:ALL}` |
 | `SessionUser` | No | User statements run as, while `User` still authenticates. JDBC's `sessionUser` |
 | `Path` | No | Default SQL path for resolving unqualified function names |
-| `TimeZone` | No | IANA session time zone (`Europe/Berlin`). Unset leaves the coordinator's |
+| `TimeZone` | No | IANA session time zone (`Europe/Berlin`). Unset leaves the coordinator's default. `timestamp with time zone` values are delivered as wall time in the session zone, which a later `SET TIME ZONE` changes |
 | `Locale` | No | Locale for locale-dependent formatting, sent as `X-Trino-Language` |
 | `ClientInfo` | No | Free-form client metadata Trino records against the query |
 | `TraceToken` | No | Correlation token Trino records against the query |
@@ -319,6 +319,12 @@ the coordinator's chain is refused even when the machine trusts that chain.
 
 **Only the first session property applies.** Wrap the value in braces. See
 [Values that contain a semicolon](#values-that-contain-a-semicolon).
+
+**A Power BI slicer misses a timestamp from the night the clocks go back.**
+`timestamp with time zone` values are shown in the session time zone, and in
+the hour that repeats, two instants share one wall time. Power BI filters on the
+wall time it showed and Trino reads that as the later of the two instants, so a
+value from the first of the repeated hours is not selected.
 
 **The browser login never opens.** Some tools, `pyodbc` among them, tell the
 driver it may not display anything. The driver reports this rather than hanging.
