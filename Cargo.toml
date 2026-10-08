@@ -38,11 +38,11 @@ snafu = "0.9"
 # reviewable edit to this line instead of whatever the branch happens to point
 # at. To build against a local checkout, use a `[patch]` in your own
 # `.cargo/config.toml` rather than editing this line; see CONTRIBUTING.md.
-# TEMPORARY: pinned to the core commit converting character data to the
-# SQL_C_INTERVAL_* C types (after `TypeInfoRow::with_preferred`) until a core
-# release containing both is tagged; switch both entries back to
-# that tag before merging.
-stackable-odbc-core = { git = "https://github.com/stackabletech/stackable-odbc-core.git", rev = "b37ca99433b15b2646e98594a6571719acc2a8fa" }
+# TEMPORARY: pinned to the core commit reporting an oversized interval text
+# field as 22015 (after the character-to-SQL_C_INTERVAL_* conversion and
+# `TypeInfoRow::with_preferred`) until a core release containing them is tagged;
+# switch both entries back to that tag before merging.
+stackable-odbc-core = { git = "https://github.com/stackabletech/stackable-odbc-core.git", rev = "2f9f7252e82de439d003b743a09001527f250b75" }
 # `time` is needed directly by `query_all_rows_within`, which bounds the login
 # round trip with `tokio::time::timeout`. It resolves without being declared,
 # because reqwest enables it, but a direct use must not rely on another crate's
@@ -64,7 +64,7 @@ serial_test = "4"
 # offline FFI tests need. It is default-off because it is test code, so it is
 # enabled here rather than on the [dependencies] entry above -- that keeps it
 # out of the shipped cdylib.
-stackable-odbc-core = { git = "https://github.com/stackabletech/stackable-odbc-core.git", rev = "b37ca99433b15b2646e98594a6571719acc2a8fa", features = ["test-support"] }
+stackable-odbc-core = { git = "https://github.com/stackabletech/stackable-odbc-core.git", rev = "2f9f7252e82de439d003b743a09001527f250b75", features = ["test-support"] }
 
 [lints.clippy]
 unwrap_in_result = "deny"
