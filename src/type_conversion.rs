@@ -183,8 +183,8 @@ impl TrinoTypeName {
             // DEFAULT_TEMPORAL_SCALE_WITHOUT_TYPE_NAME, Trino's actual
             // default declared precision). TimeWithTimeZone is also 12, not
             // HH:MM:SS.mmm+HH:MM (18): `parse_trino_time_with_tz` applies the
-            // offset and normalises to UTC (matching TIMESTAMP WITH TIME
-            // ZONE), so the offset never survives into SQL_TIME_STRUCT;
+            // offset and converts to the session time zone (matching TIMESTAMP
+            // WITH TIME ZONE), so the offset never survives into SQL_TIME_STRUCT;
             // only the fractional seconds do (preserved via `ColumnValue::
             // Time`'s `fraction` field, delivered through SQL_C_CHAR/WCHAR
             // text conversions). Keep the two as distinct arms, matching
@@ -204,8 +204,8 @@ impl TrinoTypeName {
             // YYYY-MM-DD HH:MM:SS.mmm = 23 chars (20 + scale 3, see
             // DEFAULT_TEMPORAL_SCALE_WITHOUT_TYPE_NAME). TimestampWithTimeZone
             // is also 23, not YYYY-MM-DD HH:MM:SS.mmm+HH:MM (29):
-            // `parse_trino_timestamp_tz` applies the offset and normalises to
-            // UTC, so it doesn't survive into SQL_TIMESTAMP_STRUCT (which has
+            // `parse_trino_timestamp_tz` applies the offset and converts to
+            // the session time zone, so it doesn't survive into SQL_TIMESTAMP_STRUCT (which has
             // no zone field either); only YYYY-MM-DD HH:MM:SS.mmm is
             // delivered. Kept as a distinct match arm (not merged with
             // `Timestamp`) to match `trino_ty_precision`, for the same reason
@@ -428,7 +428,8 @@ pub fn trino_ty_precision(ty: &TrinoTy) -> u32 {
             DEFAULT_TEMPORAL_SCALE_WITHOUT_TYPE_NAME,
         )),
         // Also HH:MM:SS.mmm, not HH:MM:SS.mmm+HH:MM: the offset is applied
-        // and the value normalised to UTC (see `parse_trino_time_with_tz`),
+        // and the value converted to the session zone (see
+        // `parse_trino_time_with_tz`),
         // so only the fractional seconds reach the application, through the
         // text conversions. SQL_TIME_STRUCT has no fraction field of its own.
         TrinoTy::TimeWithTimeZone => precision_as_u32(column_size(
@@ -444,7 +445,8 @@ pub fn trino_ty_precision(ty: &TrinoTy) -> u32 {
             DEFAULT_TEMPORAL_SCALE_WITHOUT_TYPE_NAME,
         )),
         // Also YYYY-MM-DD HH:MM:SS.mmm, not ...+HH:MM: the offset is applied
-        // and the value normalised to UTC (see `parse_trino_timestamp_tz`),
+        // and the value converted to the session zone (see
+        // `parse_trino_timestamp_tz`),
         // so only YYYY-MM-DD HH:MM:SS.mmm reaches SQL_TIMESTAMP_STRUCT.
         TrinoTy::TimestampWithTimeZone => precision_as_u32(column_size(
             SqlDataType::TIMESTAMP,
@@ -781,12 +783,14 @@ fn parse_trino_time(s: &str) -> Option<ColumnValue> {
     })
 }
 
-/// Parse `TIME WITH TIME ZONE` and normalise to UTC.
+/// Parse `TIME WITH TIME ZONE` and deliver it as the time of day at
+/// `session_offset_minutes`, the session zone's offset (see
+/// [`SessionZone::offset_minutes_at`]).
 ///
 /// `SQL_TIME_STRUCT` has no timezone field, so the offset cannot be carried.
-/// Applying it and returning UTC matches what `TIMESTAMP WITH TIME ZONE`
-/// already does; do not discard the offset silently, or the two "with time
-/// zone" types behave inconsistently.
+/// The value's own offset fixes the instant and the session's decides how it
+/// is shown, as for `TIMESTAMP WITH TIME ZONE`; do not discard the offset
+/// silently, or the two "with time zone" types behave inconsistently.
 ///
 /// Trino renders the zone two ways: a space-separated name (`"13:14:15.000
 /// UTC"`) or a glued numeric offset (`"13:14:15+02:00"`, `"13:14:15-05:30"`).
@@ -796,7 +800,7 @@ fn parse_trino_time(s: &str) -> Option<ColumnValue> {
 /// only affects the rare case of a non-UTC named zone, since Trino's own
 /// numeric-offset rendering is the common form.
 /// Returns `None` if the string is malformed.
-fn parse_trino_time_with_tz(s: &str) -> Option<ColumnValue> {
+fn parse_trino_time_with_tz(s: &str, session_offset_minutes: i32) -> Option<ColumnValue> {
     let t = s.trim();
 
     // A space-separated named zone, e.g. "13:14:15.000 UTC".
@@ -813,7 +817,7 @@ fn parse_trino_time_with_tz(s: &str) -> Option<ColumnValue> {
             );
             0
         };
-        return shift_time(time_part, offset_minutes);
+        return shift_time(time_part, offset_minutes - session_offset_minutes);
     }
 
     // A glued numeric offset, e.g. "13:14:15+02:00" or "13:14:15-05:30".
@@ -832,10 +836,13 @@ fn parse_trino_time_with_tz(s: &str) -> Option<ColumnValue> {
     // `None` keeps the value as text, which is what every other unparseable
     // temporal string here already does.
     let offset_minutes = oh.checked_mul(60)?.checked_add(om)?.checked_mul(sign)?;
-    shift_time(time_part, offset_minutes)
+    shift_time(
+        time_part,
+        offset_minutes.checked_sub(session_offset_minutes)?,
+    )
 }
 
-/// Shift `HH:MM:SS[.f]` by `offset_minutes`, wrapping within the day.
+/// Shift `HH:MM:SS[.f]` back by `offset_minutes`, wrapping within the day.
 ///
 /// A `TIME` has no date to carry an overflow into, so the result wraps
 /// within `[0, 24h)`. `rem_euclid` (not `%`) is used because a negative
@@ -956,6 +963,21 @@ impl SessionZone {
         chrono::FixedOffset::east_opt(sign * (h * 3600 + m * 60)).map(SessionZone::Fixed)
     }
 
+    /// This zone's offset from UTC, in minutes, at the instant `utc`.
+    ///
+    /// A `TIME WITH TIME ZONE` has no date, so a named zone is resolved at the
+    /// current instant, as Trino resolves one when it casts `TIME` to
+    /// `TIME WITH TIME ZONE` in the session zone.
+    pub fn offset_minutes_at(self, utc: chrono::NaiveDateTime) -> i32 {
+        use chrono::Offset as _;
+        use chrono::TimeZone as _;
+        let seconds = match self {
+            SessionZone::Named(tz) => tz.offset_from_utc_datetime(&utc).fix().local_minus_utc(),
+            SessionZone::Fixed(offset) => offset.local_minus_utc(),
+        };
+        seconds / 60
+    }
+
     /// The wall time in this zone at the instant `utc`.
     ///
     /// Unambiguous: every instant has exactly one wall time, including the two
@@ -967,6 +989,23 @@ impl SessionZone {
             SessionZone::Fixed(offset) => offset.from_utc_datetime(&utc).naive_local(),
         }
     }
+}
+
+/// The current instant, in UTC.
+///
+/// From `SystemTime` because this crate builds chrono without its `clock`
+/// feature. A clock before 1970 reads as the epoch, which only affects which
+/// side of a DST change a named zone's offset is taken from.
+fn utc_now() -> chrono::NaiveDateTime {
+    let since_epoch = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    chrono::DateTime::from_timestamp(
+        i64::try_from(since_epoch.as_secs()).unwrap_or(0),
+        since_epoch.subsec_nanos(),
+    )
+    .unwrap_or_default()
+    .naive_utc()
 }
 
 /// Parse a Trino TIMESTAMP WITH TIME ZONE string and deliver it as wall time
@@ -1194,16 +1233,18 @@ pub fn json_to_column_value(val: Value, ty: &TrinoTy, session: SessionZone) -> C
                 ColumnValue::String(val.to_string())
             }
         }
-        // TIME WITH TIME ZONE: parse and normalise to UTC, mirroring
-        // TIMESTAMP WITH TIME ZONE. See `parse_trino_time_with_tz` for why
+        // TIME WITH TIME ZONE: parse and convert to the session zone's
+        // current offset, mirroring TIMESTAMP WITH TIME ZONE. See `parse_trino_time_with_tz` for why
         // this must not share `parse_trino_time`, which silently discards
         // the offset instead of applying it.
         TrinoTy::TimeWithTimeZone => {
             if let Value::String(ref s) = val {
-                parse_trino_time_with_tz(s).unwrap_or_else(|| {
-                    tracing::warn!(raw = s, "failed to parse Trino TIME WITH TIME ZONE string");
-                    ColumnValue::String(s.clone())
-                })
+                parse_trino_time_with_tz(s, session.offset_minutes_at(utc_now())).unwrap_or_else(
+                    || {
+                        tracing::warn!(raw = s, "failed to parse Trino TIME WITH TIME ZONE string");
+                        ColumnValue::String(s.clone())
+                    },
+                )
             } else {
                 ColumnValue::String(val.to_string())
             }
@@ -1352,6 +1393,14 @@ mod tests {
         }
     }
 
+    fn convert_in(val: Value, ty: &TrinoTy, zone: &str) -> ColumnValue {
+        json_to_column_value(
+            val,
+            ty,
+            SessionZone::parse(zone).expect("a zone Trino reports"),
+        )
+    }
+
     fn tz_in(raw: &str, zone: &str) -> ColumnValue {
         json_to_column_value(
             Value::String(raw.into()),
@@ -1425,6 +1474,58 @@ mod tests {
                 "{utc}"
             );
         }
+    }
+
+    /// A `TIME WITH TIME ZONE` is delivered as the time of day in the
+    /// session's offset, as a `TIMESTAMP WITH TIME ZONE` is; the value's own
+    /// offset only fixes the instant.
+    #[test]
+    fn time_with_tz_is_delivered_in_the_session_offset() {
+        let time = |hour, minute, second| ColumnValue::Time {
+            hour,
+            minute,
+            second,
+            fraction: 0,
+        };
+        assert_eq!(
+            parse_trino_time_with_tz("13:14:15+02:00", 120),
+            Some(time(13, 14, 15))
+        );
+        assert_eq!(
+            parse_trino_time_with_tz("13:14:15+00:00", -300),
+            Some(time(8, 14, 15))
+        );
+        // Wraps within the day, as the UTC normalisation already did.
+        assert_eq!(
+            parse_trino_time_with_tz("23:30:00+00:00", 120),
+            Some(time(1, 30, 0))
+        );
+        assert_eq!(
+            convert_in(
+                Value::String("13:14:15+00:00".into()),
+                &TrinoTy::TimeWithTimeZone,
+                "+05:30"
+            ),
+            time(18, 44, 15)
+        );
+    }
+
+    /// A time has no date, so a named session zone is resolved at the current
+    /// instant, which is what Trino does when it casts `TIME` to
+    /// `TIME WITH TIME ZONE` (`+02:00` in Europe/Berlin on 2026-10-07).
+    #[test]
+    fn a_session_zones_offset_depends_on_the_day_it_is_read() {
+        let at = |y, m, d| {
+            chrono::NaiveDate::from_ymd_opt(y, m, d)
+                .and_then(|d| d.and_hms_opt(12, 0, 0))
+                .expect("a valid date")
+        };
+        let berlin = SessionZone::parse("Europe/Berlin").expect("a zone");
+        assert_eq!(berlin.offset_minutes_at(at(2026, 1, 15)), 60);
+        assert_eq!(berlin.offset_minutes_at(at(2026, 7, 15)), 120);
+        let fixed = SessionZone::parse("+05:30").expect("a zone");
+        assert_eq!(fixed.offset_minutes_at(at(2026, 1, 15)), 330);
+        assert_eq!(SessionZone::UTC.offset_minutes_at(at(2026, 7, 15)), 0);
     }
 
     #[test]
@@ -2366,7 +2467,7 @@ mod tests {
         // The two "with time zone" types must agree: TIMESTAMP WITH TIME
         // ZONE converts to UTC, so discarding the offset here rather than
         // applying it would make TIME WITH TIME ZONE contradict it.
-        let val = parse_trino_time_with_tz("13:14:15+02:00").expect("parses");
+        let val = parse_trino_time_with_tz("13:14:15+02:00", 0).expect("parses");
         assert_eq!(
             val,
             ColumnValue::Time {
@@ -2380,7 +2481,7 @@ mod tests {
 
     #[test]
     fn time_with_negative_offset_normalises_to_utc() {
-        let val = parse_trino_time_with_tz("13:14:15-05:30").expect("parses");
+        let val = parse_trino_time_with_tz("13:14:15-05:30", 0).expect("parses");
         assert_eq!(
             val,
             ColumnValue::Time {
@@ -2394,7 +2495,7 @@ mod tests {
 
     #[test]
     fn time_with_offset_wraps_across_midnight() {
-        let val = parse_trino_time_with_tz("01:00:00+02:00").expect("parses");
+        let val = parse_trino_time_with_tz("01:00:00+02:00", 0).expect("parses");
         assert_eq!(
             val,
             ColumnValue::Time {
@@ -2408,7 +2509,7 @@ mod tests {
 
     #[test]
     fn time_with_utc_offset_is_unchanged() {
-        let val = parse_trino_time_with_tz("13:14:15.000 UTC").expect("parses");
+        let val = parse_trino_time_with_tz("13:14:15.000 UTC", 0).expect("parses");
         assert_eq!(
             val,
             ColumnValue::Time {
@@ -2424,7 +2525,7 @@ mod tests {
     fn time_with_timezone_keeps_fraction_through_offset_shift() {
         // The offset shift only touches whole minutes, so a fractional-seconds
         // part must survive `shift_time` unchanged.
-        let val = parse_trino_time_with_tz("13:14:15.123456+02:00").expect("parses");
+        let val = parse_trino_time_with_tz("13:14:15.123456+02:00", 0).expect("parses");
         assert_eq!(
             val,
             ColumnValue::Time {
@@ -2443,7 +2544,7 @@ mod tests {
         // `i32` and only overflows when converted to minutes. Release builds
         // carry no overflow checks, so an unchecked multiply here reports a
         // *different* time instead of declining the value.
-        assert_eq!(parse_trino_time_with_tz("00:00:00+949378864"), None);
+        assert_eq!(parse_trino_time_with_tz("00:00:00+949378864", 0), None);
         assert_eq!(
             convert(
                 Value::String("+999\0\0\0\0+00949378864".into()),
@@ -2458,7 +2559,7 @@ mod tests {
         // The same class one frame down, in `shift_time`: the time-of-day hour
         // is text too, so `hour * 60` overflows before the offset is ever
         // applied.
-        assert_eq!(parse_trino_time_with_tz("2147483647:00:00+01:00"), None);
+        assert_eq!(parse_trino_time_with_tz("2147483647:00:00+01:00", 0), None);
     }
 
     #[test]
@@ -2466,7 +2567,7 @@ mod tests {
         // The checked arithmetic must not narrow what a valid offset can be:
         // the widest zones in use are +14:00 and -12:00.
         assert_eq!(
-            parse_trino_time_with_tz("13:14:15+14:00"),
+            parse_trino_time_with_tz("13:14:15+14:00", 0),
             Some(ColumnValue::Time {
                 hour: 23,
                 minute: 14,
@@ -2475,7 +2576,7 @@ mod tests {
             })
         );
         assert_eq!(
-            parse_trino_time_with_tz("13:14:15-12:00"),
+            parse_trino_time_with_tz("13:14:15-12:00", 0),
             Some(ColumnValue::Time {
                 hour: 1,
                 minute: 14,

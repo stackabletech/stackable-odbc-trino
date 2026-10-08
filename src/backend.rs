@@ -662,6 +662,15 @@ fn probe_session(conn: &TrinoConnection) -> SessionProbe {
     if probe.user.is_none() {
         tracing::warn!("SELECT current_user returned no usable value");
     }
+    if probe.time_zone.is_none() {
+        // Falls back to UTC, which shifts every timestamp-with-time-zone value
+        // by the server's offset, so it must not pass silently.
+        tracing::warn!(
+            current_timezone = column(2),
+            "SELECT current_timezone() returned no zone this driver can read; \
+             delivering time-zone values in UTC unless TimeZone= is set"
+        );
+    }
 
     let Some(raw) = column(0) else {
         tracing::warn!("SELECT version() returned no usable value");

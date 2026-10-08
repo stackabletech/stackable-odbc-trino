@@ -148,7 +148,7 @@ The authoritative list is `src/backend/types/connect_params.rs`.
 | `Roles` | No | Authorisation role per catalog, `{catalog:role;catalog2:ALL}` |
 | `SessionUser` | No | User statements run as, while `User` still authenticates. JDBC's `sessionUser` |
 | `Path` | No | Default SQL path for resolving unqualified function names |
-| `TimeZone` | No | IANA session time zone (`Europe/Berlin`). Unset leaves the coordinator's default. `timestamp with time zone` values are delivered as wall time in the session zone, which a later `SET TIME ZONE` changes |
+| `TimeZone` | No | IANA session time zone (`Europe/Berlin`). Unset leaves the coordinator's default. `timestamp with time zone` and `time with time zone` values are delivered as wall time in the session zone, which a later `SET TIME ZONE` changes |
 | `Locale` | No | Locale for locale-dependent formatting, sent as `X-Trino-Language` |
 | `ClientInfo` | No | Free-form client metadata Trino records against the query |
 | `TraceToken` | No | Correlation token Trino records against the query |

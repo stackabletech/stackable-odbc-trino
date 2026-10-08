@@ -15,7 +15,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   folds the value it showed back as a plain `TIMESTAMP` literal, which Trino
   reads in the session zone, so a DirectQuery slicer on such a column only
   selected its rows in a UTC session. Applications reading these columns see
-  different values unless the session is UTC.
+  different values unless the session is UTC. `time with time zone` values
+  follow the same zone, at its current offset because a time has no date, which
+  is how Trino itself casts `TIME` to `TIME WITH TIME ZONE`.
 - The Power BI connector reports that Trino cannot convert `TIME` to
   `TIMESTAMP` (`SQL_CONVERT_TIME` without `SQL_CVT_TIMESTAMP`). A DirectQuery
   slicer on a time column folded to a comparison against Power BI's base date,

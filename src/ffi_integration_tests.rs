@@ -1823,7 +1823,7 @@ fn timestamp_with_tz_returns_wchar() {
 #[test]
 #[serial]
 #[ignore = "requires Trino at localhost:8443; run ./integration-tests/setup.sh first"]
-fn timestamp_with_named_tz_returns_utc_via_get_data() {
+fn timestamp_with_named_tz_returns_utc_in_a_utc_session() {
     // UTC because the shared connection sets no `TimeZone=` and the test
     // stack's coordinator defaults to UTC: values are delivered in the session
     // zone (see `timestamptz_is_delivered_in_the_session_time_zone`).
@@ -2011,6 +2011,88 @@ fn set_time_zone_moves_later_statements_into_the_new_zone() {
         run_on(conn, "SET TIME ZONE LOCAL");
         assert_delivered_in_session_zone(conn, "after LOCAL");
         cleanup(env, conn, stmt);
+    }
+}
+
+/// Assert that a `TIME WITH TIME ZONE` arrives as the time of day Trino itself
+/// gives it in the session: cast back to `TIME WITH TIME ZONE` in that
+/// session, the delivered time is the same instant.
+unsafe fn assert_time_tz_delivered_in_session(conn: *mut c_void, label: &str) {
+    let value = "TIME '13:14:15+05:00'";
+    unsafe {
+        let mut stmt: *mut c_void = std::ptr::null_mut();
+        assert_eq!(
+            ffi::handle::sql_alloc_handle::<TrinoBackend>(HandleType::Stmt as i16, conn, &mut stmt),
+            SqlReturn::SUCCESS
+        );
+        assert_eq!(
+            exec_direct(stmt, &format!("SELECT {value}")),
+            SqlReturn::SUCCESS
+        );
+        assert_eq!(
+            ffi::fetch::sql_fetch::<TrinoBackend>(stmt),
+            SqlReturn::SUCCESS
+        );
+        let mut t = odbc_sys::Time::default();
+        let mut ind: isize = 0;
+        assert_eq!(
+            ffi::fetch::sql_get_data::<TrinoBackend>(
+                stmt,
+                1,
+                CDataType::TypeTime as i16,
+                (&raw mut t).cast(),
+                std::mem::size_of::<odbc_sys::Time>() as isize,
+                &mut ind,
+            ),
+            SqlReturn::SUCCESS
+        );
+        cleanup_stmt(stmt);
+
+        let shown = format!("{:02}:{:02}:{:02}", t.hour, t.minute, t.second);
+        let mut stmt: *mut c_void = std::ptr::null_mut();
+        assert_eq!(
+            ffi::handle::sql_alloc_handle::<TrinoBackend>(HandleType::Stmt as i16, conn, &mut stmt),
+            SqlReturn::SUCCESS
+        );
+        let sql = format!(
+            "SELECT CAST({value} = CAST(TIME '{shown}' AS TIME WITH TIME ZONE) AS VARCHAR), \
+             current_timezone()"
+        );
+        assert_eq!(exec_direct(stmt, &sql), SqlReturn::SUCCESS, "{sql}");
+        assert_eq!(
+            ffi::fetch::sql_fetch::<TrinoBackend>(stmt),
+            SqlReturn::SUCCESS
+        );
+        let same = get_wchar_col(stmt, 1);
+        let zone = get_wchar_col(stmt, 2);
+        assert_eq!(
+            same, "true",
+            "{label}: delivered {shown} in session zone {zone}"
+        );
+        cleanup_stmt(stmt);
+    }
+}
+
+/// `TIME WITH TIME ZONE` follows the session zone as `TIMESTAMP WITH TIME
+/// ZONE` does, including after `SET TIME ZONE`.
+#[test]
+#[serial]
+#[ignore = "requires Trino at localhost:8443; run ./integration-tests/setup.sh first"]
+fn time_with_tz_is_delivered_in_the_session_time_zone() {
+    for extra in ["", ";TimeZone=Europe/Berlin"] {
+        unsafe {
+            let (env, conn, stmt) = alloc_handles();
+            assert_eq!(
+                connect_trino_with(conn, extra),
+                SqlReturn::SUCCESS,
+                "{extra}: {}",
+                conn_diag_message(conn)
+            );
+            assert_time_tz_delivered_in_session(conn, extra);
+            run_on(conn, "SET TIME ZONE '+05:30'");
+            assert_time_tz_delivered_in_session(conn, "after +05:30");
+            cleanup(env, conn, stmt);
+        }
     }
 }
 
