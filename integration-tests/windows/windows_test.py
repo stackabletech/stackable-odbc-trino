@@ -563,9 +563,15 @@ def run_remote(session, script: str, argv) -> int:
     """Run one suite on the VM and return its exit code."""
     args = " ".join(ps_quote(a) for a in argv)
     # Enable driver-side debug logging and DM tracing.
+    #
+    # PYTHONIOENCODING: over WinRM the suite's stdout is not a console, so
+    # Python would encode it as cp1252, which cannot represent the non-Latin
+    # test values some suites print (a UnicodeEncodeError ends the suite). The
+    # output is decoded as UTF-8 below, so it is encoded as UTF-8 here.
     r = session.run_ps(
         f'$env:ODBC_LOG_LEVEL = "debug"; '
         f'$env:ODBC_LOG_FILE = "{REMOTE_LOG}"; '
+        f'$env:PYTHONIOENCODING = "utf-8"; '
         f'& {REMOTE_PYTHON} "{REMOTE_SUITES}\\{script}" {args}'
     )
     stdout = r.std_out.decode("utf-8", errors="replace")
