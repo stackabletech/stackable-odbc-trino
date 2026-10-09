@@ -83,7 +83,10 @@ services:
 
   minio:
     profiles: [spooling]
-    image: quay.io/minio/minio:RELEASE.2025-04-22T22-12-26Z
+    # pgsty's build of MinIO, as stackabletech/demos uses: pulls of
+    # quay.io/minio were refused ("unauthorized") in CI on 2026-10-09. pgsty also
+    # publishes `mc` (below), and both images carry /bin/sh.
+    image: docker.io/pgsty/minio:RELEASE.2026-08-04T00-00-00Z
     command: ["server", "/data"]
     environment:
       # Interpolated from scripts/lib.sh, which is the single source; the
@@ -98,7 +101,7 @@ services:
 
   minio-init:
     profiles: [spooling]
-    image: quay.io/minio/mc:RELEASE.2025-04-16T18-13-26Z
+    image: docker.io/pgsty/mc:RELEASE.2026-09-16T00-00-00Z
     depends_on:
       minio:
         condition: service_started
