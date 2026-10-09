@@ -6,7 +6,7 @@
 # suite connecting normally gets `Access Denied: Cannot create schema`. Once the
 # schema exists and admin owns it, everything else an ordinary connection needs
 # works without a role: creating tables, writing, reading and granting. So this
-# seeds exactly the schema and stops.
+# seeds the schema, plus one view no other catalog can provide (below).
 #
 # Idempotent, and run on every setup: the file metastore lives in the
 # coordinator's writable layer, so recreating the container starts it empty.
@@ -49,4 +49,22 @@ trino_run() {
 }
 
 trino_run "CREATE SCHEMA IF NOT EXISTS hive.$HIVE_SCHEMA" admin
-echo "Seeded hive.$HIVE_SCHEMA"
+
+# INTERVAL columns, which no table in the stack has: a Hive table cannot store
+# the type, and the postgresql catalog does not expose Postgres intervals. A
+# view computes them over postgresql.public.types_test, so a Power BI slicer on
+# an interval column can be tested next to the text and date/time columns that
+# table already has.
+trino_run "CREATE OR REPLACE VIEW hive.$HIVE_SCHEMA.interval_test AS
+SELECT id, col_varchar, col_integer,
+       col_date, col_time, col_timestamp, col_timestamptz,
+       CASE id WHEN 1 THEN INTERVAL '0.5' SECOND
+               WHEN 5 THEN INTERVAL '1' DAY
+               WHEN 6 THEN INTERVAL '2' HOUR
+               WHEN 7 THEN INTERVAL '1' DAY + INTERVAL '30' MINUTE
+               WHEN 8 THEN INTERVAL '-1' DAY END AS col_interval_ds,
+       CASE id WHEN 5 THEN INTERVAL '1' YEAR
+               WHEN 6 THEN INTERVAL '3' MONTH
+               WHEN 8 THEN INTERVAL '-1' YEAR END AS col_interval_ym
+FROM postgresql.public.types_test" admin
+echo "Seeded hive.$HIVE_SCHEMA and hive.$HIVE_SCHEMA.interval_test"

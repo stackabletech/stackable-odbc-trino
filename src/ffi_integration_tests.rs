@@ -33,8 +33,8 @@ use stackable_odbc_core::odbc_sys;
 use stackable_odbc_core::test_support::{attach_connection, detach_connection};
 use stackable_odbc_core::types::{
     AttrOdbcVersion, CDataType, Desc, EnvironmentAttribute, HandleType, HeaderDiagnosticIdentifier,
-    InfoType, ParamType, SQL_AUTOCOMMIT_OFF, SQL_AUTOCOMMIT_ON, SQL_FETCH_BOOKMARK, SQL_IC_LOWER,
-    SQL_INDEX_UNIQUE, SQL_LOCK_NO_CHANGE, SQL_NTS, SQL_NULL_DATA, SQL_PARAM_ERROR,
+    InfoType, Interval, ParamType, SQL_AUTOCOMMIT_OFF, SQL_AUTOCOMMIT_ON, SQL_FETCH_BOOKMARK,
+    SQL_IC_LOWER, SQL_INDEX_UNIQUE, SQL_LOCK_NO_CHANGE, SQL_NTS, SQL_NULL_DATA, SQL_PARAM_ERROR,
     SQL_PARAM_SUCCESS, SQL_POSITION, SQL_QUICK, SqlDataType, SqlReturn, StatementAttribute,
     expected_kind,
 };
@@ -197,6 +197,12 @@ unsafe fn alloc_handles() -> (*mut c_void, *mut c_void, *mut c_void) {
 
 /// Helper: connect to Trino at localhost:8443.
 unsafe fn connect_trino(conn: *mut c_void) -> SqlReturn {
+    unsafe { connect_trino_with(conn, "") }
+}
+
+/// [`connect_trino`] with `extra` appended to the connection string, e.g.
+/// `";TimeZone=Europe/Berlin"`.
+unsafe fn connect_trino_with(conn: *mut c_void, extra: &str) -> SqlReturn {
     // The terminator is part of the buffer, because the length argument below
     // is SQL_NTS: that tells the driver the string is null-terminated and to
     // find the end itself. Without it the driver reads past this Vec until it
@@ -207,7 +213,10 @@ unsafe fn connect_trino(conn: *mut c_void) -> SqlReturn {
     //
     // Every other wide buffer in this file passes an explicit length instead,
     // and needs no terminator.
-    let wide: Vec<u16> = CONN_STR.encode_utf16().chain(std::iter::once(0)).collect();
+    let wide: Vec<u16> = format!("{CONN_STR}{extra}")
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
     unsafe {
         ffi::connect::sql_driver_connect_w::<TrinoBackend>(
             conn,
@@ -607,6 +616,59 @@ fn get_info_groups_that_constrain_each_other_agree() {
             violations.join("\n  ")
         );
 
+        cleanup_injected_conn(env, conn);
+    }
+}
+
+/// What Power Query sees: `SQLGetTypeInfo(DATA_TYPE)` through core's real
+/// entry point, first row's TYPE_NAME. A shared DATA_TYPE must lead with the
+/// plain type, never a variant such as `INTERVAL DAY TO SECOND` that merely
+/// sorts first. Needs no server: `get_type_info` reads a static table.
+#[test]
+#[serial]
+fn get_type_info_leads_each_shared_data_type_with_the_plain_type() {
+    unsafe {
+        let (env, conn) = alloc_conn_with_injected_trino_connection();
+        for (data_type, expected) in [
+            (SqlDataType::EXT_W_VARCHAR, "VARCHAR"),
+            (SqlDataType::TIME, "TIME"),
+            (SqlDataType::TIMESTAMP, "TIMESTAMP"),
+        ] {
+            let mut stmt: *mut c_void = std::ptr::null_mut();
+            assert_eq!(
+                ffi::handle::sql_alloc_handle::<TrinoBackend>(
+                    HandleType::Stmt as i16,
+                    conn,
+                    &mut stmt
+                ),
+                SqlReturn::SUCCESS
+            );
+            assert_eq!(
+                ffi::info::sql_get_type_info::<TrinoBackend>(stmt, data_type.0),
+                SqlReturn::SUCCESS,
+                "SQLGetTypeInfo({data_type:?})"
+            );
+            assert_eq!(
+                ffi::fetch::sql_fetch::<TrinoBackend>(stmt),
+                SqlReturn::SUCCESS
+            );
+            let mut buf = [0u16; 64];
+            let mut ind: isize = 0;
+            assert_eq!(
+                ffi::fetch::sql_get_data::<TrinoBackend>(
+                    stmt,
+                    1,
+                    CDataType::WChar as i16,
+                    buf.as_mut_ptr().cast(),
+                    std::mem::size_of_val(&buf) as isize,
+                    &mut ind,
+                ),
+                SqlReturn::SUCCESS
+            );
+            let name = String::from_utf16(&buf[..(ind as usize / 2)]).expect("UTF-16 TYPE_NAME");
+            assert_eq!(name, expected, "first SQLGetTypeInfo row for {data_type:?}");
+            let _ = ffi::handle::sql_free_handle::<TrinoBackend>(HandleType::Stmt as i16, stmt);
+        }
         cleanup_injected_conn(env, conn);
     }
 }
@@ -1605,9 +1667,10 @@ fn interval_year_month_returns_wchar() {
             ffi::fetch::sql_fetch::<TrinoBackend>(stmt),
             SqlReturn::SUCCESS
         );
-        let s = fetch_wchar(stmt);
-        assert!(s.contains('3'), "expected '3' in {s:?}");
-        assert!(s.contains('7'), "expected '7' in {s:?}");
+        // Trino's own rendering, unchanged: Power BI folds a slicer on this
+        // column to `cast(col as VARCHAR) = '<shown>'`, which only matches if
+        // the shown text is what that CAST produces.
+        assert_eq!(fetch_wchar(stmt), "3-7");
         cleanup_stmt(stmt);
     }
 }
@@ -1626,8 +1689,113 @@ fn interval_day_time_returns_wchar() {
             ffi::fetch::sql_fetch::<TrinoBackend>(stmt),
             SqlReturn::SUCCESS
         );
-        let s = fetch_wchar(stmt);
-        assert!(s.contains('2'), "expected '2' in {s:?}");
+        assert_eq!(fetch_wchar(stmt), "2 03:04:05.678");
+        cleanup_stmt(stmt);
+    }
+}
+
+/// The values the Power BI slicer view (`seed-hive.sh`) holds, whose re-rendered
+/// text (`-1-00`, `0 00:00:00.5`) differed from Trino's and so selected no rows.
+#[test]
+#[serial]
+#[ignore = "requires Trino at localhost:8443; run ./integration-tests/setup.sh first"]
+fn intervals_are_delivered_as_trinos_cast_to_varchar_text() {
+    for expr in [
+        "INTERVAL '-1' YEAR",
+        "INTERVAL '3' MONTH",
+        "INTERVAL '-1' DAY",
+        "INTERVAL '0.5' SECOND",
+        "INTERVAL '1' DAY + INTERVAL '30' MINUTE",
+    ] {
+        unsafe {
+            let (_env, _conn, stmt) = alloc_stmt();
+            assert_eq!(
+                exec_direct(stmt, &format!("SELECT {expr}, CAST({expr} AS VARCHAR)")),
+                SqlReturn::SUCCESS
+            );
+            assert_eq!(
+                ffi::fetch::sql_fetch::<TrinoBackend>(stmt),
+                SqlReturn::SUCCESS
+            );
+            let cast = get_wchar_col(stmt, 2);
+            assert_eq!(get_wchar_col(stmt, 1), cast, "{expr}");
+            cleanup_stmt(stmt);
+        }
+    }
+}
+
+/// Read column 1 into a `SQL_INTERVAL_STRUCT` as `target`.
+unsafe fn fetch_interval(stmt: *mut c_void, target: CDataType) -> odbc_sys::IntervalStruct {
+    let mut out = odbc_sys::IntervalStruct {
+        interval_type: 0,
+        interval_sign: 0,
+        interval_value: odbc_sys::IntervalUnion {
+            day_second: odbc_sys::DaySecond::default(),
+        },
+    };
+    let mut ind: isize = 0;
+    let ret = unsafe {
+        ffi::fetch::sql_get_data::<TrinoBackend>(
+            stmt,
+            1,
+            target as i16,
+            (&raw mut out).cast(),
+            size_of::<odbc_sys::IntervalStruct>() as isize,
+            &mut ind,
+        )
+    };
+    assert_eq!(ret, SqlReturn::SUCCESS, "sql_get_data as {target:?} failed");
+    out
+}
+
+/// Delivering interval columns as text must not cost an application the
+/// `SQL_C_INTERVAL_*` C types: core converts the text, per the spec's
+/// "SQL to C: Character" table.
+#[test]
+#[serial]
+#[ignore = "requires Trino at localhost:8443; run ./integration-tests/setup.sh first"]
+fn interval_year_month_reads_as_sql_c_interval_year_to_month() {
+    unsafe {
+        let (_env, _conn, stmt) = alloc_stmt();
+        assert_eq!(
+            exec_direct(stmt, "SELECT INTERVAL '-3-7' YEAR TO MONTH"),
+            SqlReturn::SUCCESS
+        );
+        assert_eq!(
+            ffi::fetch::sql_fetch::<TrinoBackend>(stmt),
+            SqlReturn::SUCCESS
+        );
+        let got = fetch_interval(stmt, CDataType::IntervalYearToMonth);
+        assert_eq!(got.interval_type, Interval::YearToMonth as i32);
+        assert_eq!(got.interval_sign, 1, "SQL_TRUE: negative");
+        let ym = got.interval_value.year_month;
+        assert_eq!((ym.year, ym.month), (3, 7));
+        cleanup_stmt(stmt);
+    }
+}
+
+#[test]
+#[serial]
+#[ignore = "requires Trino at localhost:8443; run ./integration-tests/setup.sh first"]
+fn interval_day_time_reads_as_sql_c_interval_day_to_second() {
+    unsafe {
+        let (_env, _conn, stmt) = alloc_stmt();
+        assert_eq!(
+            exec_direct(stmt, "SELECT INTERVAL '2 03:04:05' DAY TO SECOND"),
+            SqlReturn::SUCCESS
+        );
+        assert_eq!(
+            ffi::fetch::sql_fetch::<TrinoBackend>(stmt),
+            SqlReturn::SUCCESS
+        );
+        let got = fetch_interval(stmt, CDataType::IntervalDayToSecond);
+        assert_eq!(got.interval_type, Interval::DayToSecond as i32);
+        assert_eq!(got.interval_sign, 0);
+        let ds = got.interval_value.day_second;
+        assert_eq!(
+            (ds.day, ds.hour, ds.minute, ds.second, ds.fraction),
+            (2, 3, 4, 5, 0)
+        );
         cleanup_stmt(stmt);
     }
 }
@@ -1655,7 +1823,10 @@ fn timestamp_with_tz_returns_wchar() {
 #[test]
 #[serial]
 #[ignore = "requires Trino at localhost:8443; run ./integration-tests/setup.sh first"]
-fn timestamp_with_named_tz_returns_utc_via_get_data() {
+fn timestamp_with_named_tz_returns_utc_in_a_utc_session() {
+    // UTC because the shared connection sets no `TimeZone=` and the test
+    // stack's coordinator defaults to UTC: values are delivered in the session
+    // zone (see `timestamptz_is_delivered_in_the_session_time_zone`).
     unsafe {
         let (_env, _conn, stmt) = alloc_stmt();
         // America/New_York in March 2025 is EDT (UTC-4).
@@ -1698,6 +1869,230 @@ fn timestamp_with_named_tz_returns_utc_via_get_data() {
         assert_eq!(ts.fraction, 123_000_000, "fraction (nanoseconds)");
 
         cleanup_stmt(stmt);
+    }
+}
+
+/// Column `col` read as a `SQL_TIMESTAMP_STRUCT`.
+unsafe fn get_timestamp_col(stmt: *mut c_void, col: u16) -> odbc_sys::Timestamp {
+    let mut ts = odbc_sys::Timestamp::default();
+    let mut ind: isize = 0;
+    let ret = unsafe {
+        ffi::fetch::sql_get_data::<TrinoBackend>(
+            stmt,
+            col,
+            CDataType::TypeTimestamp as i16,
+            (&raw mut ts).cast(),
+            std::mem::size_of::<odbc_sys::Timestamp>() as isize,
+            &mut ind,
+        )
+    };
+    assert_eq!(
+        ret,
+        SqlReturn::SUCCESS,
+        "sql_get_data(TypeTimestamp) on column {col}"
+    );
+    ts
+}
+
+/// Run `sql` to completion in its own statement on `conn`.
+unsafe fn run_on(conn: *mut c_void, sql: &str) {
+    unsafe {
+        let mut stmt: *mut c_void = std::ptr::null_mut();
+        assert_eq!(
+            ffi::handle::sql_alloc_handle::<TrinoBackend>(HandleType::Stmt as i16, conn, &mut stmt),
+            SqlReturn::SUCCESS
+        );
+        assert_eq!(
+            exec_direct(stmt, sql),
+            SqlReturn::SUCCESS,
+            "{sql}: {}",
+            diag_message(stmt)
+        );
+        cleanup_stmt(stmt);
+    }
+}
+
+/// Assert that a timestamp-with-time-zone value arrives as the wall time Trino
+/// itself gives it in the session zone, and return that zone's name.
+///
+/// The oracle is Trino's own `at_timezone(x, current_timezone())` cast to a
+/// plain `TIMESTAMP`: the wall time a Power BI literal folded back from the
+/// delivered value is compared against.
+unsafe fn assert_delivered_in_session_zone(conn: *mut c_void, label: &str) -> String {
+    unsafe {
+        let mut stmt: *mut c_void = std::ptr::null_mut();
+        assert_eq!(
+            ffi::handle::sql_alloc_handle::<TrinoBackend>(HandleType::Stmt as i16, conn, &mut stmt),
+            SqlReturn::SUCCESS
+        );
+        assert_eq!(
+            exec_direct(
+                stmt,
+                "SELECT x, CAST(at_timezone(x, current_timezone()) AS TIMESTAMP(3)), \
+                 current_timezone() \
+                 FROM (VALUES TIMESTAMP '2025-03-10 20:21:22.123 America/New_York') t(x)"
+            ),
+            SqlReturn::SUCCESS,
+            "{label}: {}",
+            diag_message(stmt)
+        );
+        assert_eq!(
+            ffi::fetch::sql_fetch::<TrinoBackend>(stmt),
+            SqlReturn::SUCCESS
+        );
+        let delivered = get_timestamp_col(stmt, 1);
+        let trinos_wall_time = get_timestamp_col(stmt, 2);
+        let zone = get_wchar_col(stmt, 3);
+        assert_eq!(delivered, trinos_wall_time, "{label}: session zone {zone}");
+        cleanup_stmt(stmt);
+        zone
+    }
+}
+
+/// The session zone comes from `TimeZone=` when it is given, and from the
+/// coordinator otherwise.
+#[test]
+#[serial]
+#[ignore = "requires Trino at localhost:8443; run ./integration-tests/setup.sh first"]
+fn timestamptz_is_delivered_in_the_session_time_zone() {
+    for (extra, want) in [
+        ("", None),
+        (";TimeZone=Europe/Berlin", Some("Europe/Berlin")),
+        (";TimeZone=America/New_York", Some("America/New_York")),
+    ] {
+        unsafe {
+            let (env, conn, stmt) = alloc_handles();
+            assert_eq!(
+                connect_trino_with(conn, extra),
+                SqlReturn::SUCCESS,
+                "{extra}: {}",
+                conn_diag_message(conn)
+            );
+            let zone = assert_delivered_in_session_zone(conn, extra);
+            if let Some(want) = want {
+                assert_eq!(zone, want, "{extra}");
+            }
+            cleanup(env, conn, stmt);
+        }
+    }
+}
+
+/// `SET TIME ZONE` changes the zone of the statements after it, and
+/// `SET TIME ZONE LOCAL` changes it back, without reconnecting.
+#[test]
+#[serial]
+#[ignore = "requires Trino at localhost:8443; run ./integration-tests/setup.sh first"]
+fn set_time_zone_moves_later_statements_into_the_new_zone() {
+    unsafe {
+        let (env, conn, stmt) = alloc_handles();
+        assert_eq!(
+            connect_trino_with(conn, ";TimeZone=Europe/Berlin"),
+            SqlReturn::SUCCESS,
+            "{}",
+            conn_diag_message(conn)
+        );
+        assert_eq!(
+            assert_delivered_in_session_zone(conn, "connected"),
+            "Europe/Berlin"
+        );
+
+        run_on(conn, "SET TIME ZONE '+05:30'");
+        assert_eq!(
+            assert_delivered_in_session_zone(conn, "after +05:30"),
+            "+05:30"
+        );
+
+        run_on(conn, "SET TIME ZONE 'America/New_York'");
+        assert_eq!(
+            assert_delivered_in_session_zone(conn, "after America/New_York"),
+            "America/New_York"
+        );
+
+        run_on(conn, "SET TIME ZONE LOCAL");
+        assert_delivered_in_session_zone(conn, "after LOCAL");
+        cleanup(env, conn, stmt);
+    }
+}
+
+/// Assert that a `TIME WITH TIME ZONE` arrives as the time of day Trino itself
+/// gives it in the session: cast back to `TIME WITH TIME ZONE` in that
+/// session, the delivered time is the same instant.
+unsafe fn assert_time_tz_delivered_in_session(conn: *mut c_void, label: &str) {
+    let value = "TIME '13:14:15+05:00'";
+    unsafe {
+        let mut stmt: *mut c_void = std::ptr::null_mut();
+        assert_eq!(
+            ffi::handle::sql_alloc_handle::<TrinoBackend>(HandleType::Stmt as i16, conn, &mut stmt),
+            SqlReturn::SUCCESS
+        );
+        assert_eq!(
+            exec_direct(stmt, &format!("SELECT {value}")),
+            SqlReturn::SUCCESS
+        );
+        assert_eq!(
+            ffi::fetch::sql_fetch::<TrinoBackend>(stmt),
+            SqlReturn::SUCCESS
+        );
+        let mut t = odbc_sys::Time::default();
+        let mut ind: isize = 0;
+        assert_eq!(
+            ffi::fetch::sql_get_data::<TrinoBackend>(
+                stmt,
+                1,
+                CDataType::TypeTime as i16,
+                (&raw mut t).cast(),
+                std::mem::size_of::<odbc_sys::Time>() as isize,
+                &mut ind,
+            ),
+            SqlReturn::SUCCESS
+        );
+        cleanup_stmt(stmt);
+
+        let shown = format!("{:02}:{:02}:{:02}", t.hour, t.minute, t.second);
+        let mut stmt: *mut c_void = std::ptr::null_mut();
+        assert_eq!(
+            ffi::handle::sql_alloc_handle::<TrinoBackend>(HandleType::Stmt as i16, conn, &mut stmt),
+            SqlReturn::SUCCESS
+        );
+        let sql = format!(
+            "SELECT CAST({value} = CAST(TIME '{shown}' AS TIME WITH TIME ZONE) AS VARCHAR), \
+             current_timezone()"
+        );
+        assert_eq!(exec_direct(stmt, &sql), SqlReturn::SUCCESS, "{sql}");
+        assert_eq!(
+            ffi::fetch::sql_fetch::<TrinoBackend>(stmt),
+            SqlReturn::SUCCESS
+        );
+        let same = get_wchar_col(stmt, 1);
+        let zone = get_wchar_col(stmt, 2);
+        assert_eq!(
+            same, "true",
+            "{label}: delivered {shown} in session zone {zone}"
+        );
+        cleanup_stmt(stmt);
+    }
+}
+
+/// `TIME WITH TIME ZONE` follows the session zone as `TIMESTAMP WITH TIME
+/// ZONE` does, including after `SET TIME ZONE`.
+#[test]
+#[serial]
+#[ignore = "requires Trino at localhost:8443; run ./integration-tests/setup.sh first"]
+fn time_with_tz_is_delivered_in_the_session_time_zone() {
+    for extra in ["", ";TimeZone=Europe/Berlin"] {
+        unsafe {
+            let (env, conn, stmt) = alloc_handles();
+            assert_eq!(
+                connect_trino_with(conn, extra),
+                SqlReturn::SUCCESS,
+                "{extra}: {}",
+                conn_diag_message(conn)
+            );
+            assert_time_tz_delivered_in_session(conn, extra);
+            run_on(conn, "SET TIME ZONE '+05:30'");
+            assert_time_tz_delivered_in_session(conn, "after +05:30");
+            cleanup(env, conn, stmt);
+        }
     }
 }
 

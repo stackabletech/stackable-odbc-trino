@@ -33,15 +33,18 @@ use stackable_odbc_core::types::ColumnValue;
 use trino_rust_client::TrinoTy;
 
 pub use crate::type_conversion::{
-    json_to_column_value, trino_type_name_to_sql_type, type_name_precision, type_name_scale,
+    SessionZone, json_to_column_value, trino_type_name_to_sql_type, type_name_precision,
+    type_name_scale,
 };
 
 /// Convert one coordinator JSON value under its declared Trino type.
 ///
 /// A thin alias for [`json_to_column_value`], kept so a target can name the
-/// whole read-path conversion without importing the type-name helpers.
+/// whole read-path conversion without importing the type-name helpers. The
+/// session zone is one with daylight saving time, so fuzzed timestamps also
+/// reach the overlap and gap hours.
 pub fn json_value(val: Value, ty: &TrinoTy) -> ColumnValue {
-    json_to_column_value(val, ty)
+    json_to_column_value(val, ty, SessionZone::Named(chrono_tz::Tz::Europe__Berlin))
 }
 
 /// Run core's ODBC escape translator with this driver's dialect.

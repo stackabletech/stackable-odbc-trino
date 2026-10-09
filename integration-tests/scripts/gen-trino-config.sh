@@ -19,7 +19,12 @@ set -euo pipefail
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib.sh"
 
 OUT="$GENERATED/trino"
-rm -rf "$OUT"
+# Emptied in place, never removed: a running coordinator bind-mounts this
+# directory, and replacing it would leave the container holding the deleted
+# one, empty, so a restart would find no config at all. setup.sh recreates
+# Trino when the assembled content changes (TRINO_CONFIG_HASH).
+mkdir -p "$OUT"
+find "$OUT" -mindepth 1 -delete
 mkdir -p "$OUT/catalog"
 
 cp -r "$STACK_DIR/trino/base/." "$OUT/"

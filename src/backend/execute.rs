@@ -20,8 +20,8 @@ use super::{
     map_trino_error_on,
 };
 use crate::type_conversion::{
-    TrinoTypeName, discards_fractional_seconds, json_to_column_value, trino_ty_precision,
-    trino_ty_scale, trino_ty_to_sql_type, type_name_precision, type_name_scale,
+    SessionZone, TrinoTypeName, discards_fractional_seconds, json_to_column_value,
+    trino_ty_precision, trino_ty_scale, trino_ty_to_sql_type, type_name_precision, type_name_scale,
 };
 
 /// Convert decoded Trino rows into `Vec<Vec<ColumnValue>>`, alongside the cells
@@ -37,6 +37,7 @@ use crate::type_conversion::{
 fn convert_rows(
     rows: Vec<Row>,
     types: &[(String, TrinoTy)],
+    session_zone: SessionZone,
 ) -> (Vec<Vec<ColumnValue>>, HashSet<(usize, usize)>) {
     let mut truncated = HashSet::new();
     let batch = rows
@@ -51,7 +52,7 @@ fn convert_rows(
                     if discards_fractional_seconds(&val, ty) {
                         truncated.insert((row_idx, col_idx));
                     }
-                    json_to_column_value(val, ty)
+                    json_to_column_value(val, ty, session_zone)
                 })
                 .collect()
         })
@@ -144,6 +145,10 @@ pub(super) fn exec_direct(
     // than opening one behind itself. `execute` reaches here too, after
     // interpolating its parameters, so this is the only site that needs it.
     conn.ensure_transaction()?;
+
+    // Read before the submit: a `SET TIME ZONE` takes effect for the
+    // statements after it, not for itself.
+    let session_zone = conn.session_zone();
 
     let submit_start = Instant::now();
     let mut page = {
@@ -272,7 +277,7 @@ pub(super) fn exec_direct(
         let _span = tracing::info_span!("trino.convert_batch", page = page_count).entered();
         let rows = decode_page_rows(&conn.runtime, &conn.client, page.data, &kept_columns)
             .map_err(|e| conn.statement_error(e))?;
-        convert_rows(rows, &trino_types)
+        convert_rows(rows, &trino_types, session_zone)
     };
     let total_convert_time = convert_start.elapsed();
     let total_rows_fetched = batch.len() as u64;
@@ -288,6 +293,7 @@ pub(super) fn exec_direct(
         pending_sql: None,
         columns,
         trino_types,
+        session_zone,
         raw_columns: kept_columns,
         batch,
         truncated_cells,
@@ -325,6 +331,8 @@ pub(super) fn prepare(
         pending_sql: Some(sql.to_string()),
         columns: Vec::new(),
         trino_types: Vec::new(),
+        // Nothing is converted until `execute` replaces this statement.
+        session_zone: SessionZone::UTC,
         raw_columns: Vec::new(),
         batch: Vec::new(),
         truncated_cells: HashSet::new(),
@@ -671,7 +679,7 @@ impl StatementBackend for TrinoStatement {
                 decode_page_rows(runtime, client, page.data, &self.raw_columns)
             };
             (self.batch, self.truncated_cells) = match decoded {
-                Ok(rows) => convert_rows(rows, &self.trino_types),
+                Ok(rows) => convert_rows(rows, &self.trino_types, self.session_zone),
                 Err(e) => {
                     let mapped = self.map_client_error(e);
                     return Err(self.end_page_fetch(mapped));
@@ -859,6 +867,7 @@ mod tests {
             pending_sql: None,
             columns: Vec::new(),
             trino_types: Vec::new(),
+            session_zone: SessionZone::UTC,
             raw_columns: Vec::new(),
             batch: Vec::new(),
             truncated_cells: HashSet::new(),

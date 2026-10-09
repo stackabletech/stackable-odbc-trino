@@ -78,6 +78,11 @@ proper entry in the **Get Data** dialog instead of the generic ODBC one.
 2. In **File > Options > Security**, allow any extension to load.
 3. Restart Power BI Desktop. **Stackable Trino** now appears under **Get Data**.
 
+For incremental refresh on a `timestamp with time zone` column, Trino compares
+the `RangeStart` and `RangeEnd` bounds in the session time zone (`TimeZone`),
+so partition boundaries follow that zone. Changing `TimeZone` on a dataset that
+already has partitions moves the boundaries.
+
 ### Your first query
 
 Assuming a Trino instance is reachable on the given host and port:
@@ -148,7 +153,7 @@ The authoritative list is `src/backend/types/connect_params.rs`.
 | `Roles` | No | Authorisation role per catalog, `{catalog:role;catalog2:ALL}` |
 | `SessionUser` | No | User statements run as, while `User` still authenticates. JDBC's `sessionUser` |
 | `Path` | No | Default SQL path for resolving unqualified function names |
-| `TimeZone` | No | IANA session time zone (`Europe/Berlin`). Unset leaves the coordinator's |
+| `TimeZone` | No | IANA session time zone (`Europe/Berlin`). Unset leaves the coordinator's default. `timestamp with time zone` and `time with time zone` values are delivered as wall time in the session zone, which a later `SET TIME ZONE` changes |
 | `Locale` | No | Locale for locale-dependent formatting, sent as `X-Trino-Language` |
 | `ClientInfo` | No | Free-form client metadata Trino records against the query |
 | `TraceToken` | No | Correlation token Trino records against the query |
@@ -259,6 +264,19 @@ ignored, so the tool can react instead of trusting a wrong answer.
   somewhere you never asked for. Set `Catalog` when you connect.
 - **Row and field size limits are not faked.** Trino can only limit a result set
   through `LIMIT` in the SQL you wrote.
+- **Power BI cannot filter on a time column in DirectQuery.** Picking a value
+  in a slicer on a `time` column fails with "We couldn't fold the expression to
+  the data source". Power BI would filter by casting the column to a timestamp
+  and comparing it with that time on 30 December 1899, while Trino, like ODBC
+  itself, puts a cast time on today's date, so the filter could never match.
+  The connector declares the cast unsupported so you see an error instead of an
+  empty report. To slice on a time of day, expose it as text in a Trino view,
+  for example `CAST(col_time AS VARCHAR) AS col_time_text`, and slice on that
+  column. Selecting "(Blank)" still works. Users who cannot create views can
+  switch the table to Import mode, where the slicer filters Power BI's own copy
+  of the data. That copy is only as fresh as its last refresh, and Power BI
+  treats a blank time as equal to midnight, so selecting 12:00:00 AM also shows
+  rows without a time.
 - **One isolation level.** Trino catalogs disagree about which levels they
   accept, so the driver offers the one they all support and refuses the rest up
   front, rather than letting a query fail later for a reason nobody can see.
@@ -306,6 +324,22 @@ the coordinator's chain is refused even when the machine trusts that chain.
 
 **Only the first session property applies.** Wrap the value in braces. See
 [Values that contain a semicolon](#values-that-contain-a-semicolon).
+
+**A Power BI slicer misses a timestamp from the night the clocks go back.**
+`timestamp with time zone` values are shown in the session time zone, and in
+the hour that repeats, two instants share one wall time. Power BI filters on the
+wall time it showed and Trino reads that as the later of the two instants, so a
+value from the first of the repeated hours is not selected.
+
+**Large reads fail with `ABANDONED_QUERY` or `Query not found`.** Trino
+abandons a query whose results the client has not fetched within
+`query.client.timeout` (5 minutes by default), and later forgets it altogether,
+after which the next fetch returns `404 Not Found: Query not found`. A client
+that reads slowly enough gets there on a large result. One cause on
+Windows is ODBC tracing left switched on: it writes every call to a file and
+slows reads down considerably. Turn it off in the ODBC Data Source
+Administrator (Tracing tab, **Stop Tracing Now**), including on an on-premises
+data gateway.
 
 **The browser login never opens.** Some tools, `pyodbc` among them, tell the
 driver it may not display anything. The driver reports this rather than hanging.

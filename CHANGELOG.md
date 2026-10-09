@@ -7,6 +7,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- `timestamp with time zone` values are delivered as wall time in the session
+  time zone instead of in UTC: `TimeZone=` when set, otherwise the
+  coordinator's default, and whatever a later `SET TIME ZONE` chose. Power BI
+  folds the value it showed back as a plain `TIMESTAMP` literal, which Trino
+  reads in the session zone, so a DirectQuery slicer on such a column only
+  selected its rows in a UTC session. Applications reading these columns see
+  different values unless the session is UTC. `time with time zone` values
+  follow the same zone, at its current offset because a time has no date, which
+  is how Trino itself casts `TIME` to `TIME WITH TIME ZONE`.
+- The Power BI connector reports that Trino cannot convert `TIME` to
+  `TIMESTAMP` (`SQL_CONVERT_TIME` without `SQL_CVT_TIMESTAMP`). A DirectQuery
+  slicer on a time column folded to a comparison against Power BI's base date,
+  30 December 1899, while Trino anchors a cast time on the current date, so the
+  report silently showed no rows. Power BI now refuses that fold with a visible
+  error instead. The README describes a view-based workaround.
+
+### Fixed
+
+- `SQLGetTypeInfo` lists the plain type first among the rows that share a
+  `DATA_TYPE`: `VARCHAR` for `SQL_WVARCHAR`, `TIME` for `SQL_TYPE_TIME` and
+  `TIMESTAMP` for `SQL_TYPE_TIMESTAMP`, as the spec's "how closely the data type
+  maps" ordering requires. The rows were sorted by name, so `SQL_WVARCHAR` led
+  with `INTERVAL DAY TO SECOND`, and Power Query, which takes the first row as
+  its `CAST` target, folded a DirectQuery slicer on a text column into
+  `CAST(... AS INTERVAL DAY TO SECOND)`, which Trino rejected.
+- The Power BI connector quotes text constants and doubles any `'` in them.
+  Power Query hands the constant over unquoted, so a slicer value folded into
+  `CAST(hello world as VARCHAR)` and failed. Together with the `SQLGetTypeInfo`
+  fix above this makes DirectQuery slicers on text columns work, so the driver
+  and the connector have to be upgraded together.
+- `INTERVAL YEAR TO MONTH` and `INTERVAL DAY TO SECOND` columns read as text now
+  return Trino's own rendering, the same text `CAST(... AS VARCHAR)` produces
+  (`-1-0`, `0 00:00:00.500`). They were parsed into fields and re-rendered
+  (`-1-00`, `0 00:00:00.5`), so a Power BI DirectQuery slicer on an interval
+  column, which folds to `cast(col as VARCHAR) = '<shown value>'`, silently
+  selected no rows. Reading these columns as `SQL_C_INTERVAL_*` still works:
+  stackable-odbc-core now converts interval text to those C types.
+
 ## [0.1.2] — 2026-09-01
 
 ### Changed

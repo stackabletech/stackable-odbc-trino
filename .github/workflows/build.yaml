@@ -310,8 +310,8 @@ jobs:
       # per layer: once a single layer exhausts it, the pull fails and takes
       # every other image with it. Layers that did arrive stay in the local
       # content store, so a second attempt refetches only what is missing and
-      # costs seconds. The spooling leg is the one that reaches quay.io for
-      # MinIO, and that is where the dropped connections have been seen.
+      # costs seconds. The spooling leg pulls the most, MinIO on top of the
+      # core images, so it is the one most exposed to a dropped connection.
       - name: Pull the stack images
         # From the stack directory, as scripts/lib.sh's `compose` wrapper does.
         # Compose derives the project name from the compose file's directory,

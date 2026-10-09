@@ -74,6 +74,10 @@ SAMPLE = {
 # as a folding gap misreports a gap that cannot exist.
 DM_COMPAT_ONLY = {"SQL_CHAR", "SQL_VARCHAR"}
 
+# SQL_CVT_* bits (sqlext.h): every defined conversion target, and TIMESTAMP's.
+SQL_CVT_ALL = 0x01FFFFFF
+SQL_CVT_TIMESTAMP = 0x00020000
+
 
 def check(label, ok, detail=""):
     R.check(f"{label}{detail}", ok)
@@ -115,6 +119,39 @@ def parse_temporal_formats(source):
             source,
         )
     )
+
+
+def parse_text_entries(source):
+    """Map each Constant-visitor key that casts to VARCHAR to its whole body.
+
+    `VARCHAR = each Cast(Quote(Text.Replace(_, "'", "''")), "VARCHAR")` yields
+    `{"VARCHAR": 'Cast(Quote(Text.Replace(_, "\\'", "\\'\\'")), "VARCHAR")'}`.
+    """
+    return dict(
+        re.findall(r'(\w+)\s*=\s*each\s+(Cast\(.*?"VARCHAR"\s*\))', source)
+    )
+
+
+def render_text_constant(body, value):
+    """The SQL a text visitor entry produces for `value`.
+
+    Power Query hands the visitor the bare text, not a quoted literal: verified
+    in Power BI Desktop on 2026-10-07, where the entry `Cast(_, "VARCHAR")`
+    produced `CAST(hello world as VARCHAR)`. So the entry has to quote the value
+    itself, and double any single quote inside it, or a value such as `O'Brien`
+    ends the literal early. This mirrors exactly those two steps, read off the
+    entry's body, so the check below fails for an entry that skips either.
+    """
+    quoted = "Quote(" in body
+    escaped = re.search(r"""Text\.Replace\(\s*_\s*,\s*"'"\s*,\s*"''"\s*\)""", body)
+    text = value.replace("'", "''") if escaped else value
+    return f"'{text}'" if quoted else text
+
+
+# Slicer values a text constant must survive. The first three are what Power BI
+# sent from `postgresql.public.types_test.col_varchar` on 2026-10-07 (the empty
+# string included); the apostrophe is the one that needs escaping.
+TEXT_SAMPLES = ["hello world", "日本語テスト 🎉🦀 café résumé", "", "O'Brien"]
 
 
 # The .NET custom date/time specifiers the connector is allowed to use, longest
@@ -297,6 +334,29 @@ def main():
             )
 
     # ------------------------------------------------------------------
+    print("\n--- the text literals the Constant visitor renders round-trip ---")
+    # A slicer on a text column folds into `"col" = <constant>`, and the
+    # constant is whatever this entry renders. Unquoted, every value but NULL
+    # is a syntax error; quoted but unescaped, an apostrophe ends the literal.
+    # Round-tripped through Trino rather than pattern-matched, because what
+    # matters is the value Trino compares against.
+    text_entries = parse_text_entries(source)
+    check(
+        "the Constant visitor has a VARCHAR entry",
+        bool(text_entries),
+        "" if text_entries else "  (none parsed)",
+    )
+    for key in sorted(text_entries):
+        for value in TEXT_SAMPLES:
+            literal = render_text_constant(text_entries[key], value)
+            label = f"{key} renders {value!r} as {literal!r}, which CASTs back to it"
+            try:
+                got = cur.execute(f"SELECT CAST({literal} AS VARCHAR)").fetchone()[0]
+                check(label, got == value, "" if got == value else f"  (got {got!r})")
+            except pyodbc.Error as e:
+                check(label, False, f"  {str(e)[:90]}")
+
+    # ------------------------------------------------------------------
     print("\n--- the row-limiting clause the AstVisitor builds parses ---")
     rendered = parse_limit_clause(source)
     check("AstVisitor's LimitClause could be parsed", rendered is not None)
@@ -347,6 +407,41 @@ def main():
         "Config_UseParameterBindings leaves SQLBindParameter enabled",
         bindings_on,
         "" if bindings_on else "  (set false, which disables a function the driver declares)",
+    )
+
+    # ------------------------------------------------------------------
+    print("\n--- TIME -> TIMESTAMP is withheld, so Power BI cannot fold it ---")
+    # A Power BI slicer on a time column folds to
+    # `cast("col" as TIMESTAMP) = CAST('1899-12-30 hh:mm:ss' as TIMESTAMP)`,
+    # anchoring the time on Power BI's base date. Trino's cast, like ODBC's own
+    # conversion tables ("SQL to C: Time" footnote [c]), uses the current date,
+    # so the filter silently matched nothing. Withholding SQL_CVT_TIMESTAMP
+    # from SQL_CONVERT_TIME makes Power BI refuse the fold with a visible error
+    # instead (measured in Power BI Desktop, 2026-10-07). The override is a
+    # deliberate misreport, so it must stay exactly "the driver's answer minus
+    # that one bit" and must be revisited if Trino's anchor ever changes.
+    override = re.search(r"SQL_CONVERT_TIME\s*=\s*(0x[0-9A-Fa-f]+|\d+)", source)
+    check(
+        "the connector overrides SQL_CONVERT_TIME",
+        override is not None,
+        "" if override else "  (no SQL_CONVERT_TIME entry in the SQLGetInfo record)",
+    )
+    if override:
+        declared = int(override.group(1), 0)
+        driver_answer = conn.getinfo(pyodbc.SQL_CONVERT_TIME) & SQL_CVT_ALL
+        expected = driver_answer & ~SQL_CVT_TIMESTAMP
+        check(
+            "SQL_CONVERT_TIME is the driver's answer without SQL_CVT_TIMESTAMP",
+            declared == expected,
+            f"  (declared {declared:#010x}, expected {expected:#010x})",
+        )
+    anchored_today = cur.execute(
+        "SELECT CAST(CAST(TIME '14:30:00' AS TIMESTAMP) AS DATE) = current_date"
+    ).fetchone()[0]
+    check(
+        "Trino still anchors TIME -> TIMESTAMP on the current date",
+        bool(anchored_today),
+        "" if anchored_today else "  (it no longer does: revisit the SQL_CONVERT_TIME override)",
     )
 
     # ------------------------------------------------------------------

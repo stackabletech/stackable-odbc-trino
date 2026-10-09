@@ -307,10 +307,10 @@ StackableTrinoODBCImpl = (
             SupportsTop = false
         ],
 
-        // Nothing is overridden. An override here silently wins over
-        // SQLGetInfoW and cannot be corrected by fixing the driver, so the
-        // record is reserved for what the driver gets wrong, and this group it
-        // answers honestly: SQL_SQL92_PREDICATES, SQL_AGGREGATE_FUNCTIONS,
+        // One entry is overridden, SQL_CONVERT_TIME, below. An override here
+        // silently wins over SQLGetInfoW and cannot be corrected by fixing the
+        // driver, so the record is otherwise reserved for what the driver gets
+        // wrong, and this group it answers honestly: SQL_SQL92_PREDICATES, SQL_AGGREGATE_FUNCTIONS,
         // SQL_SQL92_RELATIONAL_JOIN_OPERATORS, SQL_SQL92_VALUE_EXPRESSIONS and
         // SQL_IDENTIFIER_QUOTE_CHAR.
         //
@@ -327,7 +327,22 @@ StackableTrinoODBCImpl = (
         // Nothing Power Query generates is lost: comparison, IN,
         // LIKE, BETWEEN, IS NULL, EXISTS and the four join types are all in
         // the driver's ungated set.
-        SQLGetInfo = defaultConfig[SQLGetInfo],
+        //
+        // SQL_CONVERT_TIME is the driver's answer (every SQL_CVT_* bit) minus
+        // SQL_CVT_TIMESTAMP, and that is a deliberate misreport: Trino can
+        // cast TIME to TIMESTAMP. It anchors the time on the current date, as
+        // ODBC's own conversion tables do ("SQL to C: Time", footnote [c]),
+        // while Power BI folds a time slicer to
+        // `cast(col as TIMESTAMP) = CAST('1899-12-30 hh:mm:ss' as TIMESTAMP)`,
+        // anchoring on its own base date. That filter ran and silently matched
+        // no row. Without the bit, Power BI refuses the fold and says so ("We
+        // couldn't fold the expression to the data source"), which is the
+        // honest outcome for a filter Trino cannot evaluate the way Power BI
+        // means it. test_folding_contract.py pins the value to the driver's
+        // answer and checks Trino's anchor is still the current date.
+        SQLGetInfo = defaultConfig[SQLGetInfo] & [
+            SQL_CONVERT_TIME = 0x01FDFFFF
+        ],
 
         SQLColumns = (catalogName, schemaName, tableName, columnName, source) =>
             source,
@@ -394,12 +409,16 @@ StackableTrinoODBCImpl = (
                     //             rendering it as Trino's `X'..'` literal
                     //             cannot be verified without Power BI Desktop.
                     //
+                    // Power Query hands a text-valued constant to the visitor
+                    // bare, not quoted: confirmed in Power BI Desktop on
+                    // 2026-10-07, where `Cast(_, "VARCHAR")` folded a slicer
+                    // into `CAST(hello world as VARCHAR)`. A text entry therefore
+                    // quotes the value itself and doubles any single quote in
+                    // it, or `O'Brien` ends the literal early.
+                    //
                     // TODO: add UUID, JSON, TIME WITH TIME ZONE and TIMESTAMP
-                    // WITH TIME ZONE. Each has a valid Trino cast, but the
-                    // rendering turns on whether Power Query hands a
-                    // text-valued constant to the visitor already quoted, which
-                    // the VARCHAR entry below also rests on. Confirm that in
-                    // Power BI Desktop, then add all four.
+                    // WITH TIME ZONE, now that the quoting question above is
+                    // settled. Each has a valid Trino cast.
                     Visitor = [
                         DECIMAL = each Cast(_, "DECIMAL"),
                         INTEGER = each Cast(_, "INTEGER"),
@@ -410,7 +429,7 @@ StackableTrinoODBCImpl = (
                         DOUBLE = each Cast(_, "DOUBLE PRECISION"),
                         BOOLEAN = each Cast(_, "BOOLEAN"),
                         DATE = each Cast(Quote(Date.ToText(_, "yyyy-MM-dd")), "DATE"),
-                        VARCHAR = each Cast(_, "VARCHAR"),
+                        VARCHAR = each Cast(Quote(Text.Replace(_, "'", "''")), "VARCHAR"),
                         // `fffffff`, not `sssssss`: in a custom format string
                         // `s` is the second and `f` is the fractional second,
                         // so the latter spelling renders the second eight times

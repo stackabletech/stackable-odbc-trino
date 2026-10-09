@@ -134,8 +134,9 @@ VALUES = [
     ("timestamp tz", "CAST('2020-02-03 04:05:06 UTC' AS TIMESTAMP WITH TIME ZONE)", None),
     ("uuid", "CAST('12151fd2-7586-11e9-8f9e-2a86e4085a59' AS UUID)", None),
     ("json", "CAST('{\"a\":1}' AS JSON)", None),
-    ("interval day", "INTERVAL '2' DAY", None),
-    ("interval year", "INTERVAL '2' YEAR", None),
+    # Trino's own text, which is what Power BI compares a slicer value against.
+    ("interval day", "INTERVAL '2' DAY", "2 00:00:00.000"),
+    ("interval year", "INTERVAL '2' YEAR", "2-0"),
     ("array", "ARRAY[1,2,3]", None),
     ("row", "CAST(ROW(1,'a') AS ROW(x INTEGER, y VARCHAR))", None),
 ]

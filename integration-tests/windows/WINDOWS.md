@@ -119,6 +119,17 @@ which can predate the feature under test by days.
 | `--gateway <ip>` | `$ODBC_TEST_HOST_GATEWAY`, else `192.168.197.1` | The host-only gateway the VM reaches the host on. `scripts/gen-certs.sh` reads the same environment variable, so the coordinator's certificate covers the address the VM connects to |
 | `--trino-host <address>` | the same as `--gateway` | Where the VM reaches Trino. The name `trino` is mapped to it in the VM's hosts file |
 | `--suite <substring>` | unset | Run only the suites whose name contains the substring. `run-tests.sh --suite` forwards to this |
+| `--allow-dm-trace` | off | Run even when ODBC Driver Manager tracing is on in the VM. Without it the run stops; see below |
+
+**Driver Manager tracing must be off.** The harness checks the three places
+Windows keeps the switch (the current user's, the machine's and the 32-bit
+Driver Manager's `ODBC.INI\ODBC` key) and stops if any has `Trace=1`. Tracing
+writes every ODBC call to a file, which slows reads down so much that Trino can
+abandon a long one (`ABANDONED_QUERY`). It is easy to leave on after a
+diagnosis, and the result looks like a driver problem. Turn it off in the ODBC
+Data Source Administrator (Tracing tab, **Stop Tracing Now**) or set `Trace` to
+`0` under the key the error names. `--allow-dm-trace` is for a run where
+tracing is the point.
 
 The verified configurations connect to `trino` rather than to an address. TLS
 sends no SNI for an IP literal, and Jetty then serves Trino's internal

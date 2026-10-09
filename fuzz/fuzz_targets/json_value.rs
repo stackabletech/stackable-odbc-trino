@@ -11,8 +11,8 @@ use trino_rust_client::{TrinoFloat, TrinoInt, TrinoTy};
 //
 // stackable-odbc-core already fuzzes the second half (`write_column_value`,
 // ColumnValue -> the caller's buffer). Nothing covered the step before it,
-// which is where this crate's temporal, interval and decimal parsers live:
-// roughly a dozen hand-written scanners over text a Trino coordinator chose.
+// which is where this crate's temporal and decimal parsers live: hand-written
+// scanners over text a Trino coordinator chose.
 // Every one of them runs on the server's side of the trust boundary.
 //
 // The property is that no input panics. A panic here is caught at the FFI
