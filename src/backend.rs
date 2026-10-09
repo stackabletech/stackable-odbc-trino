@@ -2823,13 +2823,21 @@ mod tests {
     /// when the client's own timeout fires. A refused port would produce a
     /// connect error instead, and no coordinator is needed to make a request
     /// take longer than it is allowed to.
+    ///
+    /// The port is fixed rather than OS-assigned (`:0`): a sandbox that allows
+    /// loopback ports one by one, as Landlock does, can list a fixed port, but
+    /// not the random one this test would then connect to. It sits below
+    /// Linux's ephemeral range (32768 and up), so an outgoing connection does
+    /// not take it by chance. Only this helper binds it.
     fn timeout_failure() -> trino_rust_client::error::Error {
-        let listener =
-            std::net::TcpListener::bind("127.0.0.1:0").expect("the loopback interface is bindable");
-        let port = listener
-            .local_addr()
-            .expect("a bound listener has an address")
-            .port();
+        const PORT: u16 = 29871;
+        let listener = std::net::TcpListener::bind(("127.0.0.1", PORT)).unwrap_or_else(|e| {
+            panic!(
+                "this test listens on 127.0.0.1:{PORT}, a fixed port so a sandbox can allow it; \
+                 binding it failed (in use, or not allowed by the sandbox): {e}"
+            )
+        });
+        let port = PORT;
         // Holds the accepted connection open, which is what makes the request
         // time out rather than fail. Detached, and outlived by the test.
         std::thread::spawn(move || {
