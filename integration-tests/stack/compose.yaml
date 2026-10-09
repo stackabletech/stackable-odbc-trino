@@ -17,6 +17,10 @@ services:
     # Pinned, never `latest`. The floor is 466: the spooling protocol the
     # spooling profile needs did not exist before it.
     image: trinodb/trino:483
+    labels:
+      # Set by scripts/setup.sh from the assembled config. A changed value is a
+      # changed service definition, so compose recreates the coordinator.
+      stackable.odbc.trino-config-hash: "${TRINO_CONFIG_HASH:-unset}"
     ports:
       - "8443:8443"
     volumes:

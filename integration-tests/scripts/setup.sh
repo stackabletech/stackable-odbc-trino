@@ -55,6 +55,12 @@ echo "=== Assembling the Keycloak realm ==="
 
 echo "=== Assembling Trino config ==="
 "$SCRIPT_DIR/gen-trino-config.sh"
+# The assembled config's content, as a label on the trino service
+# (compose.yaml): compose recreates a service whose definition changed, so a
+# changed fragment reaches a running coordinator without a profile change.
+TRINO_CONFIG_HASH="$(cd "$GENERATED/trino" && find . -type f -print0 | sort -z \
+    | xargs -0 sha256sum | sha256sum | cut -c1-16)"
+export TRINO_CONFIG_HASH
 
 # After every generator, before anything is mounted.
 make_mounts_readable
