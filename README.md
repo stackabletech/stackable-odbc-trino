@@ -78,6 +78,11 @@ proper entry in the **Get Data** dialog instead of the generic ODBC one.
 2. In **File > Options > Security**, allow any extension to load.
 3. Restart Power BI Desktop. **Stackable Trino** now appears under **Get Data**.
 
+For incremental refresh on a `timestamp with time zone` column, Trino compares
+the `RangeStart` and `RangeEnd` bounds in the session time zone (`TimeZone`),
+so partition boundaries follow that zone. Changing `TimeZone` on a dataset that
+already has partitions moves the boundaries.
+
 ### Your first query
 
 Assuming a Trino instance is reachable on the given host and port:
