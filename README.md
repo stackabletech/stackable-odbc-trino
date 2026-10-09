@@ -326,6 +326,16 @@ the hour that repeats, two instants share one wall time. Power BI filters on the
 wall time it showed and Trino reads that as the later of the two instants, so a
 value from the first of the repeated hours is not selected.
 
+**Large reads fail with `ABANDONED_QUERY` or `Query not found`.** Trino
+abandons a query whose results the client has not fetched within
+`query.client.timeout` (5 minutes by default), and later forgets it altogether,
+after which the next fetch returns `404 Not Found: Query not found`. A client
+that reads slowly enough gets there on a large result. One cause we have
+measured on Windows is ODBC tracing left switched on: it writes every call to a
+file, and made a read 25 to 130 times slower. Turn it off in the ODBC Data Source
+Administrator (Tracing tab, **Stop Tracing Now**), including on an on-premises
+data gateway.
+
 **The browser login never opens.** Some tools, `pyodbc` among them, tell the
 driver it may not display anything. The driver reports this rather than hanging.
 Use `AccessToken` with those tools, or connect through one that allows a prompt.

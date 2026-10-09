@@ -127,6 +127,8 @@ def main():
     # Wait for VM setup to complete (Python, pyodbc installed).
     wait_for_setup(session)
 
+    check_dm_tracing(session, args.allow_dm_trace)
+
     deploy(session, args.gateway, dll_path)
 
     # Before `register_driver`, because the uninstaller it runs deregisters the
@@ -419,6 +421,12 @@ def parse_args():
         default="",
         help="only run suites whose name contains this string",
     )
+    p.add_argument(
+        "--allow-dm-trace",
+        action="store_true",
+        help="run even when ODBC Driver Manager tracing is on in the VM "
+             "(it slows every ODBC call; for deliberate diagnosis only)",
+    )
     return p.parse_args()
 
 
@@ -653,6 +661,52 @@ def _port_available(port: int) -> bool:
             return True
         except OSError:
             return False
+
+
+# Where the Driver Manager reads its tracing switch: the current user (the
+# ODBC Data Source Administrator's Tracing tab), the machine, and the 32-bit
+# Driver Manager's own copy.
+DM_TRACE_KEYS = (
+    r"HKCU:\Software\ODBC\ODBC.INI\ODBC",
+    r"HKLM:\SOFTWARE\ODBC\ODBC.INI\ODBC",
+    r"HKLM:\SOFTWARE\WOW6432Node\ODBC\ODBC.INI\ODBC",
+)
+
+
+def check_dm_tracing(session, allowed: bool):
+    """Refuse to run while ODBC Driver Manager tracing is on in the VM.
+
+    Tracing writes every ODBC call to a file. Measured on this VM (2026-10-09):
+    2,000 rows of tpcds.sf1.customer took 1.3-1.7 s with tracing off and
+    42-172 s with it on. That is slow enough for Trino to abandon a long read
+    (ABANDONED_QUERY), which failed the spooling suite and was taken for a
+    driver problem for a day. Tracing is easy to leave on after a diagnosis,
+    and nothing else here would say so.
+    """
+    keys = ", ".join(f"'{k}'" for k in DM_TRACE_KEYS)
+    r = session.run_ps(
+        f"foreach ($k in {keys}) {{ "
+        f"$p = Get-ItemProperty $k -ErrorAction SilentlyContinue; "
+        f"if ($p -and \"$($p.Trace)\" -eq '1') {{ \"$k -> $($p.TraceFile)\" }} }}"
+    )
+    on = [line for line in r.std_out.decode("utf-8", errors="replace").splitlines() if line.strip()]
+    if not on:
+        return
+    message = "ODBC Driver Manager tracing is ON in the VM (Trace=1):\n" + "\n".join(
+        f"  {line}" for line in on
+    )
+    if allowed:
+        print(f"WARNING: {message}\n  continuing because of --allow-dm-trace; "
+              "expect every suite to run far slower", file=sys.stderr)
+        return
+    print(
+        f"ERROR: {message}\n"
+        "Tracing slows every ODBC call enough for Trino to abandon long reads.\n"
+        "Turn it off (ODBC Data Source Administrator > Tracing > Stop Tracing Now, "
+        "or set Trace to 0 under the key above), or pass --allow-dm-trace.",
+        file=sys.stderr,
+    )
+    sys.exit(1)
 
 
 def check_installers(session):
