@@ -1680,16 +1680,16 @@ undefined-behaviour risk lives and where both are run.
 
 ### Cutting a release
 
-`main` is protected: changes reach it only through a pull request and the merge
-queue, so cargo-release cannot push its commit or tag there. The release commit
-goes through a pull request like any other change, and the tag is made by hand
-once it has merged.
+`main` is protected: changes reach it only through an approved pull request,
+so cargo-release cannot push its release commit there. The release commit goes
+through a pull request like any other change, and the tag is made by hand once
+the pull request has been approved and merged.
 
 ```mermaid
 flowchart LR
     B["branch<br/>chore/release-X.Y.Z"] -->|"release.sh --execute<br/>(no push, no tag)"| C["signed release commit"]
-    C -->|pull request| Q["merge queue"]
-    Q --> M["main"]
+    C -->|pull request| P["approved and merged"]
+    P --> M["main"]
     M -->|"git tag -s vX.Y.Z<br/>on the merged commit"| T["tag pushed"]
     T --> W["release.yaml builds and<br/>publishes the GitHub Release"]
 ```
@@ -1709,8 +1709,8 @@ bumps `Cargo.toml`, rewrites `CHANGELOG.md` and the connector's `[Version]`, and
 makes one signed commit.
 
 After the pull request has merged, tag the commit `main` now points at, never
-the one on the release branch: the merge queue may squash or merge, and either
-way the commit on `main` is not the one you made.
+the one on the release branch: merging creates a new commit on `main` (a merge
+or a squash commit), so it is not the one you made.
 
 ```bash
 git switch main && git pull --ff-only
