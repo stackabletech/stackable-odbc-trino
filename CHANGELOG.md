@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] — 2026-10-09
+
 ### Changed
 
 - `timestamp with time zone` values are delivered as wall time in the session
@@ -153,7 +155,8 @@ covered by `sha256sums.txt`.
 - Only the `READ UNCOMMITTED` isolation level is offered, because it is the one
   every Trino catalog accepts.
 
-[Unreleased]: https://github.com/stackabletech/stackable-odbc-trino/compare/v0.1.2...HEAD
+[Unreleased]: https://github.com/stackabletech/stackable-odbc-trino/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/stackabletech/stackable-odbc-trino/releases/tag/v0.2.0
 [0.1.2]: https://github.com/stackabletech/stackable-odbc-trino/releases/tag/v0.1.2
 [0.1.1]: https://github.com/stackabletech/stackable-odbc-trino/releases/tag/v0.1.1
 [0.1.0]: https://github.com/stackabletech/stackable-odbc-trino/releases/tag/v0.1.0
