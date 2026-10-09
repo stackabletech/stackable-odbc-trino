@@ -676,12 +676,10 @@ DM_TRACE_KEYS = (
 def check_dm_tracing(session, allowed: bool):
     """Refuse to run while ODBC Driver Manager tracing is on in the VM.
 
-    Tracing writes every ODBC call to a file. Measured on this VM (2026-10-09):
-    2,000 rows of tpcds.sf1.customer took 1.3-1.7 s with tracing off and
-    42-172 s with it on. That is slow enough for Trino to abandon a long read
-    (ABANDONED_QUERY), which failed the spooling suite and was taken for a
-    driver problem for a day. Tracing is easy to leave on after a diagnosis,
-    and nothing else here would say so.
+    Tracing writes every ODBC call to a file, which slows reads down so much
+    that Trino can abandon a long one (ABANDONED_QUERY): timing-sensitive
+    suites then fail in a way that looks like a driver problem. Tracing is
+    easy to leave on after a diagnosis, and nothing else here would say so.
     """
     keys = ", ".join(f"'{k}'" for k in DM_TRACE_KEYS)
     r = session.run_ps(

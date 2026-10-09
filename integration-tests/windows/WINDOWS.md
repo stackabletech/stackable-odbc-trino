@@ -124,12 +124,12 @@ which can predate the feature under test by days.
 **Driver Manager tracing must be off.** The harness checks the three places
 Windows keeps the switch (the current user's, the machine's and the 32-bit
 Driver Manager's `ODBC.INI\ODBC` key) and stops if any has `Trace=1`. Tracing
-writes every ODBC call to a file: on this VM, 2,000 rows took 1.3-1.7 s with it
-off and 42-172 s with it on, slow enough for Trino to abandon a long read
-(`ABANDONED_QUERY`). It is easy to leave on after a diagnosis, and the result
-looks like a driver problem. Turn it off in the ODBC Data Source Administrator
-(Tracing tab, **Stop Tracing Now**) or set `Trace` to `0` under the key the
-error names. `--allow-dm-trace` is for a run where tracing is the point.
+writes every ODBC call to a file, which slows reads down so much that Trino can
+abandon a long one (`ABANDONED_QUERY`). It is easy to leave on after a
+diagnosis, and the result looks like a driver problem. Turn it off in the ODBC
+Data Source Administrator (Tracing tab, **Stop Tracing Now**) or set `Trace` to
+`0` under the key the error names. `--allow-dm-trace` is for a run where
+tracing is the point.
 
 The verified configurations connect to `trino` rather than to an address. TLS
 sends no SNI for an IP literal, and Jetty then serves Trino's internal
