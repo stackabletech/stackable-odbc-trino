@@ -1680,16 +1680,49 @@ undefined-behaviour risk lives and where both are run.
 
 ### Cutting a release
 
-```bash
-release/release.sh minor            # dry run; cargo-release is dry-run by default
-release/release.sh minor --execute
+`main` is protected: changes reach it only through an approved pull request,
+so cargo-release cannot push its release commit there. The release commit goes
+through a pull request like any other change, and the tag is made by hand once
+the pull request has been approved and merged.
+
+```mermaid
+flowchart LR
+    B["branch<br/>chore/release-X.Y.Z"] -->|"release.sh --execute<br/>(no push, no tag)"| C["signed release commit"]
+    C -->|pull request| P["approved and merged"]
+    P --> M["main"]
+    M -->|"git tag -s vX.Y.Z<br/>on the merged commit"| T["tag pushed"]
+    T --> W["release.yaml builds and<br/>publishes the GitHub Release"]
 ```
 
-That bumps `Cargo.toml`, rewrites `CHANGELOG.md` and the version examples in
-`packaging/README.md`, commits, and pushes a signed `v<version>` tag. The tag
-triggers `.github/workflows/release.yaml`, which builds both binaries with
-`cargo auditable build --locked --release`, runs `build-archives.sh`, attests the
-result and publishes the GitHub Release. `release.toml` restricts this to `main`.
+```bash
+git switch main && git pull --ff-only
+git switch -c chore/release-0.3.0
+release/release.sh minor --allow-branch 'chore/release-*' --no-push --no-tag            # dry run
+release/release.sh minor --allow-branch 'chore/release-*' --no-push --no-tag --execute
+git push -u origin chore/release-0.3.0    # then open the pull request
+```
+
+`--allow-branch` overrides `release.toml`'s `allow-branch = ["main"]`, and
+`--no-push --no-tag` stop cargo-release before the steps the protection would
+refuse. The run executes the pre-release hook (`pre-commit run --all-files`),
+bumps `Cargo.toml`, rewrites `CHANGELOG.md` and the connector's `[Version]`, and
+makes one signed commit.
+
+After the pull request has merged, tag the commit `main` now points at, never
+the one on the release branch: merging creates a new commit on `main` (a merge
+or a squash commit), so it is not the one you made.
+
+```bash
+git switch main && git pull --ff-only
+git log -1 --oneline                      # chore(release): version X.Y.Z (#N)
+git tag -s vX.Y.Z -m "chore(release): version X.Y.Z"
+git push origin vX.Y.Z
+```
+
+The tag triggers `.github/workflows/release.yaml`, which builds both binaries
+with `cargo auditable build --locked --release`, runs `build-archives.sh`,
+attests the result and publishes the GitHub Release, with release notes GitHub
+generates from the merged pull requests.
 
 syft and cargo-auditable are installed at pinned versions, named once in the
 workflow's `env`. Both are preconditions of packaging rather than extras:
@@ -1893,14 +1926,17 @@ list: `AccessToken`, `ExtraCredentials`, `ExtraHeaders`, `ProxyPassword`. An
 option set here is stored in the query text inside the `.pbix`, which is a file
 people mail to each other.
 
-**`SessionProperties`, `ResourceEstimates` and `Roles` are unverified through
-Power Query.** All three carry `;`, and whether `Odbc.DataSource` escapes a
-record value containing one is not established here: nothing in this repo
-executes the `.pq`, since `suites/test_folding_contract.py` parses it and Power
-BI is what runs it. They are passed unbraced, relying on Power Query's own
-escaping. **Before a release, set `SessionProperties` to two pairs in Power BI
-Desktop and confirm both apply.** If only the first does, brace those three in
-the connector the way `Build-ConnectionString` does in `configure-dsn.ps1`.
+**`SessionProperties`, `ResourceEstimates` and `Roles` are passed unbraced,
+relying on Power Query's own escaping.** All three carry `;`, which also ends a
+connection-string value. `Odbc.DataSource` does escape it: with
+`SessionProperties` set to two pairs in Power BI Desktop, every query reached
+Trino with both properties set (Trino's `/v1/query` lists each query's
+`session.systemProperties`). `ResourceEstimates` and `Roles` take the same path
+but have not been checked individually. Nothing in this repo executes the
+`.pq`, since `suites/test_folding_contract.py` only parses it, so repeat that
+check whenever the connector's option handling changes. If only the first pair
+ever applies, brace those three in the connector the way
+`Build-ConnectionString` does in `configure-dsn.ps1`.
 `DirectQuery` needs no such check and no option of its own: it is a `Publish`
 capability (`SupportsDirectQuery`), and Power BI draws the Import/DirectQuery
 selector itself.
